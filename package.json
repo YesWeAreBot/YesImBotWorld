@@ -1,0 +1,58 @@
+{
+  "name": "koishi-plugin-yesimbot-world",
+  "version": "0.1.0",
+  "description": "YesImBot World: 让 Bot 生活在由另一个 LLM 维护的独立虚拟世界中，持续生成行动流",
+  "type": "module",
+  "main": "dist/index.cjs",
+  "module": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist"
+  ],
+  "license": "MIT",
+  "scripts": {
+    "build": "pkgroll --sourcemap",
+    "check": "tsc --noEmit"
+  },
+  "keywords": [
+    "koishi",
+    "plugin",
+    "yesimbot",
+    "llm",
+    "agent",
+    "virtual-world"
+  ],
+  "koishi": {
+    "description": {
+      "zh": "YesImBot World：由 World-LLM 维护的虚拟世界 + 持续运行的 Bot-LLM 行动流"
+    },
+    "service": {
+      "required": [
+        "database"
+      ],
+      "implements": [
+        "yesimbotWorld"
+      ]
+    }
+  },
+  "peerDependencies": {
+    "koishi": "^4.18.11"
+  },
+  "devDependencies": {
+    "@koishijs/plugin-database-memory": "^3.7.0",
+    "@koishijs/plugin-mock": "^2.6.6",
+    "@types/node": "^22.7.5",
+    "koishi": "^4.18.11",
+    "pkgroll": "^2.6.1",
+    "typescript": "^5.9.3"
+  },
+  "packageManager": "yarn@4.12.0"
+}

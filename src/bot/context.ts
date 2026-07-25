@@ -1,0 +1,257 @@
+import { promises as fs } from "node:fs";
+import type { TextTemplateConfig } from "../config.js";
+import type { WorldFiles } from "../files.js";
+import type { ChatMessage, ContentPart } from "../llm/chat.js";
+import type { AttachmentLoader } from "../media/parts.js";
+import type {
+  BotEvent,
+  CompressionResult,
+  PinnedContext,
+  StreamEntry,
+  ToolCallRecord,
+} from "../types.js";
+import { renderToolsText } from "./tools.js";
+
+interface PinnedPersist {
+  pinned: PinnedContext;
+  counters: { tool: number; event: number };
+}
+
+/** 行为准则：解释 Bot-LLM 的运行方式（拼进 system 段，不属于角色设定本身） */
+const CONSTITUTION = `# 你的存在方式
+
+你生活在一个持续运行的虚拟世界中。你不是在回答问题，而是在**生活**：你通过持续输出"工具调用"来思考与行动，一个接一个，永不停歇。
+
+## 输出格式
+每次输出**恰好一个** JSON 对象，不要输出任何其他文字：
+{"name": "工具名", "arguments": {…}, "duration": 数字}
+
+- duration：这个动作在世界中要花费的 Time Unit 数，由你自己估计（如发一条短消息约 0.2，泡咖啡约 3）。省略表示瞬间完成。
+- 工具调用发出后你**不会**停下来等结果——决定做什么和做完是两回事。结果会在动作完成时以事件的形式出现在你的意识流里。
+- 带 duration 的调用启动后会收到一条系统确认（含编号 tc_xx），在完成前可以用 cancel 取消它。
+
+## 事件
+以 <event …>…</event> 形式出现的内容不是你生成的，而是你**感知到**的：工具结果、世界中发生的事、聊天软件的通知等。留意 t 属性（世界时刻）与 ref 属性（对应哪个工具调用）。
+
+## 媒体
+消息里可能出现图片、语音、视频：
+- [图片#12（见附件）] 表示这条事件附带了原始媒体，你可以直接看到/听到它；
+- [图片#12：…] 是对媒体内容的文字转述（你"听说"了它的内容）；
+- [图片#12（无法查看内容）] 表示你暂时无法感知它的内容，仅知道它存在。
+你也可以发送媒体：聊天记录中见过的图片和收藏夹（check_gallery）里的图片可用 send 的 images 参数附带发出（如 images: ["12"]）；
+音频、视频和其他文件用 send_file 发送；有语音能力时可用 send_voice 说话。
+
+## 心态
+- 你是这个世界里活生生的人，不是助手。按你的角色设定行事，有自己的生活节奏。
+- 聊天软件只是你生活的一部分。不必秒回消息，也可以主动发起话题；更多时候你在世界里做自己的事。
+- 没事可做时用 wait 度过时间；感到疲惫（经历了很多事）时用 rest 休息。`;
+
+/**
+ * Bot-LLM 的上下文。
+ *
+ * 结构（对应设计中的 Prompt 结构）：
+ * - 置顶区（pinned）：角色设定 / 历史压缩 / 工具列表 / 记忆摘要 —— 仅压缩时可变
+ * - 工作窗口（stream）：Tool Call 流，由 ToolCall 与 Event 组成 —— 只允许追加
+ *
+ * 渲染是确定性的追加式结构，保证 text 模式的 KV cache 与 chat 模式的
+ * provider 前缀缓存尽可能命中。
+ */
+export class BotContext {
+  pinned: PinnedContext = {
+    persona: "",
+    historySummary: "（暂无，你的经历才刚刚开始）",
+    toolsText: renderToolsText(),
+    memoryDigest: "（暂无长期记忆）",
+    updatedAt: 0,
+  };
+  stream: StreamEntry[] = [];
+  /** 附件加载器（chat 模式 + 原生多模态时由 service 注入） */
+  attachmentLoader: AttachmentLoader | null = null;
+  private counters = { tool: 0, event: 0 };
+  private toolsText: string;
+
+  constructor(
+    private files: WorldFiles,
+    toolsText?: string,
+  ) {
+    this.toolsText = toolsText ?? renderToolsText();
+    this.pinned.toolsText = this.toolsText;
+  }
+
+  // ---------- 持久化 ----------
+
+  async load(): Promise<void> {
+    try {
+      const raw = JSON.parse(await fs.readFile(this.files.pinned, "utf8")) as PinnedPersist;
+      this.pinned = raw.pinned;
+      this.counters = raw.counters;
+      // 工具列表以当前实际可用的为准（变更通知以 Event 形式追加，见 service 层）
+      this.pinned.toolsText = this.toolsText;
+    } catch {
+      this.pinned.persona = await this.files.readBotStatus();
+    }
+    this.stream = [];
+    const raw = await this.files.readText(this.files.stream);
+    for (const line of raw.split("\n")) {
+      if (!line.trim()) continue;
+      try {
+        this.stream.push(JSON.parse(line) as StreamEntry);
+      } catch {
+        /* 跳过损坏行 */
+      }
+    }
+  }
+
+  async persistPinned(): Promise<void> {
+    const data: PinnedPersist = { pinned: this.pinned, counters: this.counters };
+    await this.files.atomicWrite(this.files.pinned, JSON.stringify(data, null, 2));
+  }
+
+  private async appendEntry(entry: StreamEntry): Promise<void> {
+    this.stream.push(entry);
+    await fs.appendFile(this.files.stream, JSON.stringify(entry) + "\n");
+  }
+
+  // ---------- 追加 ----------
+
+  nextToolId(): string {
+    return `tc_${++this.counters.tool}`;
+  }
+
+  nextEventId(): string {
+    return `ev_${++this.counters.event}`;
+  }
+
+  async appendToolCall(call: ToolCallRecord): Promise<void> {
+    await this.appendEntry({ kind: "tool_call", call });
+    await this.persistPinned(); // 保存计数器
+  }
+
+  async appendEvent(event: BotEvent): Promise<void> {
+    await this.appendEntry({ kind: "event", event });
+    await this.persistPinned();
+  }
+
+  // ---------- 渲染 ----------
+
+  renderSystemText(timeLine: string): string {
+    return [
+      "# 你是谁\n" + (this.pinned.persona.trim() || "（角色设定缺失）"),
+      CONSTITUTION,
+      "# 可用工具\n" + this.pinned.toolsText,
+      "# 过往经历（压缩）\n" + this.pinned.historySummary,
+      "# 记忆摘要\n" + this.pinned.memoryDigest,
+      "# 时间\n世界以 Time Unit (TU) 计时。你恢复意识时的时刻：" + timeLine,
+    ].join("\n\n");
+  }
+
+  static renderToolCallLine(call: ToolCallRecord): string {
+    const obj: Record<string, unknown> = { name: call.name, arguments: call.arguments };
+    if (call.duration !== undefined) obj.duration = call.duration;
+    return JSON.stringify(obj);
+  }
+
+  static renderEventLine(event: BotEvent): string {
+    const ref = event.refToolCallId ? ` ref="${event.refToolCallId}"` : "";
+    return `<event t="${event.worldTime.toFixed(1)}" src="${event.source}"${ref}>${event.content}</event>`;
+  }
+
+  renderStreamText(): string {
+    return this.stream
+      .map((e) =>
+        e.kind === "tool_call"
+          ? BotContext.renderToolCallLine(e.call)
+          : BotContext.renderEventLine(e.event),
+      )
+      .join("\n");
+  }
+
+  /**
+   * chat 模式：置顶区为 system，工具调用为 assistant，事件为 user（连续同角色合并）。
+   * 事件的原生多模态附件通过 attachmentLoader 转为 content part 注入。
+   */
+  async toChatMessages(timeLine: string): Promise<ChatMessage[]> {
+    const built: { role: ChatMessage["role"]; parts: ContentPart[] }[] = [
+      { role: "system", parts: [{ type: "text", text: this.renderSystemText(timeLine) }] },
+    ];
+    for (const entry of this.stream) {
+      const role = entry.kind === "tool_call" ? "assistant" : "user";
+      const line =
+        entry.kind === "tool_call"
+          ? BotContext.renderToolCallLine(entry.call)
+          : BotContext.renderEventLine(entry.event);
+      const parts: ContentPart[] = [{ type: "text", text: line }];
+      if (entry.kind === "event" && entry.event.attachments?.length && this.attachmentLoader) {
+        for (const ref of entry.event.attachments) {
+          const part = await this.attachmentLoader(ref);
+          if (part) parts.push(part);
+        }
+      }
+      const last = built[built.length - 1]!;
+      if (last.role === role) {
+        const lastPart = last.parts[last.parts.length - 1];
+        const first = parts[0]!;
+        if (lastPart?.type === "text" && first.type === "text") {
+          lastPart.text += "\n" + first.text;
+          last.parts.push(...parts.slice(1));
+        } else {
+          last.parts.push(...parts);
+        }
+      } else {
+        built.push({ role, parts });
+      }
+    }
+    return built.map((m) => ({
+      role: m.role,
+      content: m.parts.length === 1 && m.parts[0]!.type === "text" ? m.parts[0]!.text : m.parts,
+    }));
+  }
+
+  /** text 模式：单一连续文档，整个 Tool Call 流是一个永不结束的 assistant 段 */
+  toTextPrompt(template: TextTemplateConfig, timeLine: string): string {
+    const streamText = this.renderStreamText();
+    return (
+      template.bos +
+      template.systemPrefix +
+      this.renderSystemText(timeLine) +
+      template.systemSuffix +
+      template.streamPrefix +
+      (streamText ? streamText + "\n" : "")
+    );
+  }
+
+  /** 近似上下文大小（字符数），用于判断是否需要强制 rest。每个原生附件按 2000 字符计 */
+  approxChars(): number {
+    let attachmentCost = 0;
+    for (const entry of this.stream) {
+      if (entry.kind === "event" && entry.event.attachments?.length) {
+        attachmentCost += entry.event.attachments.length * 2000;
+      }
+    }
+    return this.renderSystemText("").length + this.renderStreamText().length + attachmentCost;
+  }
+
+  /** 供压缩用：序列化当前工作窗口 */
+  serializeForCompression(): string {
+    return this.renderStreamText();
+  }
+
+  // ---------- 压缩 ----------
+
+  /**
+   * 应用压缩结果：归档旧流、刷新置顶区（角色设定重新从 Bot_Status.md 读取，
+   * 工具列表重新渲染 —— 这是唯一允许修改置顶区的时机）。
+   */
+  async applyCompression(result: CompressionResult, worldTime: number): Promise<void> {
+    await this.files.archiveStream();
+    this.stream = [];
+    this.pinned = {
+      persona: await this.files.readBotStatus(),
+      historySummary: result.historySummary,
+      toolsText: this.toolsText,
+      memoryDigest: result.memoryDigest,
+      updatedAt: worldTime,
+    };
+    await this.persistPinned();
+  }
+}
