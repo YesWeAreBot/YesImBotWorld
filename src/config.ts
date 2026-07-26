@@ -93,13 +93,34 @@ export interface MessagingConfig {
   longMessageChars: number;
 }
 
-/** 聊天平台扩展操作（收发消息之外的能力），默认全部关闭 */
+/** 聊天平台扩展操作（收发消息之外的能力），每个接口独立开关，默认全部关闭 */
 export interface PlatformOpsConfig {
   recall: boolean;
   react: boolean;
+  reply: boolean;
   poke: boolean;
   handleRequests: boolean;
   listFriends: boolean;
+  userInfo: boolean;
+  sendLike: boolean;
+  deleteFriend: boolean;
+  profile: boolean;
+  listGroups: boolean;
+  groupInfo: boolean;
+  listMembers: boolean;
+  memberInfo: boolean;
+  groupCard: boolean;
+  groupName: boolean;
+  groupPortrait: boolean;
+  groupNotice: boolean;
+  essence: boolean;
+  groupSign: boolean;
+  groupBan: boolean;
+  groupWholeBan: boolean;
+  groupKick: boolean;
+  groupAdmin: boolean;
+  specialTitle: boolean;
+  groupLeave: boolean;
 }
 
 export interface Config {
@@ -233,6 +254,9 @@ export const Config: Schema<Config> = Schema.intersect([
           "react：给消息贴表情回应（OneBot 走 set_msg_emoji_like，需实现端支持，如 NapCat / LLOneBot / Lagrange；" +
             "其他平台走通用 createReaction）。开启后消息记录会附带 (msg:xxx) 消息编号",
         ),
+      reply: Schema.boolean()
+        .default(false)
+        .description("reply：send 时可用 reply_to 引用回复某条消息。开启后消息记录会附带 (msg:xxx) 消息编号"),
       poke: Schema.boolean()
         .default(false)
         .description("poke：戳一戳（仅 OneBot，需实现端支持 friend_poke / group_poke，如 NapCat / LLOneBot）"),
@@ -244,7 +268,67 @@ export const Config: Schema<Config> = Schema.intersect([
         ),
       listFriends: Schema.boolean()
         .default(false)
-        .description("list_friends：查看好友列表（名字与可用于 send 的频道 id）"),
+        .description("list_friends：查看好友列表（名字与可用于 send 的频道 id）［get_friend_list］"),
+      userInfo: Schema.boolean()
+        .default(false)
+        .description("user_info：查看某个用户的资料（昵称、性别、年龄、签名等）［get_stranger_info］"),
+      sendLike: Schema.boolean()
+        .default(false)
+        .description("send_like：给某人的资料卡点赞（每天最多 10 次）［send_like］"),
+      deleteFriend: Schema.boolean()
+        .default(false)
+        .description("delete_friend：删除好友（不可逆，谨慎开启）［delete_friend］"),
+      profile: Schema.boolean()
+        .default(false)
+        .description("set_profile：修改自己的昵称、个性签名、头像［set_qq_profile / set_qq_avatar］"),
+      listGroups: Schema.boolean()
+        .default(false)
+        .description("list_groups：查看自己加入的群列表［get_group_list］"),
+      groupInfo: Schema.boolean()
+        .default(false)
+        .description("group_info：查看某个群的信息（群名、人数等）［get_group_info］"),
+      listMembers: Schema.boolean()
+        .default(false)
+        .description("list_members：查看群成员列表［get_group_member_list］"),
+      memberInfo: Schema.boolean()
+        .default(false)
+        .description("member_info：查看某个群成员的详细信息（名片、头衔、身份等）［get_group_member_info］"),
+      groupCard: Schema.boolean()
+        .default(false)
+        .description("set_group_card：修改自己在群里显示的名称（群名片）［set_group_card］"),
+      groupName: Schema.boolean()
+        .default(false)
+        .description("set_group_name：修改群名（需要相应权限）［set_group_name］"),
+      groupPortrait: Schema.boolean()
+        .default(false)
+        .description("set_group_portrait：修改群头像（需要管理员权限）［set_group_portrait］"),
+      groupNotice: Schema.boolean()
+        .default(false)
+        .description("send_group_notice：发布群公告（需要管理员权限）［_send_group_notice］"),
+      essence: Schema.boolean()
+        .default(false)
+        .description("set_essence：把群消息设为/移出精华（需要管理员权限）［set_essence_msg / delete_essence_msg］"),
+      groupSign: Schema.boolean()
+        .default(false)
+        .description("group_sign：群打卡［set_group_sign / send_group_sign］"),
+      groupBan: Schema.boolean()
+        .default(false)
+        .description("group_ban：禁言/解除禁言群成员（需要管理员权限）［set_group_ban］"),
+      groupWholeBan: Schema.boolean()
+        .default(false)
+        .description("group_whole_ban：开启/关闭全员禁言（需要管理员权限）［set_group_whole_ban］"),
+      groupKick: Schema.boolean()
+        .default(false)
+        .description("group_kick：把成员移出群（需要管理员权限，谨慎开启）［set_group_kick］"),
+      groupAdmin: Schema.boolean()
+        .default(false)
+        .description("group_admin：设置/取消群管理员（需要群主权限）［set_group_admin］"),
+      specialTitle: Schema.boolean()
+        .default(false)
+        .description("set_special_title：授予群成员专属头衔（需要群主权限）［set_group_special_title］"),
+      groupLeave: Schema.boolean()
+        .default(false)
+        .description("group_leave：退出群聊（不可逆，谨慎开启）［set_group_leave］"),
     }).description(
       "聊天平台扩展操作：为 Bot 提供收发消息之外的平台能力（默认全部关闭）。" +
         "开关变化会以事件告知 Bot 并即刻生效；置顶的工具列表在下次 rest 压缩时才同步（保护前缀缓存）",

@@ -14,7 +14,10 @@ export interface MessengerApi {
   recentChannels(n: number): Promise<RichText>;
   channelMessages(id: string, n: number): Promise<RichText>;
   gallery(): Promise<string>;
-  send(id: string, msg: string, images?: (string | number)[]): Promise<string>;
+  checkMedia(n: number, type?: "image" | "audio" | "video"): Promise<string>;
+  gallerySave(mediaId: string, name?: string): Promise<string>;
+  galleryRemove(name: string): Promise<string>;
+  send(id: string, msg: string, media?: (string | number)[], replyTo?: string): Promise<string>;
   sendFile(id: string, ref: string): Promise<string>;
   sendVoice(id: string, text: string): Promise<string>;
   putDownPhone(): Promise<string>;
@@ -23,6 +26,26 @@ export interface MessengerApi {
   poke(id: string, userId?: string): Promise<string>;
   handleRequest(requestId: string, approve: boolean, reason?: string): Promise<string>;
   listFriends(): Promise<string>;
+  userInfo(userId: string): Promise<string>;
+  sendLike(userId: string, times: number): Promise<string>;
+  deleteFriend(userId: string): Promise<string>;
+  setProfile(opts: { nickname?: string; signature?: string; avatar?: string }): Promise<string>;
+  listGroups(): Promise<string>;
+  groupInfo(id: string): Promise<string>;
+  listMembers(id: string): Promise<string>;
+  memberInfo(id: string, userId: string): Promise<string>;
+  setGroupCard(id: string, card: string): Promise<string>;
+  setGroupName(id: string, name: string): Promise<string>;
+  setGroupPortrait(id: string, image: string): Promise<string>;
+  sendGroupNotice(id: string, content: string): Promise<string>;
+  setEssence(msgId: string, remove: boolean): Promise<string>;
+  groupSign(id: string): Promise<string>;
+  groupBan(id: string, userId: string, minutes: number): Promise<string>;
+  groupWholeBan(id: string, enable: boolean): Promise<string>;
+  groupKick(id: string, userId: string, block: boolean): Promise<string>;
+  groupAdmin(id: string, userId: string, enable: boolean): Promise<string>;
+  setSpecialTitle(id: string, userId: string, title: string): Promise<string>;
+  groupLeave(id: string): Promise<string>;
 }
 
 /** 即时调用结果的宽限等待上限（毫秒）：超过则不再等待，照常进入下一轮生成 */
@@ -322,6 +345,30 @@ export class BotAgent {
         );
       case "check_gallery":
         return this.dispatchLocal(call, async () => this.messenger.gallery());
+      case "check_media": {
+        const typeRaw = String(call.arguments.type ?? "");
+        const type = typeRaw === "image" || typeRaw === "audio" || typeRaw === "video" ? typeRaw : undefined;
+        return this.dispatchLocal(call, async () =>
+          this.messenger.checkMedia(clampInt(call.arguments.n, 1, 30, 10), type),
+        );
+      }
+      case "gallery_save": {
+        const mediaId = String(call.arguments.media_id ?? call.arguments.mediaId ?? call.arguments.id ?? "");
+        if (!mediaId) {
+          this.pushEvent("system", "（gallery_save 需要 media_id 参数（媒体编号）。）", { ref: call.id });
+          return;
+        }
+        const name = call.arguments.name != null ? String(call.arguments.name) : undefined;
+        return this.dispatchLocal(call, async () => this.messenger.gallerySave(mediaId, name));
+      }
+      case "gallery_remove": {
+        const name = String(call.arguments.name ?? "");
+        if (!name) {
+          this.pushEvent("system", "（gallery_remove 需要 name 参数（收藏夹文件名）。）", { ref: call.id });
+          return;
+        }
+        return this.dispatchLocal(call, async () => this.messenger.galleryRemove(name));
+      }
       case "send":
         return this.dispatchSend(call);
       case "send_file":
@@ -373,6 +420,180 @@ export class BotAgent {
       }
       case "list_friends":
         return this.dispatchLocal(call, async () => this.messenger.listFriends());
+      case "user_info": {
+        const userId = String(call.arguments.user_id ?? call.arguments.userId ?? call.arguments.id ?? "");
+        if (!userId) {
+          this.pushEvent("system", "（user_info 需要 user_id 参数。）", { ref: call.id });
+          return;
+        }
+        return this.dispatchLocal(call, async () => this.messenger.userInfo(userId));
+      }
+      case "send_like": {
+        const userId = String(call.arguments.user_id ?? call.arguments.userId ?? call.arguments.id ?? "");
+        if (!userId) {
+          this.pushEvent("system", "（send_like 需要 user_id 参数。）", { ref: call.id });
+          return;
+        }
+        const times = clampInt(call.arguments.times, 1, 10, 1);
+        return this.dispatchLocal(call, async () => this.messenger.sendLike(userId, times));
+      }
+      case "delete_friend": {
+        const userId = String(call.arguments.user_id ?? call.arguments.userId ?? call.arguments.id ?? "");
+        if (!userId) {
+          this.pushEvent("system", "（delete_friend 需要 user_id 参数。）", { ref: call.id });
+          return;
+        }
+        return this.dispatchLocal(call, async () => this.messenger.deleteFriend(userId));
+      }
+      case "set_profile": {
+        const nickname = call.arguments.nickname != null ? String(call.arguments.nickname) : undefined;
+        const signature = call.arguments.signature != null ? String(call.arguments.signature) : undefined;
+        const avatar = call.arguments.avatar != null ? String(call.arguments.avatar) : undefined;
+        if (!nickname && !signature && !avatar) {
+          this.pushEvent("system", "（set_profile 需要 nickname、signature、avatar 中至少一个参数。）", { ref: call.id });
+          return;
+        }
+        return this.dispatchLocal(call, async () => this.messenger.setProfile({ nickname, signature, avatar }));
+      }
+      case "list_groups":
+        return this.dispatchLocal(call, async () => this.messenger.listGroups());
+      case "group_info": {
+        const id = String(call.arguments.id ?? "");
+        if (!id) {
+          this.pushEvent("system", "（group_info 需要 id 参数（群频道 id）。）", { ref: call.id });
+          return;
+        }
+        return this.dispatchLocal(call, async () => this.messenger.groupInfo(id));
+      }
+      case "list_members": {
+        const id = String(call.arguments.id ?? "");
+        if (!id) {
+          this.pushEvent("system", "（list_members 需要 id 参数（群频道 id）。）", { ref: call.id });
+          return;
+        }
+        return this.dispatchLocal(call, async () => this.messenger.listMembers(id));
+      }
+      case "member_info": {
+        const id = String(call.arguments.id ?? "");
+        const userId = String(call.arguments.user_id ?? call.arguments.userId ?? "");
+        if (!id || !userId) {
+          this.pushEvent("system", "（member_info 需要 id 和 user_id 参数。）", { ref: call.id });
+          return;
+        }
+        return this.dispatchLocal(call, async () => this.messenger.memberInfo(id, userId));
+      }
+      case "set_group_card": {
+        const id = String(call.arguments.id ?? "");
+        const card = String(call.arguments.card ?? call.arguments.name ?? "");
+        if (!id || !card) {
+          this.pushEvent("system", "（set_group_card 需要 id 和 card 参数。）", { ref: call.id });
+          return;
+        }
+        return this.dispatchLocal(call, async () => this.messenger.setGroupCard(id, card));
+      }
+      case "set_group_name": {
+        const id = String(call.arguments.id ?? "");
+        const name = String(call.arguments.name ?? "");
+        if (!id || !name) {
+          this.pushEvent("system", "（set_group_name 需要 id 和 name 参数。）", { ref: call.id });
+          return;
+        }
+        return this.dispatchLocal(call, async () => this.messenger.setGroupName(id, name));
+      }
+      case "set_group_portrait": {
+        const id = String(call.arguments.id ?? "");
+        const image = String(call.arguments.image ?? "");
+        if (!id || !image) {
+          this.pushEvent("system", "（set_group_portrait 需要 id 和 image 参数。）", { ref: call.id });
+          return;
+        }
+        return this.dispatchLocal(call, async () => this.messenger.setGroupPortrait(id, image));
+      }
+      case "send_group_notice": {
+        const id = String(call.arguments.id ?? "");
+        const content = String(call.arguments.content ?? "");
+        if (!id || !content) {
+          this.pushEvent("system", "（send_group_notice 需要 id 和 content 参数。）", { ref: call.id });
+          return;
+        }
+        return this.dispatchLocal(call, async () => this.messenger.sendGroupNotice(id, content));
+      }
+      case "set_essence": {
+        const msgId = String(call.arguments.msg_id ?? call.arguments.msgId ?? "");
+        if (!msgId) {
+          this.pushEvent("system", "（set_essence 需要 msg_id 参数，来自消息记录里的 (msg:xxx) 标注。）", { ref: call.id });
+          return;
+        }
+        return this.dispatchLocal(call, async () =>
+          this.messenger.setEssence(msgId, isTruthy(call.arguments.remove)),
+        );
+      }
+      case "group_sign": {
+        const id = String(call.arguments.id ?? "");
+        if (!id) {
+          this.pushEvent("system", "（group_sign 需要 id 参数（群频道 id）。）", { ref: call.id });
+          return;
+        }
+        return this.dispatchLocal(call, async () => this.messenger.groupSign(id));
+      }
+      case "group_ban": {
+        const id = String(call.arguments.id ?? "");
+        const userId = String(call.arguments.user_id ?? call.arguments.userId ?? "");
+        const minutes = Number(call.arguments.minutes ?? call.arguments.duration ?? NaN);
+        if (!id || !userId || !Number.isFinite(minutes) || minutes < 0) {
+          this.pushEvent("system", "（group_ban 需要 id、user_id 和 minutes 参数（0 表示解除禁言）。）", { ref: call.id });
+          return;
+        }
+        return this.dispatchLocal(call, async () => this.messenger.groupBan(id, userId, minutes));
+      }
+      case "group_whole_ban": {
+        const id = String(call.arguments.id ?? "");
+        const enable = call.arguments.enable;
+        if (!id || enable === undefined || enable === null) {
+          this.pushEvent("system", "（group_whole_ban 需要 id 和 enable 参数。）", { ref: call.id });
+          return;
+        }
+        return this.dispatchLocal(call, async () => this.messenger.groupWholeBan(id, isTruthy(enable)));
+      }
+      case "group_kick": {
+        const id = String(call.arguments.id ?? "");
+        const userId = String(call.arguments.user_id ?? call.arguments.userId ?? "");
+        if (!id || !userId) {
+          this.pushEvent("system", "（group_kick 需要 id 和 user_id 参数。）", { ref: call.id });
+          return;
+        }
+        return this.dispatchLocal(call, async () =>
+          this.messenger.groupKick(id, userId, isTruthy(call.arguments.block)),
+        );
+      }
+      case "group_admin": {
+        const id = String(call.arguments.id ?? "");
+        const userId = String(call.arguments.user_id ?? call.arguments.userId ?? "");
+        const enable = call.arguments.enable;
+        if (!id || !userId || enable === undefined || enable === null) {
+          this.pushEvent("system", "（group_admin 需要 id、user_id 和 enable 参数。）", { ref: call.id });
+          return;
+        }
+        return this.dispatchLocal(call, async () => this.messenger.groupAdmin(id, userId, isTruthy(enable)));
+      }
+      case "set_special_title": {
+        const id = String(call.arguments.id ?? "");
+        const userId = String(call.arguments.user_id ?? call.arguments.userId ?? "");
+        const title = String(call.arguments.title ?? "");
+        if (!id || !userId) {
+          this.pushEvent("system", "（set_special_title 需要 id 和 user_id 参数（title 为空表示移除头衔）。）", { ref: call.id });
+          return;
+        }
+        return this.dispatchLocal(call, async () => this.messenger.setSpecialTitle(id, userId, title));
+      }
+      case "group_leave": {
+        const id = String(call.arguments.id ?? "");
+        if (!id) {
+          this.pushEvent("system", "（group_leave 需要 id 参数（群频道 id）。）", { ref: call.id });
+          return;
+        }
+        return this.dispatchLocal(call, async () => this.messenger.groupLeave(id));
+      }
       case "cancel":
         return this.dispatchCancel(call);
       case "identity_recall":
@@ -462,11 +683,12 @@ export class BotAgent {
   private dispatchSend(call: ToolCallRecord): void {
     const id = String(call.arguments.id ?? "");
     const msg = String(call.arguments.msg ?? "");
-    const images = Array.isArray(call.arguments.images)
-      ? (call.arguments.images as (string | number)[])
-      : [];
-    if (!id || (!msg && !images.length)) {
-      this.pushEvent("system", "（send 需要 id 和 msg（或 images）参数。）", { ref: call.id });
+    const mediaRaw = call.arguments.media ?? call.arguments.images;
+    const media = Array.isArray(mediaRaw) ? (mediaRaw as (string | number)[]) : [];
+    const replyRaw = call.arguments.reply_to ?? call.arguments.replyTo ?? call.arguments.quote;
+    const replyTo = replyRaw !== undefined && replyRaw !== null ? String(replyRaw) : undefined;
+    if (!id || (!msg && !media.length)) {
+      this.pushEvent("system", "（send 需要 id 和 msg（或 media）参数。）", { ref: call.id });
       return;
     }
     // 超长消息拦截：真人聊天单条消息很短；确需发长文时要求二次确认
@@ -482,7 +704,7 @@ export class BotAgent {
       return;
     }
     // 拦截与上一条完全相同的发送（模型常见的复读行为），除非显式声明 resend
-    const sig = JSON.stringify([id, msg, images.map(String)]);
+    const sig = JSON.stringify([id, msg, media.map(String), replyTo ?? ""]);
     if (sig === this.lastSendSig && !isTruthy(call.arguments.resend)) {
       this.pushEvent(
         "system",
@@ -496,7 +718,7 @@ export class BotAgent {
     this.ackIfDurable(call);
     this.scheduler.schedule(call, {
       executeAt: "expected", // 打字完成的那一刻消息才真正发出（此前可 cancel）
-      run: async () => this.messenger.send(id, msg, images),
+      run: async () => this.messenger.send(id, msg, media, replyTo),
     });
   }
 

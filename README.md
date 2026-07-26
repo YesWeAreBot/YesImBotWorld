@@ -5,7 +5,7 @@ YesImBot World：让 Bot 生活在一个由 LLM 独立维护的虚拟世界中�
 两个 LLM 同时运行：
 
 - **Bot-LLM**：持续推理的 Agent，一个接一个地生成工具调用（Tool Call），像文字版 VLA——它不是在"回复消息"，而是在世界中**生活**：行动、等待、休息、翻手机、聊天。
-- **World-LLM**：世界模拟引擎。无持续上下文，按需被唤起：裁定 Bot 行动的结果、响应等待到期、响应 Tingle（世界心跳）推进世界演化，并维护 `World_Status.md` 与 `News.db`。
+- **World-LLM**：世界模拟引擎。无持续上下文，按需被唤起：裁定 Bot 行动的结果、响应等待到期、响应 Tingle（世界心跳）推进世界演化，并维护 `World_Status.md` 与 `News.db`。它只模拟 Bot 所处的虚拟世界——聊天平台属于外部真实系统，World-LLM 被明确禁止虚构平台内的事件（消息、好友申请等只能来自 Koishi）。
 
 ## 提醒
 
@@ -44,6 +44,7 @@ YesImBot World：让 Bot 生活在一个由 LLM 独立维护的虚拟世界中�
 | `stream.jsonl` | 运行时 | Bot 工作窗口（Tool Call 流）持久化 |
 | `pinned.json` | 运行时 | 置顶上下文 + id 计数器 |
 | `clock.json` | 运行时 | World Clock（暂停时时间静止） |
+| `focus.json` | 运行时 | Bot 正在关注的频道（关注期间消息必定完整呈现） |
 | `archive/` | 运行时 | 压缩/重置时归档的历史 |
 
 ## 使用步骤
@@ -94,10 +95,16 @@ YesImBot World：让 Bot 生活在一个由 LLM 独立维护的虚拟世界中�
 
 ## 上下文规则（缓存友好 + 拟人）
 
-- 除压缩外**禁止修改上下文**，一切变更以 Event 形式**追加**（工具列表更新、用户改设定，均通过 Event / `world.reload` 通知）；
-- 事件注入只发生在两次生成之间（当前工具调用生成完毕后统一应用）；
+- 除压缩外**禁止修改上下文**，一切变更以 Event 形式**追加**：配置变更导致工具集变化时，
+  差异（新增工具的完整用法、失效工具名单）以 Event 告知并即刻生效，**置顶的工具列表保持不变**
+  （保护前缀缓存），直到下次 rest 压缩时才同步；用户改设定通过 `world.reload` 以世界观内方式告知；
+- 事件注入只发生在两次生成之间（当前工具调用生成完毕后统一应用）；即时工具（查手机、看状态等）
+  派发后有一个短暂宽限窗口等结果先进邮箱，避免 Bot 因看不到结果而重复调用；
 - 上下文超过 `maxWindowChars` 时强制触发 `rest()`，Bot 收到的解释是"你感到疲惫不堪"——符合世界观；
-- `rest()` 由 World-LLM 执行压缩：合并历史摘要、更新记忆摘要、按需演化 `Bot_Status.md`（这是角色设定唯一的合法修改渠道），醒来后被告知过去了几个 TU。
+- `rest()` 由 World-LLM 执行压缩：合并历史摘要、更新记忆摘要、按需演化 `Bot_Status.md`（这是角色设定唯一的合法修改渠道），醒来后被告知过去了几个 TU；
+- 压缩有两道安全阀：送入 World-LLM 的意识流超过 `world.compressMaxInputChars` 时只保留最近部分
+  （防止压缩请求本身超过模型窗口）；压缩失败时降级处理（归档丢弃工作窗口、沿用旧摘要），
+  保证上下文一定缩小、不会陷入"压缩失败 → 立即再次强制 rest"的死循环。
 
 ## 多模态
 
@@ -119,20 +126,34 @@ YesImBot World：让 Bot 生活在一个由 LLM 独立维护的虚拟世界中�
 
 Bot 不只能收，也能发：
 
-- **发图**：`send` 的 `images` 参数附带图片编号（如 `images: ["12"]`），来源是聊天记录中
-  收到过的图片（资产库）或**收藏夹**——用户把表情包/图片放进 `basePath/gallery/` 目录，
-  Bot 通过 `check_gallery` 浏览（图片经解释器生成内容描述并缓存，方便它挑选合适的图）；
-- **发文件**：音频、视频不能作为图片直接发送，统一走 `send_file`（引用媒体编号或
+- **发图/发视频**：`send` 的 `media` 参数附带媒体编号（如 `media: ["12"]`），支持图片与视频；
+  在 `msg` 里写 `[图片#12]` / `[视频#3]` 可把媒体**嵌在文字中间**发出（图文混排，支持混排的
+  平台原样呈现，QQ 等平台由平台自行分开显示）；
+- **挑图流程**：优先翻**收藏夹**（`check_gallery`）；收藏夹里没有，再用 `check_media` 翻看
+  媒体缓存——聊天中见过的所有图片/语音/视频都留在缓存里（**对 Bot 只读**），图片会按需生成
+  内容摘要（缓存，同一媒体只解释一次）。喜欢的东西 Bot 可用 `gallery_save` 存进收藏夹
+  （存入时生成摘要、可起名），不要的用 `gallery_remove` 移出；用户也可以直接向
+  `basePath/gallery/` 目录投放文件；
+- **发文件**：音频、视频文件和其他文件统一走 `send_file`（引用媒体编号或
   `gallery:文件名`），按类型映射为 audio / video / file 元素（audio 在 QQ 即语音）；
 - **发语音**：配置 TTS（OpenAI 兼容 `/v1/audio/speech`，如 kokoro / fish-speech / openai）后
   Bot 获得 `send_voice` 工具，把文字合成为自己的声音发出。合成的语音同样入资产库留痕
   （转写缓存 = 原文本），聊天记录回看时能"记得自己说过什么"。
 
-三种发送都遵循"打字/说话耗时"语义：duration 到点才真正发出，此前可 `cancel` 撤回；
+发送都遵循"打字/说话耗时"语义：duration 到点才真正发出，此前可 `cancel` 撤回；
 发出的媒体以占位符入库，之后 `select_channel` 回看自己发过的图和语音。
 未配置 TTS 时 `send_voice` 不会出现在工具列表（GBNF 语法同步收窄）。
 
+另外两条拟人化约束：
+
+- **短消息**：Prompt 要求 Bot 像真人一样发短消息；`msg` 超过 `messaging.longMessageChars`
+  （默认 100 字符）时不会发出，而是提醒 Bot 拆分或加 `confirm_long: true` 二次确认（发长文资料时用）；
+- **频道 id 纠错**：Bot 把频道 id 写错时（如把用户名当频道 `onebot:TouchNight`），插件会用
+  已知频道的参与者模糊匹配，**不执行发送**，而是以事件提示正确的频道 id 让它下次填对。
+
 ## Bot 可用工具
+
+### 基础工具（始终可用）
 
 | 工具 | 说明 |
 |---|---|
@@ -142,12 +163,57 @@ Bot 不只能收，也能发：
 | `check_status(target)` | 查看自身（`self`）或世界（`world`，含近期 News） |
 | `check_msg(n)` | 最近活跃的 n 个频道及最新一条消息 |
 | `select_channel(id, n)` | 查看频道最近 n 条消息（`id` 为 `platform:channelId`） |
-| `check_gallery()` | 浏览收藏夹（`basePath/gallery/`，用户投放的图片/文件） |
-| `send(id, msg, images?)` | 发消息，可附图片（duration = 打字时间，发出前可撤回） |
+| `check_gallery()` | 浏览收藏夹（`basePath/gallery/`，Bot 或用户投放的图片/文件） |
+| `check_media(n?, type?)` | 只读翻看媒体缓存（聊天中见过的媒体，图片按需生成摘要） |
+| `gallery_save(media_id, name?)` | 把缓存媒体存进收藏夹（生成内容摘要、可起名） |
+| `gallery_remove(name)` | 把文件移出收藏夹 |
+| `send(id, msg, media?)` | 发消息，可附图片/视频、`[图片#12]` 内联混排（duration = 打字时间，发出前可撤回） |
 | `send_file(id, file)` | 发送音频/视频/任意文件（媒体编号或 `gallery:文件名`） |
 | `send_voice(id, text)` | TTS 合成语音消息（需配置 tts，duration = 说话时间） |
+| `put_down_phone()` | 清除全部频道关注（关注机制开启时可用） |
 | `cancel(id)` | 取消倒计时中的工具调用 |
 | `identity_recall()` | 反思身份：角色设定以 Event 再次注入 |
+
+### 平台扩展操作（`platformOps.*`，每项独立开关，默认全部关闭）
+
+收发消息之外的平台能力逐接口单独适配，用户可细粒度控制 Bot 拥有哪些能力。
+开关变化以 Event 告知 Bot 并即刻生效；置顶工具列表在下次 rest 压缩时才同步（保护前缀缓存）。
+
+| 开关 | 工具 | 底层接口 | 说明 |
+|---|---|---|---|
+| `recall` | `recall(id, msg_id)` | `delete_msg`（通用 deleteMessage） | 撤回已发出的消息 |
+| `react` | `react(id, msg_id, emoji)` | `set_msg_emoji_like` / 通用 createReaction | 贴表情回应（emoji 字符或表情编号） |
+| `reply` | `send(…, reply_to)` | quote 元素（OneBot 回复） | 引用回复某条消息 |
+| `poke` | `poke(id, user_id?)` | `friend_poke` / `group_poke` | 戳一戳 |
+| `handleRequests` | `handle_request(request_id, approve, reason?)` | `set_friend_add_request` / `set_group_add_request` | 处理好友申请与入群邀请/申请（请求以手机通知事件告知 Bot） |
+| `listFriends` | `list_friends()` | `get_friend_list`（通用） | 好友列表（含可 send 的频道 id） |
+| `userInfo` | `user_info(user_id)` | `get_stranger_info` | 查看用户资料 |
+| `sendLike` | `send_like(user_id, times?)` | `send_like` | 资料卡点赞 |
+| `deleteFriend` | `delete_friend(user_id)` | `delete_friend` | 删除好友（谨慎开启） |
+| `profile` | `set_profile(nickname?, signature?, avatar?)` | `set_qq_profile` / `set_qq_avatar` | 改自己的昵称/签名/头像 |
+| `listGroups` | `list_groups()` | `get_group_list` | 群列表 |
+| `groupInfo` | `group_info(id)` | `get_group_info` | 群信息 |
+| `listMembers` | `list_members(id)` | `get_group_member_list` | 群成员列表 |
+| `memberInfo` | `member_info(id, user_id)` | `get_group_member_info` | 群成员详情 |
+| `groupCard` | `set_group_card(id, card)` | `set_group_card` | 改自己在群里显示的名称 |
+| `groupName` | `set_group_name(id, name)` | `set_group_name` | 改群名 |
+| `groupPortrait` | `set_group_portrait(id, image)` | `set_group_portrait` | 改群头像 |
+| `groupNotice` | `send_group_notice(id, content)` | `_send_group_notice` | 发群公告 |
+| `essence` | `set_essence(msg_id, remove?)` | `set_essence_msg` / `delete_essence_msg` | 设置/移出群精华 |
+| `groupSign` | `group_sign(id)` | `set_group_sign` / `send_group_sign` | 群打卡 |
+| `groupBan` | `group_ban(id, user_id, minutes)` | `set_group_ban` | 禁言/解除禁言 |
+| `groupWholeBan` | `group_whole_ban(id, enable)` | `set_group_whole_ban` | 全员禁言 |
+| `groupKick` | `group_kick(id, user_id, block?)` | `set_group_kick` | 移出群成员（谨慎开启） |
+| `groupAdmin` | `group_admin(id, user_id, enable)` | `set_group_admin` | 设置/取消管理员（需群主） |
+| `specialTitle` | `set_special_title(id, user_id, title)` | `set_group_special_title` | 授予专属头衔（需群主） |
+| `groupLeave` | `group_leave(id)` | `set_group_leave` | 退群（谨慎开启） |
+
+说明：
+
+- 开启 `recall` / `react` / `reply` 任意一项后，消息记录与发送结果会附带 `(msg:xxx)` 消息编号供引用；
+- 标准 OneBot v11 之外的扩展接口（贴表情、戳一戳、改资料/头像、群打卡等）需要实现端支持
+  （NapCat / LLOneBot / Lagrange 等，支持范围各有差异，不支持时 Bot 会收到明确的失败提示）；
+- **无法主动添加好友**：OneBot 协议没有"发起好友申请"的接口（QQ 协议限制），只能处理收到的申请。
 
 ## 部署到 Koishi 实例（开发链接）
 
@@ -207,12 +273,44 @@ plugins:
       notifyChannels: ["onebot:123456789"]
       notifyPolicy: channel
       wakeOnNotify: true
+      longMessageChars: 100 # 单条消息超长提醒阈值（0 禁用）
+    platformOps: # 平台扩展操作，每项独立开关（默认全部 false，此处为示例）
+      recall: true
+      react: true
+      reply: true
+      poke: true
+      handleRequests: true
+      listFriends: true
+      userInfo: false
+      sendLike: false
+      deleteFriend: false
+      profile: false
+      listGroups: false
+      groupInfo: false
+      listMembers: false
+      memberInfo: false
+      groupCard: false
+      groupName: false
+      groupPortrait: false
+      groupNotice: false
+      essence: false
+      groupSign: false
+      groupBan: false
+      groupWholeBan: false
+      groupKick: false
+      groupAdmin: false
+      specialTitle: false
+      groupLeave: false
 ```
 
 ## 已知限制
 
 - World-LLM 需要支持 OpenAI tool calling；
 - 重启后未完成的动作（进行中的 act/send）不恢复，Bot 会收到"失神"事件提示自查状态；
-- 工具列表按配置在启动时确定（如 TTS 开关影响 send_voice）；运行中动态增删工具（含以 Event 通知变更）留有设计位；
+- 工具列表按配置在启动时确定（如 TTS / platformOps 开关）；配置变更后重启，差异以 Event 告知 Bot、置顶列表在下次 rest 时同步；
+- 平台扩展操作以 OneBot（QQ）为主；`recall` / `react` / `reply` / `list_friends` 走 Koishi 通用接口，
+  其他平台可部分复用，其余操作仅 OneBot；扩展接口的支持范围取决于实现端（NapCat / LLOneBot / Lagrange 等）；
+- 无法主动发起好友申请（OneBot 协议无此接口）；
+- 好友申请/入群邀请的待处理请求（`req_N`）只保存在内存中，重启后失效；
 - 视频解释走 video_url content part（Qwen-VL 系约定），不做本地抽帧；
 - 文件/媒体发送以 base64 data URL 传给适配器，超大文件受平台限制。

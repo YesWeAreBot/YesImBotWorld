@@ -66,6 +66,12 @@ export class FocusManager {
     return [...this.channels.entries()].filter(([, until]) => t < until).map(([key]) => key);
   }
 
+  /** 取消对单个频道的关注（如退群后） */
+  async unfocus(key: string): Promise<void> {
+    if (!this.channels.delete(key)) return;
+    await this.save().catch(() => {});
+  }
+
   /** 放下手机：清除全部关注，返回清除前仍在关注的频道 */
   async clear(): Promise<string[]> {
     const active = this.activeKeys();

@@ -122,6 +122,15 @@ export class MediaStore {
     };
   }
 
+  /** 最近摄取的媒体（新的在前），供 Bot 只读翻看缓存 */
+  async recent(n: number, type?: MediaType): Promise<WorldMediaRow[]> {
+    return this.ctx.database.get(
+      "yesimbot_world_media",
+      type ? { type } : {},
+      { sort: { id: "desc" }, limit: n },
+    );
+  }
+
   async setSummary(id: number, summary: string): Promise<void> {
     await this.ctx.database.set("yesimbot_world_media", { id }, { summary });
   }

@@ -12,6 +12,9 @@ import type { PlatformOpsConfig } from "../config.js";
 import type { KnownChannel, MessageStore } from "./messages.js";
 import type { RequestStore } from "./requests.js";
 
+/** msg 中的内联媒体标记：Bot 会照抄事件里见到的 [图片#12]、[视频#3：描述] 等形式 */
+const INLINE_MEDIA = /\[(图片|视频|音频|语音)#(\d+)[^\]]*\]/g;
+
 const IMAGE_EXT = new Set([".jpg", ".jpeg", ".png", ".gif", ".webp"]);
 const AUDIO_EXT = new Set([".mp3", ".wav", ".ogg", ".flac", ".aac", ".amr", ".m4a"]);
 const VIDEO_EXT = new Set([".mp4", ".webm", ".mkv", ".mov", ".avi"]);
@@ -39,9 +42,9 @@ export class KoishiMessenger implements MessengerApi {
     private requests: RequestStore,
   ) {}
 
-  /** 是否需要在消息记录中展示平台消息 id（recall / react 需要引用） */
+  /** 是否需要在消息记录中展示平台消息 id（recall / react / reply 需要引用） */
   private get showMsgId(): boolean {
-    return this.ops.recall || this.ops.react;
+    return this.ops.recall || this.ops.react || this.ops.reply;
   }
 
   // ---------- 查看 ----------
@@ -123,27 +126,129 @@ export class KoishiMessenger implements MessengerApi {
     return `你翻了翻自己的收藏夹：\n${lines.join("\n")}`;
   }
 
+  /**
+   * 翻看媒体缓存（只读）：聊天中见过的媒体都会留在缓存里。
+   * 图片按需生成内容摘要（结果缓存，同一媒体只解释一次）。
+   */
+  async checkMedia(n: number, type?: MediaType): Promise<string> {
+    const rows = await this.media.recent(n, type);
+    if (!rows.length) return "（媒体缓存是空的，你还没在聊天里见过任何媒体。）";
+    const lines: string[] = [];
+    for (const row of rows) {
+      const label = LABEL[row.type as MediaType] ?? row.type;
+      let summary = row.summary;
+      if (!summary && row.type === "image") {
+        const full = await this.media.get(row.id);
+        if (full) summary = (await this.captioner.describe(full.ref)) ?? "";
+      }
+      lines.push(
+        `- [${label}#${row.id}] ${formatSize(row.size)} ${formatTime(row.createdAt)}` +
+          (summary ? `：${truncate(summary, 100)}` : "（无内容摘要）"),
+      );
+    }
+    return (
+      `你翻看了最近的媒体缓存（最新在前，缓存只读）：\n${lines.join("\n")}\n` +
+      `（想留下的可以用 gallery_save 存进收藏夹）`
+    );
+  }
+
+  /** 把缓存里的媒体存进收藏夹（存入时生成内容摘要） */
+  async gallerySave(mediaId: string, name?: string): Promise<string> {
+    const match = mediaId.match(/(\d+)\s*$/);
+    if (!match) return `（无法理解的媒体编号："${mediaId}"）`;
+    const row = await this.media.get(Number(match[1]));
+    if (!row) return `（找不到媒体 #${match[1]}，可先用 check_media 查看缓存。）`;
+
+    const ext = path.extname(row.file) || "";
+    let filename: string;
+    if (name?.trim()) {
+      const safe = sanitizeName(name.trim());
+      if (!safe) return `（文件名不合法："${name}"）`;
+      // 扩展名缺失或与媒体实际类型不符时，补上正确的扩展名（避免收藏夹误判类型）
+      filename = path.extname(safe) && typeByExt(safe) === row.type ? safe : safe + ext;
+    } else {
+      filename = `${row.type}-${row.id}${ext}`;
+    }
+    await fs.mkdir(this.galleryDir, { recursive: true });
+    const dest = path.join(this.galleryDir, filename);
+    if (await fs.stat(dest).then((s) => s.isFile()).catch(() => false)) {
+      return `（收藏夹里已经有 "${filename}" 了，换个名字试试。）`;
+    }
+    await fs.copyFile(row.ref.file, dest);
+    const caption = row.summary || (await this.captioner.describe(row.ref));
+    const label = LABEL[row.type as MediaType] ?? row.type;
+    return `你把${label}#${row.id} 存进了收藏夹：${filename}${caption ? `（内容：${truncate(caption, 80)}）` : ""}`;
+  }
+
+  /** 把文件移出收藏夹 */
+  async galleryRemove(name: string): Promise<string> {
+    const safe = sanitizeName(name.trim());
+    if (!safe) return `（文件名不合法："${name}"）`;
+    const file = path.join(this.galleryDir, safe);
+    const stat = await fs.stat(file).catch(() => null);
+    if (!stat?.isFile()) return `（收藏夹里没有 "${safe}"，可先用 check_gallery 看看。）`;
+    await fs.unlink(file);
+    return `你把 "${safe}" 移出了收藏夹。`;
+  }
+
   // ---------- 发送 ----------
 
-  async send(id: string, msg: string, images: (string | number)[] = []): Promise<string> {
+  async send(
+    id: string,
+    msg: string,
+    media: (string | number)[] = [],
+    replyTo?: string,
+  ): Promise<string> {
     const target = await this.resolveBot(id);
     if ("error" in target) return target.error;
 
     const elements: h[] = [];
-    if (msg) elements.push(h.text(msg));
+    if (replyTo) elements.push(h("quote", { id: replyTo }));
     const sentRefs: MediaRef[] = [];
     const problems: string[] = [];
-    for (const item of images.slice(0, 9)) {
-      const resolved = await this.resolveMediaRef(String(item), "image");
+    const inlineIds = new Set<number>();
+    let stored = "";
+
+    // msg 中的内联媒体标记（[图片#12] / [视频#3]…）→ 在对应位置嵌入媒体，实现图文混排
+    let cursor = 0;
+    for (const match of msg.matchAll(INLINE_MEDIA)) {
+      const before = msg.slice(cursor, match.index);
+      cursor = match.index! + match[0].length;
+      if (before) {
+        elements.push(h.text(before));
+        stored += before;
+      }
+      const resolved = await this.resolveMediaRef(match[2]!, ["image", "video"]);
       if ("error" in resolved) {
         problems.push(resolved.error);
         continue;
       }
-      const data = await this.media.readFile(resolved.ref);
-      elements.push(h("img", { src: toDataUrl(data, resolved.ref.mime) }));
+      elements.push(await this.mediaElement(resolved.ref));
       sentRefs.push(resolved.ref);
+      inlineIds.add(resolved.ref.id);
+      stored += mediaPlaceholder(resolved.ref.id, resolved.ref.type);
     }
-    if (!elements.length) return `（消息没发出去：没有可发送的内容。${problems.join("；")}）`;
+    const rest = msg.slice(cursor);
+    if (rest) {
+      elements.push(h.text(rest));
+      stored += rest;
+    }
+
+    // media 参数中的媒体（未在 msg 中内联过的）追加在末尾
+    for (const item of media.slice(0, 9)) {
+      const resolved = await this.resolveMediaRef(String(item), ["image", "video"]);
+      if ("error" in resolved) {
+        problems.push(resolved.error);
+        continue;
+      }
+      if (inlineIds.has(resolved.ref.id)) continue;
+      elements.push(await this.mediaElement(resolved.ref));
+      sentRefs.push(resolved.ref);
+      stored += mediaPlaceholder(resolved.ref.id, resolved.ref.type);
+    }
+    if (!elements.some((el) => el.type !== "quote")) {
+      return `（消息没发出去：没有可发送的内容。${problems.join("；")}）`;
+    }
 
     let msgIds: string[] = [];
     try {
@@ -151,15 +256,20 @@ export class KoishiMessenger implements MessengerApi {
     } catch (err) {
       return `（消息发送失败：${(err as Error).message ?? err}）`;
     }
-    const stored =
-      (msg || "") + sentRefs.map((ref) => mediaPlaceholder(ref.id, ref.type)).join("");
     await this.storeSelf(target, stored, msgIds[0]);
     await this.focus.focus(`${target.platform}:${target.channelId}`);
     let result = `消息已发送到 ${id}。`;
     if (this.showMsgId && msgIds[0]) result = `消息已发送到 ${id}（msg:${msgIds[0]}）。`;
-    if (sentRefs.length) result += `（附 ${sentRefs.length} 张图片）`;
+    if (sentRefs.length) result += `（附 ${sentRefs.length} 个媒体）`;
     if (problems.length) result += `注意：${problems.join("；")}`;
     return result;
+  }
+
+  /** 媒体引用 → 消息元素（图片 / 视频） */
+  private async mediaElement(ref: MediaRef): Promise<h> {
+    const data = await this.media.readFile(ref);
+    const src = toDataUrl(data, ref.mime);
+    return ref.type === "video" ? h("video", { src }) : h("img", { src });
   }
 
   /** 以文件形式发送音频/视频/任意文件 */
@@ -324,6 +434,390 @@ export class KoishiMessenger implements MessengerApi {
     return approve ? `你同意了 ${who} 加入群 ${req.guildId} 的申请。` : `你拒绝了 ${who} 加入群 ${req.guildId} 的申请。`;
   }
 
+  /** 修改自己的账号资料（昵称 / 签名 / 头像，仅 OneBot） */
+  async setProfile(opts: { nickname?: string; signature?: string; avatar?: string }): Promise<string> {
+    const bot = this.findOnebot();
+    if (!bot) return "（修改资料目前只支持 QQ（OneBot）平台，但没有可用的 OneBot 账号。）";
+    if (!opts.nickname && !opts.signature && !opts.avatar) {
+      return "（set_profile 需要 nickname、signature、avatar 中至少一个参数。）";
+    }
+    const done: string[] = [];
+    try {
+      if (opts.nickname || opts.signature) {
+        const params: Record<string, unknown> = {};
+        if (opts.nickname) params.nickname = opts.nickname;
+        if (opts.signature) params.personal_note = opts.signature;
+        await callOnebot(bot, "set_qq_profile", params);
+        if (opts.nickname) done.push(`昵称改成了「${opts.nickname}」`);
+        if (opts.signature) done.push(`签名改成了「${opts.signature}」`);
+      }
+      if (opts.avatar) {
+        const resolved = await this.resolveMediaRef(opts.avatar, ["image"]);
+        if ("error" in resolved) return resolved.error;
+        const data = await this.media.readFile(resolved.ref);
+        await callOnebot(bot, "set_qq_avatar", { file: `base64://${data.toString("base64")}` });
+        done.push("头像换成了新图片");
+      }
+    } catch (err) {
+      return `（修改资料失败：${(err as Error).message ?? err}）`;
+    }
+    return `你更新了自己的账号资料：${done.join("；")}。`;
+  }
+
+  /** 修改自己在某个群里显示的名称（群名片，仅 OneBot） */
+  async setGroupCard(id: string, card: string): Promise<string> {
+    const target = await this.resolveBot(id);
+    if ("error" in target) return target.error;
+    if (target.platform !== "onebot") return "（修改群名片目前只支持 QQ（OneBot）平台。）";
+    if (target.channelId.startsWith("private:")) return "（这是私聊频道，没有群名片可改。）";
+    try {
+      await callOnebot(target.bot, "set_group_card", {
+        group_id: toIdValue(target.channelId),
+        user_id: toIdValue(target.bot.selfId ?? ""),
+        card,
+      });
+    } catch (err) {
+      return `（修改群名片失败：${(err as Error).message ?? err}）`;
+    }
+    return `你在群 ${id} 里显示的名称改成了「${card}」。`;
+  }
+
+  // ---------- 用户相关（OneBot） ----------
+
+  /** 查看某个用户的资料 */
+  async userInfo(userId: string): Promise<string> {
+    const bot = this.findOnebot();
+    if (!bot) return "（没有可用的 OneBot 账号。）";
+    const uid = parseUserId(userId);
+    if (!uid) return `（无法理解的用户 id："${userId}"）`;
+    let data: Record<string, unknown>;
+    try {
+      data = ((await callOnebot(bot, "get_stranger_info", { user_id: toIdValue(uid) })) ?? {}) as Record<string, unknown>;
+    } catch (err) {
+      return `（查看资料失败：${(err as Error).message ?? err}）`;
+    }
+    const parts: string[] = [];
+    if (data.nickname) parts.push(`昵称：${data.nickname}`);
+    parts.push(`QQ：${data.user_id ?? uid}`);
+    if (data.sex === "male") parts.push("性别：男");
+    else if (data.sex === "female") parts.push("性别：女");
+    if (typeof data.age === "number" && data.age > 0) parts.push(`年龄：${data.age}`);
+    if (data.level) parts.push(`等级：${data.level}`);
+    if (data.long_nick) parts.push(`签名：${truncate(String(data.long_nick), 60)}`);
+    return `你看了看 ${data.nickname ?? uid} 的资料——${parts.join("；")}`;
+  }
+
+  /** 给某人的资料卡点赞 */
+  async sendLike(userId: string, times: number): Promise<string> {
+    const bot = this.findOnebot();
+    if (!bot) return "（没有可用的 OneBot 账号。）";
+    const uid = parseUserId(userId);
+    if (!uid) return `（无法理解的用户 id："${userId}"）`;
+    try {
+      await callOnebot(bot, "send_like", { user_id: toIdValue(uid), times });
+    } catch (err) {
+      return `（点赞失败：${(err as Error).message ?? err}）`;
+    }
+    return `你给 ${uid} 的资料卡点了 ${times} 个赞。`;
+  }
+
+  /** 删除好友 */
+  async deleteFriend(userId: string): Promise<string> {
+    const bot = this.findOnebot();
+    if (!bot) return "（没有可用的 OneBot 账号。）";
+    const uid = parseUserId(userId);
+    if (!uid) return `（无法理解的用户 id："${userId}"）`;
+    try {
+      await callOnebot(bot, "delete_friend", { user_id: toIdValue(uid) });
+    } catch (err) {
+      return `（删除好友失败：${(err as Error).message ?? err}）`;
+    }
+    return `你删除了好友 ${uid}。`;
+  }
+
+  // ---------- 群相关（OneBot） ----------
+
+  /** 查看自己加入的群列表 */
+  async listGroups(): Promise<string> {
+    const bot = this.findOnebot();
+    if (!bot) return "（没有可用的 OneBot 账号。）";
+    let data: Record<string, unknown>[];
+    try {
+      data = ((await callOnebot(bot, "get_group_list", {})) ?? []) as Record<string, unknown>[];
+    } catch (err) {
+      return `（查看群列表失败：${(err as Error).message ?? err}）`;
+    }
+    if (!Array.isArray(data) || !data.length) return "（你没有加入任何群。）";
+    const lines = data
+      .slice(0, 100)
+      .map((g) => `- ${g.group_name ?? "（未命名）"}（onebot:${g.group_id}，${g.member_count ?? "?"}/${g.max_member_count ?? "?"} 人）`);
+    const more = data.length > 100 ? `\n（其余 ${data.length - 100} 个群未显示）` : "";
+    return `你翻了翻自己加入的群（共 ${data.length} 个）：\n${lines.join("\n")}${more}`;
+  }
+
+  /** 查看某个群的信息 */
+  async groupInfo(id: string): Promise<string> {
+    const target = await this.resolveOnebotGroup(id);
+    if ("error" in target) return target.error;
+    let data: Record<string, unknown>;
+    try {
+      data = ((await callOnebot(target.bot, "get_group_info", { group_id: toIdValue(target.groupId) })) ?? {}) as Record<string, unknown>;
+    } catch (err) {
+      return `（查看群信息失败：${(err as Error).message ?? err}）`;
+    }
+    return (
+      `你看了看群 ${id} 的信息——群名：${data.group_name ?? "（未知）"}；群号：${data.group_id ?? target.groupId}；` +
+      `成员：${data.member_count ?? "?"}/${data.max_member_count ?? "?"} 人`
+    );
+  }
+
+  /** 查看群成员列表 */
+  async listMembers(id: string): Promise<string> {
+    const target = await this.resolveOnebotGroup(id);
+    if ("error" in target) return target.error;
+    let data: Record<string, unknown>[];
+    try {
+      data = ((await callOnebot(target.bot, "get_group_member_list", { group_id: toIdValue(target.groupId) })) ?? []) as Record<string, unknown>[];
+    } catch (err) {
+      return `（查看群成员失败：${(err as Error).message ?? err}）`;
+    }
+    if (!Array.isArray(data) || !data.length) return `（群 ${id} 的成员列表是空的。）`;
+    const roleTag = (r: unknown) => (r === "owner" ? "［群主］" : r === "admin" ? "［管理员］" : "");
+    const sorted = [...data].sort((a, b) => roleRank(a.role) - roleRank(b.role));
+    const lines = sorted
+      .slice(0, 50)
+      .map((m) => `- ${m.card || m.nickname || m.user_id}（${m.user_id}）${roleTag(m.role)}`);
+    const more = data.length > 50 ? `\n（其余 ${data.length - 50} 人未显示，可用 member_info 查看具体某人）` : "";
+    return `你看了看群 ${id} 的成员（共 ${data.length} 人）：\n${lines.join("\n")}${more}`;
+  }
+
+  /** 查看某个群成员的详细信息 */
+  async memberInfo(id: string, userId: string): Promise<string> {
+    const target = await this.resolveOnebotGroup(id);
+    if ("error" in target) return target.error;
+    const uid = parseUserId(userId);
+    if (!uid) return `（无法理解的用户 id："${userId}"）`;
+    let data: Record<string, unknown>;
+    try {
+      data = ((await callOnebot(target.bot, "get_group_member_info", {
+        group_id: toIdValue(target.groupId),
+        user_id: toIdValue(uid),
+      })) ?? {}) as Record<string, unknown>;
+    } catch (err) {
+      return `（查看成员信息失败：${(err as Error).message ?? err}）`;
+    }
+    const parts: string[] = [];
+    if (data.card) parts.push(`群名片：${data.card}`);
+    if (data.nickname) parts.push(`昵称：${data.nickname}`);
+    parts.push(`QQ：${data.user_id ?? uid}`);
+    if (data.role === "owner") parts.push("身份：群主");
+    else if (data.role === "admin") parts.push("身份：管理员");
+    if (data.title) parts.push(`头衔：${data.title}`);
+    if (typeof data.join_time === "number" && data.join_time > 0) {
+      parts.push(`入群时间：${formatTime(new Date(data.join_time * 1000))}`);
+    }
+    return `你看了看群 ${id} 里 ${data.card || data.nickname || uid} 的信息——${parts.join("；")}`;
+  }
+
+  /** 禁言 / 解除禁言群成员 */
+  async groupBan(id: string, userId: string, minutes: number): Promise<string> {
+    const target = await this.resolveOnebotGroup(id);
+    if ("error" in target) return target.error;
+    const uid = parseUserId(userId);
+    if (!uid) return `（无法理解的用户 id："${userId}"）`;
+    try {
+      await callOnebot(target.bot, "set_group_ban", {
+        group_id: toIdValue(target.groupId),
+        user_id: toIdValue(uid),
+        duration: Math.max(0, Math.round(minutes * 60)),
+      });
+    } catch (err) {
+      return `（禁言操作失败：${(err as Error).message ?? err}。你可能不是管理员。）`;
+    }
+    return minutes > 0 ? `你把 ${uid} 禁言了 ${minutes} 分钟。` : `你解除了 ${uid} 的禁言。`;
+  }
+
+  /** 开启 / 关闭全员禁言 */
+  async groupWholeBan(id: string, enable: boolean): Promise<string> {
+    const target = await this.resolveOnebotGroup(id);
+    if ("error" in target) return target.error;
+    try {
+      await callOnebot(target.bot, "set_group_whole_ban", {
+        group_id: toIdValue(target.groupId),
+        enable,
+      });
+    } catch (err) {
+      return `（全员禁言操作失败：${(err as Error).message ?? err}。你可能不是管理员。）`;
+    }
+    return enable ? `你在群 ${id} 开启了全员禁言。` : `你解除了群 ${id} 的全员禁言。`;
+  }
+
+  /** 把成员移出群 */
+  async groupKick(id: string, userId: string, block: boolean): Promise<string> {
+    const target = await this.resolveOnebotGroup(id);
+    if ("error" in target) return target.error;
+    const uid = parseUserId(userId);
+    if (!uid) return `（无法理解的用户 id："${userId}"）`;
+    try {
+      await callOnebot(target.bot, "set_group_kick", {
+        group_id: toIdValue(target.groupId),
+        user_id: toIdValue(uid),
+        reject_add_request: block,
+      });
+    } catch (err) {
+      return `（移出群操作失败：${(err as Error).message ?? err}。你可能不是管理员。）`;
+    }
+    return `你把 ${uid} 移出了群 ${id}${block ? "，并拒绝其再次加群" : ""}。`;
+  }
+
+  /** 设置 / 取消群管理员 */
+  async groupAdmin(id: string, userId: string, enable: boolean): Promise<string> {
+    const target = await this.resolveOnebotGroup(id);
+    if ("error" in target) return target.error;
+    const uid = parseUserId(userId);
+    if (!uid) return `（无法理解的用户 id："${userId}"）`;
+    try {
+      await callOnebot(target.bot, "set_group_admin", {
+        group_id: toIdValue(target.groupId),
+        user_id: toIdValue(uid),
+        enable,
+      });
+    } catch (err) {
+      return `（设置管理员失败：${(err as Error).message ?? err}。只有群主能设置管理员。）`;
+    }
+    return enable ? `你把 ${uid} 设为了群 ${id} 的管理员。` : `你取消了 ${uid} 在群 ${id} 的管理员身份。`;
+  }
+
+  /** 修改群名 */
+  async setGroupName(id: string, name: string): Promise<string> {
+    const target = await this.resolveOnebotGroup(id);
+    if ("error" in target) return target.error;
+    try {
+      await callOnebot(target.bot, "set_group_name", {
+        group_id: toIdValue(target.groupId),
+        group_name: name,
+      });
+    } catch (err) {
+      return `（修改群名失败：${(err as Error).message ?? err}）`;
+    }
+    return `你把群 ${id} 的群名改成了「${name}」。`;
+  }
+
+  /** 修改群头像 */
+  async setGroupPortrait(id: string, image: string): Promise<string> {
+    const target = await this.resolveOnebotGroup(id);
+    if ("error" in target) return target.error;
+    const resolved = await this.resolveMediaRef(image, ["image"]);
+    if ("error" in resolved) return resolved.error;
+    try {
+      const data = await this.media.readFile(resolved.ref);
+      await callOnebot(target.bot, "set_group_portrait", {
+        group_id: toIdValue(target.groupId),
+        file: `base64://${data.toString("base64")}`,
+      });
+    } catch (err) {
+      return `（修改群头像失败：${(err as Error).message ?? err}。你可能不是管理员。）`;
+    }
+    return `你把群 ${id} 的头像换成了新图片。`;
+  }
+
+  /** 授予群成员专属头衔 */
+  async setSpecialTitle(id: string, userId: string, title: string): Promise<string> {
+    const target = await this.resolveOnebotGroup(id);
+    if ("error" in target) return target.error;
+    const uid = parseUserId(userId);
+    if (!uid) return `（无法理解的用户 id："${userId}"）`;
+    try {
+      await callOnebot(target.bot, "set_group_special_title", {
+        group_id: toIdValue(target.groupId),
+        user_id: toIdValue(uid),
+        special_title: title,
+      });
+    } catch (err) {
+      return `（设置头衔失败：${(err as Error).message ?? err}。只有群主能授予头衔。）`;
+    }
+    return title
+      ? `你授予了 ${uid} 专属头衔「${title}」。`
+      : `你移除了 ${uid} 的专属头衔。`;
+  }
+
+  /** 退出群聊 */
+  async groupLeave(id: string): Promise<string> {
+    const target = await this.resolveOnebotGroup(id);
+    if ("error" in target) return target.error;
+    try {
+      await callOnebot(target.bot, "set_group_leave", {
+        group_id: toIdValue(target.groupId),
+      });
+    } catch (err) {
+      return `（退群失败：${(err as Error).message ?? err}）`;
+    }
+    await this.focus.unfocus(`${target.platform}:${target.channelId}`);
+    return `你退出了群 ${id}。`;
+  }
+
+  /** 设置 / 移出群精华消息 */
+  async setEssence(msgId: string, remove: boolean): Promise<string> {
+    const bot = this.findOnebot();
+    if (!bot) return "（没有可用的 OneBot 账号。）";
+    try {
+      await callOnebot(bot, remove ? "delete_essence_msg" : "set_essence_msg", {
+        message_id: toIdValue(msgId),
+      });
+    } catch (err) {
+      return `（精华消息操作失败：${(err as Error).message ?? err}。你可能不是管理员。）`;
+    }
+    return remove ? `你把消息（msg:${msgId}）移出了群精华。` : `你把消息（msg:${msgId}）设为了群精华。`;
+  }
+
+  /** 发布群公告 */
+  async sendGroupNotice(id: string, content: string): Promise<string> {
+    const target = await this.resolveOnebotGroup(id);
+    if ("error" in target) return target.error;
+    try {
+      await callOnebot(target.bot, "_send_group_notice", {
+        group_id: toIdValue(target.groupId),
+        content,
+      });
+    } catch (err) {
+      return `（发布公告失败：${(err as Error).message ?? err}。你可能不是管理员。）`;
+    }
+    return `你在群 ${id} 发布了公告：「${truncate(content, 60)}」`;
+  }
+
+  /** 群打卡 */
+  async groupSign(id: string): Promise<string> {
+    const target = await this.resolveOnebotGroup(id);
+    if ("error" in target) return target.error;
+    const params = { group_id: toIdValue(target.groupId) };
+    try {
+      await callOnebot(target.bot, "set_group_sign", params);
+    } catch {
+      try {
+        await callOnebot(target.bot, "send_group_sign", params);
+      } catch (err) {
+        return `（群打卡失败：${(err as Error).message ?? err}）`;
+      }
+    }
+    return `你在群 ${id} 打了卡。`;
+  }
+
+  private findOnebot(): Bot | undefined {
+    const candidates = this.ctx.bots.filter((b) => b.platform === "onebot");
+    return candidates.find((b) => b.isActive) ?? candidates[0];
+  }
+
+  /** 解析并校验一个 OneBot 群频道 id */
+  private async resolveOnebotGroup(
+    id: string,
+  ): Promise<{ bot: Bot; platform: string; channelId: string; groupId: string } | { error: string }> {
+    const target = await this.resolveBot(id);
+    if ("error" in target) return target;
+    if (target.platform !== "onebot") return { error: "（这个操作目前只支持 QQ（OneBot）平台。）" };
+    if (target.channelId.startsWith("private:")) return { error: `（${id} 是私聊频道，不是群。）` };
+    return { ...target, groupId: target.channelId };
+  }
+
   /** 查看好友列表 */
   async listFriends(): Promise<string> {
     const lines: string[] = [];
@@ -438,10 +932,10 @@ export class KoishiMessenger implements MessengerApi {
     return { platform, channelId };
   }
 
-  /** 解析媒体引用："12" / "media:12" / "图片#12" / "gallery:name.png" */
+  /** 解析媒体引用："12" / "media:12" / "图片#12" / "gallery:name.png"，可限定允许的媒体类型 */
   private async resolveMediaRef(
     refText: string,
-    requireType?: MediaType,
+    allowTypes?: MediaType[],
   ): Promise<{ ref: MediaRef } | { error: string }> {
     const galleryName = parseGalleryRef(refText);
     if (galleryName !== null) {
@@ -449,10 +943,10 @@ export class KoishiMessenger implements MessengerApi {
       if (!safe) return { error: `（文件名不合法："${galleryName}"）` };
       const file = path.join(this.galleryDir, safe);
       const type = typeByExt(safe);
-      if (requireType && type !== requireType) {
-        return { error: `（"${safe}" 不是${requireType === "image" ? "图片" : "所需类型"}，请用 send_file 发送）` };
-      }
       if (type === "file") return { error: `（"${safe}" 不是媒体文件，请用 send_file 发送）` };
+      if (allowTypes && !allowTypes.includes(type)) {
+        return { error: `（"${safe}" 是${LABEL[type]}，不能放进普通消息；请用 send_file${type === "audio" ? " 或 send_voice" : ""} 发送）` };
+      }
       const id = await this.media.ingest(`file://${file}`, type);
       if (id === null) return { error: `（读取 "${safe}" 失败，可先用 check_gallery 确认它存在。）` };
       const row = await this.media.get(id);
@@ -463,8 +957,10 @@ export class KoishiMessenger implements MessengerApi {
     if (!match) return { error: `（无法理解的媒体引用："${refText}"）` };
     const row = await this.media.get(Number(match[1]));
     if (!row) return { error: `（找不到媒体 #${match[1]}，它可能未被收录。）` };
-    if (requireType && row.ref.type !== requireType) {
-      return { error: `（#${row.id} 是${row.ref.type}，不是${requireType}；音视频请用 send_file 发送。）` };
+    if (allowTypes && !allowTypes.includes(row.ref.type)) {
+      return {
+        error: `（#${row.id} 是${LABEL[row.ref.type]}，不能放进普通消息；请用 send_file${row.ref.type === "audio" ? " 或 send_voice" : ""} 发送。）`,
+      };
     }
     return { ref: row.ref };
   }
@@ -500,10 +996,10 @@ export class KoishiMessenger implements MessengerApi {
 // ---------- 工具函数 ----------
 
 /**
- * 调用 OneBot 底层 API（adapter-onebot 的 internal._request）。
- * 用于 Koishi 通用接口未覆盖的实现端扩展（set_msg_emoji_like / friend_poke 等）。
+ * 调用 OneBot 底层 API（adapter-onebot 的 internal._request），返回 data 部分。
+ * 用于 Koishi 通用接口未覆盖的实现端扩展（set_msg_emoji_like / friend_poke / set_qq_profile 等）。
  */
-async function callOnebot(bot: Bot, action: string, params: Record<string, unknown>): Promise<void> {
+async function callOnebot(bot: Bot, action: string, params: Record<string, unknown>): Promise<unknown> {
   const internal = (
     bot as unknown as {
       internal?: { _request?: (action: string, params: Record<string, unknown>) => Promise<unknown> };
@@ -511,18 +1007,32 @@ async function callOnebot(bot: Bot, action: string, params: Record<string, unkno
   ).internal;
   if (!internal?._request) throw new Error("当前 OneBot 适配器不支持该底层操作");
   const res = (await internal._request(action, params)) as
-    | { status?: string; retcode?: number; message?: string; msg?: string; wording?: string }
+    | { status?: string; retcode?: number; message?: string; msg?: string; wording?: string; data?: unknown }
     | undefined;
   if (res && typeof res === "object" && res.retcode !== undefined && ![0, 1].includes(Number(res.retcode))) {
     throw new Error(
       `${action} 失败（retcode ${res.retcode}${res.wording || res.message || res.msg ? `：${res.wording || res.message || res.msg}` : ""}）`,
     );
   }
+  return res && typeof res === "object" && "data" in res ? res.data : res;
 }
 
 /** OneBot 的 id 多为数字；能转则转成数字，转不了原样传字符串 */
 function toIdValue(id: string): number | string {
   return /^-?\d+$/.test(id) ? Number(id) : id;
+}
+
+/** 宽松解析用户 id：容忍 Bot 传入 "onebot:private:123" / "private:123" / "@123" 等形式 */
+function parseUserId(raw: string): string | null {
+  const trimmed = raw.trim().replace(/^@/, "");
+  if (!trimmed) return null;
+  const last = trimmed.split(":").pop()!.trim();
+  return last || null;
+}
+
+/** 群成员排序权重：群主 → 管理员 → 普通成员 */
+function roleRank(role: unknown): number {
+  return role === "owner" ? 0 : role === "admin" ? 1 : 2;
 }
 
 /** emoji 参数 → OneBot 表情编号：纯数字视为编号，否则取首个 Unicode 码点（QQ 回应支持 emoji 码点作为编号） */
