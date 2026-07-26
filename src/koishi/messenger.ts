@@ -8,7 +8,7 @@ import type { MediaStore } from "../media/store.js";
 import type { TtsClient } from "../media/tts.js";
 import type { MediaRef, MediaType, RichText } from "../types.js";
 import type { FocusManager } from "./focus.js";
-import type { MessageStore } from "./messages.js";
+import type { KnownChannel, MessageStore } from "./messages.js";
 
 const IMAGE_EXT = new Set([".jpg", ".jpeg", ".png", ".gif", ".webp"]);
 const AUDIO_EXT = new Set([".mp3", ".wav", ".ogg", ".flac", ".aac", ".amr", ".m4a"]);
@@ -50,8 +50,9 @@ export class KoishiMessenger implements MessengerApi {
   }
 
   async channelMessages(id: string, n: number): Promise<RichText> {
-    const { platform, channelId, error } = parseChannelKey(id);
-    if (error) return { text: error };
+    const resolved = await this.resolveChannel(id);
+    if ("error" in resolved) return { text: resolved.error };
+    const { platform, channelId } = resolved;
     // 打开频道 = 开始关注：一段时间内该频道的新消息会直接呈现内容
     await this.focus.focus(`${platform}:${channelId}`);
     const rows = await this.store.channelMessages(platform, channelId, n);
@@ -115,7 +116,7 @@ export class KoishiMessenger implements MessengerApi {
   // ---------- 发送 ----------
 
   async send(id: string, msg: string, images: (string | number)[] = []): Promise<string> {
-    const target = this.resolveBot(id);
+    const target = await this.resolveBot(id);
     if ("error" in target) return target.error;
 
     const elements: h[] = [];
@@ -151,7 +152,7 @@ export class KoishiMessenger implements MessengerApi {
 
   /** 以文件形式发送音频/视频/任意文件 */
   async sendFile(id: string, refText: string): Promise<string> {
-    const target = this.resolveBot(id);
+    const target = await this.resolveBot(id);
     if ("error" in target) return target.error;
 
     let element: h;
@@ -197,7 +198,7 @@ export class KoishiMessenger implements MessengerApi {
   /** TTS 合成并以语音消息发送 */
   async sendVoice(id: string, text: string): Promise<string> {
     if (!this.tts) return "（你没有可用的语音合成能力。）";
-    const target = this.resolveBot(id);
+    const target = await this.resolveBot(id);
     if ("error" in target) return target.error;
 
     let audio: { data: Buffer; mime: string };
@@ -236,15 +237,80 @@ export class KoishiMessenger implements MessengerApi {
 
   // ---------- 内部 ----------
 
-  private resolveBot(
+  private async resolveBot(
     id: string,
-  ): { bot: Bot; platform: string; channelId: string } | { error: string } {
-    const { platform, channelId, error } = parseChannelKey(id);
-    if (error) return { error };
+  ): Promise<{ bot: Bot; platform: string; channelId: string } | { error: string }> {
+    const resolved = await this.resolveChannel(id);
+    if ("error" in resolved) return resolved;
+    const { platform, channelId } = resolved;
     const candidates = this.ctx.bots.filter((b) => b.platform === platform);
     const bot = candidates.find((b) => b.isActive) ?? candidates[0];
     if (!bot) return { error: `（消息没发出去：没有可用的 ${platform} 账号。）` };
     return { bot, platform, channelId };
+  }
+
+  /**
+   * 频道 id 的宽松解析。
+   *
+   * Bot 常把频道 id 写错（如把用户名当频道，写成 "onebot:TouchNight" 甚至 "chat:TouchNight"）。
+   * 策略：
+   * 1. 与已知频道（消息记录）精确匹配 → 直接通过；
+   * 2. 不匹配时，用 id 中的片段模糊匹配已知频道的参与者用户名/用户 id/频道 id ——
+   *    找到候选时**不执行操作**，而是返回提示（会以事件形式送达 Bot），让它下次用正确的 id 调用；
+   * 3. 格式正确但完全无线索的 id 放行（可能是没有历史消息的新频道，交由平台判定）。
+   */
+  private async resolveChannel(
+    id: string,
+  ): Promise<{ platform: string; channelId: string } | { error: string }> {
+    const { platform, channelId, error } = parseChannelKey(id);
+    let channels: KnownChannel[] = [];
+    try {
+      channels = await this.store.knownChannels();
+    } catch {
+      /* 查询失败时退化为原有行为 */
+    }
+
+    if (!error && channels.some((c) => c.platform === platform && c.channelId === channelId)) {
+      return { platform, channelId };
+    }
+
+    // 模糊匹配：取 id 中的非平台片段作为查询词
+    const knownPlatforms = new Set(
+      this.ctx.bots.map((b) => b.platform?.toLowerCase()).filter((p): p is string => !!p),
+    );
+    const GENERIC = new Set(["private", "group", "channel", "guild", "chat", "discord", "telegram", "onebot", "qq"]);
+    const terms = id
+      .split(":")
+      .map((s) => s.trim().toLowerCase())
+      .filter((s) => s.length >= 2 && !knownPlatforms.has(s) && !GENERIC.has(s));
+
+    const matches = terms.length
+      ? channels.filter((c) => {
+          const hay = [
+            c.channelId.toLowerCase(),
+            ...c.participants.flatMap((p) => [p.username.toLowerCase(), p.userId.toLowerCase()]),
+          ].filter((s) => s.length >= 2);
+          return terms.some((t) => hay.some((s) => s.includes(t) || t.includes(s)));
+        })
+      : [];
+
+    if (matches.length) {
+      const list = matches
+        .slice(0, 3)
+        .map((c) => {
+          const names = c.participants.slice(0, 3).map((p) => p.username || p.userId).join("、");
+          return `${c.key}${names ? `（${names}）` : ""}`;
+        })
+        .join("；");
+      return {
+        error:
+          `（没有找到频道 "${id}"。你是想找 ${list} 吗？` +
+          `什么都没有发生——请在下次调用时使用上面这种完整的频道 id。）`,
+      };
+    }
+
+    if (error) return { error };
+    return { platform, channelId };
   }
 
   /** 解析媒体引用："12" / "media:12" / "图片#12" / "gallery:name.png" */

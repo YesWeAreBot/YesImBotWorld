@@ -3,7 +3,7 @@ import type { WorldClock } from "../clock.js";
 import type { Config } from "../config.js";
 import type { WorldFiles } from "../files.js";
 import { ToolCallParseError } from "../llm/parse.js";
-import type { BotEvent, EventSource, MediaRef, ParsedToolCall, RichText, ToolCallRecord } from "../types.js";
+import type { BotEvent, CompressionResult, EventSource, MediaRef, ParsedToolCall, RichText, ToolCallRecord } from "../types.js";
 import type { WorldAgent } from "../world/agent.js";
 import { createBackend, type BotBackend } from "./backend.js";
 import type { BotContext } from "./context.js";
@@ -400,6 +400,18 @@ export class BotAgent {
       this.pushEvent("system", "（send 需要 id 和 msg（或 images）参数。）", { ref: call.id });
       return;
     }
+    // 超长消息拦截：真人聊天单条消息很短；确需发长文时要求二次确认
+    const longLimit = this.config.messaging.longMessageChars;
+    if (longLimit > 0 && msg.length > longLimit && !isTruthy(call.arguments.confirm_long)) {
+      this.pushEvent(
+        "system",
+        `（这条消息长达 ${msg.length} 字，没有发出。日常聊天中一条消息一般只有十来个字，` +
+          `太长会显得不像真人——建议精简，或拆成几条短消息分开发。` +
+          `如果你确实要一次性发送长内容（如资料、长文），请在参数里加上 confirm_long: true 再发一次。）`,
+        { ref: call.id },
+      );
+      return;
+    }
     // 拦截与上一条完全相同的发送（模型常见的复读行为），除非显式声明 resend
     const sig = JSON.stringify([id, msg, images.map(String)]);
     if (sig === this.lastSendSig && !isTruthy(call.arguments.resend)) {
@@ -541,13 +553,26 @@ export class BotAgent {
     const startReal = Date.now();
     this.logger.info("开始休息（%s），压缩上下文：%d 条记录，约 %d 字符", forced ? "强制" : "主动", this.context.stream.length, this.context.approxChars());
 
-    const result = await this.world.compress({
-      persona: this.context.pinned.persona,
-      historySummary: this.context.pinned.historySummary,
-      memoryDigest: this.context.pinned.memoryDigest,
-      streamText: this.context.serializeForCompression(),
-      timeLine: this.clock.timeLine(),
-    });
+    // 压缩失败绝不能让上下文原样保留：否则强制 rest 会立即再次触发，陷入死循环。
+    // World-LLM 不可用时降级：直接归档丢弃工作窗口，沿用旧摘要并注明记忆模糊。
+    let result: CompressionResult;
+    try {
+      result = await this.world.compress({
+        persona: this.context.pinned.persona,
+        historySummary: this.context.pinned.historySummary,
+        memoryDigest: this.context.pinned.memoryDigest,
+        streamText: this.context.serializeForCompression(),
+        timeLine: this.clock.timeLine(),
+      });
+    } catch (err) {
+      this.logger.warn("上下文压缩失败，降级处理（丢弃工作窗口，沿用旧摘要）: %s", err);
+      const note = "（注：最近一段经历未能沉淀为记忆，这部分显得有些模糊。）";
+      const oldSummary = this.context.pinned.historySummary;
+      result = {
+        historySummary: oldSummary.includes(note) ? oldSummary : `${oldSummary}\n${note}`.slice(0, 4000),
+        memoryDigest: this.context.pinned.memoryDigest,
+      };
+    }
     if (result.botStatus) await this.files.writeBotStatus(result.botStatus);
     await this.context.applyCompression(result, this.clock.now());
 

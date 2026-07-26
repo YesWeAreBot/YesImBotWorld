@@ -73,6 +73,7 @@ export interface WorldModelConfig {
   maxTokens: number;
   disableThinking: boolean;
   maxToolRounds: number;
+  compressMaxInputChars: number;
 }
 
 export interface ClockConfigData {
@@ -89,6 +90,7 @@ export interface MessagingConfig {
   notifyPolicy: NotifyPolicy;
   wakeOnNotify: boolean;
   focusDurationUnits: number;
+  longMessageChars: number;
 }
 
 export interface Config {
@@ -181,6 +183,12 @@ export const Config: Schema<Config> = Schema.intersect([
             "请求会附带 enable_thinking: false 与 chat_template_kwargs.enable_thinking: false",
         ),
       maxToolRounds: Schema.natural().default(8).description("单次响应中允许的最大工具调用轮数"),
+      compressMaxInputChars: Schema.natural()
+        .default(100000)
+        .description(
+          "上下文压缩时送入 World-LLM 的意识流文本上限（字符数）。" +
+            "超出部分会从最早处截断（仅保留最近内容），防止压缩请求本身超过模型上下文窗口而失败",
+        ),
     }).description("World-LLM：维护世界状态、裁定事件的模型（也负责上下文压缩与初始化）"),
   }),
 
@@ -299,6 +307,12 @@ export const Config: Schema<Config> = Schema.intersect([
           "Bot 打开频道（select_channel）或向频道发送消息后，持续关注该频道多少个 Time Unit。" +
             "关注期间该频道的消息无视通知策略与频道列表，必定呈现完整内容；" +
             "Bot 可用 put_down_phone 主动放下手机。0 表示禁用关注机制",
+        ),
+      longMessageChars: Schema.natural()
+        .default(100)
+        .description(
+          "单条消息的长度提醒阈值（字符数）。send 的 msg 超过该长度时不会立即发出，" +
+            "而是提醒 Bot 日常聊天应使用短消息，需要它加 confirm_long: true 二次确认才发送。0 表示禁用",
         ),
     }).description("Koishi 消息接入"),
   }),

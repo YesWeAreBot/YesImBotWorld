@@ -198,6 +198,21 @@ export class WorldAgent {
     timeLine: string;
   }): Promise<CompressionResult> {
     return this.enqueue(async () => {
+      // 输入长度防护：意识流过长时只保留最近部分，防止压缩请求本身超过模型上下文窗口
+      let streamText = input.streamText;
+      const cap = this.cfg.compressMaxInputChars;
+      if (cap > 0 && streamText.length > cap) {
+        const tail = streamText.slice(-cap);
+        const cut = tail.indexOf("\n");
+        streamText =
+          `（意识流过长，最早的约 ${streamText.length - cap} 字符已被省略，以下仅为最近部分）\n` +
+          (cut >= 0 ? tail.slice(cut + 1) : tail);
+        this.logger.warn(
+          "压缩输入过长（%d 字符），已截断至最近 %d 字符",
+          input.streamText.length,
+          cap,
+        );
+      }
       const system =
         "你是一个虚拟角色的记忆整理器。角色刚进入休息状态，你需要把它近期的意识流（工具调用与事件）" +
         "压缩沉淀为长期记忆。输出必须严格使用给定的 XML 标签格式，不要输出其他内容。";
@@ -206,7 +221,7 @@ export class WorldAgent {
         `<persona>（角色的自我认知文件 Bot_Status.md 当前内容）\n${input.persona}\n</persona>\n\n` +
         `<old_history_summary>\n${input.historySummary}\n</old_history_summary>\n\n` +
         `<old_memory_digest>\n${input.memoryDigest}\n</old_memory_digest>\n\n` +
-        `<recent_stream>（本次要压缩的意识流）\n${input.streamText}\n</recent_stream>\n\n` +
+        `<recent_stream>（本次要压缩的意识流）\n${streamText}\n</recent_stream>\n\n` +
         `请输出三段：\n` +
         `<HISTORY_SUMMARY>合并旧摘要与本次意识流，按时间顺序压缩成第二人称的经历叙述（"你做了…"），` +
         `保留：正在进行的事、未完成的工具调用、承诺过的事、聊天中的重要对话与人物。控制在 800 字内。</HISTORY_SUMMARY>\n` +

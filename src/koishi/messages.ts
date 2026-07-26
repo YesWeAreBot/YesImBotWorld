@@ -6,6 +6,13 @@ declare module "koishi" {
   }
 }
 
+export interface KnownChannel {
+  key: string;
+  platform: string;
+  channelId: string;
+  participants: { userId: string; username: string }[];
+}
+
 export interface WorldMessageRow {
   id: number;
   platform: string;
@@ -59,6 +66,31 @@ export class MessageStore {
       if (seen.size >= n) break;
     }
     return [...seen.entries()].map(([key, latest]) => ({ key, latest }));
+  }
+
+  /**
+   * 已知频道及各自的参与者（非自己），用于频道 id 的宽松解析纠错。
+   * 基于最近的消息记录聚合，越活跃的频道排得越靠前。
+   */
+  async knownChannels(): Promise<KnownChannel[]> {
+    const rows = await this.ctx.database.get(
+      "yesimbot_world_message",
+      {},
+      { sort: { timestamp: "desc" }, limit: 1000 },
+    );
+    const map = new Map<string, KnownChannel>();
+    for (const row of rows) {
+      const key = `${row.platform}:${row.channelId}`;
+      let entry = map.get(key);
+      if (!entry) {
+        entry = { key, platform: row.platform, channelId: row.channelId, participants: [] };
+        map.set(key, entry);
+      }
+      if (!row.self && !entry.participants.some((p) => p.userId === row.userId)) {
+        entry.participants.push({ userId: row.userId, username: row.username });
+      }
+    }
+    return [...map.values()];
   }
 
   /** 某频道最近 n 条消息（时间正序返回） */
