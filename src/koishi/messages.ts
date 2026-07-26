@@ -23,6 +23,8 @@ export interface WorldMessageRow {
   content: string;
   timestamp: Date;
   self: boolean;
+  /** 平台侧消息 id（用于 recall / react），可能为空 */
+  messageId: string;
 }
 
 /**
@@ -43,6 +45,7 @@ export class MessageStore {
         content: "text",
         timestamp: "timestamp",
         self: "boolean",
+        messageId: { type: "string", length: 255, initial: "" },
       },
       { autoInc: true, primary: "id" },
     );

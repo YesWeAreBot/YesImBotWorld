@@ -8,7 +8,9 @@ import type { MediaStore } from "../media/store.js";
 import type { TtsClient } from "../media/tts.js";
 import type { MediaRef, MediaType, RichText } from "../types.js";
 import type { FocusManager } from "./focus.js";
+import type { PlatformOpsConfig } from "../config.js";
 import type { KnownChannel, MessageStore } from "./messages.js";
+import type { RequestStore } from "./requests.js";
 
 const IMAGE_EXT = new Set([".jpg", ".jpeg", ".png", ".gif", ".webp"]);
 const AUDIO_EXT = new Set([".mp3", ".wav", ".ogg", ".flac", ".aac", ".amr", ".m4a"]);
@@ -33,7 +35,14 @@ export class KoishiMessenger implements MessengerApi {
     private galleryDir: string,
     private tts: TtsClient | null,
     private focus: FocusManager,
+    private ops: PlatformOpsConfig,
+    private requests: RequestStore,
   ) {}
+
+  /** 是否需要在消息记录中展示平台消息 id（recall / react 需要引用） */
+  private get showMsgId(): boolean {
+    return this.ops.recall || this.ops.react;
+  }
 
   // ---------- 查看 ----------
 
@@ -64,7 +73,8 @@ export class KoishiMessenger implements MessengerApi {
       const who = row.self ? "你" : row.username || row.userId;
       const rendered = await this.renderer.render(row.content);
       if (rendered.attachments) attachments.push(...rendered.attachments);
-      lines.push(`[${formatTime(row.timestamp)}] ${who}: ${rendered.text}`);
+      const msgTag = this.showMsgId && row.messageId ? ` (msg:${row.messageId})` : "";
+      lines.push(`[${formatTime(row.timestamp)}]${msgTag} ${who}: ${rendered.text}`);
     }
     return {
       text: `你打开了 ${id} 的聊天记录（最近 ${rows.length} 条）：\n${lines.join("\n")}`,
@@ -135,16 +145,18 @@ export class KoishiMessenger implements MessengerApi {
     }
     if (!elements.length) return `（消息没发出去：没有可发送的内容。${problems.join("；")}）`;
 
+    let msgIds: string[] = [];
     try {
-      await target.bot.sendMessage(target.channelId, elements);
+      msgIds = await target.bot.sendMessage(target.channelId, elements);
     } catch (err) {
       return `（消息发送失败：${(err as Error).message ?? err}）`;
     }
     const stored =
       (msg || "") + sentRefs.map((ref) => mediaPlaceholder(ref.id, ref.type)).join("");
-    await this.storeSelf(target, stored);
+    await this.storeSelf(target, stored, msgIds[0]);
     await this.focus.focus(`${target.platform}:${target.channelId}`);
     let result = `消息已发送到 ${id}。`;
+    if (this.showMsgId && msgIds[0]) result = `消息已发送到 ${id}（msg:${msgIds[0]}）。`;
     if (sentRefs.length) result += `（附 ${sentRefs.length} 张图片）`;
     if (problems.length) result += `注意：${problems.join("；")}`;
     return result;
@@ -185,12 +197,13 @@ export class KoishiMessenger implements MessengerApi {
       stored = mediaPlaceholder(resolved.ref.id, resolved.ref.type);
     }
 
+    let msgIds: string[] = [];
     try {
-      await target.bot.sendMessage(target.channelId, element);
+      msgIds = await target.bot.sendMessage(target.channelId, element);
     } catch (err) {
       return `（文件发送失败：${(err as Error).message ?? err}）`;
     }
-    await this.storeSelf(target, stored);
+    await this.storeSelf(target, stored, msgIds[0]);
     await this.focus.focus(`${target.platform}:${target.channelId}`);
     return `文件已发送到 ${id}。`;
   }
@@ -207,8 +220,9 @@ export class KoishiMessenger implements MessengerApi {
     } catch (err) {
       return `（语音合成失败：${(err as Error).message ?? err}）`;
     }
+    let msgIds: string[] = [];
     try {
-      await target.bot.sendMessage(
+      msgIds = await target.bot.sendMessage(
         target.channelId,
         h("audio", { src: toDataUrl(audio.data, audio.mime) }),
       );
@@ -220,9 +234,120 @@ export class KoishiMessenger implements MessengerApi {
     if (mediaId !== null) await this.media.setSummary(mediaId, `（语音转写）${text}`);
     const stored =
       mediaId !== null ? `${mediaPlaceholder(mediaId, "audio")}（语音内容：${text}）` : `[语音] ${text}`;
-    await this.storeSelf(target, stored);
+    await this.storeSelf(target, stored, msgIds[0]);
     await this.focus.focus(`${target.platform}:${target.channelId}`);
     return `语音已发送到 ${id}：「${text}」`;
+  }
+
+  // ---------- 平台扩展操作 ----------
+
+  /** 撤回自己已发出的消息 */
+  async recall(id: string, msgId: string): Promise<string> {
+    const target = await this.resolveBot(id);
+    if ("error" in target) return target.error;
+    try {
+      await target.bot.deleteMessage(target.channelId, msgId);
+    } catch (err) {
+      return `（撤回失败：${(err as Error).message ?? err}。只能撤回自己发出不久的消息。）`;
+    }
+    return `你撤回了 ${id} 里的消息（msg:${msgId}）。`;
+  }
+
+  /** 给某条消息贴表情回应 */
+  async react(id: string, msgId: string, emoji: string): Promise<string> {
+    const target = await this.resolveBot(id);
+    if ("error" in target) return target.error;
+    try {
+      if (target.platform === "onebot") {
+        // OneBot：set_msg_emoji_like（NapCat / LLOneBot / Lagrange 扩展）
+        await callOnebot(target.bot, "set_msg_emoji_like", {
+          message_id: toIdValue(msgId),
+          emoji_id: emojiToOnebotId(emoji),
+          set: true,
+        });
+      } else {
+        await target.bot.createReaction(target.channelId, msgId, emoji);
+      }
+    } catch (err) {
+      return `（贴表情失败：${(err as Error).message ?? err}）`;
+    }
+    return `你给 ${id} 里的消息（msg:${msgId}）贴上了 ${emoji} 的回应。`;
+  }
+
+  /** 戳一戳（仅 OneBot，需实现端支持 friend_poke / group_poke） */
+  async poke(id: string, userId?: string): Promise<string> {
+    const target = await this.resolveBot(id);
+    if ("error" in target) return target.error;
+    if (target.platform !== "onebot") return "（戳一戳目前只支持 QQ（OneBot）平台。）";
+    const isPrivate = target.channelId.startsWith("private:");
+    const uid = userId?.trim() || (isPrivate ? target.channelId.slice("private:".length) : "");
+    if (!uid) return "（在群里 poke 需要 user_id 参数指明戳谁。）";
+    try {
+      if (isPrivate) {
+        await callOnebot(target.bot, "friend_poke", { user_id: toIdValue(uid) });
+      } else {
+        await callOnebot(target.bot, "group_poke", {
+          group_id: toIdValue(target.channelId),
+          user_id: toIdValue(uid),
+        });
+      }
+    } catch (err) {
+      return `（戳一戳失败：${(err as Error).message ?? err}）`;
+    }
+    return isPrivate ? `你戳了戳 ${id} 的对方。` : `你在 ${id} 里戳了戳 ${uid}。`;
+  }
+
+  /** 处理好友申请 / 入群邀请 / 入群申请 */
+  async handleRequest(requestId: string, approve: boolean, reason?: string): Promise<string> {
+    const req = this.requests.get(requestId);
+    if (!req) return `（找不到待处理的请求 ${requestId}，它可能已被处理过或已失效。）`;
+    const candidates = this.ctx.bots.filter((b) => b.platform === req.platform);
+    const bot = candidates.find((b) => b.selfId === req.selfId) ?? candidates.find((b) => b.isActive) ?? candidates[0];
+    if (!bot) return `（没有可用的 ${req.platform} 账号来处理这个请求。）`;
+    try {
+      if (req.kind === "friend") await bot.handleFriendRequest(req.messageId, approve, reason);
+      else if (req.kind === "guild") await bot.handleGuildRequest(req.messageId, approve, reason);
+      else await bot.handleGuildMemberRequest(req.messageId, approve, reason);
+    } catch (err) {
+      return `（处理请求失败：${(err as Error).message ?? err}）`;
+    }
+    this.requests.remove(requestId);
+    const who = req.username || req.userId;
+    if (req.kind === "friend") {
+      return approve
+        ? `你通过了 ${who} 的好友申请。现在可以在 ${req.platform}:private:${req.userId} 和 TA 聊天了。`
+        : `你拒绝了 ${who} 的好友申请。`;
+    }
+    if (req.kind === "guild") {
+      return approve ? `你接受了加入群 ${req.guildId} 的邀请。` : `你婉拒了加入群 ${req.guildId} 的邀请。`;
+    }
+    return approve ? `你同意了 ${who} 加入群 ${req.guildId} 的申请。` : `你拒绝了 ${who} 加入群 ${req.guildId} 的申请。`;
+  }
+
+  /** 查看好友列表 */
+  async listFriends(): Promise<string> {
+    const lines: string[] = [];
+    for (const bot of this.ctx.bots) {
+      try {
+        let next: string | undefined;
+        do {
+          const page = await bot.getFriendList(next);
+          for (const friend of page.data) {
+            const uid = friend.user?.id;
+            if (!uid) continue;
+            const name = friend.nick || friend.user?.nick || friend.user?.name || uid;
+            lines.push(`- ${name}（${bot.platform}:private:${uid}）`);
+          }
+          next = page.next;
+        } while (next && lines.length < 500);
+      } catch {
+        /* 平台不支持好友列表 */
+      }
+    }
+    if (!lines.length) return "（拿不到好友列表：当前平台不支持，或者你还没有好友。）";
+    const shown = lines.slice(0, 200);
+    const more = lines.length > shown.length ? `\n（其余 ${lines.length - shown.length} 人未显示）` : "";
+    return `你翻了翻好友列表（共 ${lines.length} 人）：\n${shown.join("\n")}${more}`;
   }
 
   /** 放下手机：清除全部频道关注，恢复为一般通知策略 */
@@ -356,6 +481,7 @@ export class KoishiMessenger implements MessengerApi {
   private async storeSelf(
     target: { bot: Bot; platform: string; channelId: string },
     content: string,
+    messageId?: string,
   ): Promise<void> {
     await this.store.store({
       platform: target.platform,
@@ -366,11 +492,47 @@ export class KoishiMessenger implements MessengerApi {
       content,
       timestamp: new Date(),
       self: true,
+      messageId: messageId ?? "",
     });
   }
 }
 
 // ---------- 工具函数 ----------
+
+/**
+ * 调用 OneBot 底层 API（adapter-onebot 的 internal._request）。
+ * 用于 Koishi 通用接口未覆盖的实现端扩展（set_msg_emoji_like / friend_poke 等）。
+ */
+async function callOnebot(bot: Bot, action: string, params: Record<string, unknown>): Promise<void> {
+  const internal = (
+    bot as unknown as {
+      internal?: { _request?: (action: string, params: Record<string, unknown>) => Promise<unknown> };
+    }
+  ).internal;
+  if (!internal?._request) throw new Error("当前 OneBot 适配器不支持该底层操作");
+  const res = (await internal._request(action, params)) as
+    | { status?: string; retcode?: number; message?: string; msg?: string; wording?: string }
+    | undefined;
+  if (res && typeof res === "object" && res.retcode !== undefined && ![0, 1].includes(Number(res.retcode))) {
+    throw new Error(
+      `${action} 失败（retcode ${res.retcode}${res.wording || res.message || res.msg ? `：${res.wording || res.message || res.msg}` : ""}）`,
+    );
+  }
+}
+
+/** OneBot 的 id 多为数字；能转则转成数字，转不了原样传字符串 */
+function toIdValue(id: string): number | string {
+  return /^-?\d+$/.test(id) ? Number(id) : id;
+}
+
+/** emoji 参数 → OneBot 表情编号：纯数字视为编号，否则取首个 Unicode 码点（QQ 回应支持 emoji 码点作为编号） */
+function emojiToOnebotId(emoji: string): number {
+  const trimmed = emoji.trim();
+  if (/^\d+$/.test(trimmed)) return Number(trimmed);
+  const cp = trimmed.codePointAt(0);
+  if (!cp) throw new Error("emoji 参数为空");
+  return cp;
+}
 
 function parseChannelKey(id: string): { platform: string; channelId: string; error?: string } {
   const idx = id.indexOf(":");

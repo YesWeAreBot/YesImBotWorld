@@ -93,6 +93,15 @@ export interface MessagingConfig {
   longMessageChars: number;
 }
 
+/** 聊天平台扩展操作（收发消息之外的能力），默认全部关闭 */
+export interface PlatformOpsConfig {
+  recall: boolean;
+  react: boolean;
+  poke: boolean;
+  handleRequests: boolean;
+  listFriends: boolean;
+}
+
 export interface Config {
   basePath: string;
   autoStart: boolean;
@@ -100,6 +109,7 @@ export interface Config {
   world: WorldModelConfig;
   clock: ClockConfigData;
   messaging: MessagingConfig;
+  platformOps: PlatformOpsConfig;
   captioners: CaptionersConfig;
   media: MediaConfig;
   tts: TtsConfig;
@@ -210,6 +220,35 @@ export const Config: Schema<Config> = Schema.intersect([
         .default(30)
         .description("每过多少个 Time Unit 产生一次 Tingle（触发 World-LLM 推进世界、生成 News）。0 表示禁用"),
     }).description("World Clock"),
+  }),
+
+  Schema.object({
+    platformOps: Schema.object({
+      recall: Schema.boolean()
+        .default(false)
+        .description("recall：撤回自己已发出的消息。开启后消息记录与发送结果会附带 (msg:xxx) 消息编号"),
+      react: Schema.boolean()
+        .default(false)
+        .description(
+          "react：给消息贴表情回应（OneBot 走 set_msg_emoji_like，需实现端支持，如 NapCat / LLOneBot / Lagrange；" +
+            "其他平台走通用 createReaction）。开启后消息记录会附带 (msg:xxx) 消息编号",
+        ),
+      poke: Schema.boolean()
+        .default(false)
+        .description("poke：戳一戳（仅 OneBot，需实现端支持 friend_poke / group_poke，如 NapCat / LLOneBot）"),
+      handleRequests: Schema.boolean()
+        .default(false)
+        .description(
+          "handle_request：处理好友申请与入群邀请/申请。" +
+            "开启后相应请求会以手机通知事件的形式告知 Bot，由它决定同意或拒绝",
+        ),
+      listFriends: Schema.boolean()
+        .default(false)
+        .description("list_friends：查看好友列表（名字与可用于 send 的频道 id）"),
+    }).description(
+      "聊天平台扩展操作：为 Bot 提供收发消息之外的平台能力（默认全部关闭）。" +
+        "开关变化会以事件告知 Bot 并即刻生效；置顶的工具列表在下次 rest 压缩时才同步（保护前缀缓存）",
+    ),
   }),
 
   Schema.object({

@@ -11,6 +11,7 @@ import { FocusManager } from "./koishi/focus.js";
 import { Gateway } from "./koishi/gateway.js";
 import { MessageStore } from "./koishi/messages.js";
 import { KoishiMessenger } from "./koishi/messenger.js";
+import { RequestStore } from "./koishi/requests.js";
 import { CaptionService } from "./media/captioner.js";
 import { createAttachmentLoader } from "./media/parts.js";
 import { MediaRenderer } from "./media/render.js";
@@ -39,6 +40,7 @@ export class WorldService extends Service<Config> {
   private renderer!: MediaRenderer;
   private world!: WorldAgent;
   private focus!: FocusManager;
+  private requests!: RequestStore;
   private botContext: BotContext | null = null;
   private bot: BotAgent | null = null;
   private tingle: TingleTimer | null = null;
@@ -70,8 +72,11 @@ export class WorldService extends Service<Config> {
       config.messaging.focusDurationUnits,
     );
 
+    // 平台请求登记处（好友申请 / 入群邀请等，Bot 用 handle_request 处理）
+    this.requests = new RequestStore();
+
     // 消息网关始终活跃：所有消息入库；通知事件仅在世界运行时投递
-    new Gateway(ctx, config.messaging, this.store, this.media, this.renderer, this.focus, {
+    new Gateway(ctx, config.messaging, config.platformOps, this.store, this.media, this.renderer, this.focus, this.requests, {
       notify: (content, wake) => {
         if (this.worldRunning && this.bot) this.bot.pushEvent("koishi", content, { wake });
       },
@@ -135,7 +140,7 @@ export class WorldService extends Service<Config> {
 
     // 建立全新的 Bot 上下文（角色设定来自刚生成的 Bot_Status.md）
     await fs.writeFile(this.files.stream, "");
-    const context = new BotContext(this.files);
+    const context = new BotContext(this.files, renderToolsText(this.currentTools()));
     context.pinned.persona = await this.files.readBotStatus();
     await context.persistPinned();
 
@@ -149,11 +154,8 @@ export class WorldService extends Service<Config> {
       return "世界尚未初始化。请先编写定义文件并执行 world.init。";
     }
 
-    // 实际可用的工具集（如未配置 TTS 则没有 send_voice；禁用关注机制则没有 put_down_phone）
-    const tools = availableTools({
-      tts: this.config.tts.enabled,
-      focus: this.config.messaging.focusDurationUnits > 0,
-    });
+    // 实际可用的工具集（如未配置 TTS 则没有 send_voice；平台扩展操作按配置开关）
+    const tools = this.currentTools();
 
     this.botContext = new BotContext(this.files, renderToolsText(tools));
     await this.botContext.load();
@@ -175,6 +177,8 @@ export class WorldService extends Service<Config> {
       this.files.galleryDir,
       this.config.tts.enabled ? new TtsClient(this.config.tts) : null,
       this.focus,
+      this.config.platformOps,
+      this.requests,
     );
     this.bot = new BotAgent(
       this.config,
@@ -201,6 +205,10 @@ export class WorldService extends Service<Config> {
         `你睁开眼睛，意识逐渐清晰。这是你有意识的第一刻。当前 ${this.clock.timeLine()}。不妨先 check_status 看看自己和这个世界。`,
       );
     }
+
+    // 工具集与置顶列表不一致（配置变更/版本升级）：以事件告知，置顶列表在下次 rest 时才同步（保护前缀缓存）
+    const toolsNotice = this.botContext.toolsChangeNotice();
+    if (toolsNotice) this.bot.pushEvent("system", toolsNotice);
 
     this.bot.start();
     this.tingle = new TingleTimer(
@@ -251,6 +259,15 @@ export class WorldService extends Service<Config> {
       lines.push("最近的世界事件：", ...news.map((e) => `- [${e.clock}] ${e.content}`));
     }
     return lines.join("\n");
+  }
+
+  /** 当前配置下实际可用的 Bot 工具集 */
+  private currentTools() {
+    return availableTools({
+      tts: this.config.tts.enabled,
+      focus: this.config.messaging.focusDurationUnits > 0,
+      ops: this.config.platformOps,
+    });
   }
 
   // ---------- 命令 ----------

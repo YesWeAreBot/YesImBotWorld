@@ -18,7 +18,15 @@ export interface MessengerApi {
   sendFile(id: string, ref: string): Promise<string>;
   sendVoice(id: string, text: string): Promise<string>;
   putDownPhone(): Promise<string>;
+  recall(id: string, msgId: string): Promise<string>;
+  react(id: string, msgId: string, emoji: string): Promise<string>;
+  poke(id: string, userId?: string): Promise<string>;
+  handleRequest(requestId: string, approve: boolean, reason?: string): Promise<string>;
+  listFriends(): Promise<string>;
 }
+
+/** 即时调用结果的宽限等待上限（毫秒）：超过则不再等待，照常进入下一轮生成 */
+const INSTANT_RESULT_GRACE_MS = 5000;
 
 interface MailboxItem {
   source: EventSource;
@@ -188,6 +196,10 @@ export class BotAgent {
 
         await this.throttle();
 
+        // throttle 睡眠期间（含上一个即时工具的执行窗口）可能有新事件到达：
+        // 生成前再次排空，避免 Bot 看不到"就差一步"的结果而误以为调用无效、重复调用
+        await this.drainMailbox();
+
         let parsed: ParsedToolCall;
         try {
           parsed = await this.backend.generate(this.context, this.clock.timeLine(), this.abort!.signal);
@@ -212,6 +224,15 @@ export class BotAgent {
           call.duration ? ` +${call.duration}TU` : "",
         );
         await this.dispatch(call);
+        // 即时调用（期望完成时刻已到却尚未交付结果，如 check_msg 的数据库查询）：
+        // 给一个短暂宽限，等结果先进入邮箱再生成下一个调用，防止 Bot 重复调用同一工具
+        if (
+          !this.isWaitingOn(call.id) &&
+          call.expectedAt <= this.clock.now() &&
+          this.scheduler.isPending(call.id)
+        ) {
+          await this.scheduler.waitForDelivery(call.id, INSTANT_RESULT_GRACE_MS);
+        }
       } catch (err) {
         if (!this.running) break;
         this.logger.error("Bot-LLM 循环出错: %s", err);
@@ -235,6 +256,11 @@ export class BotAgent {
       };
       await this.context.appendEvent(event);
     }
+  }
+
+  /** 是否正因某个调用而暂停生成（独立方法以避免 TS 对 this.waiting 的过窄推断） */
+  private isWaitingOn(callId: string): boolean {
+    return this.waiting !== null && this.waiting.callId === callId;
   }
 
   private async sleepUntilWoken(): Promise<void> {
@@ -304,6 +330,49 @@ export class BotAgent {
         return this.dispatchSendVoice(call);
       case "put_down_phone":
         return this.dispatchLocal(call, async () => this.messenger.putDownPhone());
+      case "recall": {
+        const id = String(call.arguments.id ?? "");
+        const msgId = String(call.arguments.msg_id ?? call.arguments.msgId ?? "");
+        if (!id || !msgId) {
+          this.pushEvent("system", "（recall 需要 id 和 msg_id 参数，msg_id 来自消息记录里的 (msg:xxx) 标注。）", { ref: call.id });
+          return;
+        }
+        return this.dispatchLocal(call, async () => this.messenger.recall(id, msgId));
+      }
+      case "react": {
+        const id = String(call.arguments.id ?? "");
+        const msgId = String(call.arguments.msg_id ?? call.arguments.msgId ?? "");
+        const emoji = String(call.arguments.emoji ?? "");
+        if (!id || !msgId || !emoji) {
+          this.pushEvent("system", "（react 需要 id、msg_id 和 emoji 参数。）", { ref: call.id });
+          return;
+        }
+        return this.dispatchLocal(call, async () => this.messenger.react(id, msgId, emoji));
+      }
+      case "poke": {
+        const id = String(call.arguments.id ?? "");
+        if (!id) {
+          this.pushEvent("system", "（poke 需要 id 参数。）", { ref: call.id });
+          return;
+        }
+        const userId = call.arguments.user_id ?? call.arguments.userId;
+        return this.dispatchLocal(call, async () =>
+          this.messenger.poke(id, userId !== undefined && userId !== null ? String(userId) : undefined),
+        );
+      }
+      case "handle_request": {
+        const requestId = String(call.arguments.request_id ?? call.arguments.requestId ?? call.arguments.id ?? "");
+        const approveRaw = call.arguments.approve;
+        if (!requestId || approveRaw === undefined || approveRaw === null) {
+          this.pushEvent("system", "（handle_request 需要 request_id 和 approve 参数。）", { ref: call.id });
+          return;
+        }
+        const approve = isTruthy(approveRaw);
+        const reason = call.arguments.reason != null ? String(call.arguments.reason) : undefined;
+        return this.dispatchLocal(call, async () => this.messenger.handleRequest(requestId, approve, reason));
+      }
+      case "list_friends":
+        return this.dispatchLocal(call, async () => this.messenger.listFriends());
       case "cancel":
         return this.dispatchCancel(call);
       case "identity_recall":
@@ -473,14 +542,14 @@ export class BotAgent {
     this.pushEvent("system", text, { ref: call.id });
   }
 
-  private dispatchIdentityRecall(call: ToolCallRecord): void {
-    void this.files.readBotStatus().then((persona) => {
-      this.pushEvent(
-        "system",
-        `你静下心来，回想起自己是谁——\n${persona.trim() || "（角色设定文件为空）"}`,
-        { ref: call.id },
-      );
-    });
+  private async dispatchIdentityRecall(call: ToolCallRecord): Promise<void> {
+    // await 读取，保证事件在下一次生成前就进入邮箱（否则 Bot 可能因看不到结果而重复调用）
+    const persona = await this.files.readBotStatus();
+    this.pushEvent(
+      "system",
+      `你静下心来，回想起自己是谁——\n${persona.trim() || "（角色设定文件为空）"}`,
+      { ref: call.id },
+    );
   }
 
   /**

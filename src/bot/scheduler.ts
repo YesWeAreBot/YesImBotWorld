@@ -10,6 +10,8 @@ interface ScheduledTask {
   executed: boolean;
   delivered: boolean;
   timer?: ReturnType<typeof setTimeout>;
+  /** waitForDelivery 的等待者，任务终结（交付/取消）时唤醒 */
+  waiters?: (() => void)[];
 }
 
 export interface ScheduleOptions {
@@ -50,6 +52,7 @@ export class Scheduler {
       task.delivered = true;
       this.tasks.delete(call.id);
       if (result !== null) this.deliver(result, call.id);
+      this.notifyWaiters(task);
     };
 
     const runNow = () => {
@@ -79,6 +82,7 @@ export class Scheduler {
         task.delivered = true;
         this.tasks.delete(call.id);
         if (result !== null) this.deliver(result, call.id);
+        this.notifyWaiters(task);
       };
 
       if (!timeReached) {
@@ -114,7 +118,35 @@ export class Scheduler {
     task.cancelled = true;
     if (task.timer) clearTimeout(task.timer);
     this.tasks.delete(id);
+    this.notifyWaiters(task);
     return "cancelled";
+  }
+
+  /**
+   * 等待某个任务终结（结果已交付或被取消），最多等待 timeoutMs。
+   * 用于即时调用的宽限窗口：让结果先进入邮箱，再开始下一次生成。
+   */
+  waitForDelivery(id: string, timeoutMs: number): Promise<void> {
+    const task = this.tasks.get(id);
+    if (!task) return Promise.resolve();
+    return new Promise((resolve) => {
+      let settled = false;
+      const done = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve();
+      };
+      const timer = setTimeout(done, timeoutMs);
+      (task.waiters ??= []).push(done);
+    });
+  }
+
+  private notifyWaiters(task: ScheduledTask): void {
+    const waiters = task.waiters;
+    if (!waiters) return;
+    task.waiters = undefined;
+    for (const waiter of waiters) waiter();
   }
 
   /** 某个工具调用是否仍在进行中（未交付、未取消） */
@@ -131,6 +163,7 @@ export class Scheduler {
     for (const task of this.tasks.values()) {
       task.cancelled = true;
       if (task.timer) clearTimeout(task.timer);
+      this.notifyWaiters(task);
     }
     this.tasks.clear();
   }

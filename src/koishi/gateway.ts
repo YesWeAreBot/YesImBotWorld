@@ -1,11 +1,12 @@
 import { h, type Context, type Session } from "koishi";
-import type { MessagingConfig } from "../config.js";
+import type { MessagingConfig, PlatformOpsConfig } from "../config.js";
 import type { MediaRenderer } from "../media/render.js";
 import { mediaPlaceholder } from "../media/render.js";
 import type { MediaStore } from "../media/store.js";
 import type { RichText } from "../types.js";
 import type { FocusManager } from "./focus.js";
 import type { MessageStore } from "./messages.js";
+import type { RequestStore } from "./requests.js";
 
 export interface GatewayCallbacks {
   /** 向 Bot-LLM 投递通知事件；wake 表示是否唤醒 wait() 中的 Bot */
@@ -22,10 +23,12 @@ export class Gateway {
   constructor(
     private ctx: Context,
     private cfg: MessagingConfig,
+    private ops: PlatformOpsConfig,
     private store: MessageStore,
     private media: MediaStore,
     private renderer: MediaRenderer,
     private focus: FocusManager,
+    private requests: RequestStore,
     private callbacks: GatewayCallbacks,
   ) {
     ctx.middleware(async (session, next) => {
@@ -36,6 +39,36 @@ export class Gateway {
       }
       return next();
     });
+
+    // 平台请求事件（好友申请 / 入群邀请 / 入群申请）：登记后以手机通知的形式告知 Bot
+    if (ops.handleRequests) {
+      ctx.on("friend-request", (session) => this.handleRequestEvent(session, "friend"));
+      ctx.on("guild-request", (session) => this.handleRequestEvent(session, "guild"));
+      ctx.on("guild-member-request", (session) => this.handleRequestEvent(session, "member"));
+    }
+  }
+
+  private handleRequestEvent(session: Session, kind: "friend" | "guild" | "member"): void {
+    const req = this.requests.add({
+      kind,
+      platform: session.platform ?? "unknown",
+      selfId: session.selfId ?? "",
+      messageId: session.messageId ?? "",
+      userId: session.userId ?? "",
+      username: session.username ?? session.userId ?? "",
+      guildId: session.guildId,
+      comment: session.content?.trim() || undefined,
+    });
+    const who = req.username && req.username !== req.userId ? `${req.username}（${req.userId}）` : req.userId;
+    const note = req.comment ? `，附言：「${req.comment}」` : "";
+    const hint = `（请求编号 ${req.id}，可用 handle_request 同意或拒绝）`;
+    const text =
+      kind === "friend"
+        ? `手机弹出提示：${req.platform} 上 ${who} 请求添加你为好友${note}。${hint}`
+        : kind === "guild"
+          ? `手机弹出提示：${who} 邀请你加入群 ${req.guildId}${note}。${hint}`
+          : `手机弹出提示：${who} 申请加入你管理的群 ${req.guildId}${note}。${hint}`;
+    this.callbacks.notify({ text }, this.cfg.wakeOnNotify);
   }
 
   private async handle(session: Session): Promise<void> {
@@ -56,6 +89,7 @@ export class Gateway {
       content,
       timestamp: new Date(session.timestamp ?? Date.now()),
       self: false,
+      messageId: session.messageId ?? "",
     });
 
     const key = `${session.platform}:${session.channelId}`;
@@ -122,8 +156,10 @@ export class Gateway {
   /** 关注中的频道：始终呈现完整内容（相当于强制 content 策略） */
   private async renderFocused(key: string, session: Session, content: string): Promise<RichText> {
     const rendered = await this.renderer.render(content);
+    const msgTag =
+      (this.ops.recall || this.ops.react) && session.messageId ? `(msg:${session.messageId}) ` : "";
     return {
-      text: `你正留意着 ${key}，看到新消息——${session.username ?? session.userId}说：${rendered.text}`,
+      text: `你正留意着 ${key}，看到新消息——${msgTag}${session.username ?? session.userId}说：${rendered.text}`,
       attachments: rendered.attachments,
     };
   }

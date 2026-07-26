@@ -1,5 +1,7 @@
 /** Bot-LLM 可用工具的定义（用于渲染置顶工具列表与 GBNF 语法约束） */
 
+import type { PlatformOpsConfig } from "../config.js";
+
 export interface BotToolDef {
   name: string;
   signature: string;
@@ -81,6 +83,38 @@ export const BOT_TOOLS: BotToolDef[] = [
       "把一段话转成你的声音，以语音消息发出。适合简短口语化的内容。duration 表示说话耗时，发出前可 cancel。",
   },
   {
+    name: "recall",
+    signature: 'recall(id: string, msg_id: string)',
+    description:
+      '撤回一条你已经发出的消息。msg_id 是消息记录里 (msg:xxx) 标注的编号。' +
+      "只能撤回自己发出不久的消息（平台通常限制两分钟内）。还没发出去的消息请用 cancel。",
+  },
+  {
+    name: "react",
+    signature: 'react(id: string, msg_id: string, emoji: string)',
+    description:
+      '给某条消息贴一个表情回应（不发新消息的轻量回应）。emoji 填一个 emoji 字符（如 "👍"）或平台表情编号；' +
+      "msg_id 来自消息记录里的 (msg:xxx) 标注。",
+  },
+  {
+    name: "poke",
+    signature: 'poke(id: string, user_id?: string)',
+    description:
+      "戳一戳：轻量地引起某人注意。私聊里戳对方（user_id 可省略）；群聊里必须给 user_id 指明戳谁。",
+  },
+  {
+    name: "handle_request",
+    signature: 'handle_request(request_id: string, approve: boolean, reason?: string)',
+    description:
+      '处理好友申请或入群邀请/申请。request_id 是手机通知里的请求编号（形如 "req_1"）。' +
+      "approve 为 true 同意、false 拒绝；reason 可选（同意好友申请时作为备注，拒绝入群申请时作为理由）。",
+  },
+  {
+    name: "list_friends",
+    signature: "list_friends()",
+    description: "翻看你在聊天平台上的好友列表：每个好友的名字与可直接用于 send 的频道 id。",
+  },
+  {
     name: "cancel",
     signature: "cancel(id: string)",
     description: '取消一个尚未到期望完成时刻的工具调用（如撤回还没发出去的消息）。id 是工具调用编号（形如 "tc_12"）。',
@@ -95,12 +129,27 @@ export const BOT_TOOLS: BotToolDef[] = [
 /** 全部工具名（宽松解析用的允许列表上限） */
 export const BOT_TOOL_NAMES = BOT_TOOLS.map((t) => t.name);
 
-/** 按配置过滤实际可用的工具（如未配置 TTS 时不提供 send_voice、禁用关注机制时不提供 put_down_phone） */
-export function availableTools(opts: { tts: boolean; focus: boolean }): BotToolDef[] {
+/** 按配置过滤实际可用的工具（如未配置 TTS 时不提供 send_voice、平台扩展操作默认关闭） */
+export function availableTools(opts: { tts: boolean; focus: boolean; ops: PlatformOpsConfig }): BotToolDef[] {
   return BOT_TOOLS.filter((t) => {
-    if (t.name === "send_voice") return opts.tts;
-    if (t.name === "put_down_phone") return opts.focus;
-    return true;
+    switch (t.name) {
+      case "send_voice":
+        return opts.tts;
+      case "put_down_phone":
+        return opts.focus;
+      case "recall":
+        return opts.ops.recall;
+      case "react":
+        return opts.ops.react;
+      case "poke":
+        return opts.ops.poke;
+      case "handle_request":
+        return opts.ops.handleRequests;
+      case "list_friends":
+        return opts.ops.listFriends;
+      default:
+        return true;
+    }
   });
 }
 

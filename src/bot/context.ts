@@ -92,8 +92,9 @@ export class BotContext {
       const raw = JSON.parse(await fs.readFile(this.files.pinned, "utf8")) as PinnedPersist;
       this.pinned = raw.pinned;
       this.counters = raw.counters;
-      // 工具列表以当前实际可用的为准（变更通知以 Event 形式追加，见 service 层）
-      this.pinned.toolsText = this.toolsText;
+      // 注意：置顶区保留持久化时的工具列表（保护前缀缓存）。
+      // 与当前实际可用工具的差异由 service 层通过 toolsChangeNotice() 以 Event 形式告知 Bot，
+      // 置顶列表在下次 rest 压缩（applyCompression）时才同步为当前列表。
     } catch {
       this.pinned.persona = await this.files.readBotStatus();
     }
@@ -243,6 +244,28 @@ export class BotContext {
     return this.renderStreamText();
   }
 
+  /**
+   * 当前实际可用的工具列表与置顶区中的差异描述（无差异返回 null）。
+   * 用于以 Event 形式告知 Bot 能力变化，而不立即改写置顶区（保护前缀缓存）。
+   */
+  toolsChangeNotice(): string | null {
+    if (this.pinned.toolsText === this.toolsText) return null;
+    const oldTools = parseToolBlocks(this.pinned.toolsText);
+    const newTools = parseToolBlocks(this.toolsText);
+    const added = [...newTools.keys()].filter((n) => !oldTools.has(n));
+    const removed = [...oldTools.keys()].filter((n) => !newTools.has(n));
+    const changed = [...newTools.keys()].filter(
+      (n) => oldTools.has(n) && oldTools.get(n) !== newTools.get(n),
+    );
+    if (!added.length && !removed.length && !changed.length) return null;
+    const parts: string[] = ["（你的能力发生了变化，以下变化即刻生效："];
+    if (added.length) parts.push(`【新增】\n${added.map((n) => newTools.get(n)).join("\n")}`);
+    if (changed.length) parts.push(`【用法更新】\n${changed.map((n) => newTools.get(n)).join("\n")}`);
+    if (removed.length) parts.push(`【失效】${removed.join("、")}（不要再调用它们）`);
+    parts.push("置顶的可用工具列表会在你下次 rest 之后同步刷新。）");
+    return parts.join("\n");
+  }
+
   // ---------- 压缩 ----------
 
   /**
@@ -261,4 +284,26 @@ export class BotContext {
     };
     await this.persistPinned();
   }
+}
+
+/** 解析渲染后的工具列表文本：工具名 → 完整定义块（"- 签名\n  描述"） */
+function parseToolBlocks(text: string): Map<string, string> {
+  const map = new Map<string, string>();
+  let current: string | null = null;
+  let buf: string[] = [];
+  const flush = () => {
+    if (current) map.set(current, buf.join("\n"));
+  };
+  for (const line of text.split("\n")) {
+    const m = line.match(/^- ([A-Za-z_][A-Za-z0-9_]*)\s*\(/);
+    if (m) {
+      flush();
+      current = m[1]!;
+      buf = [line];
+    } else if (current) {
+      buf.push(line);
+    }
+  }
+  flush();
+  return map;
 }
