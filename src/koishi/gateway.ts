@@ -130,9 +130,15 @@ export class Gateway {
         case "face":
           out += `[表情:${el.attrs.name ?? el.attrs.id ?? ""}]`;
           break;
-        case "quote":
-          out += "[引用了一条消息]";
+        case "quote": {
+          // 开启 recall/react/reply 时带上被引用的消息 id，Bot 能看懂引用链并可跟进引用
+          const quotedId = el.attrs.id;
+          out +=
+            (this.ops.recall || this.ops.react || this.ops.reply) && quotedId
+              ? `[引用 msg:${quotedId}]`
+              : "[引用了一条消息]";
           break;
+        }
         default:
           if (el.children?.length) out += await this.serializeElements(el.children);
           break;

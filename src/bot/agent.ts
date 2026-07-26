@@ -17,7 +17,7 @@ export interface MessengerApi {
   checkMedia(n: number, type?: "image" | "audio" | "video"): Promise<string>;
   gallerySave(mediaId: string, name?: string): Promise<string>;
   galleryRemove(name: string): Promise<string>;
-  send(id: string, msg: string, media?: (string | number)[], replyTo?: string): Promise<string>;
+  send(id: string, msg: string, media?: (string | number)[], replyTo?: string, atSender?: boolean): Promise<string>;
   sendFile(id: string, ref: string): Promise<string>;
   sendVoice(id: string, text: string): Promise<string>;
   putDownPhone(): Promise<string>;
@@ -687,6 +687,9 @@ export class BotAgent {
     const media = Array.isArray(mediaRaw) ? (mediaRaw as (string | number)[]) : [];
     const replyRaw = call.arguments.reply_to ?? call.arguments.replyTo ?? call.arguments.quote;
     const replyTo = replyRaw !== undefined && replyRaw !== null ? String(replyRaw) : undefined;
+    // 引用回复默认自动 @ 原发送人（模拟 QQ 客户端），Bot 显式给 at_sender: false 时去掉
+    const atRaw = call.arguments.at_sender ?? call.arguments.atSender ?? call.arguments.at;
+    const atSender = !(atRaw === false || atRaw === "false" || atRaw === 0);
     if (!id || (!msg && !media.length)) {
       this.pushEvent("system", "（send 需要 id 和 msg（或 media）参数。）", { ref: call.id });
       return;
@@ -704,7 +707,7 @@ export class BotAgent {
       return;
     }
     // 拦截与上一条完全相同的发送（模型常见的复读行为），除非显式声明 resend
-    const sig = JSON.stringify([id, msg, media.map(String), replyTo ?? ""]);
+    const sig = JSON.stringify([id, msg, media.map(String), replyTo ?? "", atSender]);
     if (sig === this.lastSendSig && !isTruthy(call.arguments.resend)) {
       this.pushEvent(
         "system",
@@ -718,7 +721,7 @@ export class BotAgent {
     this.ackIfDurable(call);
     this.scheduler.schedule(call, {
       executeAt: "expected", // 打字完成的那一刻消息才真正发出（此前可 cancel）
-      run: async () => this.messenger.send(id, msg, media, replyTo),
+      run: async () => this.messenger.send(id, msg, media, replyTo, atSender),
     });
   }
 

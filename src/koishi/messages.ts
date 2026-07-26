@@ -96,6 +96,21 @@ export class MessageStore {
     return [...map.values()];
   }
 
+  /** 按平台消息 id 查找某频道内的一条消息（用于引用回复时定位原发送人） */
+  async findByMessageId(
+    platform: string,
+    channelId: string,
+    messageId: string,
+  ): Promise<WorldMessageRow | null> {
+    if (!messageId) return null;
+    const rows = await this.ctx.database.get(
+      "yesimbot_world_message",
+      { platform, channelId, messageId },
+      { limit: 1 },
+    );
+    return rows[0] ?? null;
+  }
+
   /** 某频道最近 n 条消息（时间正序返回） */
   async channelMessages(platform: string, channelId: string, n: number): Promise<WorldMessageRow[]> {
     const rows = await this.ctx.database.get(

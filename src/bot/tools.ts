@@ -315,15 +315,21 @@ export function availableTools(opts: { tts: boolean; focus: boolean; ops: Platfo
         return true;
     }
   });
-  // 开启引用回复时，send 增加 reply_to 参数说明
+  // 开启引用回复时，send 增加 reply_to / at_sender 参数说明
   if (!opts.ops.reply) return tools;
   return tools.map((t) =>
     t.name === "send"
       ? {
           ...t,
-          signature: t.signature.replace("media?: string[]", "media?: string[], reply_to?: string"),
+          signature: t.signature.replace(
+            "media?: string[]",
+            "media?: string[], reply_to?: string, at_sender?: boolean",
+          ),
           description:
-            t.description + "reply_to 可引用回复某条消息，填消息记录里 (msg:xxx) 的编号。",
+            t.description +
+            "reply_to 可引用回复某条消息，填消息记录里 (msg:xxx) 的编号；由你决定要不要引用、引用哪条。" +
+            "群聊里引用回复会像 QQ 一样自动在开头 @ 对方——大多数时候保留即可；" +
+            "如果不想 @（比如只是顺带提到、或不想打扰对方），加 at_sender: false 去掉，就像真人删掉自动加上的 @。",
         }
       : t,
   );

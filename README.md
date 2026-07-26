@@ -183,7 +183,7 @@ Bot 不只能收，也能发：
 |---|---|---|---|
 | `recall` | `recall(id, msg_id)` | `delete_msg`（通用 deleteMessage） | 撤回已发出的消息 |
 | `react` | `react(id, msg_id, emoji)` | `set_msg_emoji_like` / 通用 createReaction | 贴表情回应（emoji 字符或表情编号） |
-| `reply` | `send(…, reply_to)` | quote 元素（OneBot 回复） | 引用回复某条消息 |
+| `reply` | `send(…, reply_to, at_sender?)` | quote + at 元素（OneBot 回复） | 引用回复：是否引用、引用哪条由 Bot 自己决定；群聊里默认模拟 QQ 客户端在开头自动 @ 原发送人，Bot 可传 `at_sender: false` 去掉（如同真人删掉自动加的 @） |
 | `poke` | `poke(id, user_id?)` | `friend_poke` / `group_poke` | 戳一戳 |
 | `handleRequests` | `handle_request(request_id, approve, reason?)` | `set_friend_add_request` / `set_group_add_request` | 处理好友申请与入群邀请/申请（请求以手机通知事件告知 Bot） |
 | `listFriends` | `list_friends()` | `get_friend_list`（通用） | 好友列表（含可 send 的频道 id） |

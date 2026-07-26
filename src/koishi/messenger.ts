@@ -198,16 +198,33 @@ export class KoishiMessenger implements MessengerApi {
     msg: string,
     media: (string | number)[] = [],
     replyTo?: string,
+    atSender = true,
   ): Promise<string> {
     const target = await this.resolveBot(id);
     if ("error" in target) return target.error;
 
     const elements: h[] = [];
-    if (replyTo) elements.push(h("quote", { id: replyTo }));
     const sentRefs: MediaRef[] = [];
     const problems: string[] = [];
     const inlineIds = new Set<number>();
     let stored = "";
+    let atNote = "";
+
+    // 引用回复：模拟 QQ 客户端行为——群聊里引用时自动在开头 @ 原发送人 + 空格，
+    // Bot 可用 at_sender: false 去掉（如同真人手动删掉自动加上的 @）
+    if (replyTo) {
+      elements.push(h("quote", { id: replyTo }));
+      stored += `[引用 msg:${replyTo}] `;
+      const isGroup = !target.channelId.startsWith("private:");
+      if (atSender && isGroup) {
+        const quoted = await this.store.findByMessageId(target.platform, target.channelId, replyTo);
+        if (quoted && !quoted.self && quoted.userId) {
+          elements.push(h("at", { id: quoted.userId, name: quoted.username || undefined }), h.text(" "));
+          stored += `@${quoted.username || quoted.userId} `;
+          atNote = `，并 @ 了 ${quoted.username || quoted.userId}`;
+        }
+      }
+    }
 
     // msg 中的内联媒体标记（[图片#12] / [视频#3]…）→ 在对应位置嵌入媒体，实现图文混排
     let cursor = 0;
@@ -260,6 +277,7 @@ export class KoishiMessenger implements MessengerApi {
     await this.focus.focus(`${target.platform}:${target.channelId}`);
     let result = `消息已发送到 ${id}。`;
     if (this.showMsgId && msgIds[0]) result = `消息已发送到 ${id}（msg:${msgIds[0]}）。`;
+    if (replyTo) result += `（引用回复了 msg:${replyTo}${atNote}）`;
     if (sentRefs.length) result += `（附 ${sentRefs.length} 个媒体）`;
     if (problems.length) result += `注意：${problems.join("；")}`;
     return result;
