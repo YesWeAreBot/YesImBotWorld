@@ -1,5 +1,5 @@
 import { h, type Context, type Session } from "koishi";
-import type { MessagingConfig, PlatformOpsConfig } from "../config.js";
+import { needsMsgIds, type MessagingConfig, type PlatformOpsConfig } from "../config.js";
 import type { MediaRenderer } from "../media/render.js";
 import { MEDIA_PLACEHOLDER, mediaPlaceholder } from "../media/render.js";
 import type { MediaStore } from "../media/store.js";
@@ -168,12 +168,9 @@ export class Gateway {
           out += `[表情:${el.attrs.name ?? el.attrs.id ?? ""}]`;
           break;
         case "quote": {
-          // 开启 recall/react/reply 时带上被引用的消息 id，Bot 能看懂引用链并可跟进引用
+          // 开启需要消息编号的操作时带上被引用的消息 id，Bot 能看懂引用链并可跟进引用
           const quotedId = el.attrs.id;
-          out +=
-            (this.ops.recall || this.ops.react || this.ops.reply) && quotedId
-              ? `[引用 msg:${quotedId}]`
-              : "[引用了一条消息]";
+          out += needsMsgIds(this.ops) && quotedId ? `[引用 msg:${quotedId}]` : "[引用了一条消息]";
           break;
         }
         default:
@@ -200,9 +197,7 @@ export class Gateway {
   private async renderFocused(key: string, session: Session, content: string): Promise<RichText> {
     const rendered = await this.renderer.render(content);
     const msgTag =
-      (this.ops.recall || this.ops.react || this.ops.reply) && session.messageId
-        ? `(msg:${session.messageId}) `
-        : "";
+      needsMsgIds(this.ops) && session.messageId ? `(msg:${session.messageId}) ` : "";
     return {
       text: `你正留意着 ${key}，看到新消息——${msgTag}${session.username ?? session.userId}说：${rendered.text}`,
       attachments: rendered.attachments,

@@ -1,4 +1,5 @@
 import type { Logger } from "koishi";
+import type { WorldClock } from "../clock.js";
 import type { ClockConfigData } from "../config.js";
 import type { WorldAgent } from "./agent.js";
 
@@ -13,6 +14,7 @@ export class TingleTimer {
 
   constructor(
     private cfg: ClockConfigData,
+    private clock: WorldClock,
     private world: WorldAgent,
     private deliver: (content: string) => void,
     private logger: Logger,
@@ -22,7 +24,7 @@ export class TingleTimer {
     if (this.running || this.cfg.tingleEveryUnits <= 0) return;
     this.running = true;
     this.scheduleNext();
-    this.logger.info("Tingle 已启动：每 %d TU（%d 现实秒）一次", this.cfg.tingleEveryUnits, this.cfg.tingleEveryUnits * this.cfg.realSecondsPerUnit);
+    this.logger.info("Tingle 已启动：每 %d TU（%d 现实秒）一次", this.cfg.tingleEveryUnits, this.cfg.tingleEveryUnits * this.clock.unitRealSeconds);
   }
 
   stop(): void {
@@ -33,7 +35,7 @@ export class TingleTimer {
 
   private scheduleNext(): void {
     if (!this.running) return;
-    const delayMs = this.cfg.tingleEveryUnits * this.cfg.realSecondsPerUnit * 1000;
+    const delayMs = this.cfg.tingleEveryUnits * this.clock.unitRealSeconds * 1000;
     this.timer = setTimeout(() => {
       void this.fire().finally(() => this.scheduleNext());
     }, delayMs);

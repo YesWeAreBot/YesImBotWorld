@@ -1,4 +1,5 @@
 import type { Logger } from "koishi";
+import { type CalendarSpec, describeCalendar, gregorian, parseCalendarSpec } from "../calendar.js";
 import type { WorldClock } from "../clock.js";
 import type { WorldModelConfig } from "../config.js";
 import type { WorldFiles } from "../files.js";
@@ -171,8 +172,79 @@ export class WorldAgent {
     await this.invokeWithTools({ task, deliver });
   }
 
-  /** 初始化：根据用户定义生成 Bot_Status.md 与 World_Status.md */
+  /** 插件离线期间世界时间照常流逝：补叙这段时间世界发生了什么，并告知刚恢复意识的 Bot */
+  async resolveOfflineGap(fromTU: number, deliver: (content: string) => void): Promise<boolean> {
+    const gapTU = this.clock.now() - fromTU;
+    const task =
+      `Bot 的意识刚刚中断了一段时间：从 ${this.clock.timeLine(fromTU)} 到现在（${this.clock.timeLine()}），` +
+      `约 ${gapTU.toFixed(1)} 个 TU。期间世界照常运转，只是没有被记录。\n` +
+      `请补写这段时间世界的变化：\n` +
+      `1. check world_status 与最近 news，保持连贯；\n` +
+      `2. 推想这段时间里世界自然发生了什么（时段更替、天气、人物作息、进行中事件的推进……），` +
+      `update world_status 使其反映当前时刻的现状；若 Bot 自身状态也随时间自然变化（比如睡着了、动作早已结束），` +
+      `一并 update bot_status；\n` +
+      `3. 只有足够重要的事才用 update news 记录（可以没有）；\n` +
+      `4. 最后必须调用一次 send_event：以第三人称客观叙述 Bot 回过神来时能感知到的情形——` +
+      `此刻的时间与环境，以及这段时间里它能察觉到的变化。`;
+    return this.invokeWithTools({ task, deliver });
+  }
+
+  // ---------- 创世 ----------
+
+  /** 创世第一步：依据世界定义与用户设定的初始时刻，生成世界的历法 */
+  private async setupCalendar(worldDef: string): Promise<void> {
+    let spec: CalendarSpec | null = null;
+    try {
+      spec = await this.generateCalendar(worldDef);
+    } catch (err) {
+      this.logger.warn("历法生成调用失败: %s", err);
+    }
+    if (!spec) {
+      this.logger.warn("World-LLM 未能生成有效的历法规格，回退为现实公历");
+      spec = gregorian(this.clock.configuredEpoch);
+    }
+    await this.clock.setCalendar(spec);
+    this.logger.info("世界历法：%s；创世时刻 %s", describeCalendar(spec), this.clock.clockString(0));
+  }
+
+  private async generateCalendar(worldDef: string): Promise<CalendarSpec | null> {
+    const system =
+      "你是一个虚拟世界的模拟引擎。现在是创世阶段，你要为这个世界设计计时方式（历法）。" +
+      "只输出严格的 JSON，不要输出任何其他内容。";
+    const user =
+      `<world_definition>（用户给出的世界定义）\n${worldDef}\n</world_definition>\n\n` +
+      `用户设定的世界初始时刻（T=0）："${this.clock.configuredEpoch}"\n` +
+      `（换算基准：1 个 Time Unit = ${this.clock.unitWorldSeconds} 世界秒）\n\n` +
+      `请判断这个世界使用什么历法，并输出对应的 JSON：\n` +
+      `- 若世界使用现实地球的公历与 24 小时制，且初始时刻是（或可无损转写为）标准日期时间，输出：\n` +
+      `  {"kind":"gregorian","epoch":"YYYY-MM-DD HH:mm"}\n` +
+      `- 否则依据世界观设计一套自洽的均匀进位历法，输出：\n` +
+      `  {"kind":"custom","era":"纪年名(可选)","units":[时间单位，从大到小],"epoch":[各单位的初始值],"format":"格式模板"}\n` +
+      `  每个时间单位形如 {"name":"单位名","count":数量,"start":显示起点,"pad":补零宽度}：\n` +
+      `  - count：该单位包含多少个下一级单位；最小的单位则表示它等于多少世界秒\n` +
+      `  - start：该单位显示时从几数起（月/日通常为 1，时/分为 0）\n` +
+      `  - pad：可选，显示为固定宽度补零\n` +
+      `  epoch 数组与 units 一一对应，为初始时刻的各单位显示值；format 用 {单位名} 与 {era} 作占位符。\n\n` +
+      `示例（初始时刻"王历1024年3月5日 辰时"的东方幻想世界）：\n` +
+      `{"kind":"custom","era":"王历","units":[{"name":"年","count":12,"start":1},` +
+      `{"name":"月","count":30,"start":1},{"name":"日","count":24,"start":1},` +
+      `{"name":"时","count":60,"start":0,"pad":2},{"name":"分","count":60,"start":0,"pad":2}],` +
+      `"epoch":[1024,3,5,8,0],"format":"{era}{年}年{月}月{日}日 {时}:{分}"}\n\n` +
+      `注意：历法必须忠实于世界定义与用户设定的初始时刻；若世界与现实无异，直接选 gregorian。只输出 JSON。`;
+    const result = await this.client.complete([
+      { role: "system", content: system },
+      { role: "user", content: user },
+    ]);
+    return parseCalendarSpec(extractJson(result.content));
+  }
+
+  /** 初始化：生成历法（同步模式跳过），再根据用户定义生成 Bot_Status.md 与 World_Status.md */
   async initialize(botDef: string, worldDef: string): Promise<void> {
+    if (this.clock.syncRealTime) {
+      this.logger.info("世界时间与现实同步，跳过历法生成；创世时刻 %s", this.clock.clockString(0));
+    } else {
+      await this.enqueue(() => this.setupCalendar(worldDef));
+    }
     const task =
       `这是世界的创世时刻（${this.clock.timeLine()}）。用户给出了以下定义：\n\n` +
       `<bot_definition>\n${botDef}\n</bot_definition>\n\n` +
@@ -393,6 +465,18 @@ export class WorldAgent {
     } catch (err) {
       return `工具执行出错: ${(err as Error).message ?? err}`;
     }
+  }
+}
+
+/** 从（可能带说明文字的）LLM 输出中提取第一个 JSON 对象 */
+function extractJson(text: string): unknown {
+  const start = text.indexOf("{");
+  const end = text.lastIndexOf("}");
+  if (start < 0 || end <= start) return null;
+  try {
+    return JSON.parse(text.slice(start, end + 1));
+  } catch {
+    return null;
   }
 }
 

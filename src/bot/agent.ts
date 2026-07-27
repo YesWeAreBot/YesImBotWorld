@@ -22,7 +22,10 @@ export interface MessengerApi {
   sendVoice(id: string, text: string): Promise<string>;
   putDownPhone(): Promise<string>;
   recall(id: string, msgId: string): Promise<string>;
-  react(id: string, msgId: string, emoji: string): Promise<string>;
+  react(id: string, msgId: string, emoji: string, remove?: boolean): Promise<string>;
+  emojiLikes(id: string, msgId: string, emoji: string): Promise<string>;
+  forwardMsgs(id: string, msgIds: string[]): Promise<string>;
+  ocrImage(image: string): Promise<string>;
   poke(id: string, userId?: string): Promise<string>;
   handleRequest(requestId: string, approve: boolean, reason?: string): Promise<string>;
   listFriends(): Promise<string>;
@@ -30,15 +33,20 @@ export interface MessengerApi {
   sendLike(userId: string, times: number): Promise<string>;
   deleteFriend(userId: string): Promise<string>;
   setProfile(opts: { nickname?: string; signature?: string; avatar?: string }): Promise<string>;
+  setModelShow(model: string): Promise<string>;
   listGroups(): Promise<string>;
   groupInfo(id: string): Promise<string>;
   listMembers(id: string): Promise<string>;
   memberInfo(id: string, userId: string): Promise<string>;
+  groupHonor(id: string): Promise<string>;
+  groupFiles(id: string, folderId?: string): Promise<string>;
   setGroupCard(id: string, card: string): Promise<string>;
   setGroupName(id: string, name: string): Promise<string>;
   setGroupPortrait(id: string, image: string): Promise<string>;
   sendGroupNotice(id: string, content: string): Promise<string>;
+  getGroupNotice(id: string): Promise<string>;
   setEssence(msgId: string, remove: boolean): Promise<string>;
+  essenceList(id: string): Promise<string>;
   groupSign(id: string): Promise<string>;
   groupBan(id: string, userId: string, minutes: number): Promise<string>;
   groupWholeBan(id: string, enable: boolean): Promise<string>;
@@ -431,7 +439,36 @@ export class BotAgent {
           this.pushEvent("system", "（react 需要 id、msg_id 和 emoji 参数。）", { ref: call.id });
           return;
         }
-        return this.dispatchLocal(call, async () => this.messenger.react(id, msgId, emoji));
+        return this.dispatchLocal(call, async () =>
+          this.messenger.react(id, msgId, emoji, isTruthy(call.arguments.remove)),
+        );
+      }
+      case "get_emoji_likes": {
+        const id = String(call.arguments.id ?? "");
+        const msgId = String(call.arguments.msg_id ?? call.arguments.msgId ?? "");
+        const emoji = String(call.arguments.emoji ?? "");
+        if (!id || !msgId || !emoji) {
+          this.pushEvent("system", "（get_emoji_likes 需要 id、msg_id 和 emoji 参数。）", { ref: call.id });
+          return;
+        }
+        return this.dispatchLocal(call, async () => this.messenger.emojiLikes(id, msgId, emoji));
+      }
+      case "forward_msgs": {
+        const id = String(call.arguments.id ?? "");
+        const msgIds = normalizeIdList(call.arguments.msg_ids ?? call.arguments.msgIds ?? call.arguments.msg_id);
+        if (!id || !msgIds.length) {
+          this.pushEvent("system", "（forward_msgs 需要 id 和 msg_ids 参数，msg_ids 为消息编号列表。）", { ref: call.id });
+          return;
+        }
+        return this.dispatchLocal(call, async () => this.messenger.forwardMsgs(id, msgIds));
+      }
+      case "ocr_image": {
+        const image = String(call.arguments.image ?? call.arguments.media_id ?? call.arguments.id ?? "");
+        if (!image) {
+          this.pushEvent("system", "（ocr_image 需要 image 参数（图片编号或收藏夹文件）。）", { ref: call.id });
+          return;
+        }
+        return this.dispatchLocal(call, async () => this.messenger.ocrImage(image));
       }
       case "poke": {
         const id = String(call.arguments.id ?? "");
@@ -492,6 +529,14 @@ export class BotAgent {
         }
         return this.dispatchLocal(call, async () => this.messenger.setProfile({ nickname, signature, avatar }));
       }
+      case "set_model_show": {
+        const model = String(call.arguments.model ?? call.arguments.name ?? "");
+        if (!model) {
+          this.pushEvent("system", "（set_model_show 需要 model 参数（想显示的机型名）。）", { ref: call.id });
+          return;
+        }
+        return this.dispatchLocal(call, async () => this.messenger.setModelShow(model));
+      }
       case "list_groups":
         return this.dispatchLocal(call, async () => this.messenger.listGroups());
       case "group_info": {
@@ -518,6 +563,24 @@ export class BotAgent {
           return;
         }
         return this.dispatchLocal(call, async () => this.messenger.memberInfo(id, userId));
+      }
+      case "group_honor": {
+        const id = String(call.arguments.id ?? "");
+        if (!id) {
+          this.pushEvent("system", "（group_honor 需要 id 参数（群频道 id）。）", { ref: call.id });
+          return;
+        }
+        return this.dispatchLocal(call, async () => this.messenger.groupHonor(id));
+      }
+      case "group_files": {
+        const id = String(call.arguments.id ?? "");
+        if (!id) {
+          this.pushEvent("system", "（group_files 需要 id 参数（群频道 id）。）", { ref: call.id });
+          return;
+        }
+        const folderRaw = call.arguments.folder_id ?? call.arguments.folderId;
+        const folderId = folderRaw != null && String(folderRaw).trim() ? String(folderRaw).trim() : undefined;
+        return this.dispatchLocal(call, async () => this.messenger.groupFiles(id, folderId));
       }
       case "set_group_card": {
         const id = String(call.arguments.id ?? "");
@@ -554,6 +617,22 @@ export class BotAgent {
           return;
         }
         return this.dispatchLocal(call, async () => this.messenger.sendGroupNotice(id, content));
+      }
+      case "get_group_notice": {
+        const id = String(call.arguments.id ?? "");
+        if (!id) {
+          this.pushEvent("system", "（get_group_notice 需要 id 参数（群频道 id）。）", { ref: call.id });
+          return;
+        }
+        return this.dispatchLocal(call, async () => this.messenger.getGroupNotice(id));
+      }
+      case "get_essence_list": {
+        const id = String(call.arguments.id ?? "");
+        if (!id) {
+          this.pushEvent("system", "（get_essence_list 需要 id 参数（群频道 id）。）", { ref: call.id });
+          return;
+        }
+        return this.dispatchLocal(call, async () => this.messenger.essenceList(id));
       }
       case "set_essence": {
         const msgId = String(call.arguments.msg_id ?? call.arguments.msgId ?? "");
@@ -919,9 +998,9 @@ export class BotAgent {
 
     // 若 Bot 指定了休息时长，且压缩很快完成，则继续睡满（现实时间流逝 = 世界时间流逝）
     const desired = call ? Number(call.arguments.duration ?? call.duration ?? 0) : 0;
-    const compressTU = (Date.now() - startReal) / 1000 / this.config.clock.realSecondsPerUnit;
+    const compressTU = (Date.now() - startReal) / 1000 / this.clock.unitRealSeconds;
     if (Number.isFinite(desired) && desired > compressTU) {
-      const remainMs = (desired - compressTU) * this.config.clock.realSecondsPerUnit * 1000;
+      const remainMs = (desired - compressTU) * this.clock.unitRealSeconds * 1000;
       await sleep(Math.min(remainMs, 6 * 3600 * 1000));
     }
     if (!this.running) return;
@@ -933,7 +1012,7 @@ export class BotAgent {
     // 预热 KV cache（text 模式）
     await this.backend.warmup?.(this.context, this.wakeTimeLine).catch(() => {});
 
-    const elapsedTU = (Date.now() - startReal) / 1000 / this.config.clock.realSecondsPerUnit;
+    const elapsedTU = (Date.now() - startReal) / 1000 / this.clock.unitRealSeconds;
     this.pushEvent(
       "system",
       `你睡了一觉，过去了 ${elapsedTU.toFixed(1)} 个 TU。醒来时头脑清明，近来的经历沉淀成了记忆。当前 ${this.clock.timeLine()}`,
@@ -961,6 +1040,20 @@ function clampInt(value: unknown, min: number, max: number, fallback: number): n
 /** 宽松解析布尔参数（模型可能输出 true / "true" / 1） */
 function isTruthy(value: unknown): boolean {
   return value === true || value === "true" || value === 1;
+}
+
+/** 宽松解析 id 列表参数：数组、或逗号/空格分隔的字符串 */
+function normalizeIdList(value: unknown): string[] {
+  if (Array.isArray(value)) {
+    return value.map((v) => String(v).trim()).filter(Boolean);
+  }
+  if (value != null) {
+    return String(value)
+      .split(/[,\s、]+/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+  }
+  return [];
 }
 
 /**

@@ -125,10 +125,28 @@ export const BOT_TOOLS: BotToolDef[] = [
   },
   {
     name: "react",
-    signature: 'react(id: string, msg_id: string, emoji: string)',
+    signature: 'react(id: string, msg_id: string, emoji: string, remove?: boolean)',
     description:
       '给某条消息贴一个表情回应（不发新消息的轻量回应）。emoji 填一个 emoji 字符（如 "👍"）或平台表情编号；' +
-      "msg_id 来自消息记录里的 (msg:xxx) 标注。",
+      "msg_id 来自消息记录里的 (msg:xxx) 标注。remove: true 表示移除你之前贴上的回应。",
+  },
+  {
+    name: "get_emoji_likes",
+    signature: 'get_emoji_likes(id: string, msg_id: string, emoji: string)',
+    description: "看看某条消息上某个表情回应都是谁贴的。emoji 与 react 的参数一致。",
+  },
+  {
+    name: "forward_msgs",
+    signature: 'forward_msgs(id: string, msg_ids: string[])',
+    description:
+      "把几条已有消息打包成一份聊天记录，合并转发到某个频道。" +
+      "msg_ids 为要转发的消息编号列表（按顺序，来自消息记录里的 (msg:xxx) 标注）。",
+  },
+  {
+    name: "ocr_image",
+    signature: 'ocr_image(image: string)',
+    description:
+      '仔细辨认一张图片里的文字（逐字识别，适合看清截图、菜单、告示上的字）。image 填图片编号（如 "12"）或收藏夹文件（如 "gallery:menu.png"）。',
   },
   {
     name: "poke",
@@ -170,6 +188,11 @@ export const BOT_TOOLS: BotToolDef[] = [
       '修改你的聊天账号资料：昵称、个性签名、头像。avatar 填图片编号（如 "12"）或收藏夹文件（如 "gallery:me.png"）。至少给一个参数。',
   },
   {
+    name: "set_model_show",
+    signature: 'set_model_show(model: string)',
+    description: "修改你资料卡上显示的在线机型（别人看到的「xxx 在线」那种），填想显示的机型名。",
+  },
+  {
     name: "list_groups",
     signature: "list_groups()",
     description: "查看你加入的群列表：群名、可用于 send 的频道 id、人数。",
@@ -188,6 +211,27 @@ export const BOT_TOOLS: BotToolDef[] = [
     name: "member_info",
     signature: 'member_info(id: string, user_id: string)',
     description: "查看某个群成员的详细信息：群名片、昵称、身份、头衔、入群时间。",
+  },
+  {
+    name: "group_honor",
+    signature: 'group_honor(id: string)',
+    description: "看看某个群的群荣誉：谁是龙王，谁有群聊之火、快乐源泉等头衔。",
+  },
+  {
+    name: "group_files",
+    signature: 'group_files(id: string, folder_id?: string)',
+    description:
+      "翻看某个群的群文件。默认列出根目录的文件与文件夹；folder_id 可进入某个文件夹（来自列表里的 folder:xxx 标注）。",
+  },
+  {
+    name: "get_group_notice",
+    signature: 'get_group_notice(id: string)',
+    description: "查看某个群的群公告列表。",
+  },
+  {
+    name: "get_essence_list",
+    signature: 'get_essence_list(id: string)',
+    description: "翻看某个群的精华消息列表。",
   },
   {
     name: "set_group_card",
@@ -277,6 +321,12 @@ export function availableTools(opts: { tts: boolean; focus: boolean; ops: Platfo
         return opts.ops.recall;
       case "react":
         return opts.ops.react;
+      case "get_emoji_likes":
+        return opts.ops.emojiLikes;
+      case "forward_msgs":
+        return opts.ops.forwardMsgs;
+      case "ocr_image":
+        return opts.ops.ocrImage;
       case "poke":
         return opts.ops.poke;
       case "handle_request":
@@ -291,6 +341,8 @@ export function availableTools(opts: { tts: boolean; focus: boolean; ops: Platfo
         return opts.ops.deleteFriend;
       case "set_profile":
         return opts.ops.profile;
+      case "set_model_show":
+        return opts.ops.modelShow;
       case "list_groups":
         return opts.ops.listGroups;
       case "group_info":
@@ -299,6 +351,10 @@ export function availableTools(opts: { tts: boolean; focus: boolean; ops: Platfo
         return opts.ops.listMembers;
       case "member_info":
         return opts.ops.memberInfo;
+      case "group_honor":
+        return opts.ops.groupHonor;
+      case "group_files":
+        return opts.ops.groupFiles;
       case "set_group_card":
         return opts.ops.groupCard;
       case "set_group_name":
@@ -307,8 +363,12 @@ export function availableTools(opts: { tts: boolean; focus: boolean; ops: Platfo
         return opts.ops.groupPortrait;
       case "send_group_notice":
         return opts.ops.groupNotice;
+      case "get_group_notice":
+        return opts.ops.getGroupNotice;
       case "set_essence":
         return opts.ops.essence;
+      case "get_essence_list":
+        return opts.ops.essenceList;
       case "group_sign":
         return opts.ops.groupSign;
       case "group_ban":

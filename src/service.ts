@@ -4,6 +4,7 @@ import { Context, Service } from "koishi";
 import { BotAgent } from "./bot/agent.js";
 import { BotContext } from "./bot/context.js";
 import { availableTools, renderToolsText } from "./bot/tools.js";
+import { describeCalendar } from "./calendar.js";
 import { WorldClock } from "./clock.js";
 import type { Config } from "./config.js";
 import { WorldFiles } from "./files.js";
@@ -122,7 +123,8 @@ export class WorldService extends Service<Config> {
   }
 
   override async stop(): Promise<void> {
-    await this.stopWorld();
+    // 插件停止（进程退出/重载）≠ 用户暂停世界：世界时间在离线期间继续流逝
+    await this.stopWorld({ suspend: true });
   }
 
   // ---------- 世界生命周期 ----------
@@ -146,7 +148,7 @@ export class WorldService extends Service<Config> {
       return `请先编写世界定义：${this.files.worldDef}`;
     }
 
-    // 创世：世界时间归零，并把当前配置的世界初始时刻（epoch）持久化进 clock.json
+    // 创世：世界时间归零；历法与初始时刻由 World-LLM 在初始化时依据定义生成并持久化
     await this.clock.reset();
 
     this.logger.info("开始创世：调用 World-LLM 生成初始状态…");
@@ -210,16 +212,31 @@ export class WorldService extends Service<Config> {
 
     await this.clock.resume();
 
-    // 恢复运行时告知 Bot（世界在暂停期间是静止的；未完成的动作已随暂停丢失）
-    if (this.botContext.stream.length > 0) {
-      this.bot.pushEvent(
-        "system",
-        `你回过神来——刚才似乎有一瞬间的失神（世界从暂停中恢复）。当前 ${this.clock.timeLine()}。进行中的动作可能已被打断，必要时重新确认状态。`,
-      );
-    } else {
+    // 唤醒 Bot：区分创世第一刻 / 离线恢复（时间照常流逝了）/ 暂停恢复（时间静止）
+    const offline = this.clock.consumeOfflineGap();
+    if (this.botContext.stream.length === 0) {
       this.bot.pushEvent(
         "system",
         `你睁开眼睛，意识逐渐清晰。这是你有意识的第一刻。当前 ${this.clock.timeLine()}。不妨先 check_status 看看自己和这个世界。`,
+      );
+    } else if (offline && offline.gapTU >= 1) {
+      this.bot.pushEvent(
+        "system",
+        `你的意识中断了一段时间——从 ${this.clock.timeLine(offline.fromTU)} 到现在，` +
+          `过去了约 ${offline.gapTU.toFixed(1)} 个 TU（当前 ${this.clock.timeLine()}）。` +
+          `世界在此期间照常运转。进行中的动作可能已被打断，必要时重新确认状态。`,
+      );
+      // 离线足够久：由 World-LLM 补叙这段时间世界发生了什么（异步，走串行队列）
+      const min = this.config.clock.offlineNarrateMinUnits;
+      if (min > 0 && offline.gapTU >= min) {
+        void this.world
+          .resolveOfflineGap(offline.fromTU, (content) => this.bot?.pushEvent("world", content))
+          .catch((err) => this.logger.warn("离线补叙失败: %s", err));
+      }
+    } else {
+      this.bot.pushEvent(
+        "system",
+        `你回过神来——刚才似乎有一瞬间的失神。当前 ${this.clock.timeLine()}。进行中的动作可能已被打断，必要时重新确认状态。`,
       );
     }
 
@@ -230,6 +247,7 @@ export class WorldService extends Service<Config> {
     this.bot.start();
     this.tingle = new TingleTimer(
       this.config.clock,
+      this.clock,
       this.world,
       (content) => this.bot?.pushEvent("world", content),
       this.logger,
@@ -240,23 +258,42 @@ export class WorldService extends Service<Config> {
     return `世界开始运转。当前 ${this.clock.timeLine()}`;
   }
 
-  async stopWorld(): Promise<string> {
+  async stopWorld(opts: { suspend?: boolean } = {}): Promise<string> {
     if (!this.worldRunning) return "世界并未在运行。";
     this.worldRunning = false;
     this.tingle?.stop();
     this.tingle = null;
     await this.bot?.stop();
     this.bot = null;
+    if (opts.suspend) {
+      // 插件停止：世界时间不冻结，离线期间继续按现实流速流逝
+      await this.clock.suspend();
+      this.logger.info("插件停止，世界时间将在离线期间继续流逝：%s", this.clock.timeLine());
+      return `插件已停止（当前 ${this.clock.timeLine()}，世界时间将继续流逝）。`;
+    }
     await this.clock.pause();
+    if (this.clock.syncRealTime) {
+      // 同步模式下时间无法冻结：只停下 Bot 与世界心跳
+      this.logger.info("世界已暂停（时间与现实同步，继续流逝）：%s", this.clock.timeLine());
+      return `世界已暂停（时间与现实保持同步、继续流逝；当前 ${this.clock.timeLine()}）。`;
+    }
     this.logger.info("世界已暂停：%s", this.clock.timeLine());
     return `世界已暂停（时间静止于 ${this.clock.timeLine()}）。`;
   }
 
   async statusText(): Promise<string> {
     const initialized = await this.files.isInitialized();
+    const stateText = !initialized
+      ? "未初始化"
+      : this.worldRunning
+        ? "运行中"
+        : this.clock.running
+          ? "未运行（世界时间仍在流逝）"
+          : "已暂停（时间静止）";
     const lines = [
-      `世界状态：${initialized ? (this.worldRunning ? "运行中" : "已暂停") : "未初始化"}`,
-      `世界时钟：${this.clock.timeLine()}（1 TU = ${this.config.clock.realSecondsPerUnit} 现实秒 / ${this.config.clock.worldSecondsPerUnit} 世界秒）`,
+      `世界状态：${stateText}`,
+      `世界时钟：${this.clock.timeLine()}（1 TU = ${this.clock.unitRealSeconds} 现实秒 / ${this.clock.unitWorldSeconds} 世界秒）`,
+      `世界历法：${this.clock.syncRealTime ? "与现实时间同步" : describeCalendar(this.clock.calendar)}`,
       `数据目录：${this.files.base}`,
     ];
     if (this.bot) {

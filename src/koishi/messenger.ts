@@ -8,7 +8,7 @@ import type { MediaStore } from "../media/store.js";
 import type { TtsClient } from "../media/tts.js";
 import type { MediaRef, MediaType, RichText } from "../types.js";
 import type { FocusManager } from "./focus.js";
-import type { PlatformOpsConfig } from "../config.js";
+import { needsMsgIds, type PlatformOpsConfig } from "../config.js";
 import type { KnownChannel, MessageStore } from "./messages.js";
 import type { OwnSendTracker } from "./ownsends.js";
 import type { RequestStore } from "./requests.js";
@@ -44,9 +44,9 @@ export class KoishiMessenger implements MessengerApi {
     private ownSends: OwnSendTracker,
   ) {}
 
-  /** 是否需要在消息记录中展示平台消息 id（recall / react / reply 需要引用） */
+  /** 是否需要在消息记录中展示平台消息 id（撤回/回应/引用/转发/精华等操作需要引用消息编号） */
   private get showMsgId(): boolean {
-    return this.ops.recall || this.ops.react || this.ops.reply;
+    return needsMsgIds(this.ops);
   }
 
   // ---------- 查看 ----------
@@ -390,8 +390,8 @@ export class KoishiMessenger implements MessengerApi {
     return `你撤回了 ${id} 里的消息（msg:${msgId}）。`;
   }
 
-  /** 给某条消息贴表情回应 */
-  async react(id: string, msgId: string, emoji: string): Promise<string> {
+  /** 给某条消息贴 / 移除表情回应 */
+  async react(id: string, msgId: string, emoji: string, remove = false): Promise<string> {
     const target = await this.resolveBot(id);
     if ("error" in target) return target.error;
     try {
@@ -400,15 +400,103 @@ export class KoishiMessenger implements MessengerApi {
         await callOnebot(target.bot, "set_msg_emoji_like", {
           message_id: toIdValue(msgId),
           emoji_id: emojiToOnebotId(emoji),
-          set: true,
+          set: !remove,
         });
+      } else if (remove) {
+        await target.bot.deleteReaction(target.channelId, msgId, emoji);
       } else {
         await target.bot.createReaction(target.channelId, msgId, emoji);
       }
     } catch (err) {
-      return `（贴表情失败：${(err as Error).message ?? err}）`;
+      return `（${remove ? "移除回应" : "贴表情"}失败：${(err as Error).message ?? err}）`;
     }
-    return `你给 ${id} 里的消息（msg:${msgId}）贴上了 ${emoji} 的回应。`;
+    return remove
+      ? `你移除了自己给 ${id} 里的消息（msg:${msgId}）贴的 ${emoji} 回应。`
+      : `你给 ${id} 里的消息（msg:${msgId}）贴上了 ${emoji} 的回应。`;
+  }
+
+  /** 查看某条消息上某个表情回应的用户列表（NapCat 特有） */
+  async emojiLikes(id: string, msgId: string, emoji: string): Promise<string> {
+    const target = await this.resolveBot(id);
+    if ("error" in target) return target.error;
+    if (target.platform !== "onebot") return "（查看回应者目前只支持 QQ（OneBot/NapCat）平台。）";
+    const emojiId = emojiToOnebotId(emoji);
+    // NapCat 按 id 长度区分回应类型：不超过三位为 QQ 系统表情，更长的为 Unicode emoji 码点
+    const emojiType = String(emojiId).length <= 3 ? "1" : "2";
+    let data: Record<string, unknown>;
+    try {
+      data = ((await callOnebot(target.bot, "fetch_emoji_like", {
+        message_id: toIdValue(msgId),
+        emojiId: String(emojiId),
+        emojiType,
+        emoji_id: String(emojiId),
+        emoji_type: emojiType,
+      })) ?? {}) as Record<string, unknown>;
+    } catch (err) {
+      return `（查看回应者失败：${(err as Error).message ?? err}。需要 NapCat 支持 fetch_emoji_like。）`;
+    }
+    const list = Array.isArray(data.emojiLikesList) ? (data.emojiLikesList as Record<string, unknown>[]) : [];
+    if (!list.length) return `（消息（msg:${msgId}）上还没有人贴 ${emoji} 的回应。）`;
+    const names = list.slice(0, 50).map((u) => String(u.nickName ?? u.tinyId ?? "?"));
+    return `你看了看消息（msg:${msgId}）上 ${emoji} 回应的名单（${list.length} 人）：${names.join("、")}`;
+  }
+
+  /** 把几条已有消息合并转发到某个频道（仅 OneBot） */
+  async forwardMsgs(id: string, msgIds: string[]): Promise<string> {
+    const target = await this.resolveBot(id);
+    if ("error" in target) return target.error;
+    if (target.platform !== "onebot") return "（合并转发目前只支持 QQ（OneBot）平台。）";
+    const ids = msgIds.slice(0, 50);
+    const messages = ids.map((m) => ({ type: "node", data: { id: toIdValue(m) } }));
+    const isPrivate = target.channelId.startsWith("private:");
+    const key = `${target.platform}:${target.channelId}`;
+    this.ownSends.expect(key);
+    let data: Record<string, unknown>;
+    try {
+      data = ((await callOnebot(
+        target.bot,
+        isPrivate ? "send_private_forward_msg" : "send_group_forward_msg",
+        isPrivate
+          ? { user_id: toIdValue(target.channelId.slice("private:".length)), messages }
+          : { group_id: toIdValue(target.channelId), messages },
+      )) ?? {}) as Record<string, unknown>;
+    } catch (err) {
+      this.ownSends.unexpect(key);
+      return `（合并转发失败：${(err as Error).message ?? err}）`;
+    }
+    const newId = data.message_id != null ? String(data.message_id) : "";
+    await this.storeSelf(target, `[合并转发了 ${ids.length} 条消息：${ids.map((m) => `msg:${m}`).join("、")}]`, newId);
+    await this.focus.focus(key);
+    return `你把 ${ids.length} 条消息打包成聊天记录，合并转发到了 ${id}${this.showMsgId && newId ? `（msg:${newId}）` : ""}。`;
+  }
+
+  /** 识别图片中的文字（OCR，仅 OneBot） */
+  async ocrImage(image: string): Promise<string> {
+    const bot = this.findOnebot();
+    if (!bot) return "（图片文字识别目前只支持 QQ（OneBot）平台，但没有可用的 OneBot 账号。）";
+    const resolved = await this.resolveMediaRef(image, ["image"]);
+    if ("error" in resolved) return resolved.error;
+    const data = await this.media.readFile(resolved.ref);
+    const params = { image: `base64://${data.toString("base64")}` };
+    let result: unknown;
+    try {
+      result = await callOnebot(bot, "ocr_image", params);
+    } catch {
+      try {
+        result = await callOnebot(bot, ".ocr_image", params);
+      } catch (err) {
+        return `（图片文字识别失败：${(err as Error).message ?? err}）`;
+      }
+    }
+    // go-cqhttp / NapCat：{ texts: [{text, ...}], language } 或直接返回数组
+    const items = Array.isArray(result)
+      ? (result as Record<string, unknown>[])
+      : Array.isArray((result as Record<string, unknown> | undefined)?.texts)
+        ? ((result as Record<string, unknown>).texts as Record<string, unknown>[])
+        : [];
+    const texts = items.map((t) => String(t.text ?? "").trim()).filter(Boolean);
+    if (!texts.length) return `你仔细看了看图片#${resolved.ref.id}，上面没认出什么文字。`;
+    return `你仔细辨认了图片#${resolved.ref.id} 上的文字：\n${texts.slice(0, 100).join("\n")}`;
   }
 
   /** 戳一戳（仅 OneBot，需实现端支持 friend_poke / group_poke） */
@@ -489,6 +577,23 @@ export class KoishiMessenger implements MessengerApi {
       return `（修改资料失败：${(err as Error).message ?? err}）`;
     }
     return `你更新了自己的账号资料：${done.join("；")}。`;
+  }
+
+  /** 修改资料卡上显示的在线机型（仅 OneBot） */
+  async setModelShow(model: string): Promise<string> {
+    const bot = this.findOnebot();
+    if (!bot) return "（修改在线机型目前只支持 QQ（OneBot）平台，但没有可用的 OneBot 账号。）";
+    const params = { model, model_show: model };
+    try {
+      await callOnebot(bot, "set_model_show", params);
+    } catch {
+      try {
+        await callOnebot(bot, "_set_model_show", params);
+      } catch (err) {
+        return `（修改在线机型失败：${(err as Error).message ?? err}）`;
+      }
+    }
+    return `你把资料卡上显示的在线机型改成了「${model}」。`;
   }
 
   /** 修改自己在某个群里显示的名称（群名片，仅 OneBot） */
@@ -644,6 +749,84 @@ export class KoishiMessenger implements MessengerApi {
       parts.push(`入群时间：${formatTime(new Date(data.join_time * 1000))}`);
     }
     return `你看了看群 ${id} 里 ${data.card || data.nickname || uid} 的信息——${parts.join("；")}`;
+  }
+
+  /** 查看群荣誉（龙王、群聊之火等） */
+  async groupHonor(id: string): Promise<string> {
+    const target = await this.resolveOnebotGroup(id);
+    if ("error" in target) return target.error;
+    let data: Record<string, unknown>;
+    try {
+      data = ((await callOnebot(target.bot, "get_group_honor_info", {
+        group_id: toIdValue(target.groupId),
+        type: "all",
+      })) ?? {}) as Record<string, unknown>;
+    } catch (err) {
+      return `（查看群荣誉失败：${(err as Error).message ?? err}）`;
+    }
+    const lines: string[] = [];
+    const current = data.current_talkative as Record<string, unknown> | undefined;
+    if (current?.user_id != null) {
+      const days = typeof current.day_count === "number" && current.day_count > 0 ? `，蝉联 ${current.day_count} 天` : "";
+      lines.push(`- 当前龙王：${current.nickname ?? current.user_id}（${current.user_id}${days}）`);
+    }
+    const section = (key: string, label: string) => {
+      const list = data[key];
+      if (!Array.isArray(list) || !list.length) return;
+      const names = (list as Record<string, unknown>[])
+        .slice(0, 10)
+        .map((m) => `${m.nickname ?? m.user_id}${m.description ? `（${m.description}）` : ""}`);
+      lines.push(`- ${label}：${names.join("、")}${list.length > 10 ? ` 等 ${list.length} 人` : ""}`);
+    };
+    section("talkative_list", "历史龙王");
+    section("performer_list", "群聊之火");
+    section("legend_list", "群聊炽焰");
+    section("strong_newbie_list", "冒尖小春笋");
+    section("emotion_list", "快乐之源");
+    if (!lines.length) return `（群 ${id} 目前没有任何群荣誉记录。）`;
+    return `你看了看群 ${id} 的群荣誉：\n${lines.join("\n")}`;
+  }
+
+  /** 浏览群文件（只读）：默认根目录，folderId 可进入子文件夹 */
+  async groupFiles(id: string, folderId?: string): Promise<string> {
+    const target = await this.resolveOnebotGroup(id);
+    if ("error" in target) return target.error;
+    let data: Record<string, unknown>;
+    try {
+      data = ((await callOnebot(
+        target.bot,
+        folderId ? "get_group_files_by_folder" : "get_group_root_files",
+        folderId
+          ? { group_id: toIdValue(target.groupId), folder_id: folderId }
+          : { group_id: toIdValue(target.groupId) },
+      )) ?? {}) as Record<string, unknown>;
+    } catch (err) {
+      return `（浏览群文件失败：${(err as Error).message ?? err}）`;
+    }
+    const folders = Array.isArray(data.folders) ? (data.folders as Record<string, unknown>[]) : [];
+    const files = Array.isArray(data.files) ? (data.files as Record<string, unknown>[]) : [];
+    if (!folders.length && !files.length) {
+      return folderId ? `（这个文件夹是空的。）` : `（群 ${id} 的群文件是空的。）`;
+    }
+    const lines: string[] = [];
+    for (const f of folders.slice(0, 30)) {
+      lines.push(
+        `- [文件夹] ${f.folder_name ?? "（未命名）"}（${f.total_file_count ?? "?"} 个文件，folder:${f.folder_id}）`,
+      );
+    }
+    for (const f of files.slice(0, 50)) {
+      const size = typeof f.file_size === "number" ? formatSize(f.file_size) : "?";
+      const uploader = f.uploader_name ? `，${f.uploader_name} 上传` : "";
+      const time =
+        typeof f.upload_time === "number" && f.upload_time > 0
+          ? `，${formatTime(new Date(f.upload_time * 1000))}`
+          : "";
+      lines.push(`- ${f.file_name ?? "（未命名）"}（${size}${uploader}${time}）`);
+    }
+    const omitted = Math.max(0, folders.length - 30) + Math.max(0, files.length - 50);
+    if (omitted > 0) lines.push(`（还有 ${omitted} 项未显示）`);
+    const where = folderId ? `群 ${id} 的一个文件夹` : `群 ${id} 的群文件`;
+    return `你翻了翻${where}（${folders.length} 个文件夹、${files.length} 个文件）：\n${lines.join("\n")}`;
   }
 
   /** 禁言 / 解除禁言群成员 */
@@ -810,6 +993,59 @@ export class KoishiMessenger implements MessengerApi {
       return `（发布公告失败：${(err as Error).message ?? err}。你可能不是管理员。）`;
     }
     return `你在群 ${id} 发布了公告：「${truncate(content, 60)}」`;
+  }
+
+  /** 查看群公告列表 */
+  async getGroupNotice(id: string): Promise<string> {
+    const target = await this.resolveOnebotGroup(id);
+    if ("error" in target) return target.error;
+    let data: Record<string, unknown>[];
+    try {
+      data = ((await callOnebot(target.bot, "_get_group_notice", {
+        group_id: toIdValue(target.groupId),
+      })) ?? []) as Record<string, unknown>[];
+    } catch (err) {
+      return `（查看群公告失败：${(err as Error).message ?? err}）`;
+    }
+    if (!Array.isArray(data) || !data.length) return `（群 ${id} 目前没有公告。）`;
+    const lines = data.slice(0, 10).map((n) => {
+      const msg = n.message as Record<string, unknown> | undefined;
+      const text = truncate(String(msg?.text ?? "").replace(/&#10;/g, " "), 120) || "（无文字内容）";
+      const images = Array.isArray(msg?.images) && msg.images.length ? `（附 ${msg.images.length} 张图）` : "";
+      const time =
+        typeof n.publish_time === "number" && n.publish_time > 0
+          ? `[${formatTime(new Date(n.publish_time * 1000))}] `
+          : "";
+      return `- ${time}${text}${images}`;
+    });
+    const more = data.length > 10 ? `\n（还有 ${data.length - 10} 条较早的公告未显示）` : "";
+    return `你看了看群 ${id} 的公告（共 ${data.length} 条，新的在前）：\n${lines.join("\n")}${more}`;
+  }
+
+  /** 查看群精华消息列表 */
+  async essenceList(id: string): Promise<string> {
+    const target = await this.resolveOnebotGroup(id);
+    if ("error" in target) return target.error;
+    let data: Record<string, unknown>[];
+    try {
+      data = ((await callOnebot(target.bot, "get_essence_msg_list", {
+        group_id: toIdValue(target.groupId),
+      })) ?? []) as Record<string, unknown>[];
+    } catch (err) {
+      return `（查看群精华失败：${(err as Error).message ?? err}）`;
+    }
+    if (!Array.isArray(data) || !data.length) return `（群 ${id} 还没有精华消息。）`;
+    const lines = data.slice(0, 20).map((e) => {
+      const sender = e.sender_nick ?? e.sender_id ?? "?";
+      const time =
+        typeof e.sender_time === "number" && e.sender_time > 0
+          ? `[${formatTime(new Date(e.sender_time * 1000))}] `
+          : "";
+      const msgTag = this.showMsgId && e.message_id != null ? ` (msg:${e.message_id})` : "";
+      return `- ${time}${sender}${msgTag}：${essencePreview(e)}`;
+    });
+    const more = data.length > 20 ? `\n（还有 ${data.length - 20} 条未显示）` : "";
+    return `你翻了翻群 ${id} 的精华消息（共 ${data.length} 条）：\n${lines.join("\n")}${more}`;
   }
 
   /** 群打卡 */
@@ -1060,6 +1296,24 @@ function parseUserId(raw: string): string | null {
 /** 群成员排序权重：群主 → 管理员 → 普通成员 */
 function roleRank(role: unknown): number {
   return role === "owner" ? 0 : role === "admin" ? 1 : 2;
+}
+
+/** 精华消息条目的内容预览：兼容 content 为消息段数组 / 字符串 / 缺失（不同实现端返回不一） */
+function essencePreview(entry: Record<string, unknown>): string {
+  const content = entry.content;
+  if (typeof content === "string" && content.trim()) return truncate(content, 80);
+  if (Array.isArray(content)) {
+    const parts = (content as Record<string, unknown>[]).map((seg) => {
+      const data = (seg.data ?? {}) as Record<string, unknown>;
+      if (seg.type === "text") return String(data.text ?? "");
+      if (seg.type === "image") return "[图片]";
+      if (seg.type === "face") return "[表情]";
+      return `[${String(seg.type ?? "?")}]`;
+    });
+    const text = parts.join("").trim();
+    if (text) return truncate(text, 80);
+  }
+  return "（无法预览的内容）";
 }
 
 /** emoji 参数 → OneBot 表情编号：纯数字视为编号，否则取首个 Unicode 码点（QQ 回应支持 emoji 码点作为编号） */

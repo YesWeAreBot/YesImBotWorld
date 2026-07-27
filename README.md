@@ -43,7 +43,7 @@ YesImBot World：让 Bot 生活在一个由 LLM 独立维护的虚拟世界中�
 | `assets/` | 运行时 | 媒体资产库（收到/发出的图片、音频、视频，sha256 去重） |
 | `stream.jsonl` | 运行时 | Bot 工作窗口（Tool Call 流）持久化 |
 | `pinned.json` | 运行时 | 置顶上下文 + id 计数器 |
-| `clock.json` | 运行时 | World Clock（暂停时时间静止） |
+| `clock.json` | 运行时 | World Clock（世界时间 + 创世时生成的历法） |
 | `focus.json` | 运行时 | Bot 正在关注的频道（关注期间消息必定完整呈现） |
 | `archive/` | 运行时 | 压缩/重置时归档的历史 |
 
@@ -86,8 +86,17 @@ YesImBot World：让 Bot 生活在一个由 LLM 独立维护的虚拟世界中�
 
 ## 时间模型
 
-- 世界以 **Time Unit (TU)** 计时：`1 TU = realSecondsPerUnit 现实秒 = worldSecondsPerUnit 世界秒`；
-- `epoch` 定义 T=0 对应的世界时刻；世界暂停（`world.stop` / 插件停用）时时间静止；
+- 世界以 **Time Unit (TU)** 计时：`1 TU = realSecondsPerUnit 现实秒 = worldSecondsPerUnit 世界秒`。
+  TU 是现实与虚拟世界时间换算的桥梁：插件只累计流逝的 TU，需要展示世界时刻时再叠加到初始时刻上；
+- **`syncRealTime`（默认开启）**：世界时间与现实时间同步——世界时钟即现实时钟，1 TU 固定为 60 秒，
+  无视 `epoch` 与流速配置（创世时也不生成自定义历法），时间无法冻结（`world.stop` 只停下 Bot 与心跳）。
+  关闭后世界才拥有下述独立时间线；
+- `epoch` 定义 T=0 对应的世界时刻，**自由文本**：可以是现实日期，也可以是幻想纪年（如「王历1024年 春月初三 辰时」）。
+  创世（`world.init`）时 World-LLM 依据世界定义与 `epoch` 生成一套匹配的**历法**（现实公历，或自定义纪年/单位/进制）
+  并持久化进 `clock.json`，此后 TU → 世界时间由代码按该历法确定性换算；
+- 只有 `world.stop` 显式暂停才会冻结时间；**插件停用 / Koishi 关闭期间世界时间照常流逝**——
+  重新启动时通过持久化的现实时间锚点补回离线时段，唤醒事件会告知 Bot 意识中断了多少 TU，
+  离线达到 `offlineNarrateMinUnits` 时还会由 World-LLM 补叙这段时间世界发生了什么；
 - 每个工具调用由 Bot-LLM 自己估计 `duration`（耗时），期望完成时刻 = 生成时刻 + duration；
 - **生成与执行解耦**：生成完一个工具调用不等待结果、立即想下一步；结果在世界到达期望完成时刻时以 Event 注入（若届时结果未就绪，则就绪后立即注入）。模型快 → 角色行动连贯；模型慢 → 角色发呆愣神——推理速度本身塑造性格；
 - `send` 在期望完成时刻（打字完成）才真正发出，此前可 `cancel`（撤回还没发出去的话）；
@@ -198,8 +207,10 @@ Bot 不只能收，也能发：
 | 开关 | 工具 | 底层接口 | 说明 |
 |---|---|---|---|
 | `recall` | `recall(id, msg_id)` | `delete_msg`（通用 deleteMessage） | 撤回已发出的消息 |
-| `react` | `react(id, msg_id, emoji)` | `set_msg_emoji_like` / 通用 createReaction | 贴表情回应（emoji 字符或表情编号） |
+| `react` | `react(id, msg_id, emoji, remove?)` | `set_msg_emoji_like` / 通用 createReaction、deleteReaction | 贴/移除表情回应（emoji 字符或表情编号） |
+| `emojiLikes` | `get_emoji_likes(id, msg_id, emoji)` | `fetch_emoji_like`（NapCat 特有） | 查看某条消息上某个表情回应的用户列表 |
 | `reply` | `send(…, reply_to, at_sender?)` | quote + at 元素（OneBot 回复） | 引用回复：是否引用、引用哪条由 Bot 自己决定；群聊里默认模拟 QQ 客户端在开头自动 @ 原发送人，Bot 可传 `at_sender: false` 去掉（如同真人删掉自动加的 @） |
+| `forwardMsgs` | `forward_msgs(id, msg_ids)` | `send_group_forward_msg` / `send_private_forward_msg` | 把几条已有消息打包成聊天记录合并转发 |
 | `poke` | `poke(id, user_id?)` | `friend_poke` / `group_poke` | 戳一戳 |
 | `handleRequests` | `handle_request(request_id, approve, reason?)` | `set_friend_add_request` / `set_group_add_request` | 处理好友申请与入群邀请/申请（请求以手机通知事件告知 Bot） |
 | `listFriends` | `list_friends()` | `get_friend_list`（通用） | 好友列表（含可 send 的频道 id） |
@@ -207,15 +218,21 @@ Bot 不只能收，也能发：
 | `sendLike` | `send_like(user_id, times?)` | `send_like` | 资料卡点赞 |
 | `deleteFriend` | `delete_friend(user_id)` | `delete_friend` | 删除好友（谨慎开启） |
 | `profile` | `set_profile(nickname?, signature?, avatar?)` | `set_qq_profile` / `set_qq_avatar` | 改自己的昵称/签名/头像 |
+| `modelShow` | `set_model_show(model)` | `set_model_show` | 改资料卡上显示的在线机型 |
+| `ocrImage` | `ocr_image(image)` | `ocr_image` | 识别图片中的文字（与解释器互补，拿到精确文本） |
 | `listGroups` | `list_groups()` | `get_group_list` | 群列表 |
 | `groupInfo` | `group_info(id)` | `get_group_info` | 群信息 |
 | `listMembers` | `list_members(id)` | `get_group_member_list` | 群成员列表 |
 | `memberInfo` | `member_info(id, user_id)` | `get_group_member_info` | 群成员详情 |
+| `groupHonor` | `group_honor(id)` | `get_group_honor_info` | 群荣誉（龙王、群聊之火等） |
+| `groupFiles` | `group_files(id, folder_id?)` | `get_group_root_files` / `get_group_files_by_folder` | 浏览群文件与文件夹（只读） |
 | `groupCard` | `set_group_card(id, card)` | `set_group_card` | 改自己在群里显示的名称 |
 | `groupName` | `set_group_name(id, name)` | `set_group_name` | 改群名 |
 | `groupPortrait` | `set_group_portrait(id, image)` | `set_group_portrait` | 改群头像 |
 | `groupNotice` | `send_group_notice(id, content)` | `_send_group_notice` | 发群公告 |
+| `getGroupNotice` | `get_group_notice(id)` | `_get_group_notice` | 查看群公告列表 |
 | `essence` | `set_essence(msg_id, remove?)` | `set_essence_msg` / `delete_essence_msg` | 设置/移出群精华 |
+| `essenceList` | `get_essence_list(id)` | `get_essence_msg_list` | 查看群精华消息列表 |
 | `groupSign` | `group_sign(id)` | `set_group_sign` / `send_group_sign` | 群打卡 |
 | `groupBan` | `group_ban(id, user_id, minutes)` | `set_group_ban` | 禁言/解除禁言 |
 | `groupWholeBan` | `group_whole_ban(id, enable)` | `set_group_whole_ban` | 全员禁言 |
@@ -281,10 +298,12 @@ plugins:
       voice: alloy
       format: mp3
     clock:
-      realSecondsPerUnit: 60
+      syncRealTime: true # 世界时间与现实同步（1 TU 固定 60 秒，无视下面三项；时间无法冻结）
+      realSecondsPerUnit: 60 # 以下三项仅在 syncRealTime: false 时生效
       worldSecondsPerUnit: 60
-      epoch: "2026-01-01 08:00"
+      epoch: "2026-01-01 08:00" # 自由文本，幻想纪年亦可（创世时由 World-LLM 生成匹配的历法）
       tingleEveryUnits: 30
+      offlineNarrateMinUnits: 10 # 离线达此 TU 数时由 World-LLM 补叙离线期间的世界（0 禁用补叙）
     messaging:
       notifyChannels: ["onebot:123456789"]
       notifyPolicy: channel
@@ -294,7 +313,9 @@ plugins:
     platformOps: # 平台扩展操作，每项独立开关（默认全部 false，此处为示例）
       recall: true
       react: true
+      emojiLikes: false
       reply: true
+      forwardMsgs: false
       poke: true
       handleRequests: true
       listFriends: true
@@ -302,15 +323,21 @@ plugins:
       sendLike: false
       deleteFriend: false
       profile: false
+      modelShow: false
+      ocrImage: false
       listGroups: false
       groupInfo: false
       listMembers: false
       memberInfo: false
+      groupHonor: false
+      groupFiles: false
       groupCard: false
       groupName: false
       groupPortrait: false
       groupNotice: false
+      getGroupNotice: false
       essence: false
+      essenceList: false
       groupSign: false
       groupBan: false
       groupWholeBan: false

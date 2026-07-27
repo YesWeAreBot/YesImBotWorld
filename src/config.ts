@@ -77,10 +77,12 @@ export interface WorldModelConfig {
 }
 
 export interface ClockConfigData {
+  syncRealTime: boolean;
   realSecondsPerUnit: number;
   worldSecondsPerUnit: number;
   epoch: string;
   tingleEveryUnits: number;
+  offlineNarrateMinUnits: number;
 }
 
 export type NotifyPolicy = "count" | "channel" | "content";
@@ -101,7 +103,9 @@ export interface MessagingConfig {
 export interface PlatformOpsConfig {
   recall: boolean;
   react: boolean;
+  emojiLikes: boolean;
   reply: boolean;
+  forwardMsgs: boolean;
   poke: boolean;
   handleRequests: boolean;
   listFriends: boolean;
@@ -109,15 +113,21 @@ export interface PlatformOpsConfig {
   sendLike: boolean;
   deleteFriend: boolean;
   profile: boolean;
+  modelShow: boolean;
+  ocrImage: boolean;
   listGroups: boolean;
   groupInfo: boolean;
   listMembers: boolean;
   memberInfo: boolean;
+  groupHonor: boolean;
+  groupFiles: boolean;
   groupCard: boolean;
   groupName: boolean;
   groupPortrait: boolean;
   groupNotice: boolean;
+  getGroupNotice: boolean;
   essence: boolean;
+  essenceList: boolean;
   groupSign: boolean;
   groupBan: boolean;
   groupWholeBan: boolean;
@@ -125,6 +135,11 @@ export interface PlatformOpsConfig {
   groupAdmin: boolean;
   specialTitle: boolean;
   groupLeave: boolean;
+}
+
+/** 这些平台操作需要引用消息编号：开启任意一项时，消息记录会附带 (msg:xxx) 标注 */
+export function needsMsgIds(ops: PlatformOpsConfig): boolean {
+  return ops.recall || ops.react || ops.reply || ops.forwardMsgs || ops.emojiLikes || ops.essence;
 }
 
 export interface Config {
@@ -229,21 +244,42 @@ export const Config: Schema<Config> = Schema.intersect([
 
   Schema.object({
     clock: Schema.object({
+      syncRealTime: Schema.boolean()
+        .default(true)
+        .description(
+          "虚拟世界时间与现实时间同步：世界时钟即现实时钟，1 TU 固定为 60 秒（1 分钟），" +
+            "并忽略下方的流速与初始时刻配置（创世时也不再生成自定义历法）。" +
+            "同步模式下时间无法冻结——world.stop 只会停下 Bot，时间照常流逝。" +
+            "关闭后世界拥有独立的时间线，按下方配置运转",
+        ),
       realSecondsPerUnit: Schema.number()
         .min(0.1)
         .default(60)
-        .description("1 个 Time Unit 等于现实世界多少秒（世界时间流速）"),
+        .description("1 个 Time Unit 等于现实世界多少秒（世界时间流速）。仅在关闭「与现实同步」时生效"),
       worldSecondsPerUnit: Schema.number()
         .min(1)
         .default(60)
-        .description("1 个 Time Unit 在虚拟世界内代表多少秒（用于换算世界时钟显示）"),
+        .description("1 个 Time Unit 在虚拟世界内代表多少秒（用于换算世界时钟显示）。仅在关闭「与现实同步」时生效"),
       epoch: Schema.string()
         .default("2026-01-01 08:00")
-        .description("世界初始时刻（T=0 对应的世界时间）"),
+        .description(
+          "世界初始时刻（T=0 对应的世界时间），自由文本：可以是现实日期（如 2026-01-01 08:00），" +
+            "也可以是幻想世界的纪年（如「王历1024年 春月初三 辰时」）。" +
+            "创世（world.init）时 World-LLM 会依据世界定义与这里的描述生成一套匹配的历法并持久化，" +
+            "此后世界时钟按该历法显示时间，修改本项需重新创世才生效。仅在关闭「与现实同步」时生效",
+        ),
       tingleEveryUnits: Schema.number()
         .min(0)
         .default(30)
         .description("每过多少个 Time Unit 产生一次 Tingle（触发 World-LLM 推进世界、生成 News）。0 表示禁用"),
+      offlineNarrateMinUnits: Schema.number()
+        .min(0)
+        .default(10)
+        .description(
+          "Koishi 关闭期间世界时间照常流逝（用 world.stop 显式暂停才会冻结时间）。" +
+            "重新启动世界时，若离线时长达到此 TU 数，将由 World-LLM 补叙这段时间世界发生了什么并告知 Bot。" +
+            "0 表示只告知流逝了多少时间、不做补叙",
+        ),
     }).description("World Clock"),
   }),
 
@@ -255,12 +291,24 @@ export const Config: Schema<Config> = Schema.intersect([
       react: Schema.boolean()
         .default(false)
         .description(
-          "react：给消息贴表情回应（OneBot 走 set_msg_emoji_like，需实现端支持，如 NapCat / LLOneBot / Lagrange；" +
-            "其他平台走通用 createReaction）。开启后消息记录会附带 (msg:xxx) 消息编号",
+          "react：给消息贴/移除表情回应（OneBot 走 set_msg_emoji_like，需实现端支持，如 NapCat / LLOneBot / Lagrange；" +
+            "其他平台走通用 createReaction / deleteReaction）。开启后消息记录会附带 (msg:xxx) 消息编号",
+        ),
+      emojiLikes: Schema.boolean()
+        .default(false)
+        .description(
+          "get_emoji_likes：查看某条消息上某个表情回应都是谁贴的（NapCat 特有）。" +
+            "开启后消息记录会附带 (msg:xxx) 消息编号［fetch_emoji_like］",
         ),
       reply: Schema.boolean()
         .default(false)
         .description("reply：send 时可用 reply_to 引用回复某条消息。开启后消息记录会附带 (msg:xxx) 消息编号"),
+      forwardMsgs: Schema.boolean()
+        .default(false)
+        .description(
+          "forward_msgs：把几条已有消息打包成聊天记录，合并转发到某个频道。" +
+            "开启后消息记录会附带 (msg:xxx) 消息编号［send_group_forward_msg / send_private_forward_msg］",
+        ),
       poke: Schema.boolean()
         .default(false)
         .description("poke：戳一戳（仅 OneBot，需实现端支持 friend_poke / group_poke，如 NapCat / LLOneBot）"),
@@ -285,6 +333,12 @@ export const Config: Schema<Config> = Schema.intersect([
       profile: Schema.boolean()
         .default(false)
         .description("set_profile：修改自己的昵称、个性签名、头像［set_qq_profile / set_qq_avatar］"),
+      modelShow: Schema.boolean()
+        .default(false)
+        .description("set_model_show：修改资料卡上显示的在线机型（如「iPhone 15 Pro」）［set_model_show］"),
+      ocrImage: Schema.boolean()
+        .default(false)
+        .description("ocr_image：识别图片中的文字（与多模态解释器互补，能拿到精确文本）［ocr_image］"),
       listGroups: Schema.boolean()
         .default(false)
         .description("list_groups：查看自己加入的群列表［get_group_list］"),
@@ -297,6 +351,12 @@ export const Config: Schema<Config> = Schema.intersect([
       memberInfo: Schema.boolean()
         .default(false)
         .description("member_info：查看某个群成员的详细信息（名片、头衔、身份等）［get_group_member_info］"),
+      groupHonor: Schema.boolean()
+        .default(false)
+        .description("group_honor：查看群荣誉（龙王、群聊之火、快乐源泉等）［get_group_honor_info］"),
+      groupFiles: Schema.boolean()
+        .default(false)
+        .description("group_files：浏览群文件与文件夹（只读）［get_group_root_files / get_group_files_by_folder］"),
       groupCard: Schema.boolean()
         .default(false)
         .description("set_group_card：修改自己在群里显示的名称（群名片）［set_group_card］"),
@@ -309,9 +369,18 @@ export const Config: Schema<Config> = Schema.intersect([
       groupNotice: Schema.boolean()
         .default(false)
         .description("send_group_notice：发布群公告（需要管理员权限）［_send_group_notice］"),
+      getGroupNotice: Schema.boolean()
+        .default(false)
+        .description("get_group_notice：查看群公告列表（普通成员也可用）［_get_group_notice］"),
       essence: Schema.boolean()
         .default(false)
-        .description("set_essence：把群消息设为/移出精华（需要管理员权限）［set_essence_msg / delete_essence_msg］"),
+        .description(
+          "set_essence：把群消息设为/移出精华（需要管理员权限）。" +
+            "开启后消息记录会附带 (msg:xxx) 消息编号［set_essence_msg / delete_essence_msg］",
+        ),
+      essenceList: Schema.boolean()
+        .default(false)
+        .description("get_essence_list：查看群精华消息列表［get_essence_msg_list］"),
       groupSign: Schema.boolean()
         .default(false)
         .description("group_sign：群打卡［set_group_sign / send_group_sign］"),
