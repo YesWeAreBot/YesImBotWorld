@@ -89,7 +89,7 @@ YesImBot World：让 Bot 生活在一个由 LLM 独立维护的虚拟世界中�
 
 - 世界以 **Time Unit (TU)** 计时：`1 TU = realSecondsPerUnit 现实秒 = worldSecondsPerUnit 世界秒`。
   TU 是现实与虚拟世界时间换算的桥梁：插件只累计流逝的 TU，需要展示世界时刻时再叠加到初始时刻上；
-- **`syncRealTime`（默认开启）**：世界时间与现实时间同步——世界时钟即现实时钟，1 TU 固定为 60 秒，
+- **`syncRealTime`（默认开启）**：世界时间与现实时间同步——世界时钟即现实时钟，1 TU 固定为 1 秒，
   无视 `epoch` 与流速配置（创世时也不生成自定义历法），时间无法冻结（`world.stop` 只停下 Bot 与心跳）。
   关闭后世界才拥有下述独立时间线；
 - `epoch` 定义 T=0 对应的世界时刻，**自由文本**：可以是现实日期，也可以是幻想纪年（如「王历1024年 春月初三 辰时」）。
@@ -318,9 +318,9 @@ plugins:
       voice: alloy
       format: mp3
     clock:
-      syncRealTime: true # 世界时间与现实同步（1 TU 固定 60 秒，无视下面三项；时间无法冻结）
-      realSecondsPerUnit: 60 # 以下三项仅在 syncRealTime: false 时生效
-      worldSecondsPerUnit: 60
+      syncRealTime: true # 世界时间与现实同步（1 TU 固定 1 秒，无视下面三项；时间无法冻结）
+      realSecondsPerUnit: 1 # 以下三项仅在 syncRealTime: false 时生效
+      worldSecondsPerUnit: 1
       epoch: "2026-01-01 08:00" # 自由文本，幻想纪年亦可（创世时由 World-LLM 生成匹配的历法）
       tingleEveryUnits: 30
       offlineNarrateMinUnits: 10 # 离线达此 TU 数时由 World-LLM 补叙离线期间的世界（0 禁用补叙）

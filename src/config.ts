@@ -268,18 +268,18 @@ export const Config: Schema<Config> = Schema.intersect([
       syncRealTime: Schema.boolean()
         .default(true)
         .description(
-          "虚拟世界时间与现实时间同步：世界时钟即现实时钟，1 TU 固定为 60 秒（1 分钟），" +
+          "虚拟世界时间与现实时间同步：世界时钟即现实时钟，1 TU 固定为 1 秒，" +
             "并忽略下方的流速与初始时刻配置（创世时也不再生成自定义历法）。" +
             "同步模式下时间无法冻结——world.stop 只会停下 Bot，时间照常流逝。" +
             "关闭后世界拥有独立的时间线，按下方配置运转",
         ),
       realSecondsPerUnit: Schema.number()
         .min(0.1)
-        .default(60)
+        .default(1)
         .description("1 个 Time Unit 等于现实世界多少秒（世界时间流速）。仅在关闭「与现实同步」时生效"),
       worldSecondsPerUnit: Schema.number()
         .min(1)
-        .default(60)
+        .default(1)
         .description("1 个 Time Unit 在虚拟世界内代表多少秒（用于换算世界时钟显示）。仅在关闭「与现实同步」时生效"),
       epoch: Schema.string()
         .default("2026-01-01 08:00")

@@ -23,8 +23,8 @@ interface ClockPersist {
 /** 运行中周期性落盘的间隔（ms）：进程存活状态最多滞后这么多现实时间 */
 const CHECKPOINT_MS = 30_000;
 
-/** 同步模式下固定的换算关系：1 TU = 60 现实秒 = 60 世界秒 */
-const SYNC_SECONDS_PER_UNIT = 60;
+/** 同步模式下固定的换算关系：1 TU = 1 现实秒 = 1 世界秒 */
+const SYNC_SECONDS_PER_UNIT = 1;
 
 /**
  * World Clock：维护世界时间（以 Time Unit 计）。
@@ -32,7 +32,7 @@ const SYNC_SECONDS_PER_UNIT = 60;
  * - TU 是现实与虚拟世界时间换算的桥梁：
  *   1 TU = realSecondsPerUnit 现实秒 = worldSecondsPerUnit 世界秒。
  * - **同步模式（syncRealTime，默认开启）**：世界时钟即现实时钟，T=0 锚定在创世的现实时刻，
- *   1 TU 固定为 60 秒；无视 epoch 与流速配置，时间无法冻结（pause 只标记离线起点）。
+ *   1 TU 固定为 1 秒；无视 epoch 与流速配置，时间无法冻结（pause 只标记离线起点）。
  * - 独立时间线模式：T=0 对应世界初始时刻（epoch）；TU → 可读的世界时间由历法（CalendarSpec）
  *   确定性换算，历法在创世时由 World-LLM 依据世界定义生成并持久化，之后不受配置变更影响。
  *   时间只有在显式暂停（world.stop）时才冻结；插件停止/Koishi 关闭期间照常流逝，
@@ -83,12 +83,12 @@ export class WorldClock {
     return this.cfg.syncRealTime;
   }
 
-  /** 1 TU 等于多少现实秒（同步模式固定 60） */
+  /** 1 TU 等于多少现实秒（同步模式固定 1） */
   get unitRealSeconds(): number {
     return this.cfg.syncRealTime ? SYNC_SECONDS_PER_UNIT : this.cfg.realSecondsPerUnit;
   }
 
-  /** 1 TU 等于多少世界秒（同步模式固定 60） */
+  /** 1 TU 等于多少世界秒（同步模式固定 1） */
   get unitWorldSeconds(): number {
     return this.cfg.syncRealTime ? SYNC_SECONDS_PER_UNIT : this.cfg.worldSecondsPerUnit;
   }
