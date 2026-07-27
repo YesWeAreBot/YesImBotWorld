@@ -189,9 +189,57 @@ export class WorldAgent {
     return this.invokeWithTools({ task, deliver });
   }
 
+  /**
+   * 世界查询：运行一次工具循环（可读写状态文件、不可 send_event），返回最终文本回答。
+   * 用于天气应用等"以世界视角回答问题"的场景。
+   */
+  async query(task: string): Promise<string> {
+    return this.enqueue(async () => {
+      const content = (await this.runToolLoop({ task }))
+        .replace(/<think>[\s\S]*?<\/think>/g, "")
+        .replace(/<thinking>[\s\S]*?<\/thinking>/g, "")
+        .trim();
+      if (!content) throw new Error("World-LLM 没有给出文本回答");
+      return content;
+    });
+  }
+
   // ---------- 创世 ----------
 
-  /** 创世第一步：依据世界定义与用户设定的初始时刻，生成世界的历法 */
+  /** 创世判定：这个世界是否是现实地球世界（决定天气应用查真实天气还是生成） */
+  private async assessRealWorld(worldDef: string): Promise<boolean | null> {
+    const system =
+      "你是一个虚拟世界的模拟引擎。现在是创世阶段。只输出严格的 JSON，不要输出任何其他内容。";
+    const user =
+      `<world_definition>（用户给出的世界定义）\n${worldDef}\n</world_definition>\n\n` +
+      `请判断这个世界是否是「现实地球世界」：与真实世界一致或基本一致——真实的地理与城市、` +
+      `现代社会、正常物理规律，没有架空历史、幻想大陆或超自然设定。\n` +
+      `是则输出 {"real_world": true}，否则输出 {"real_world": false}。只输出 JSON。`;
+    const result = await this.client.complete([
+      { role: "system", content: system },
+      { role: "user", content: user },
+    ]);
+    const parsed = extractJson(result.content) as Record<string, unknown> | null;
+    return parsed && typeof parsed.real_world === "boolean" ? parsed.real_world : null;
+  }
+
+  /** 创世第一步：判定世界性质并持久化（天气应用等依赖它区分现实/虚构） */
+  private async setupWorldMeta(worldDef: string): Promise<void> {
+    let real: boolean | null = null;
+    try {
+      real = await this.assessRealWorld(worldDef);
+    } catch (err) {
+      this.logger.warn("世界性质判定调用失败: %s", err);
+    }
+    // 判定失败时回退：与现实时间同步的世界更可能是现实设定
+    const realWorld = real ?? this.clock.syncRealTime;
+    if (real === null) this.logger.warn("World-LLM 未能判定世界性质，按 %s 处理", realWorld ? "现实世界" : "虚构世界");
+    const meta = await this.files.readMeta();
+    await this.files.writeMeta({ ...meta, realWorld });
+    this.logger.info("世界性质：%s", realWorld ? "现实地球世界" : "虚构世界");
+  }
+
+  /** 创世：依据世界定义与用户设定的初始时刻，生成世界的历法 */
   private async setupCalendar(worldDef: string): Promise<void> {
     let spec: CalendarSpec | null = null;
     try {
@@ -238,8 +286,9 @@ export class WorldAgent {
     return parseCalendarSpec(extractJson(result.content));
   }
 
-  /** 初始化：生成历法（同步模式跳过），再根据用户定义生成 Bot_Status.md 与 World_Status.md */
+  /** 初始化：判定世界性质、生成历法（同步模式跳过），再根据用户定义生成状态文件 */
   async initialize(botDef: string, worldDef: string): Promise<void> {
+    await this.enqueue(() => this.setupWorldMeta(worldDef));
     if (this.clock.syncRealTime) {
       this.logger.info("世界时间与现实同步，跳过历法生成；创世时刻 %s", this.clock.clockString(0));
     } else {
@@ -368,7 +417,8 @@ export class WorldAgent {
     );
   }
 
-  private async runToolLoop(invocation: WorldInvocation): Promise<void> {
+  /** 运行工具循环，返回模型最后一轮的文本内容 */
+  private async runToolLoop(invocation: WorldInvocation): Promise<string> {
     const tools = invocation.deliver
       ? WORLD_TOOLS
       : WORLD_TOOLS.filter((t) => t.function.name !== "send_event");
@@ -377,9 +427,11 @@ export class WorldAgent {
       { role: "user", content: invocation.task },
     ];
 
+    let finalContent = "";
     let lastCallSig = "";
     for (let round = 0; round < this.cfg.maxToolRounds; round++) {
       const result = await this.client.complete(messages, { tools });
+      finalContent = result.content ?? "";
       if (!result.toolCalls.length) break;
       messages.push({
         role: "assistant",
@@ -406,6 +458,7 @@ export class WorldAgent {
         messages.push({ role: "tool", tool_call_id: tc.id, content: output });
       }
     }
+    return finalContent;
   }
 
   private async executeTool(

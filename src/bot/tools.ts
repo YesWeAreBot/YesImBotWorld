@@ -66,6 +66,18 @@ export const BOT_TOOLS: BotToolDef[] = [
       "放下手机：不再留意之前打开过或聊过的频道。之后那些频道的新消息只会像平常一样通知你，不会直接呈现内容。",
   },
   {
+    name: "open_app",
+    signature: 'open_app(name: string)',
+    description:
+      "打开手机里的一个应用。打开聊天应用相当于看一眼最近的消息；打开其他应用后，" +
+      "你会看到它提供的操作，这些操作即刻可以像普通能力一样调用。一次只能打开一个应用，打开新的会自动关掉上一个。",
+  },
+  {
+    name: "close_app",
+    signature: "close_app()",
+    description: "关闭当前打开的应用，它提供的操作随之失效。",
+  },
+  {
     name: "check_gallery",
     signature: "check_gallery()",
     description:
@@ -309,14 +321,29 @@ export const BOT_TOOLS: BotToolDef[] = [
 /** 全部工具名（宽松解析用的允许列表上限） */
 export const BOT_TOOL_NAMES = BOT_TOOLS.map((t) => t.name);
 
+/** 手机里已安装的应用（用于 open_app 的描述） */
+export interface AppInfo {
+  name: string;
+  description: string;
+}
+
 /** 按配置过滤实际可用的工具（如未配置 TTS 时不提供 send_voice、平台扩展操作默认关闭） */
-export function availableTools(opts: { tts: boolean; focus: boolean; ops: PlatformOpsConfig }): BotToolDef[] {
+export function availableTools(opts: {
+  tts: boolean;
+  focus: boolean;
+  ops: PlatformOpsConfig;
+  apps?: AppInfo[];
+}): BotToolDef[] {
+  // apps[0] 是聊天平台；只有存在可展开的应用（天气/MCP）时才提供 close_app
+  const hasExpandableApps = (opts.apps?.length ?? 0) > 1;
   const tools = BOT_TOOLS.filter((t) => {
     switch (t.name) {
       case "send_voice":
         return opts.tts;
       case "put_down_phone":
         return opts.focus;
+      case "close_app":
+        return hasExpandableApps;
       case "recall":
         return opts.ops.recall;
       case "react":
@@ -387,24 +414,33 @@ export function availableTools(opts: { tts: boolean; focus: boolean; ops: Platfo
         return true;
     }
   });
-  // 开启引用回复时，send 增加 reply_to / at_sender 参数说明
-  if (!opts.ops.reply) return tools;
-  return tools.map((t) =>
-    t.name === "send"
-      ? {
-          ...t,
-          signature: t.signature.replace(
-            "media?: string[]",
-            "media?: string[], reply_to?: string, at_sender?: boolean",
-          ),
-          description:
-            t.description +
-            "reply_to 可引用回复某条消息，填消息记录里 (msg:xxx) 的编号；由你决定要不要引用、引用哪条。" +
-            "群聊里引用回复会像 QQ 一样自动在开头 @ 对方——大多数时候保留即可；" +
-            "如果不想 @（比如只是顺带提到、或不想打扰对方），加 at_sender: false 去掉，就像真人删掉自动加上的 @。",
-        }
-      : t,
-  );
+  return tools.map((t) => {
+    // 开启引用回复时，send 增加 reply_to / at_sender 参数说明
+    if (t.name === "send" && opts.ops.reply) {
+      return {
+        ...t,
+        signature: t.signature.replace(
+          "media?: string[]",
+          "media?: string[], reply_to?: string, at_sender?: boolean",
+        ),
+        description:
+          t.description +
+          "reply_to 可引用回复某条消息，填消息记录里 (msg:xxx) 的编号；由你决定要不要引用、引用哪条。" +
+          "群聊里引用回复会像 QQ 一样自动在开头 @ 对方——大多数时候保留即可；" +
+          "如果不想 @（比如只是顺带提到、或不想打扰对方），加 at_sender: false 去掉，就像真人删掉自动加上的 @。",
+      };
+    }
+    // open_app 的描述里列出已安装的应用
+    if (t.name === "open_app" && opts.apps?.length) {
+      return {
+        ...t,
+        description:
+          t.description +
+          `已安装的应用：${opts.apps.map((a) => `${a.name}（${a.description}）`).join("、")}。`,
+      };
+    }
+    return t;
+  });
 }
 
 export function renderToolsText(tools: BotToolDef[] = BOT_TOOLS): string {

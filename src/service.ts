@@ -1,9 +1,12 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { Context, Service } from "koishi";
+import { AppManager } from "./apps/manager.js";
+import { McpApp } from "./apps/mcp.js";
+import { WeatherApp } from "./apps/weather.js";
 import { BotAgent } from "./bot/agent.js";
 import { BotContext } from "./bot/context.js";
-import { availableTools, renderToolsText } from "./bot/tools.js";
+import { availableTools, renderToolsText, type AppInfo } from "./bot/tools.js";
 import { describeCalendar } from "./calendar.js";
 import { WorldClock } from "./clock.js";
 import type { Config } from "./config.js";
@@ -47,6 +50,7 @@ export class WorldService extends Service<Config> {
   private botContext: BotContext | null = null;
   private bot: BotAgent | null = null;
   private tingle: TingleTimer | null = null;
+  private appManager: AppManager | null = null;
   private worldRunning = false;
 
   constructor(ctx: Context, config: Config) {
@@ -199,6 +203,22 @@ export class WorldService extends Service<Config> {
       this.requests,
       this.ownSends,
     );
+    // 手机应用（Apps / MCP）：内置天气 + 外接 MCP Server，open_app 打开后工具才展开
+    const worldApps = [
+      ...(this.config.apps.weatherEnabled
+        ? [new WeatherApp(this.world, this.files, this.clock, this.config.apps, this.logger)]
+        : []),
+      ...this.config.apps.mcpServers
+        .filter((s) => s.enabled && s.name.trim())
+        .map((s) => new McpApp(s, this.logger)),
+    ];
+    this.appManager = new AppManager(
+      this.config.apps.chatAppName,
+      worldApps,
+      new Set(tools.map((t) => t.name)),
+      this.logger,
+    );
+
     this.bot = new BotAgent(
       this.config,
       this.clock,
@@ -206,6 +226,7 @@ export class WorldService extends Service<Config> {
       this.botContext,
       this.world,
       messenger,
+      this.appManager,
       this.logger,
       tools.map((t) => t.name),
     );
@@ -265,6 +286,8 @@ export class WorldService extends Service<Config> {
     this.tingle = null;
     await this.bot?.stop();
     this.bot = null;
+    await this.appManager?.closeAll().catch(() => {});
+    this.appManager = null;
     if (opts.suspend) {
       // 插件停止：世界时间不冻结，离线期间继续按现实流速流逝
       await this.clock.suspend();
@@ -303,6 +326,8 @@ export class WorldService extends Service<Config> {
         `工作窗口：${s.streamLength} 条记录，约 ${s.approxChars} 字符（预算 ${this.config.bot.maxWindowChars}）`,
         `等待中：${s.waiting ?? "否"}；进行中的动作：${s.pendingTasks} 个；World-LLM 队列：${this.world.queueLength} 个`,
       );
+      const openApp = this.appManager?.currentName;
+      if (openApp) lines.push(`手机里打开的应用：「${openApp}」`);
     }
     const focused = this.focus.activeKeys();
     if (focused.length) {
@@ -321,7 +346,22 @@ export class WorldService extends Service<Config> {
       tts: this.config.tts.enabled,
       focus: this.config.messaging.focusDurationUnits > 0,
       ops: this.config.platformOps,
+      apps: this.appInfos(),
     });
+  }
+
+  /** 手机里已安装的应用列表（聊天平台在前） */
+  private appInfos(): AppInfo[] {
+    const list: AppInfo[] = [
+      { name: this.config.apps.chatAppName, description: "聊天，打开即看到最近的消息" },
+    ];
+    if (this.config.apps.weatherEnabled) {
+      list.push({ name: "天气", description: "查询当前天气与未来几天的预报" });
+    }
+    for (const s of this.config.apps.mcpServers) {
+      if (s.enabled && s.name.trim()) list.push({ name: s.name.trim(), description: s.description || "外部应用" });
+    }
+    return list;
   }
 
   // ---------- 命令 ----------

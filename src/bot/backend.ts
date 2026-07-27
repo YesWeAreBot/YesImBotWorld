@@ -12,6 +12,8 @@ export interface BotBackend {
   generate(context: BotContext, timeLine: string, signal?: AbortSignal): Promise<ParsedToolCall>;
   /** 可选：压缩后预热 KV cache（rest 期间"计算 KVcache"） */
   warmup?(context: BotContext, timeLine: string): Promise<void>;
+  /** 更新允许的工具名集（App 打开/关闭时动态调整；text 模式会重建 GBNF 语法） */
+  setToolNames(names: string[]): void;
 }
 
 /**
@@ -32,6 +34,10 @@ export class ChatBackend implements BotBackend {
       maxTokens: cfg.maxTokens,
       disableThinking: cfg.disableThinking,
     });
+  }
+
+  setToolNames(names: string[]): void {
+    this.toolNames = names;
   }
 
   async generate(context: BotContext, timeLine: string, signal?: AbortSignal): Promise<ParsedToolCall> {
@@ -74,6 +80,12 @@ export class TextBackend implements BotBackend {
       maxTokens: cfg.maxTokens,
     });
     this.grammar = buildToolCallGrammar(toolNames);
+  }
+
+  setToolNames(names: string[]): void {
+    this.toolNames = names;
+    // 语法是逐请求发送的采样约束，重建不影响 KV cache
+    this.grammar = buildToolCallGrammar(names);
   }
 
   async generate(context: BotContext, timeLine: string, signal?: AbortSignal): Promise<ParsedToolCall> {

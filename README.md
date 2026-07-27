@@ -44,6 +44,7 @@ YesImBot World：让 Bot 生活在一个由 LLM 独立维护的虚拟世界中�
 | `stream.jsonl` | 运行时 | Bot 工作窗口（Tool Call 流）持久化 |
 | `pinned.json` | 运行时 | 置顶上下文 + id 计数器 |
 | `clock.json` | 运行时 | World Clock（世界时间 + 创世时生成的历法） |
+| `meta.json` | 运行时 | 世界元数据（创世时判定：是否现实世界设定） |
 | `focus.json` | 运行时 | Bot 正在关注的频道（关注期间消息必定完整呈现） |
 | `archive/` | 运行时 | 压缩/重置时归档的历史 |
 
@@ -196,6 +197,8 @@ Bot 不只能收，也能发：
 | `send_file(id, file)` | 发送音频/视频/任意文件（媒体编号或 `gallery:文件名`） |
 | `send_voice(id, text)` | TTS 合成语音消息（需配置 tts，duration = 说话时间） |
 | `put_down_phone()` | 清除全部频道关注（关注机制开启时可用） |
+| `open_app(name)` | 打开手机里的一个应用：聊天应用 = 看最近消息（check_msg），其他应用展开其操作 |
+| `close_app()` | 关闭当前打开的应用（存在可展开的应用时可用） |
 | `cancel(id)` | 取消倒计时中的工具调用 |
 | `identity_recall()` | 反思身份：角色设定以 Event 再次注入 |
 
@@ -243,10 +246,27 @@ Bot 不只能收，也能发：
 
 说明：
 
-- 开启 `recall` / `react` / `reply` 任意一项后，消息记录与发送结果会附带 `(msg:xxx)` 消息编号供引用；
+- 开启 `recall` / `react` / `reply` / `forwardMsgs` / `emojiLikes` / `essence` 任意一项后，消息记录与发送结果会附带 `(msg:xxx)` 消息编号供引用；
 - 标准 OneBot v11 之外的扩展接口（贴表情、戳一戳、改资料/头像、群打卡等）需要实现端支持
   （NapCat / LLOneBot / Lagrange 等，支持范围各有差异，不支持时 Bot 会收到明确的失败提示）；
 - **无法主动添加好友**：OneBot 协议没有"发起好友申请"的接口（QQ 协议限制），只能处理收到的申请。
+
+### 手机应用（Apps / MCP，`apps.*`）
+
+对 Bot 来说，**MCP Server 就是手机/电脑里的 App**——如同 Koishi 是手机里的聊天平台，
+只不过聊天平台的能力常驻工具位，而 App 的操作不占常驻位、按需展开：
+
+- `open_app(name)` 打开一个应用：
+  - 打开聊天应用（名字可配置，默认 `QQ`，也认 `聊天`/`chat`/`koishi` 等别名）= 看一眼最近消息（等效 `check_msg(10)`）；
+  - 打开其他应用 = 连接对应 MCP Server / 内置应用，其工具（名字、参数签名、说明）以事件展开，
+    即刻可像普通工具一样调用（动态加入允许列表与 GBNF 语法，工具名与常驻工具冲突时加 `应用名.` 前缀）；
+- **一次只能打开一个 App**：打开新的自动关掉上一个；`close_app()` 主动关闭；`rest` 睡醒后自动关闭；
+- MCP 客户端为零依赖极简实现（`initialize` / `tools/list` / `tools/call`），
+  传输支持 **stdio**（本地子进程）与 **Streamable HTTP**（含 SSE 响应）；
+- **内置天气应用**（`apps.weatherEnabled`，默认开启）：`query_weather(city?)`——
+  现实世界设定查询真实天气（Open-Meteo，免费无需 key，可配置 `weatherDefaultCity`）；
+  虚构世界设定由 World-LLM 生成，并把天气写进 `World_Status.md`，保证连续查询与世界裁定一致。
+  现实/虚构在创世（`world.init`）时由 World-LLM 依据 `World_Definition.md` 判定，持久化在 `meta.json`。
 
 ## 部署到 Koishi 实例（开发链接）
 
@@ -345,6 +365,19 @@ plugins:
       groupAdmin: false
       specialTitle: false
       groupLeave: false
+    apps: # 手机应用（Apps / MCP）：open_app 打开后工具才展开，一次只开一个
+      chatAppName: QQ # 聊天平台在 Bot 手机里的应用名
+      weatherEnabled: true # 内置天气应用（现实设定查 Open-Meteo，虚构设定由 World-LLM 生成）
+      weatherDefaultCity: "" # 真实天气默认城市（留空则要求 Bot 自己给出）
+      mcpServers: # 外接 MCP Server：每个都是手机里的一个 App
+        - enabled: true
+          name: 备忘录
+          description: 记录和查看备忘
+          transport: stdio # stdio / http
+          command: npx -y @modelcontextprotocol/server-memory
+          # args: []            # stdio 参数（command 里整条写也行）
+          # url: ""             # http 端点
+          # headers: {}         # http 附加请求头
 ```
 
 ## 已知限制

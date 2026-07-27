@@ -2,6 +2,12 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import type { NewsEntry } from "./types.js";
 
+/** 世界元数据（创世时由 World-LLM 判定并持久化） */
+export interface WorldMeta {
+  /** 世界是否是现实地球世界（决定天气应用查真实天气还是由 World-LLM 生成） */
+  realWorld?: boolean;
+}
+
 const BOT_DEF_TEMPLATE = `# Bot 角色定义
 
 <!-- 在这里编写你的 Bot 角色定义，然后执行 world.init 生成初始状态。 -->
@@ -30,6 +36,7 @@ const WORLD_DEF_TEMPLATE = `# 世界定义
  * ├── World_Status.md      # World-LLM 维护：世界当前状态
  * ├── News.db              # World-LLM 维护：世界事件列表（JSONL 格式）
  * ├── clock.json           # World Clock 状态
+ * ├── meta.json            # 世界元数据（创世时判定：是否现实世界等）
  * ├── focus.json           # Bot 正在关注的频道
  * ├── pinned.json          # Bot-LLM 置顶上下文 + 计数器
  * ├── stream.jsonl         # Bot-LLM 工作窗口（Tool Call 流）
@@ -43,6 +50,7 @@ export class WorldFiles {
   readonly worldStatus: string;
   readonly news: string;
   readonly clock: string;
+  readonly meta: string;
   readonly focus: string;
   readonly pinned: string;
   readonly stream: string;
@@ -56,6 +64,7 @@ export class WorldFiles {
     this.worldStatus = path.join(base, "World_Status.md");
     this.news = path.join(base, "News.db");
     this.clock = path.join(base, "clock.json");
+    this.meta = path.join(base, "meta.json");
     this.focus = path.join(base, "focus.json");
     this.pinned = path.join(base, "pinned.json");
     this.stream = path.join(base, "stream.jsonl");
@@ -128,6 +137,20 @@ export class WorldFiles {
     return entries;
   }
 
+  /** 读取世界元数据（不存在时返回空对象） */
+  async readMeta(): Promise<WorldMeta> {
+    try {
+      const parsed = JSON.parse(await this.readText(this.meta)) as WorldMeta;
+      return typeof parsed === "object" && parsed !== null ? parsed : {};
+    } catch {
+      return {};
+    }
+  }
+
+  async writeMeta(meta: WorldMeta): Promise<void> {
+    await this.atomicWrite(this.meta, JSON.stringify(meta));
+  }
+
   async readDefinitions(): Promise<{ botDef: string; worldDef: string }> {
     return {
       botDef: await this.readText(this.botDef),
@@ -148,7 +171,7 @@ export class WorldFiles {
   /** 重置全部运行时状态（保留用户定义文件），旧状态归档 */
   async reset(): Promise<void> {
     const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-    for (const file of [this.botStatus, this.worldStatus, this.news, this.pinned, this.stream, this.clock, this.focus]) {
+    for (const file of [this.botStatus, this.worldStatus, this.news, this.pinned, this.stream, this.clock, this.meta, this.focus]) {
       if (await this.exists(file)) {
         const dest = path.join(this.archiveDir, `${stamp}-${path.basename(file)}`);
         await fs.rename(file, dest).catch(() => fs.rm(file, { force: true }));

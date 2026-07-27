@@ -1,4 +1,5 @@
 import type { Logger } from "koishi";
+import type { AppManager } from "../apps/manager.js";
 import type { WorldClock } from "../clock.js";
 import type { Config } from "../config.js";
 import type { WorldFiles } from "../files.js";
@@ -8,6 +9,7 @@ import type { WorldAgent } from "../world/agent.js";
 import { createBackend, type BotBackend } from "./backend.js";
 import type { BotContext } from "./context.js";
 import { Scheduler } from "./scheduler.js";
+import { BOT_TOOLS } from "./tools.js";
 
 /** Koishi 侧能力（消息查询与发送），由 service 层实现注入 */
 export interface MessengerApi {
@@ -103,6 +105,9 @@ export class BotAgent {
    */
   private wakeTimeLine = "";
 
+  /** 常驻工具名（App 工具在此基础上动态叠加） */
+  private baseToolNames: string[];
+
   constructor(
     private config: Config,
     private clock: WorldClock,
@@ -110,15 +115,22 @@ export class BotAgent {
     private context: BotContext,
     private world: WorldAgent,
     private messenger: MessengerApi,
+    private apps: AppManager | null,
     private logger: Logger,
     toolNames?: string[],
   ) {
-    this.backend = createBackend(config.bot, toolNames);
+    this.baseToolNames = toolNames ?? BOT_TOOLS.map((t) => t.name);
+    this.backend = createBackend(config.bot, this.baseToolNames);
     this.scheduler = new Scheduler(
       clock,
       (content, ref) => this.pushEvent("tool", content, { ref }),
       logger,
     );
+  }
+
+  /** App 打开/关闭后：把当前展开的 App 工具同步进后端的允许列表与语法 */
+  private refreshAppTools(): void {
+    this.backend.setToolNames([...this.baseToolNames, ...(this.apps?.activeToolNames() ?? [])]);
   }
 
   // ---------- 生命周期 ----------
@@ -422,6 +434,24 @@ export class BotAgent {
         return this.dispatchSendVoice(call);
       case "put_down_phone":
         return this.dispatchLocal(call, async () => this.messenger.putDownPhone());
+      case "open_app": {
+        const name = String(call.arguments.name ?? call.arguments.app ?? "");
+        if (!name.trim()) {
+          this.pushEvent(
+            "system",
+            `（open_app 需要 name 参数。已安装的应用：${this.apps?.installedText() ?? "（无）"}）`,
+            { ref: call.id },
+          );
+          return;
+        }
+        return this.dispatchOpenApp(call, name.trim());
+      }
+      case "close_app":
+        return this.dispatchLocal(call, async () => {
+          const closed = await this.apps?.closeCurrent();
+          this.refreshAppTools();
+          return closed ? `你关闭了「${closed}」，它的操作已失效。` : "（当前没有打开的应用。）";
+        });
       case "recall": {
         const id = String(call.arguments.id ?? "");
         const msgId = String(call.arguments.msg_id ?? call.arguments.msgId ?? "");
@@ -715,6 +745,17 @@ export class BotAgent {
       case "identity_recall":
         return this.dispatchIdentityRecall(call);
       default:
+        // 当前打开的 App 展开的工具
+        if (this.apps?.hasTool(call.name)) {
+          const appName = this.apps.currentName;
+          return this.dispatchLocal(call, async () => {
+            try {
+              return await this.apps!.call(call.name, call.arguments);
+            } catch (err) {
+              return `（「${appName}」的 ${call.name} 操作失败：${(err as Error).message ?? err}）`;
+            }
+          });
+        }
         this.pushEvent("system", `（没有名为 ${call.name} 的能力。）`, { ref: call.id });
     }
   }
@@ -799,6 +840,42 @@ export class BotAgent {
     if (this.config.bot.blockingAct) {
       this.waiting = { callId: call.id, kind: "act" };
     }
+  }
+
+  /** open_app：打开聊天平台 = 看一眼最近消息；打开其他 App = 展开其工具 */
+  private dispatchOpenApp(call: ToolCallRecord, name: string): void {
+    const resolved = this.apps?.resolve(name) ?? null;
+    if (!resolved) {
+      return this.dispatchLocal(call, async () => {
+        return `（手机里没有叫「${name}」的应用。已安装的应用：${this.apps?.installedText() ?? "（无）"}）`;
+      });
+    }
+    if (resolved.kind === "chat") {
+      // 打开聊天应用：切走当前 App，并看一眼最近的消息（check_msg(10)）
+      return this.dispatchLocal(call, async () => {
+        const closed = await this.apps?.closeCurrent();
+        if (closed) this.refreshAppTools();
+        const rich = await this.messenger.recentChannels(10);
+        const prefix = closed ? `（你关掉了「${closed}」）` : "";
+        return typeof rich === "string" ? { text: prefix + rich } : { ...rich, text: prefix + rich.text };
+      });
+    }
+    return this.dispatchLocal(call, async () => {
+      try {
+        const { closed, defs } = await this.apps!.open(resolved.app);
+        this.refreshAppTools();
+        const lines = defs.length
+          ? defs.map((d) => `- ${d.signature}\n  ${d.description}`).join("\n")
+          : "（这个应用没有提供任何操作。）";
+        return (
+          `你打开了「${resolved.app.name}」。${closed ? `（「${closed}」已被关掉）` : ""}\n` +
+          `它提供这些操作，即刻可以像普通能力一样调用（关闭应用或打开其他应用后失效）：\n${lines}`
+        );
+      } catch (err) {
+        this.refreshAppTools();
+        return `（「${resolved.app.name}」启动失败：${(err as Error).message ?? err}）`;
+      }
+    });
   }
 
   private dispatchLocal(call: ToolCallRecord, run: () => Promise<string | RichText>): void {
@@ -1005,6 +1082,10 @@ export class BotAgent {
     }
     if (!this.running) return;
 
+    // 休息时手机里开着的应用自动关闭（醒来后需重新打开）
+    const closedApp = await this.apps?.closeCurrent().catch(() => null);
+    if (closedApp) this.refreshAppTools();
+
     // 醒来时刻更新为当前时间（这是 system 段时间唯一的合法更新时机——
     // 压缩后前缀本来就要重建，此时更新不损失缓存）
     this.wakeTimeLine = this.clock.timeLine();
@@ -1015,7 +1096,8 @@ export class BotAgent {
     const elapsedTU = (Date.now() - startReal) / 1000 / this.clock.unitRealSeconds;
     this.pushEvent(
       "system",
-      `你睡了一觉，过去了 ${elapsedTU.toFixed(1)} 个 TU。醒来时头脑清明，近来的经历沉淀成了记忆。当前 ${this.clock.timeLine()}`,
+      `你睡了一觉，过去了 ${elapsedTU.toFixed(1)} 个 TU。醒来时头脑清明，近来的经历沉淀成了记忆。当前 ${this.clock.timeLine()}` +
+        (closedApp ? `（睡前开着的「${closedApp}」已经自动关闭）` : ""),
       { ref: call?.id },
     );
     this.logger.info("休息结束，耗时 %s 秒，新上下文约 %d 字符", ((Date.now() - startReal) / 1000).toFixed(1), this.context.approxChars());

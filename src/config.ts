@@ -137,6 +137,26 @@ export interface PlatformOpsConfig {
   groupLeave: boolean;
 }
 
+/** 外接 MCP Server（对 Bot 呈现为手机里的一个 App） */
+export interface McpServerConfig {
+  enabled: boolean;
+  name: string;
+  description: string;
+  transport: "stdio" | "http";
+  command: string;
+  args: string[];
+  url: string;
+  headers: Record<string, string>;
+}
+
+/** 手机应用（Apps）：聊天平台之外，Bot 可以用 open_app 打开的应用 */
+export interface AppsConfig {
+  chatAppName: string;
+  weatherEnabled: boolean;
+  weatherDefaultCity: string;
+  mcpServers: McpServerConfig[];
+}
+
 /** 这些平台操作需要引用消息编号：开启任意一项时，消息记录会附带 (msg:xxx) 标注 */
 export function needsMsgIds(ops: PlatformOpsConfig): boolean {
   return ops.recall || ops.react || ops.reply || ops.forwardMsgs || ops.emojiLikes || ops.essence;
@@ -150,6 +170,7 @@ export interface Config {
   clock: ClockConfigData;
   messaging: MessagingConfig;
   platformOps: PlatformOpsConfig;
+  apps: AppsConfig;
   captioners: CaptionersConfig;
   media: MediaConfig;
   tts: TtsConfig;
@@ -405,6 +426,47 @@ export const Config: Schema<Config> = Schema.intersect([
     }).description(
       "聊天平台扩展操作：为 Bot 提供收发消息之外的平台能力（默认全部关闭）。" +
         "开关变化会以事件告知 Bot 并即刻生效；置顶的工具列表在下次 rest 压缩时才同步（保护前缀缓存）",
+    ),
+  }),
+
+  Schema.object({
+    apps: Schema.object({
+      chatAppName: Schema.string()
+        .default("QQ")
+        .description("聊天平台在 Bot 手机里的应用名。open_app 打开它 = 看一眼最近消息（check_msg）"),
+      weatherEnabled: Schema.boolean()
+        .default(true)
+        .description(
+          "内置天气应用：现实世界设定查询真实天气（Open-Meteo，免费无需 key）；" +
+            "虚构世界设定由 World-LLM 生成并沉淀进世界状态。现实/虚构在创世（world.init）时由 World-LLM 依据世界定义判定",
+        ),
+      weatherDefaultCity: Schema.string()
+        .default("")
+        .description("真实天气的默认城市（Bot 查询时不指定城市则使用；留空则要求 Bot 自己给出城市）"),
+      mcpServers: Schema.array(
+        Schema.object({
+          enabled: Schema.boolean().default(true).description("启用该应用"),
+          name: Schema.string().default("").description("应用名（Bot 用 open_app 打开它的名字）"),
+          description: Schema.string().default("").description("一句话介绍（展示在已安装应用列表里）"),
+          transport: Schema.union([
+            Schema.const("stdio").description("stdio：本地子进程"),
+            Schema.const("http").description("http：Streamable HTTP 端点"),
+          ])
+            .default("stdio")
+            .description("传输方式"),
+          command: Schema.string()
+            .default("")
+            .description('stdio：启动命令（args 留空时可整条写在这里，如 "npx -y @modelcontextprotocol/server-filesystem /tmp"）'),
+          args: Schema.array(Schema.string()).default([]).description("stdio：命令参数"),
+          url: Schema.string().default("").description("http：MCP 端点 URL"),
+          headers: Schema.dict(Schema.string()).default({}).description("http：附加请求头（如 Authorization）"),
+        }),
+      )
+        .default([])
+        .description("外接 MCP Server 列表：每个 Server 对 Bot 来说是手机里的一个 App"),
+    }).description(
+      "手机应用（Apps / MCP）：MCP Server 与内置应用不占用常驻工具位，" +
+        "Bot 用 open_app 打开后其操作才展开可用（一次只开一个，切换/关闭/rest 后失效）",
     ),
   }),
 
