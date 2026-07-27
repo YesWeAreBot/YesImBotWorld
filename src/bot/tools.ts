@@ -36,6 +36,18 @@ export const BOT_TOOLS: BotToolDef[] = [
       "需要重温全文时加 full: true。状态不会频繁变化，无事时不必反复查看。",
   },
   {
+    name: "check_time",
+    signature: "check_time()",
+    description:
+      "看一眼现在几点了（看手表、掏手机、找附近的时钟）。能否看到、通过什么看到由世界决定——身边没有计时工具时可能失败。",
+  },
+  {
+    name: "check_news",
+    signature: "check_news(n?: number)",
+    description:
+      "回想或打听世界上近来发生的事（新闻与见闻），列出最近 n 条（默认 10）。check_status(world) 只给新增的，这里可以完整回看。",
+  },
+  {
     name: "check_msg",
     signature: "check_msg(n: number)",
     description: "拿起手机看一眼：列出最近活跃的 n 个频道及各自的最新一条消息。",

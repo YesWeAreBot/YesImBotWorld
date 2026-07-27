@@ -161,6 +161,8 @@ Bot 不只能收，也能发：
 | `act(description)` | 在世界中做事，World-LLM 裁定结果 |
 | `rest(duration?)` | 休息：压缩上下文 + 预热 KV cache，醒来获知流逝的 TU |
 | `check_status(target)` | 查看自身（`self`）或世界（`world`，含近期 News） |
+| `check_time()` | 看一眼现在几点（世界裁定能否得知——身边没有计时工具时可能失败；World-LLM 不可用时退化为直接报时） |
+| `check_news(n?)` | 回看世界近期新闻/见闻（最近 n 条，默认 10；与 check_status 的增量视图同步） |
 | `check_msg(n)` | 最近活跃的 n 个频道及最新一条消息 |
 | `select_channel(id, n)` | 查看频道最近 n 条消息（`id` 为 `platform:channelId`） |
 | `check_gallery()` | 浏览收藏夹（`basePath/gallery/`，Bot 或用户投放的图片/文件） |

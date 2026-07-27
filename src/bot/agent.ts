@@ -88,6 +88,13 @@ export class BotAgent {
   private lastSendSig: string | null = null;
   /** 上一次 act 的描述与调用编号，用于拦截"结果未出就重复做同一件事" */
   private lastAct: { sig: string; callId: string } | null = null;
+  /**
+   * 注入 system 段的"醒来时刻"：仅在 start() 与 rest 结束时更新。
+   * 决不能用实时时间——那会让 system 段每 0.1 TU 变一次，
+   * 前缀在 system 处断裂，整个 Tool Call 流每次请求都重新 prompt eval（缓存全灭）。
+   * 当前时间由事件的 t 属性承载。
+   */
+  private wakeTimeLine = "";
 
   constructor(
     private config: Config,
@@ -112,6 +119,7 @@ export class BotAgent {
   start(): void {
     if (this.running) return;
     this.running = true;
+    this.wakeTimeLine = this.clock.timeLine();
     this.abort = new AbortController();
     this.loopPromise = this.runLoop().catch((err) => {
       this.logger.error("Bot-LLM 主循环异常退出: %s", err);
@@ -225,7 +233,7 @@ export class BotAgent {
 
         let parsed: ParsedToolCall;
         try {
-          parsed = await this.backend.generate(this.context, this.clock.timeLine(), this.abort!.signal);
+          parsed = await this.backend.generate(this.context, this.wakeTimeLine, this.abort!.signal);
         } catch (err) {
           if (!this.running) break;
           if (err instanceof ToolCallParseError) {
@@ -247,15 +255,6 @@ export class BotAgent {
           call.duration ? ` +${call.duration}TU` : "",
         );
         await this.dispatch(call);
-        // 即时调用（期望完成时刻已到却尚未交付结果，如 check_msg 的数据库查询）：
-        // 给一个短暂宽限，等结果先进入邮箱再生成下一个调用，防止 Bot 重复调用同一工具
-        if (
-          !this.isWaitingOn(call.id) &&
-          call.expectedAt <= this.clock.now() &&
-          this.scheduler.isPending(call.id)
-        ) {
-          await this.scheduler.waitForDelivery(call.id, INSTANT_RESULT_GRACE_MS);
-        }
       } catch (err) {
         if (!this.running) break;
         this.logger.error("Bot-LLM 循环出错: %s", err);
@@ -279,11 +278,6 @@ export class BotAgent {
       };
       await this.context.appendEvent(event);
     }
-  }
-
-  /** 是否正因某个调用而暂停生成（独立方法以避免 TS 对 this.waiting 的过窄推断） */
-  private isWaitingOn(callId: string): boolean {
-    return this.waiting !== null && this.waiting.callId === callId;
   }
 
   private async sleepUntilWoken(): Promise<void> {
@@ -332,6 +326,21 @@ export class BotAgent {
         return this.doRest(call, false);
       case "check_status":
         return this.dispatchLocal(call, async () => this.readStatus(call));
+      case "check_time":
+        // 由世界裁定能否得知时间（允许失败）；World-LLM 不可用时退化为直接报时，保证工具可靠
+        return this.dispatchLocal(call, async () => {
+          const parts: string[] = [];
+          await this.world.resolveCheckTime((content) => parts.push(content));
+          return parts.length ? parts.join("\n") : `你看了看时间——当前 ${this.clock.timeLine()}`;
+        });
+      case "check_news":
+        return this.dispatchLocal(call, async () => {
+          const news = await this.files.readNews(clampInt(call.arguments.n, 1, 30, 10));
+          if (!news.length) return "你回想近来听到的种种消息——似乎没什么值得一提的大事。";
+          // 与 check_status(world) 的增量视图保持同步：这里看过的不再作为"新发生的事"重复出现
+          this.lastNewsT = Math.max(...news.map((e) => e.t));
+          return `你回想起近来听到的种种消息：\n` + news.map((e) => `- [${e.clock}] ${e.content}`).join("\n");
+        });
       case "check_msg":
         return this.dispatchLocal(call, async () =>
           this.messenger.recentChannels(clampInt(call.arguments.n, 1, 20, 5)),
@@ -675,9 +684,15 @@ export class BotAgent {
     }
   }
 
-  private dispatchLocal(call: ToolCallRecord, run: () => Promise<string | RichText>): void {
+  private async dispatchLocal(call: ToolCallRecord, run: () => Promise<string | RichText>): Promise<void> {
     this.ackIfDurable(call);
     this.scheduler.schedule(call, { executeAt: "now", run });
+    // 即时查询类工具（无 duration 的本地操作）：给一个短暂宽限等结果先进邮箱，
+    // 避免下一次生成时结果尚不可见导致 Bot 重复调用。
+    // act/send 有各自的复读拦截，且其执行可能较慢（世界裁定/网络），不在此等待。
+    if ((call.duration ?? 0) <= 0) {
+      await this.scheduler.waitForDelivery(call.id, INSTANT_RESULT_GRACE_MS);
+    }
   }
 
   private dispatchSend(call: ToolCallRecord): void {
@@ -879,8 +894,12 @@ export class BotAgent {
     }
     if (!this.running) return;
 
+    // 醒来时刻更新为当前时间（这是 system 段时间唯一的合法更新时机——
+    // 压缩后前缀本来就要重建，此时更新不损失缓存）
+    this.wakeTimeLine = this.clock.timeLine();
+
     // 预热 KV cache（text 模式）
-    await this.backend.warmup?.(this.context, this.clock.timeLine()).catch(() => {});
+    await this.backend.warmup?.(this.context, this.wakeTimeLine).catch(() => {});
 
     const elapsedTU = (Date.now() - startReal) / 1000 / this.config.clock.realSecondsPerUnit;
     this.pushEvent(

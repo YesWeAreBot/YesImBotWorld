@@ -126,7 +126,11 @@ export class WorldAgent {
       `1. 按需 check 世界/Bot 状态，保证裁定与现状一致；\n` +
       `2. 必须调用一次 send_event，以第三人称客观叙述动作完成时的结果——聚焦什么发生了变化、` +
       `什么被怎么样了（允许失败、意外或有趣的转折）；\n` +
-      `3. 若动作改变了世界或 Bot 的处境，update 对应状态；值得记录的事用 update news 记一条。`;
+      `3. 动作若改变了 Bot 自身——位置、姿态、状态、心情、正在做的事、随身物品——` +
+      `**必须** update bot_status 使其与裁定后的现实一致（这一步经常被遗漏，请自查）；` +
+      `若改变了周遭世界，update world_status；\n` +
+      `4. News 是大事记不是流水账：只有足够重要、之后可能被提起或产生影响的结果才 update news 记一条，` +
+      `日常小动作不要记录。`;
     return this.invokeWithTools({ task, deliver });
   }
 
@@ -142,15 +146,28 @@ export class WorldAgent {
     return this.invokeWithTools({ task, deliver });
   }
 
+  /** Bot 主动查看时间：由世界裁定它此刻能否得知时间（允许失败） */
+  async resolveCheckTime(deliver: (content: string) => void): Promise<boolean> {
+    const task =
+      `Bot 想知道现在几点了（看手表、掏出手机、或寻找附近的时钟）。当前实际时刻：${this.clock.timeLine()}。\n` +
+      `请根据 bot_status / world_status（按需 check）裁定它此刻能否得知时间：\n` +
+      `- 能：send_event 以第三人称叙述它如何得知（如「手机屏幕亮起，显示 08:42」「墙上的挂钟指向下午三点」），` +
+      `事件内容必须包含具体的时间；\n` +
+      `- 不能（例如身处荒野、没有任何计时工具、手表停了）：send_event 叙述它找不到时间来源，不要透露时间。`;
+    return this.invokeWithTools({ task, deliver });
+  }
+
   /** Tingle：世界心跳，推进世界演化 */
   async tingle(deliver: (content: string) => void): Promise<void> {
     const task =
       `世界心跳（Tingle）触发，当前 ${this.clock.timeLine()}。\n` +
       `请推进世界的自然演化：\n` +
       `1. check world_status 与最近 news，保持连贯；\n` +
-      `2. 构思一件此刻世界中发生的事（大小皆可：天气变化、路人经过、新闻播报、突发事件……），` +
-      `用 update news 记录，并按需 update world_status；\n` +
-      `3. 仅当这件事会被 Bot 直接感知到（发生在它身边、有巨大动静等）时，才 send_event 告诉它，否则不要打扰。`;
+      `2. 构思一件此刻世界中正在发生的事（大小皆可：天气变化、路人经过、新闻播报、突发事件……），` +
+      `把由此产生的状态变化 update 到 world_status；\n` +
+      `3. News 是世界的大事记，不是心跳流水账：只有足够重要、之后可能被提起或产生影响的事` +
+      `才 update news 记一条——**大多数心跳不需要写 News**，日常背景动静（天气微变、路人走过）绝不要记录；\n` +
+      `4. 仅当这件事会被 Bot 直接感知到（发生在它身边、有巨大动静等）时，才 send_event 告诉它，否则不要打扰。`;
     await this.invokeWithTools({ task, deliver });
   }
 
@@ -270,6 +287,9 @@ export class WorldAgent {
       "世界中的虚构角色也不存在于聊天平台上，不会给 Bot 发消息或加好友\n" +
       "- 裁定要合理：允许失败、意外与惊喜，但不刻意刁难。若 Bot 试图通过普通动作操作聊天平台" +
       "（如「在手机上回复消息」），不要虚构操作结果，事件中提示它需要亲自去看手机/发消息（它自有相应的能力）\n" +
+      "- 状态文件是当前时刻的真实快照：裁定或演化导致状态变化时必须及时 update——" +
+      "尤其 Bot 的位置、状态、正在做的事、随身物品发生变化时，一定要更新 bot_status，不要让它过时\n" +
+      "- News 是世界的大事记，不是流水账：只记录重要、之后可能被提起或产生影响的事件，日常背景动静不要写入\n" +
       "- 修改状态文件时保持 Markdown 结构稳定，只改需要改的部分\n\n" +
       `当前时刻：${this.clock.timeLine()}\n\n` +
       `<world_definition>（用户给出的世界定义，最高准则）\n${worldDef}\n</world_definition>`

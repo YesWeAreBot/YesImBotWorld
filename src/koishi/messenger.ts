@@ -211,7 +211,8 @@ export class KoishiMessenger implements MessengerApi {
     let atNote = "";
 
     // 引用回复：模拟 QQ 客户端行为——群聊里引用时自动在开头 @ 原发送人 + 空格，
-    // Bot 可用 at_sender: false 去掉（如同真人手动删掉自动加上的 @）
+    // Bot 可用 at_sender: false 去掉（如同真人手动删掉自动加上的 @）。
+    // 私聊没有 @ 的概念，绝不附加 at 元素（QQ 私聊无法渲染 at，会留下一个空格）。
     if (replyTo) {
       elements.push(h("quote", { id: replyTo }));
       stored += `[引用 msg:${replyTo}] `;
@@ -224,6 +225,9 @@ export class KoishiMessenger implements MessengerApi {
           atNote = `，并 @ 了 ${quoted.username || quoted.userId}`;
         }
       }
+      // 没有附加 @ 时（私聊 / 找不到原发送人 / at_sender: false），
+      // 去掉 msg 开头的空白——模型可能模仿"@某人 内容"的格式留下前导空格
+      if (!atNote) msg = msg.trimStart();
     }
 
     // msg 中的内联媒体标记（[图片#12] / [视频#3]…）→ 在对应位置嵌入媒体，实现图文混排
