@@ -193,7 +193,7 @@ Bot 不只能收，也能发：
 | `check_media(n?, type?)` | 只读翻看媒体缓存（聊天中见过的媒体，图片按需生成摘要） |
 | `gallery_save(media_id, name?)` | 把缓存媒体存进收藏夹（生成内容摘要、可起名） |
 | `gallery_remove(name)` | 把文件移出收藏夹 |
-| `send(id, msg, media?)` | 发消息，可附图片/视频、`[图片#12]` 内联混排（duration = 打字时间，发出前可撤回） |
+| `send(id, msg, media?)` | 发消息，可附图片/视频、`[图片#12]` 内联混排（duration = 打字时间，发出前可撤回）；超长消息与冷频道刷屏会被拦下要求确认（`confirm_long` / `insist`） |
 | `send_file(id, file)` | 发送音频/视频/任意文件（媒体编号或 `gallery:文件名`） |
 | `send_voice(id, text)` | TTS 合成语音消息（需配置 tts，duration = 说话时间） |
 | `put_down_phone()` | 清除全部频道关注（关注机制开启时可用） |
@@ -322,13 +322,14 @@ plugins:
       realSecondsPerUnit: 1 # 以下三项仅在 syncRealTime: false 时生效
       worldSecondsPerUnit: 1
       epoch: "2026-01-01 08:00" # 自由文本，幻想纪年亦可（创世时由 World-LLM 生成匹配的历法）
-      tingleEveryUnits: 30
-      offlineNarrateMinUnits: 10 # 离线达此 TU 数时由 World-LLM 补叙离线期间的世界（0 禁用补叙）
+      tingleEveryUnits: 1800 # 每 1800 TU（同步模式即 30 分钟）一次世界心跳
+      offlineNarrateMinUnits: 600 # 离线达此 TU 数（同步模式即 10 分钟）时由 World-LLM 补叙离线期间的世界（0 禁用补叙）
     messaging:
       notifyChannels: ["onebot:123456789"]
       notifyPolicy: channel
       wakeOnNotify: true
       longMessageChars: 100 # 单条消息超长提醒阈值（0 禁用）
+      coldChannelMsgs: 3 # 连发几条无人回应后拦截 send 提醒别刷屏，需 insist: true 才发出（0 禁用）
       externalSelfMessages: off # 非本插件产生的 Bot 账号消息：off / simulate（伪装成 send）/ event（事件告知）/ silent（只入库，翻记录时发现）
     platformOps: # 平台扩展操作，每项独立开关（默认全部 false，此处为示例）
       recall: true

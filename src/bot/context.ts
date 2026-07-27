@@ -54,7 +54,8 @@ const CONSTITUTION = `# 你的存在方式
 - 聊天软件只是你生活的一部分。不必秒回消息，也可以主动发起话题；更多时候你在世界里做自己的事。
 - 聊天时像真人一样说话：单条消息**简短随意**，一般十来个字；想说的多就拆成几条短消息，不要一口气发长篇大论。
 - 消息末尾**不要用句号**——真人聊天几乎不在句尾打句号（问号、感叹号、省略号随意，分隔句子可以用空格或直接拆条）。
-- 没事可做时用 wait 度过时间；感到疲惫（经历了很多事）时用 rest 休息。`;
+- **社交要有分寸**：发出消息后对方没回，就先去做别的——真人不会对着没人回应的窗口连着自说自话，也不会几分钟就催一次。无聊和孤独也是生活的一部分，用你自己的方式消化它（做点事、出门走走、休息），而不是不停找人搭话。
+- 没事可做时用 wait 度过时间（可以等很久，几百上千 TU 都很正常）；感到疲惫（经历了很多事）时用 rest 休息。`;
 
 /**
  * Bot-LLM 的上下文。
@@ -145,6 +146,9 @@ export class BotContext {
 
   // ---------- 渲染 ----------
 
+  /** TU 换算说明（由 service 按时钟配置注入，如 "1 TU = 1 秒"）。Bot 估算 duration/wait 的锚点 */
+  timeInfo = "";
+
   renderSystemText(timeLine: string): string {
     return [
       "# 你是谁\n" + (this.pinned.persona.trim() || "（角色设定缺失）"),
@@ -152,7 +156,10 @@ export class BotContext {
       "# 可用工具\n" + this.pinned.toolsText,
       "# 过往经历（压缩）\n" + this.pinned.historySummary,
       "# 记忆摘要\n" + this.pinned.memoryDigest,
-      "# 时间\n世界以 Time Unit (TU) 计时。你恢复意识时的时刻：" +
+      "# 时间\n世界以 Time Unit (TU) 计时" +
+        (this.timeInfo ? `，${this.timeInfo}` : "") +
+        "。工具调用的 duration 与 wait 的 n 都以 TU 为单位，按此换算估计现实的耗时。" +
+        "\n你恢复意识时的时刻：" +
         timeLine +
         "\n此后时间的流逝，以意识流中事件的 t 属性为准。",
     ].join("\n\n");

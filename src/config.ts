@@ -96,6 +96,7 @@ export interface MessagingConfig {
   wakeOnNotify: boolean;
   focusDurationUnits: number;
   longMessageChars: number;
+  coldChannelMsgs: number;
   externalSelfMessages: ExternalSelfMessageMode;
 }
 
@@ -291,15 +292,15 @@ export const Config: Schema<Config> = Schema.intersect([
         ),
       tingleEveryUnits: Schema.number()
         .min(0)
-        .default(30)
-        .description("每过多少个 Time Unit 产生一次 Tingle（触发 World-LLM 推进世界、生成 News）。0 表示禁用"),
+        .default(1800)
+        .description("每过多少个 Time Unit 产生一次 Tingle（触发 World-LLM 推进世界、生成 News）。默认 1800（同步模式下即 30 分钟）。0 表示禁用"),
       offlineNarrateMinUnits: Schema.number()
         .min(0)
-        .default(10)
+        .default(600)
         .description(
           "Koishi 关闭期间世界时间照常流逝（用 world.stop 显式暂停才会冻结时间）。" +
             "重新启动世界时，若离线时长达到此 TU 数，将由 World-LLM 补叙这段时间世界发生了什么并告知 Bot。" +
-            "0 表示只告知流逝了多少时间、不做补叙",
+            "默认 600（同步模式下即 10 分钟）。0 表示只告知流逝了多少时间、不做补叙",
         ),
     }).description("World Clock"),
   }),
@@ -560,17 +561,23 @@ export const Config: Schema<Config> = Schema.intersect([
         .description("Bot 处于 wait() 中时，收到通知是否将其唤醒（类似手机震动打断等待）"),
       focusDurationUnits: Schema.number()
         .min(0)
-        .default(30)
+        .default(1800)
         .description(
           "Bot 打开频道（select_channel）或向频道发送消息后，持续关注该频道多少个 Time Unit。" +
             "关注期间该频道的消息无视通知策略与频道列表，必定呈现完整内容；" +
-            "Bot 可用 put_down_phone 主动放下手机。0 表示禁用关注机制",
+            "Bot 可用 put_down_phone 主动放下手机。默认 1800（同步模式下即 30 分钟）。0 表示禁用关注机制",
         ),
       longMessageChars: Schema.natural()
         .default(100)
         .description(
           "单条消息的长度提醒阈值（字符数）。send 的 msg 超过该长度时不会立即发出，" +
             "而是提醒 Bot 日常聊天应使用短消息，需要它加 confirm_long: true 二次确认才发送。0 表示禁用",
+        ),
+      coldChannelMsgs: Schema.natural()
+        .default(3)
+        .description(
+          "冷频道刷屏提醒：连续向同一频道发出多少条消息而无人回应后，继续 send 会被拦下提醒" +
+            "（像真人一样避免对着没人回应的窗口自说自话），需要 Bot 加 insist: true 才发出。0 表示禁用",
         ),
       externalSelfMessages: Schema.union([
         Schema.const("off").description("忽略（默认）"),

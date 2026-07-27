@@ -19,7 +19,14 @@ export interface MessengerApi {
   checkMedia(n: number, type?: "image" | "audio" | "video"): Promise<string>;
   gallerySave(mediaId: string, name?: string): Promise<string>;
   galleryRemove(name: string): Promise<string>;
-  send(id: string, msg: string, media?: (string | number)[], replyTo?: string, atSender?: boolean): Promise<string>;
+  send(
+    id: string,
+    msg: string,
+    media?: (string | number)[],
+    replyTo?: string,
+    atSender?: boolean,
+    insist?: boolean,
+  ): Promise<string>;
   sendFile(id: string, ref: string): Promise<string>;
   sendVoice(id: string, text: string): Promise<string>;
   putDownPhone(): Promise<string>;
@@ -99,7 +106,7 @@ export class BotAgent {
   private lastAct: { sig: string; callId: string } | null = null;
   /**
    * 注入 system 段的"醒来时刻"：仅在 start() 与 rest 结束时更新。
-   * 决不能用实时时间——那会让 system 段每 0.1 TU 变一次，
+   * 决不能用实时时间——那会让 system 段随时间不断变化，
    * 前缀在 system 处断裂，整个 Tool Call 流每次请求都重新 prompt eval（缓存全灭）。
    * 当前时间由事件的 t 属性承载。
    */
@@ -922,9 +929,10 @@ export class BotAgent {
     }
     this.lastSendSig = sig;
     this.ackStart(call);
+    const insist = isTruthy(call.arguments.insist);
     this.scheduler.schedule(call, {
       executeAt: "expected", // 打字完成的那一刻消息才真正发出（此前可 cancel）
-      run: async () => this.messenger.send(id, msg, media, replyTo, atSender),
+      run: async () => this.messenger.send(id, msg, media, replyTo, atSender, insist),
     });
   }
 

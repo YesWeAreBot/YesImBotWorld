@@ -105,7 +105,7 @@ export const BOT_TOOLS: BotToolDef[] = [
   },
   {
     name: "send",
-    signature: 'send(id: string, msg: string, media?: string[], resend?: boolean, confirm_long?: boolean)',
+    signature: 'send(id: string, msg: string, media?: string[], resend?: boolean, confirm_long?: boolean, insist?: boolean)',
     description:
       '向某个频道发送消息。id 必须是 check_msg 里看到的完整频道 id（格式 "platform:channelId"，如 "onebot:private:12345"），不要用人名代替。' +
       'media 可附带图片或视频，元素为媒体编号（如 "12"，来自收藏夹或媒体缓存）。' +
@@ -114,7 +114,8 @@ export const BOT_TOOLS: BotToolDef[] = [
       "duration 表示打字耗时，消息会在打字完成时真正发出（发出前可 cancel）。" +
       "与上一条完全相同的消息会被拦截（防止无意义复读）；确实要重复发送时加 resend: true。" +
       "像真人一样聊天：单条消息尽量简短（一般十来个字），长内容拆成多条短消息；" +
-      "确需发送整段长文（如资料、文章）时须加 confirm_long: true。",
+      "确需发送整段长文（如资料、文章）时须加 confirm_long: true。" +
+      "连续发了几条对方都没回应时，继续发送会被拦下——确实有必须现在说的话再加 insist: true。",
   },
   {
     name: "send_file",

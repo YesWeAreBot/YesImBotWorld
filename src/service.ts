@@ -180,6 +180,10 @@ export class WorldService extends Service<Config> {
     const tools = this.currentTools();
 
     this.botContext = new BotContext(this.files, renderToolsText(tools));
+    // TU 换算锚点：Bot 估算 duration / wait 时长的依据（如「1 TU = 1 秒」）
+    this.botContext.timeInfo =
+      `1 TU = ${this.clock.unitWorldSeconds} 秒` +
+      (this.clock.syncRealTime ? "（世界时间与现实同步）" : `（现实中 ${this.clock.unitRealSeconds} 秒）`);
     await this.botContext.load();
     if (!this.botContext.pinned.persona.trim()) {
       this.botContext.pinned.persona = await this.files.readBotStatus();
@@ -200,6 +204,7 @@ export class WorldService extends Service<Config> {
       this.config.tts.enabled ? new TtsClient(this.config.tts) : null,
       this.focus,
       this.config.platformOps,
+      this.config.messaging,
       this.requests,
       this.ownSends,
     );
@@ -240,7 +245,8 @@ export class WorldService extends Service<Config> {
         "system",
         `你睁开眼睛，意识逐渐清晰。这是你有意识的第一刻。当前 ${this.clock.timeLine()}。不妨先 check_status 看看自己和这个世界。`,
       );
-    } else if (offline && offline.gapTU >= 1) {
+    } else if (offline && offline.gapTU * this.clock.unitWorldSeconds >= 60) {
+      // 离线超过 1 世界分钟才算"意识中断"（更短的间隙用下面的"一瞬间失神"）
       this.bot.pushEvent(
         "system",
         `你的意识中断了一段时间——从 ${this.clock.timeLine(offline.fromTU)} 到现在，` +

@@ -8,7 +8,7 @@ import type { MediaStore } from "../media/store.js";
 import type { TtsClient } from "../media/tts.js";
 import type { MediaRef, MediaType, RichText } from "../types.js";
 import type { FocusManager } from "./focus.js";
-import { needsMsgIds, type PlatformOpsConfig } from "../config.js";
+import { needsMsgIds, type MessagingConfig, type PlatformOpsConfig } from "../config.js";
 import type { KnownChannel, MessageStore } from "./messages.js";
 import type { OwnSendTracker } from "./ownsends.js";
 import type { RequestStore } from "./requests.js";
@@ -40,6 +40,7 @@ export class KoishiMessenger implements MessengerApi {
     private tts: TtsClient | null,
     private focus: FocusManager,
     private ops: PlatformOpsConfig,
+    private messaging: MessagingConfig,
     private requests: RequestStore,
     private ownSends: OwnSendTracker,
   ) {}
@@ -201,9 +202,24 @@ export class KoishiMessenger implements MessengerApi {
     media: (string | number)[] = [],
     replyTo?: string,
     atSender = true,
+    insist = false,
   ): Promise<string> {
     const target = await this.resolveBot(id);
     if ("error" in target) return target.error;
+
+    // 冷频道刷屏拦截：最近 N 条消息全是自己发的（无人回应）时，继续发送需要 insist 确认。
+    // 在实际发出时刻检查（而非生成时刻）——打字期间对方回复了就不拦。
+    const coldLimit = this.messaging.coldChannelMsgs;
+    if (coldLimit > 0 && !insist) {
+      const recent = await this.store.channelMessages(target.platform, target.channelId, coldLimit);
+      if (recent.length >= coldLimit && recent.every((r) => r.self)) {
+        return (
+          `（消息没有发出：你已经连着给 ${id} 发了至少 ${recent.length} 条消息，对方一直没有回应。` +
+          `真人不会这样对着窗口自说自话——先去做点别的吧，对方回复时你会收到通知。` +
+          `如果你确实还有必须现在说的话，在参数里加上 insist: true 再发。）`
+        );
+      }
+    }
 
     const elements: h[] = [];
     const sentRefs: MediaRef[] = [];
