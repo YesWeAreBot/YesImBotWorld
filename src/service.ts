@@ -11,6 +11,7 @@ import { FocusManager } from "./koishi/focus.js";
 import { Gateway } from "./koishi/gateway.js";
 import { MessageStore } from "./koishi/messages.js";
 import { KoishiMessenger } from "./koishi/messenger.js";
+import { OwnSendTracker } from "./koishi/ownsends.js";
 import { RequestStore } from "./koishi/requests.js";
 import { CaptionService } from "./media/captioner.js";
 import { createAttachmentLoader } from "./media/parts.js";
@@ -41,6 +42,7 @@ export class WorldService extends Service<Config> {
   private world!: WorldAgent;
   private focus!: FocusManager;
   private requests!: RequestStore;
+  private ownSends!: OwnSendTracker;
   private botContext: BotContext | null = null;
   private bot: BotAgent | null = null;
   private tingle: TingleTimer | null = null;
@@ -74,11 +76,25 @@ export class WorldService extends Service<Config> {
 
     // 平台请求登记处（好友申请 / 入群邀请等，Bot 用 handle_request 处理）
     this.requests = new RequestStore();
+    // 本插件自身发送标记（区分外部以 Bot 账号发出的消息）
+    this.ownSends = new OwnSendTracker();
 
     // 消息网关始终活跃：所有消息入库；通知事件仅在世界运行时投递
-    new Gateway(ctx, config.messaging, config.platformOps, this.store, this.media, this.renderer, this.focus, this.requests, {
+    new Gateway(ctx, config.messaging, config.platformOps, this.store, this.media, this.renderer, this.focus, this.requests, this.ownSends, {
       notify: (content, wake) => {
         if (this.worldRunning && this.bot) this.bot.pushEvent("koishi", content, { wake });
+      },
+      selfMessage: (key, content) => {
+        if (!this.worldRunning || !this.bot) return;
+        const mode = config.messaging.externalSelfMessages;
+        if (mode === "simulate") {
+          this.bot.simulateExternalSend(key, content);
+        } else if (mode === "event") {
+          this.bot.pushEvent(
+            "koishi",
+            `你注意到自己的账号在 ${key} 发出了一条消息——但那不是你发的（大概是手机里某个应用的自动回复）：${content}`,
+          );
+        }
       },
     });
 
@@ -179,6 +195,7 @@ export class WorldService extends Service<Config> {
       this.focus,
       this.config.platformOps,
       this.requests,
+      this.ownSends,
     );
     this.bot = new BotAgent(
       this.config,

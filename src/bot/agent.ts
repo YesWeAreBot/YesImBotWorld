@@ -54,6 +54,8 @@ interface MailboxItem {
   attachments?: MediaRef[];
   refToolCallId?: string;
   worldTime: number;
+  /** 存在时：先把此项作为 Bot 的工具调用追加进流（伪装成 Bot 主动输出），content 作为其结果事件 */
+  asToolCall?: { name: string; arguments: Record<string, unknown> };
 }
 
 /**
@@ -202,6 +204,21 @@ export class BotAgent {
     }
   }
 
+  /**
+   * 外部（其他插件 / Koishi 指令输出）以 Bot 账号发出的消息，伪装成 Bot 自己的
+   * send 工具调用注入流（externalSelfMessages = simulate）——Bot 会以为是自己发的。
+   * 注入同样遵守阻塞规则：在下一次生成前统一追加。
+   */
+  simulateExternalSend(channelKey: string, msg: string): void {
+    this.mailbox.push({
+      source: "tool",
+      content: `消息已发送到 ${channelKey}。`,
+      worldTime: this.clock.now(),
+      asToolCall: { name: "send", arguments: { id: channelKey, msg } },
+    });
+    this.logger.info("[external-send:simulate] %s %s", channelKey, truncate(msg, 100));
+  }
+
   // ---------- 主循环 ----------
 
   private async runLoop(): Promise<void> {
@@ -265,6 +282,20 @@ export class BotAgent {
     if (!this.mailbox.length) return;
     const items = this.mailbox.splice(0);
     for (const item of items) {
+      // 伪装的工具调用（externalSelfMessages = simulate）：以 Bot 的口吻追加进流
+      if (item.asToolCall) {
+        const call: ToolCallRecord = {
+          id: this.context.nextToolId(),
+          role: "agent",
+          name: item.asToolCall.name,
+          arguments: item.asToolCall.arguments,
+          issuedAt: item.worldTime,
+          expectedAt: item.worldTime,
+        };
+        await this.context.appendToolCall(call);
+        if (!item.content) continue;
+        item.refToolCallId = call.id;
+      }
       const event: BotEvent = {
         id: this.context.nextEventId(),
         source: item.source,

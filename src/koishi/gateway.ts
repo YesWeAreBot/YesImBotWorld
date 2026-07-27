@@ -1,16 +1,19 @@
 import { h, type Context, type Session } from "koishi";
 import type { MessagingConfig, PlatformOpsConfig } from "../config.js";
 import type { MediaRenderer } from "../media/render.js";
-import { mediaPlaceholder } from "../media/render.js";
+import { MEDIA_PLACEHOLDER, mediaPlaceholder } from "../media/render.js";
 import type { MediaStore } from "../media/store.js";
 import type { RichText } from "../types.js";
 import type { FocusManager } from "./focus.js";
 import type { MessageStore } from "./messages.js";
+import type { OwnSendTracker } from "./ownsends.js";
 import type { RequestStore } from "./requests.js";
 
 export interface GatewayCallbacks {
   /** 向 Bot-LLM 投递通知事件；wake 表示是否唤醒 wait() 中的 Bot */
   notify(content: RichText, wake: boolean): void;
+  /** 外部（其他插件/指令输出）以 Bot 账号发出的消息（externalSelfMessages 开启时） */
+  selfMessage(channelKey: string, content: string): void;
 }
 
 /**
@@ -29,16 +32,25 @@ export class Gateway {
     private renderer: MediaRenderer,
     private focus: FocusManager,
     private requests: RequestStore,
+    private ownSends: OwnSendTracker,
     private callbacks: GatewayCallbacks,
   ) {
-    ctx.middleware(async (session, next) => {
-      try {
-        await this.handle(session);
-      } catch (err) {
+    // 用 message 事件而非中间件：保证他人的指令消息（会被指令系统处理）也一样被当作普通消息
+    // 入库并按通知策略投递（指令照常执行，互不影响）
+    ctx.on("message", (session) => {
+      void this.handle(session).catch((err) => {
         ctx.logger("yesimbot-world").warn("消息处理失败: %s", err);
-      }
-      return next();
+      });
     });
+
+    // Bot 账号发出的、非本插件产生的消息（其他插件/指令输出等）
+    if (cfg.externalSelfMessages !== "off") {
+      ctx.on("send", (session) => {
+        void this.handleSelfSent(session).catch((err) => {
+          ctx.logger("yesimbot-world").warn("外发消息处理失败: %s", err);
+        });
+      });
+    }
 
     // 平台请求事件（好友申请 / 入群邀请 / 入群申请）：登记后以手机通知的形式告知 Bot
     if (ops.handleRequests) {
@@ -69,6 +81,31 @@ export class Gateway {
           ? `手机弹出提示：${who} 邀请你加入群 ${req.guildId}${note}。${hint}`
           : `手机弹出提示：${who} 申请加入你管理的群 ${req.guildId}${note}。${hint}`;
     this.callbacks.notify({ text }, this.cfg.wakeOnNotify);
+  }
+
+  /** Koishi send 事件：Bot 账号发出了一条消息。区分本插件发送与外部发送 */
+  private async handleSelfSent(session: Session): Promise<void> {
+    if (!session.channelId) return;
+    const key = `${session.platform}:${session.channelId}`;
+    // 本插件（messenger）发出的：已由 storeSelf 入库并有工具调用结果，跳过
+    if (this.ownSends.consume(key)) return;
+
+    const elements = session.elements ?? h.parse(session.content ?? "");
+    const content = await this.serializeElements(elements);
+    if (!content.trim()) return;
+
+    await this.store.store({
+      platform: session.platform ?? "unknown",
+      channelId: session.channelId,
+      guildId: session.guildId ?? "",
+      userId: session.selfId ?? "self",
+      username: "（我）",
+      content,
+      timestamp: new Date(),
+      self: true,
+      messageId: session.messageId ?? "",
+    });
+    this.callbacks.selfMessage(key, toMarkerText(content));
   }
 
   private async handle(session: Session): Promise<void> {
@@ -163,7 +200,9 @@ export class Gateway {
   private async renderFocused(key: string, session: Session, content: string): Promise<RichText> {
     const rendered = await this.renderer.render(content);
     const msgTag =
-      (this.ops.recall || this.ops.react) && session.messageId ? `(msg:${session.messageId}) ` : "";
+      (this.ops.recall || this.ops.react || this.ops.reply) && session.messageId
+        ? `(msg:${session.messageId}) `
+        : "";
     return {
       text: `你正留意着 ${key}，看到新消息——${msgTag}${session.username ?? session.userId}说：${rendered.text}`,
       attachments: rendered.attachments,
@@ -185,4 +224,14 @@ export class Gateway {
       }
     }
   }
+}
+
+const MARKER_LABEL: Record<string, string> = { image: "图片", audio: "音频", video: "视频" };
+
+/** 媒体占位符 → Bot 的内联标记形式（[图片#12]），用于伪装 send 工具调用的 msg 参数 */
+function toMarkerText(content: string): string {
+  return content.replace(
+    MEDIA_PLACEHOLDER,
+    (_, id, type) => `[${MARKER_LABEL[type as string] ?? type}#${id}]`,
+  );
 }

@@ -152,6 +152,19 @@ Bot 不只能收，也能发：
 - **频道 id 纠错**：Bot 把频道 id 写错时（如把用户名当频道 `onebot:TouchNight`），插件会用
   已知频道的参与者模糊匹配，**不执行发送**，而是以事件提示正确的频道 id 让它下次填对。
 
+### 指令消息与外部自发消息
+
+- 他人发送的**指令消息**（如 `world.status`）与普通消息一视同仁：照常入库、按通知策略投递给
+  Bot（指令本身也照常执行，互不影响）；
+- `messaging.externalSelfMessages`（默认 `off`）控制 Bot 账号发出的、**非本插件产生**的消息
+  （其他插件的输出、Koishi 指令回复等）是否让 Bot-LLM 看到：
+  - `simulate`：伪装成 Bot 自己的 `send` 工具调用注入流——Bot 会以为是自己发的（适合特殊玩法）；
+  - `event`：以事件告知"你的账号发出了一条消息，但那不是你发的"——Bot 知情但不认领；
+  - `silent`：不做任何通知，只是像普通消息一样入库（发送者是 Bot 自己的账号）——
+    等 Bot 之后翻看聊天记录（`select_channel`）时自己"意外发现"；
+  - 各模式下这类消息都会入库，`select_channel` 可回看；本插件自己发的消息通过内部标记区分，
+    不会被重复上报。
+
 ## Bot 可用工具
 
 ### 基础工具（始终可用）
@@ -277,6 +290,7 @@ plugins:
       notifyPolicy: channel
       wakeOnNotify: true
       longMessageChars: 100 # 单条消息超长提醒阈值（0 禁用）
+      externalSelfMessages: off # 非本插件产生的 Bot 账号消息：off / simulate（伪装成 send）/ event（事件告知）/ silent（只入库，翻记录时发现）
     platformOps: # 平台扩展操作，每项独立开关（默认全部 false，此处为示例）
       recall: true
       react: true

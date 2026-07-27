@@ -10,6 +10,7 @@ import type { MediaRef, MediaType, RichText } from "../types.js";
 import type { FocusManager } from "./focus.js";
 import type { PlatformOpsConfig } from "../config.js";
 import type { KnownChannel, MessageStore } from "./messages.js";
+import type { OwnSendTracker } from "./ownsends.js";
 import type { RequestStore } from "./requests.js";
 
 /** msg 中的内联媒体标记：Bot 会照抄事件里见到的 [图片#12]、[视频#3：描述] 等形式 */
@@ -40,6 +41,7 @@ export class KoishiMessenger implements MessengerApi {
     private focus: FocusManager,
     private ops: PlatformOpsConfig,
     private requests: RequestStore,
+    private ownSends: OwnSendTracker,
   ) {}
 
   /** 是否需要在消息记录中展示平台消息 id（recall / react / reply 需要引用） */
@@ -269,9 +271,11 @@ export class KoishiMessenger implements MessengerApi {
     }
 
     let msgIds: string[] = [];
+    this.ownSends.expect(`${target.platform}:${target.channelId}`);
     try {
       msgIds = await target.bot.sendMessage(target.channelId, elements);
     } catch (err) {
+      this.ownSends.unexpect(`${target.platform}:${target.channelId}`);
       return `（消息发送失败：${(err as Error).message ?? err}）`;
     }
     await this.storeSelf(target, stored, msgIds[0]);
@@ -327,9 +331,11 @@ export class KoishiMessenger implements MessengerApi {
     }
 
     let msgIds: string[] = [];
+    this.ownSends.expect(`${target.platform}:${target.channelId}`);
     try {
       msgIds = await target.bot.sendMessage(target.channelId, element);
     } catch (err) {
+      this.ownSends.unexpect(`${target.platform}:${target.channelId}`);
       return `（文件发送失败：${(err as Error).message ?? err}）`;
     }
     await this.storeSelf(target, stored, msgIds[0]);
@@ -350,12 +356,14 @@ export class KoishiMessenger implements MessengerApi {
       return `（语音合成失败：${(err as Error).message ?? err}）`;
     }
     let msgIds: string[] = [];
+    this.ownSends.expect(`${target.platform}:${target.channelId}`);
     try {
       msgIds = await target.bot.sendMessage(
         target.channelId,
         h("audio", { src: toDataUrl(audio.data, audio.mime) }),
       );
     } catch (err) {
+      this.ownSends.unexpect(`${target.platform}:${target.channelId}`);
       return `（语音发送失败：${(err as Error).message ?? err}）`;
     }
     // 入资产库留痕，历史记录中可回看

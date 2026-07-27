@@ -85,12 +85,16 @@ export interface ClockConfigData {
 
 export type NotifyPolicy = "count" | "channel" | "content";
 
+/** 非本插件产生的 Bot 账号消息（其他插件/指令输出等）的呈现方式 */
+export type ExternalSelfMessageMode = "off" | "simulate" | "event" | "silent";
+
 export interface MessagingConfig {
   notifyChannels: string[];
   notifyPolicy: NotifyPolicy;
   wakeOnNotify: boolean;
   focusDurationUnits: number;
   longMessageChars: number;
+  externalSelfMessages: ExternalSelfMessageMode;
 }
 
 /** 聊天平台扩展操作（收发消息之外的能力），每个接口独立开关，默认全部关闭 */
@@ -436,6 +440,17 @@ export const Config: Schema<Config> = Schema.intersect([
         .description(
           "单条消息的长度提醒阈值（字符数）。send 的 msg 超过该长度时不会立即发出，" +
             "而是提醒 Bot 日常聊天应使用短消息，需要它加 confirm_long: true 二次确认才发送。0 表示禁用",
+        ),
+      externalSelfMessages: Schema.union([
+        Schema.const("off").description("忽略（默认）"),
+        Schema.const("simulate").description("伪装成 Bot 自己的 send 工具调用（Bot 会以为是自己发的）"),
+        Schema.const("event").description("以事件告知 Bot：你的账号自己发出了一条消息（Bot 知道不是自己发的）"),
+        Schema.const("silent").description("只入库不通知：像别人发的消息一样静静躺在记录里，等 Bot 翻看聊天记录时自己发现"),
+      ])
+        .default("off")
+        .description(
+          "Bot 账号发出的、非本插件产生的消息（其他插件的输出、Koishi 指令回复等）是否让 Bot-LLM 看到。" +
+            "开启后这类消息也会入库（消息记录中可回看）",
         ),
     }).description("Koishi 消息接入"),
   }),
