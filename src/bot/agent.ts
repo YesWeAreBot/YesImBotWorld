@@ -48,9 +48,6 @@ export interface MessengerApi {
   groupLeave(id: string): Promise<string>;
 }
 
-/** 即时调用结果的宽限等待上限（毫秒）：超过则不再等待，照常进入下一轮生成 */
-const INSTANT_RESULT_GRACE_MS = 5000;
-
 interface MailboxItem {
   source: EventSource;
   content: string;
@@ -612,12 +609,22 @@ export class BotAgent {
     }
   }
 
-  /** 带 duration 的调用发出启动确认，让 Bot 知道编号（可 cancel）与预计完成时刻 */
-  private ackIfDurable(call: ToolCallRecord): void {
+  /**
+   * 调度类调用的启动确认：生成后立即以事件告知"已开始执行"，随后照常生成下一个调用。
+   * 这从源头消除了"结果尚未进邮箱 → Bot 以为工具没反应 → 重复调用"的信息真空，
+   * 且不引入任何等待延迟。带 duration 的调用额外附上编号（可 cancel）与预计完成时刻。
+   */
+  private ackStart(call: ToolCallRecord): void {
     if ((call.duration ?? 0) > 0) {
       this.pushEvent(
         "system",
         `${call.id} ${call.name} 已开始，预计 T=${call.expectedAt.toFixed(1)} 完成。`,
+        { ref: call.id },
+      );
+    } else {
+      this.pushEvent(
+        "system",
+        `${call.id} ${call.name} 已开始执行，完成时你会收到结果——不必重复调用。`,
         { ref: call.id },
       );
     }
@@ -666,7 +673,7 @@ export class BotAgent {
       return;
     }
     this.lastAct = { sig, callId: call.id };
-    this.ackIfDurable(call);
+    this.ackStart(call);
     this.scheduler.schedule(call, {
       executeAt: "now", // 世界立刻开始裁定；结果压到期望完成时刻交付
       run: async (task) => {
@@ -684,15 +691,9 @@ export class BotAgent {
     }
   }
 
-  private async dispatchLocal(call: ToolCallRecord, run: () => Promise<string | RichText>): Promise<void> {
-    this.ackIfDurable(call);
+  private dispatchLocal(call: ToolCallRecord, run: () => Promise<string | RichText>): void {
+    this.ackStart(call);
     this.scheduler.schedule(call, { executeAt: "now", run });
-    // 即时查询类工具（无 duration 的本地操作）：给一个短暂宽限等结果先进邮箱，
-    // 避免下一次生成时结果尚不可见导致 Bot 重复调用。
-    // act/send 有各自的复读拦截，且其执行可能较慢（世界裁定/网络），不在此等待。
-    if ((call.duration ?? 0) <= 0) {
-      await this.scheduler.waitForDelivery(call.id, INSTANT_RESULT_GRACE_MS);
-    }
   }
 
   private dispatchSend(call: ToolCallRecord): void {
@@ -733,7 +734,7 @@ export class BotAgent {
       return;
     }
     this.lastSendSig = sig;
-    this.ackIfDurable(call);
+    this.ackStart(call);
     this.scheduler.schedule(call, {
       executeAt: "expected", // 打字完成的那一刻消息才真正发出（此前可 cancel）
       run: async () => this.messenger.send(id, msg, media, replyTo, atSender),
@@ -747,7 +748,7 @@ export class BotAgent {
       this.pushEvent("system", "（send_file 需要 id 和 file 参数。）", { ref: call.id });
       return;
     }
-    this.ackIfDurable(call);
+    this.ackStart(call);
     this.scheduler.schedule(call, {
       executeAt: "expected",
       run: async () => this.messenger.sendFile(id, file),
@@ -761,7 +762,7 @@ export class BotAgent {
       this.pushEvent("system", "（send_voice 需要 id 和 text 参数。）", { ref: call.id });
       return;
     }
-    this.ackIfDurable(call);
+    this.ackStart(call);
     this.scheduler.schedule(call, {
       executeAt: "expected", // 说完的那一刻语音才发出（此前可 cancel）
       run: async () => this.messenger.sendVoice(id, text),
