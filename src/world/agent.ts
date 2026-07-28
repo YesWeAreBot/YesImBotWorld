@@ -141,9 +141,13 @@ export class WorldAgent {
     const task =
       `Bot 从 ${this.clock.timeLine(call.issuedAt)} 开始等待 ${n} 个 TU，等待即将在 ` +
       `${this.clock.timeLine(call.expectedAt)} 结束（届时它会被自动唤醒）。\n` +
-      `请先 check news 和 world_status 了解这段等待期间世界的变化，然后必须调用一次 send_event 告诉 Bot：` +
-      `这段时间里发生的、它能感知到的变化——用第三人称客观叙述什么发生了变化、` +
-      `什么被怎么样了（如果无事发生，就平实地叙述周遭环境此刻的样子）。不必提"等待结束"，唤醒另有提示。`;
+      `请先 check news 和 world_status 了解这段等待期间世界的变化：\n` +
+      `1. 若时间流逝让世界状态发生了变化（时段、天气、进行中事件的推进……），update world_status；\n` +
+      `2. 若 Bot 自身状态也随时间自然变化（等待中的姿态、疲劳、正在做的事已结束等），` +
+      `**一并 update bot_status** 使其反映当前时刻的真实状态；\n` +
+      `3. 然后必须调用一次 send_event 告诉 Bot：这段时间里发生的、它能感知到的变化——` +
+      `用第三人称客观叙述什么发生了变化、什么被怎么样了` +
+      `（如果无事发生，就平实地叙述周遭环境此刻的样子）。不必提"等待结束"，唤醒另有提示。`;
     return this.invokeWithTools({ task, deliver });
   }
 
@@ -166,9 +170,11 @@ export class WorldAgent {
       `1. check world_status 与最近 news，保持连贯；\n` +
       `2. 构思一件此刻世界中正在发生的事（大小皆可：天气变化、路人经过、新闻播报、突发事件……），` +
       `把由此产生的状态变化 update 到 world_status；\n` +
-      `3. News 是世界的大事记，不是心跳流水账：只有足够重要、之后可能被提起或产生影响的事` +
+      `3. 顺手核对 bot_status 是否过时：若时间流逝或这次演化让 Bot 自身状态发生了自然变化` +
+      `（时段更替后的作息、之前在做的事早已结束、疲劳饥饿等），update bot_status 使其与当前时刻一致；\n` +
+      `4. News 是世界的大事记，不是心跳流水账：只有足够重要、之后可能被提起或产生影响的事` +
       `才 update news 记一条——**大多数心跳不需要写 News**，日常背景动静（天气微变、路人走过）绝不要记录；\n` +
-      `4. 仅当这件事会被 Bot 直接感知到（发生在它身边、有巨大动静等）时，才 send_event 告诉它，否则不要打扰。`;
+      `5. 仅当这件事会被 Bot 直接感知到（发生在它身边、有巨大动静等）时，才 send_event 告诉它，否则不要打扰。`;
     await this.invokeWithTools({ task, deliver });
   }
 

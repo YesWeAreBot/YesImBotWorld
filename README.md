@@ -59,11 +59,12 @@ YesImBot World：让 Bot 生活在一个由 LLM 独立维护的虚拟世界中�
 
 | 指令 | 权限 | 说明 |
 |---|---|---|
-| `world.init [-f]` | 3 | 创世（`-f` 归档并重新创世） |
+| `world.init [-f]` | 3 | 创世（`-f` 归档并重新创世）。创世会**清空聊天消息记录**（全新的开始） |
 | `world.start` / `world.stop` | 3 | 运转 / 暂停（时间静止） |
 | `world.status` | 1 | 世界与 Bot 运行状态 |
 | `world.reload` | 3 | 修改定义文件后重载：World-LLM 调整状态，并以世界观内方式告知 Bot |
 | `world.inject <text>` | 3 | 注入一条系统事件（调试用，会唤醒等待中的 Bot） |
+| `world.clearmsg` | 4 | 只清空 Bot 的聊天消息记录（不影响世界状态与定义） |
 | `world.reset` | 4 | 归档并清空全部运行时状态（保留定义文件） |
 
 ## Bot-LLM 两种持续生成模式

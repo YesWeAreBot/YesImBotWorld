@@ -167,6 +167,9 @@ export class WorldService extends Service<Config> {
       return `请先编写世界定义：${this.files.worldDef}`;
     }
 
+    // 创世 = 全新的开始：清空聊天消息记录（否则 Bot 仍能翻到"上辈子"的聊天历史）
+    await this.store.clear();
+
     // 创世：世界时间归零；历法与初始时刻由 World-LLM 在初始化时依据定义生成并持久化
     await this.clock.reset();
 
@@ -417,9 +420,13 @@ export class WorldService extends Service<Config> {
     cmd
       .subcommand(".init", "初始化（创世）：由 World-LLM 根据定义生成初始状态", { authority: 3 })
       .option("force", "-f 强制重新创世（归档并清空当前世界）")
-      .action(async ({ options }) => {
+      .action(async ({ session, options }) => {
         if (this.notReady()) return this.notReady()!;
         try {
+          // 创世要跑多次 World-LLM 调用，耗时可能数分钟：先给出即时反馈
+          if ((await this.files.isInitialized()) ? !!options?.force : true) {
+            await session?.send("开始创世：World-LLM 正在依据定义生成世界（判定世界性质、历法与初始状态），可能需要几分钟，请稍候……");
+          }
           return await this.initWorld(!!options?.force);
         } catch (err) {
           return `创世失败：${(err as Error).message ?? err}`;
@@ -447,14 +454,23 @@ export class WorldService extends Service<Config> {
 
     cmd
       .subcommand(".reload", "用户修改定义文件后：让世界调整状态并（以世界观内方式）告知 Bot", { authority: 3 })
-      .action(async () => {
+      .action(async ({ session }) => {
         if (this.notReady()) return this.notReady()!;
         if (!(await this.files.isInitialized())) return "世界尚未初始化。";
+        await session?.send("正在重载定义：World-LLM 正在调整世界状态，请稍候……");
         const { botDef, worldDef } = await this.files.readDefinitions();
         await this.world.reconcileDefinitions(botDef, worldDef, (content) => {
           this.bot?.pushEvent("world", content);
         });
         return "定义已重新载入，世界状态已调整。";
+      });
+
+    cmd
+      .subcommand(".clearmsg", "清空 Bot 的聊天消息记录（不影响世界状态与定义）", { authority: 4 })
+      .action(async () => {
+        if (this.notReady()) return this.notReady()!;
+        await this.store.clear();
+        return "聊天消息记录已清空（媒体缓存与世界状态不受影响）。";
       });
 
     cmd

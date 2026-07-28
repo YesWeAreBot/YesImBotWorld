@@ -55,6 +55,11 @@ export class MessageStore {
     await this.ctx.database.create("yesimbot_world_message", row);
   }
 
+  /** 清空全部消息记录（world.clearmsg / 创世时调用） */
+  async clear(): Promise<void> {
+    await this.ctx.database.remove("yesimbot_world_message", {});
+  }
+
   /** 最近活跃的 n 个频道及各自最新一条消息 */
   async recentChannels(n: number): Promise<{ key: string; latest: WorldMessageRow }[]> {
     const rows = await this.ctx.database.get(
