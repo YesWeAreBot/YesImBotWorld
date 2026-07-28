@@ -52,6 +52,7 @@ export class WorldFiles {
   readonly clock: string;
   readonly meta: string;
   readonly focus: string;
+  readonly notify: string;
   readonly pinned: string;
   readonly stream: string;
   readonly archiveDir: string;
@@ -66,6 +67,7 @@ export class WorldFiles {
     this.clock = path.join(base, "clock.json");
     this.meta = path.join(base, "meta.json");
     this.focus = path.join(base, "focus.json");
+    this.notify = path.join(base, "notify.json");
     this.pinned = path.join(base, "pinned.json");
     this.stream = path.join(base, "stream.jsonl");
     this.archiveDir = path.join(base, "archive");
@@ -171,7 +173,7 @@ export class WorldFiles {
   /** 重置全部运行时状态（保留用户定义文件），旧状态归档 */
   async reset(): Promise<void> {
     const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-    for (const file of [this.botStatus, this.worldStatus, this.news, this.pinned, this.stream, this.clock, this.meta, this.focus]) {
+    for (const file of [this.botStatus, this.worldStatus, this.news, this.pinned, this.stream, this.clock, this.meta, this.focus, this.notify]) {
       if (await this.exists(file)) {
         const dest = path.join(this.archiveDir, `${stamp}-${path.basename(file)}`);
         await fs.rename(file, dest).catch(() => fs.rm(file, { force: true }));

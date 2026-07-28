@@ -3,9 +3,10 @@ import { needsMsgIds, type MessagingConfig, type PlatformOpsConfig } from "../co
 import type { MediaRenderer } from "../media/render.js";
 import { MEDIA_PLACEHOLDER, mediaPlaceholder } from "../media/render.js";
 import type { MediaStore } from "../media/store.js";
-import type { RichText } from "../types.js";
+import type { PhoneStatus, RichText } from "../types.js";
 import type { FocusManager } from "./focus.js";
 import type { MessageStore } from "./messages.js";
+import type { NotifyManager } from "./notify.js";
 import type { OwnSendTracker } from "./ownsends.js";
 import type { RequestStore } from "./requests.js";
 
@@ -31,6 +32,8 @@ export class Gateway {
     private media: MediaStore,
     private renderer: MediaRenderer,
     private focus: FocusManager,
+    private notifyList: NotifyManager,
+    private phone: PhoneStatus,
     private requests: RequestStore,
     private ownSends: OwnSendTracker,
     private callbacks: GatewayCallbacks,
@@ -71,6 +74,11 @@ export class Gateway {
       guildId: session.guildId,
       comment: session.content?.trim() || undefined,
     });
+    // 手机被放下：只感觉到震动，不呈现内容（请求仍已登记，拿起手机后可处理）
+    if (this.phone.down) {
+      this.callbacks.notify({ text: "放在一边的手机震了一下。" }, this.cfg.wakeOnNotify);
+      return;
+    }
     const who = req.username && req.username !== req.userId ? `${req.username}（${req.userId}）` : req.userId;
     const note = req.comment ? `，附言：「${req.comment}」` : "";
     const hint = `（请求编号 ${req.id}，可用 handle_request 同意或拒绝）`;
@@ -132,7 +140,13 @@ export class Gateway {
     const key = `${session.platform}:${session.channelId}`;
     // Bot 正在关注的频道：无视通知策略与频道列表，必定呈现完整内容并唤醒
     const focused = this.focus.isFocused(key);
-    if (!focused && !this.isNotifyChannel(key)) return;
+    if (!focused && !this.notifyList.isNotifyChannel(key)) return;
+
+    // 手机被放下：本会通知的消息一律降级为"感觉到震动"，不呈现任何内容
+    if (this.phone.down) {
+      this.callbacks.notify({ text: "放在一边的手机震了一下。" }, this.cfg.wakeOnNotify);
+      return;
+    }
 
     const notification = focused
       ? await this.renderFocused(key, session, content)
@@ -187,10 +201,6 @@ export class Gateway {
     const mimeHint = typeof el.attrs.type === "string" && el.attrs.type.includes("/") ? el.attrs.type : undefined;
     const id = await this.media.ingest(src, type, mimeHint);
     return id !== null ? mediaPlaceholder(id, type) : fallback;
-  }
-
-  private isNotifyChannel(key: string): boolean {
-    return this.cfg.notifyChannels.includes("*") || this.cfg.notifyChannels.includes(key);
   }
 
   /** 关注中的频道：始终呈现完整内容（相当于强制 content 策略） */

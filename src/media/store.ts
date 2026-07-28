@@ -81,7 +81,20 @@ export class MediaStore {
     try {
       const fetched = await this.fetchSource(src, mimeHint);
       if (!fetched) return null;
-      const { data, mime } = fetched;
+      const { data } = fetched;
+      let { mime } = fetched;
+      // 图片以真实字节为准：平台特殊表情（mface 等）的 URL 可能顶着 image 的
+      // content-type 返回非图片内容，存进缓存后每次注入模型都会 400。
+      // 识别得出真实图片格式 → 修正 mime；识别不出 → 视为下载失败。
+      if (type === "image") {
+        const sniffed = sniffMime(data);
+        if (sniffed.startsWith("image/")) {
+          mime = sniffed;
+        } else {
+          this.logger.warn("图片内容校验失败（实际字节不是可识别的图片格式）: %s", src.slice(0, 120));
+          return null;
+        }
+      }
       const sha256 = createHash("sha256").update(data).digest("hex");
 
       const existing = await this.ctx.database.get("yesimbot_world_media", { sha256 }, { limit: 1 });
@@ -192,6 +205,7 @@ function sniffMime(data: Buffer): string {
     if (data[0] === 0x89 && data[1] === 0x50 && data[2] === 0x4e && data[3] === 0x47) return "image/png";
     if (data[0] === 0x47 && data[1] === 0x49 && data[2] === 0x46) return "image/gif";
     if (data.length >= 12 && data.subarray(8, 12).toString("ascii") === "WEBP") return "image/webp";
+    if (data[0] === 0x42 && data[1] === 0x4d) return "image/bmp";
     if (data.subarray(0, 4).toString("ascii") === "RIFF" && data.length >= 12 && data.subarray(8, 12).toString("ascii") === "WAVE")
       return "audio/wav";
     if (data.subarray(0, 3).toString("ascii") === "ID3" || (data[0] === 0xff && (data[1]! & 0xe0) === 0xe0))

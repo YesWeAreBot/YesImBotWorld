@@ -11,6 +11,18 @@ export function mediaPlaceholder(id: number, type: MediaType): string {
 const TYPE_LABEL: Record<MediaType, string> = { image: "图片", audio: "音频", video: "视频" };
 
 /**
+ * 可作为原生附件注入的图片格式（真实字节格式，入库时经 magic-byte 校验）。
+ * 排除的是校验失败/未知格式（如顶着 image content-type 的非图片响应），
+ * 这类文件注入请求会让每一次生成都 400。
+ */
+const SAFE_NATIVE_IMAGE_MIMES = new Set(["image/jpeg", "image/png", "image/webp", "image/gif"]);
+
+/** 该媒体是否适合作为原生附件注入模型（格式安全性检查，与模态开关无关） */
+export function nativeSafeMime(ref: MediaRef): boolean {
+  return ref.type !== "image" || SAFE_NATIVE_IMAGE_MIMES.has(ref.mime);
+}
+
+/**
  * 把含媒体占位符的文本渲染为 Bot 可感知的形式：
  *
  * - Bot-LLM 原生支持该模态（chat 模式 + 声明能力）→ 文本保留 `[图片#12]` 标记，
@@ -22,7 +34,7 @@ export class MediaRenderer {
   constructor(
     private store: MediaStore,
     private captioner: CaptionService,
-    private nativeSupport: (type: MediaType) => boolean,
+    private nativeSupport: (ref: MediaRef) => boolean,
     private maxAttachments: number,
   ) {}
 
@@ -49,7 +61,7 @@ export class MediaRenderer {
     const row = await this.store.get(id);
     if (!row) return `[${label}（已丢失）]`;
 
-    if (this.nativeSupport(type) && attachments.length < this.maxAttachments) {
+    if (this.nativeSupport(row.ref) && attachments.length < this.maxAttachments) {
       attachments.push(row.ref);
       return `[${label}（见附件）]`;
     }

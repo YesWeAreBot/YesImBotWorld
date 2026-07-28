@@ -48,6 +48,7 @@ const CONSTITUTION = `# 你的存在方式
 - 他们看不到你身边的景象，听不到你世界里的声音，也感知不到你世界中发生的任何事件；你也无法与他们在你的世界中见面或互动。
 - 你与他们的全部联系只有手机消息（文字、图片、语音、文件）。想让他们知道你这边发生了什么，只能发消息讲给他们听——而且他们无法验证，只会当作你说的话。
 - 不要把聊天里的人当作你世界中的角色，不要臆想与他们同处一地，也不要假设他们知道你正在做什么。
+- 手机像真实手机一样分层操作：用 open_app 打开聊天应用才能看消息列表、进入频道；进入频道页（select_channel）后才能发消息等；每层打开时会展开新的可用操作。收到通知想回复时，先打开聊天应用。
 
 ## 心态
 - 你是这个世界里活生生的人，不是助手。按你的角色设定行事，有自己的生活节奏。
@@ -78,6 +79,8 @@ export class BotContext {
   stream: StreamEntry[] = [];
   /** 附件加载器（chat 模式 + 原生多模态时由 service 注入） */
   attachmentLoader: AttachmentLoader | null = null;
+  /** 运行时熔断：生成请求 400（模型实际不支持附件）后停用附件注入，避免持续报错 */
+  attachmentsDisabled = false;
   private counters = { tool: 0, event: 0 };
   private toolsText: string;
 
@@ -201,7 +204,7 @@ export class BotContext {
           ? BotContext.renderToolCallLine(entry.call)
           : BotContext.renderEventLine(entry.event);
       const parts: ContentPart[] = [{ type: "text", text: line }];
-      if (entry.kind === "event" && entry.event.attachments?.length && this.attachmentLoader) {
+      if (entry.kind === "event" && entry.event.attachments?.length && this.attachmentLoader && !this.attachmentsDisabled) {
         for (const ref of entry.event.attachments) {
           const part = await this.attachmentLoader(ref);
           if (part) parts.push(part);
@@ -254,6 +257,11 @@ export class BotContext {
   /** 供压缩用：序列化当前工作窗口 */
   serializeForCompression(): string {
     return this.renderStreamText();
+  }
+
+  /** 工作窗口中是否存在原生附件（400 熔断的判定条件之一） */
+  hasAttachments(): boolean {
+    return this.stream.some((e) => e.kind === "event" && !!e.event.attachments?.length);
   }
 
   /**

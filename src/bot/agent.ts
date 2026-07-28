@@ -4,15 +4,18 @@ import type { WorldClock } from "../clock.js";
 import type { Config } from "../config.js";
 import type { WorldFiles } from "../files.js";
 import { ToolCallParseError } from "../llm/parse.js";
-import type { BotEvent, CompressionResult, EventSource, MediaRef, ParsedToolCall, RichText, ToolCallRecord } from "../types.js";
+import type { BotEvent, CompressionResult, EventSource, MediaRef, ParsedToolCall, PhoneStatus, RichText, ToolCallRecord } from "../types.js";
 import type { WorldAgent } from "../world/agent.js";
+import type { NotifyManager } from "../koishi/notify.js";
 import { createBackend, type BotBackend } from "./backend.js";
 import type { BotContext } from "./context.js";
 import { Scheduler } from "./scheduler.js";
-import { BOT_TOOLS } from "./tools.js";
+import { BOT_TOOLS, renderToolsText, toolLayer, type BotToolDef } from "./tools.js";
 
 /** Koishi 侧能力（消息查询与发送），由 service 层实现注入 */
 export interface MessengerApi {
+  /** 宽松解析频道 id，返回规范化 key 与是否私聊（用于进入频道页/自动切频道） */
+  resolveKey(id: string): Promise<{ key: string; isPrivate: boolean } | { error: string }>;
   recentChannels(n: number): Promise<RichText>;
   channelMessages(id: string, n: number): Promise<RichText>;
   gallery(): Promise<string>;
@@ -112,8 +115,10 @@ export class BotAgent {
    */
   private wakeTimeLine = "";
 
-  /** 常驻工具名（App 工具在此基础上动态叠加） */
-  private baseToolNames: string[];
+  /** 配置过滤后的全部工具定义（分层展开的来源） */
+  private toolDefs: BotToolDef[];
+  /** 手机界面状态：聊天应用是否打开、当前所在频道（分层解锁的依据） */
+  private phoneUi = { chatOpen: false, channelKey: null as string | null, channelIsGroup: false };
 
   constructor(
     private config: Config,
@@ -123,11 +128,13 @@ export class BotAgent {
     private world: WorldAgent,
     private messenger: MessengerApi,
     private apps: AppManager | null,
+    private notifyList: NotifyManager | null,
+    private phone: PhoneStatus,
     private logger: Logger,
-    toolNames?: string[],
+    tools?: BotToolDef[],
   ) {
-    this.baseToolNames = toolNames ?? BOT_TOOLS.map((t) => t.name);
-    this.backend = createBackend(config.bot, this.baseToolNames);
+    this.toolDefs = tools ?? BOT_TOOLS;
+    this.backend = createBackend(config.bot, this.layerNames("core"));
     this.scheduler = new Scheduler(
       clock,
       (content, ref) => this.pushEvent("tool", content, { ref }),
@@ -135,9 +142,58 @@ export class BotAgent {
     );
   }
 
-  /** App 打开/关闭后：把当前展开的 App 工具同步进后端的允许列表与语法 */
-  private refreshAppTools(): void {
-    this.backend.setToolNames([...this.baseToolNames, ...(this.apps?.activeToolNames() ?? [])]);
+  // ---------- 工具分层 ----------
+
+  private layerDefs(layer: ReturnType<typeof toolLayer>): BotToolDef[] {
+    return this.toolDefs.filter((t) => toolLayer(t.name) === layer);
+  }
+
+  private layerNames(layer: ReturnType<typeof toolLayer>): string[] {
+    return this.layerDefs(layer).map((t) => t.name);
+  }
+
+  /** 手机界面状态 / App 打开状态变化后：重算允许的工具名集并同步进后端（含 GBNF 语法） */
+  private refreshToolGate(): void {
+    const names = [...this.layerNames("core")];
+    if (this.phoneUi.chatOpen) {
+      names.push(...this.layerNames("chat"));
+      if (this.phoneUi.channelKey) {
+        names.push(...this.layerNames("channel"));
+        if (this.phoneUi.channelIsGroup) names.push(...this.layerNames("group"));
+      }
+    }
+    names.push(...(this.apps?.activeToolNames() ?? []));
+    this.backend.setToolNames(names);
+  }
+
+  /** 解析频道参数：显式给了 id 用 id，否则用当前所在频道 */
+  private channelArg(call: ToolCallRecord): string | null {
+    const raw = call.arguments.id ?? call.arguments.channel;
+    const explicit = raw != null ? String(raw).trim() : "";
+    return explicit || this.phoneUi.channelKey;
+  }
+
+  /**
+   * 进入（或切换到）一个频道页：更新当前频道、按频道类型解锁操作。
+   * 工具集有变化时（首次进频道 / 群私切换）以事件展开可用操作。
+   */
+  private async enterChannel(key: string, isPrivate: boolean): Promise<void> {
+    const isGroup = !isPrivate;
+    const prev = this.phoneUi;
+    const toolsetChanged =
+      !prev.channelKey || prev.channelIsGroup !== isGroup;
+    this.phoneUi = { chatOpen: true, channelKey: key, channelIsGroup: isGroup };
+    this.refreshToolGate();
+    if (toolsetChanged) {
+      const defs = [...this.layerDefs("channel"), ...(isGroup ? this.layerDefs("group") : [])];
+      if (defs.length) {
+        this.pushEvent(
+          "system",
+          `（你正在 ${key} 的${isGroup ? "群聊" : "私聊"}页面里。频道内可用操作` +
+            `（id 参数可省略，缺省即当前频道；离开频道或关闭应用后失效）：\n${renderToolsText(defs)}）`,
+        );
+      }
+    }
   }
 
   // ---------- 生命周期 ----------
@@ -281,6 +337,22 @@ export class BotAgent {
             this.pushEvent("system", `（意识有些恍惚，刚才的想法没有成形：${err.message}。请重新输出一个合法的工具调用。）`);
             continue;
           }
+          // 400 且上下文含原生附件：几乎必然是模型实际不支持声明的模态（或附件格式不被接受）。
+          // 熔断附件注入后立即重试，否则同一附件会让之后每一次请求都 400。
+          if (
+            this.config.bot.mode === "chat" &&
+            !this.context.attachmentsDisabled &&
+            /\(400\)/.test(String(err)) &&
+            this.context.hasAttachments()
+          ) {
+            this.context.attachmentsDisabled = true;
+            this.logger.warn(
+              "生成请求返回 400 且上下文含原生媒体附件：已停用附件注入（本次会话内）。" +
+                "请核对 bot.modalities 配置与模型的实际多模态能力。原始错误：%s",
+              err,
+            );
+            continue;
+          }
           this.logger.warn("Bot-LLM 生成失败，%dms 后重试: %s", this.config.bot.retryDelayMs, err);
           await sleep(this.config.bot.retryDelayMs);
           continue;
@@ -400,13 +472,19 @@ export class BotAgent {
         return this.dispatchLocal(call, async () =>
           this.messenger.recentChannels(clampInt(call.arguments.n, 1, 20, 5)),
         );
-      case "select_channel":
-        return this.dispatchLocal(call, async () =>
-          this.messenger.channelMessages(
-            String(call.arguments.id ?? ""),
-            clampInt(call.arguments.n, 1, 50, 10),
-          ),
-        );
+      case "select_channel": {
+        const id = String(call.arguments.id ?? "");
+        if (!id.trim()) {
+          this.pushEvent("system", "（select_channel 需要 id 参数（频道 id，见消息列表）。）", { ref: call.id });
+          return;
+        }
+        return this.dispatchLocal(call, async () => {
+          const resolved = await this.messenger.resolveKey(id.trim());
+          if ("error" in resolved) return resolved.error;
+          await this.enterChannel(resolved.key, resolved.isPrivate);
+          return this.messenger.channelMessages(resolved.key, clampInt(call.arguments.n, 1, 50, 10));
+        });
+      }
       case "check_gallery":
         return this.dispatchLocal(call, async () => this.messenger.gallery());
       case "check_media": {
@@ -440,7 +518,44 @@ export class BotAgent {
       case "send_voice":
         return this.dispatchSendVoice(call);
       case "put_down_phone":
-        return this.dispatchLocal(call, async () => this.messenger.putDownPhone());
+        return this.dispatchLocal(call, async () => {
+          const closedApp = await this.apps?.closeCurrent();
+          this.phoneUi = { chatOpen: false, channelKey: null, channelIsGroup: false };
+          this.phone.down = true;
+          this.refreshToolGate();
+          const focusNote = await this.messenger.putDownPhone();
+          return (
+            `你把手机放到了一边${closedApp ? `（「${closedApp}」已关闭）` : ""}。` +
+            `之后再有消息你只会感觉到它震一下，不会看到内容——想看手机时先 pick_up_phone。\n${focusNote}`
+          );
+        });
+      case "pick_up_phone":
+        return this.dispatchLocal(call, async () => {
+          if (!this.phone.down) return "（手机本来就在你手里。）";
+          this.phone.down = false;
+          return "你把手机拿回手里，消息通知恢复正常。（想看消息就打开聊天应用。）";
+        });
+      case "channel_notify": {
+        const allowRaw = call.arguments.allow;
+        if (allowRaw === undefined || allowRaw === null) {
+          this.pushEvent("system", "（channel_notify 需要 allow 参数（true 开启通知 / false 免打扰）。）", { ref: call.id });
+          return;
+        }
+        const id = this.channelArg(call);
+        if (!id) {
+          this.pushEvent("system", "（channel_notify 需要 id 参数，或先进入一个频道。）", { ref: call.id });
+          return;
+        }
+        const allow = isTruthy(allowRaw);
+        return this.dispatchLocal(call, async () => {
+          const resolved = await this.messenger.resolveKey(id);
+          if ("error" in resolved) return resolved.error;
+          await this.notifyList?.set(resolved.key, allow);
+          return allow
+            ? `你打开了 ${resolved.key} 的消息通知。`
+            : `你把 ${resolved.key} 设为了免打扰，之后它的新消息不会再提醒你（消息记录里仍能翻到）。`;
+        });
+      }
       case "open_app": {
         const name = String(call.arguments.name ?? call.arguments.app ?? "");
         if (!name.trim()) {
@@ -456,11 +571,19 @@ export class BotAgent {
       case "close_app":
         return this.dispatchLocal(call, async () => {
           const closed = await this.apps?.closeCurrent();
-          this.refreshAppTools();
-          return closed ? `你关闭了「${closed}」，它的操作已失效。` : "（当前没有打开的应用。）";
+          if (closed) {
+            this.refreshToolGate();
+            return `你关闭了「${closed}」，它的操作已失效。`;
+          }
+          if (this.phoneUi.chatOpen) {
+            this.phoneUi = { chatOpen: false, channelKey: null, channelIsGroup: false };
+            this.refreshToolGate();
+            return "你关闭了聊天应用，相关操作已失效（手机还在手里，有消息仍会通知你）。";
+          }
+          return "（当前没有打开的应用。）";
         });
       case "recall": {
-        const id = String(call.arguments.id ?? "");
+        const id = this.channelArg(call) ?? "";
         const msgId = String(call.arguments.msg_id ?? call.arguments.msgId ?? "");
         if (!id || !msgId) {
           this.pushEvent("system", "（recall 需要 id 和 msg_id 参数，msg_id 来自消息记录里的 (msg:xxx) 标注。）", { ref: call.id });
@@ -469,7 +592,7 @@ export class BotAgent {
         return this.dispatchLocal(call, async () => this.messenger.recall(id, msgId));
       }
       case "react": {
-        const id = String(call.arguments.id ?? "");
+        const id = this.channelArg(call) ?? "";
         const msgId = String(call.arguments.msg_id ?? call.arguments.msgId ?? "");
         const emoji = String(call.arguments.emoji ?? "");
         if (!id || !msgId || !emoji) {
@@ -481,7 +604,7 @@ export class BotAgent {
         );
       }
       case "get_emoji_likes": {
-        const id = String(call.arguments.id ?? "");
+        const id = this.channelArg(call) ?? "";
         const msgId = String(call.arguments.msg_id ?? call.arguments.msgId ?? "");
         const emoji = String(call.arguments.emoji ?? "");
         if (!id || !msgId || !emoji) {
@@ -491,7 +614,7 @@ export class BotAgent {
         return this.dispatchLocal(call, async () => this.messenger.emojiLikes(id, msgId, emoji));
       }
       case "forward_msgs": {
-        const id = String(call.arguments.id ?? "");
+        const id = this.channelArg(call) ?? "";
         const msgIds = normalizeIdList(call.arguments.msg_ids ?? call.arguments.msgIds ?? call.arguments.msg_id);
         if (!id || !msgIds.length) {
           this.pushEvent("system", "（forward_msgs 需要 id 和 msg_ids 参数，msg_ids 为消息编号列表。）", { ref: call.id });
@@ -508,7 +631,7 @@ export class BotAgent {
         return this.dispatchLocal(call, async () => this.messenger.ocrImage(image));
       }
       case "poke": {
-        const id = String(call.arguments.id ?? "");
+        const id = this.channelArg(call) ?? "";
         if (!id) {
           this.pushEvent("system", "（poke 需要 id 参数。）", { ref: call.id });
           return;
@@ -577,7 +700,7 @@ export class BotAgent {
       case "list_groups":
         return this.dispatchLocal(call, async () => this.messenger.listGroups());
       case "group_info": {
-        const id = String(call.arguments.id ?? "");
+        const id = this.channelArg(call) ?? "";
         if (!id) {
           this.pushEvent("system", "（group_info 需要 id 参数（群频道 id）。）", { ref: call.id });
           return;
@@ -585,7 +708,7 @@ export class BotAgent {
         return this.dispatchLocal(call, async () => this.messenger.groupInfo(id));
       }
       case "list_members": {
-        const id = String(call.arguments.id ?? "");
+        const id = this.channelArg(call) ?? "";
         if (!id) {
           this.pushEvent("system", "（list_members 需要 id 参数（群频道 id）。）", { ref: call.id });
           return;
@@ -593,7 +716,7 @@ export class BotAgent {
         return this.dispatchLocal(call, async () => this.messenger.listMembers(id));
       }
       case "member_info": {
-        const id = String(call.arguments.id ?? "");
+        const id = this.channelArg(call) ?? "";
         const userId = String(call.arguments.user_id ?? call.arguments.userId ?? "");
         if (!id || !userId) {
           this.pushEvent("system", "（member_info 需要 id 和 user_id 参数。）", { ref: call.id });
@@ -602,7 +725,7 @@ export class BotAgent {
         return this.dispatchLocal(call, async () => this.messenger.memberInfo(id, userId));
       }
       case "group_honor": {
-        const id = String(call.arguments.id ?? "");
+        const id = this.channelArg(call) ?? "";
         if (!id) {
           this.pushEvent("system", "（group_honor 需要 id 参数（群频道 id）。）", { ref: call.id });
           return;
@@ -610,7 +733,7 @@ export class BotAgent {
         return this.dispatchLocal(call, async () => this.messenger.groupHonor(id));
       }
       case "group_files": {
-        const id = String(call.arguments.id ?? "");
+        const id = this.channelArg(call) ?? "";
         if (!id) {
           this.pushEvent("system", "（group_files 需要 id 参数（群频道 id）。）", { ref: call.id });
           return;
@@ -620,7 +743,7 @@ export class BotAgent {
         return this.dispatchLocal(call, async () => this.messenger.groupFiles(id, folderId));
       }
       case "set_group_card": {
-        const id = String(call.arguments.id ?? "");
+        const id = this.channelArg(call) ?? "";
         const card = String(call.arguments.card ?? call.arguments.name ?? "");
         if (!id || !card) {
           this.pushEvent("system", "（set_group_card 需要 id 和 card 参数。）", { ref: call.id });
@@ -629,7 +752,7 @@ export class BotAgent {
         return this.dispatchLocal(call, async () => this.messenger.setGroupCard(id, card));
       }
       case "set_group_name": {
-        const id = String(call.arguments.id ?? "");
+        const id = this.channelArg(call) ?? "";
         const name = String(call.arguments.name ?? "");
         if (!id || !name) {
           this.pushEvent("system", "（set_group_name 需要 id 和 name 参数。）", { ref: call.id });
@@ -638,7 +761,7 @@ export class BotAgent {
         return this.dispatchLocal(call, async () => this.messenger.setGroupName(id, name));
       }
       case "set_group_portrait": {
-        const id = String(call.arguments.id ?? "");
+        const id = this.channelArg(call) ?? "";
         const image = String(call.arguments.image ?? "");
         if (!id || !image) {
           this.pushEvent("system", "（set_group_portrait 需要 id 和 image 参数。）", { ref: call.id });
@@ -647,7 +770,7 @@ export class BotAgent {
         return this.dispatchLocal(call, async () => this.messenger.setGroupPortrait(id, image));
       }
       case "send_group_notice": {
-        const id = String(call.arguments.id ?? "");
+        const id = this.channelArg(call) ?? "";
         const content = String(call.arguments.content ?? "");
         if (!id || !content) {
           this.pushEvent("system", "（send_group_notice 需要 id 和 content 参数。）", { ref: call.id });
@@ -656,7 +779,7 @@ export class BotAgent {
         return this.dispatchLocal(call, async () => this.messenger.sendGroupNotice(id, content));
       }
       case "get_group_notice": {
-        const id = String(call.arguments.id ?? "");
+        const id = this.channelArg(call) ?? "";
         if (!id) {
           this.pushEvent("system", "（get_group_notice 需要 id 参数（群频道 id）。）", { ref: call.id });
           return;
@@ -664,7 +787,7 @@ export class BotAgent {
         return this.dispatchLocal(call, async () => this.messenger.getGroupNotice(id));
       }
       case "get_essence_list": {
-        const id = String(call.arguments.id ?? "");
+        const id = this.channelArg(call) ?? "";
         if (!id) {
           this.pushEvent("system", "（get_essence_list 需要 id 参数（群频道 id）。）", { ref: call.id });
           return;
@@ -682,7 +805,7 @@ export class BotAgent {
         );
       }
       case "group_sign": {
-        const id = String(call.arguments.id ?? "");
+        const id = this.channelArg(call) ?? "";
         if (!id) {
           this.pushEvent("system", "（group_sign 需要 id 参数（群频道 id）。）", { ref: call.id });
           return;
@@ -690,7 +813,7 @@ export class BotAgent {
         return this.dispatchLocal(call, async () => this.messenger.groupSign(id));
       }
       case "group_ban": {
-        const id = String(call.arguments.id ?? "");
+        const id = this.channelArg(call) ?? "";
         const userId = String(call.arguments.user_id ?? call.arguments.userId ?? "");
         const minutes = Number(call.arguments.minutes ?? call.arguments.duration ?? NaN);
         if (!id || !userId || !Number.isFinite(minutes) || minutes < 0) {
@@ -700,7 +823,7 @@ export class BotAgent {
         return this.dispatchLocal(call, async () => this.messenger.groupBan(id, userId, minutes));
       }
       case "group_whole_ban": {
-        const id = String(call.arguments.id ?? "");
+        const id = this.channelArg(call) ?? "";
         const enable = call.arguments.enable;
         if (!id || enable === undefined || enable === null) {
           this.pushEvent("system", "（group_whole_ban 需要 id 和 enable 参数。）", { ref: call.id });
@@ -709,7 +832,7 @@ export class BotAgent {
         return this.dispatchLocal(call, async () => this.messenger.groupWholeBan(id, isTruthy(enable)));
       }
       case "group_kick": {
-        const id = String(call.arguments.id ?? "");
+        const id = this.channelArg(call) ?? "";
         const userId = String(call.arguments.user_id ?? call.arguments.userId ?? "");
         if (!id || !userId) {
           this.pushEvent("system", "（group_kick 需要 id 和 user_id 参数。）", { ref: call.id });
@@ -720,7 +843,7 @@ export class BotAgent {
         );
       }
       case "group_admin": {
-        const id = String(call.arguments.id ?? "");
+        const id = this.channelArg(call) ?? "";
         const userId = String(call.arguments.user_id ?? call.arguments.userId ?? "");
         const enable = call.arguments.enable;
         if (!id || !userId || enable === undefined || enable === null) {
@@ -730,7 +853,7 @@ export class BotAgent {
         return this.dispatchLocal(call, async () => this.messenger.groupAdmin(id, userId, isTruthy(enable)));
       }
       case "set_special_title": {
-        const id = String(call.arguments.id ?? "");
+        const id = this.channelArg(call) ?? "";
         const userId = String(call.arguments.user_id ?? call.arguments.userId ?? "");
         const title = String(call.arguments.title ?? "");
         if (!id || !userId) {
@@ -740,7 +863,7 @@ export class BotAgent {
         return this.dispatchLocal(call, async () => this.messenger.setSpecialTitle(id, userId, title));
       }
       case "group_leave": {
-        const id = String(call.arguments.id ?? "");
+        const id = this.channelArg(call) ?? "";
         if (!id) {
           this.pushEvent("system", "（group_leave 需要 id 参数（群频道 id）。）", { ref: call.id });
           return;
@@ -788,6 +911,11 @@ export class BotAgent {
     }
   }
 
+  /**
+   * wait：纯计时器实现，到点**准时**解除暂停（不被 World-LLM 的速度拖累）。
+   * 现实等待时长达到阈值时，快结束前提前让 World-LLM 生成期间见闻：
+   * 生成得及 → 随唤醒事件一起送达；生成不及 → 先准时唤醒，见闻随后补送。
+   */
   private dispatchWait(call: ToolCallRecord): void {
     const n = call.duration ?? 0;
     if (n <= 0) {
@@ -795,19 +923,44 @@ export class BotAgent {
       return;
     }
     this.waiting = { callId: call.id, kind: "wait" };
+
+    // 长等待：提前 lead 启动 World-LLM 补叙（结果收集到 parts，不直接推事件）
+    const realMs = this.clock.realMsUntil(call.expectedAt);
+    const narrateMinMs = this.config.world.waitNarrateMinRealSeconds * 1000;
+    let summary: { parts: string[]; done: boolean; promise: Promise<void> } | null = null;
+    if (narrateMinMs > 0 && realMs >= narrateMinMs) {
+      const lead = Math.min(30_000, realMs / 2);
+      const timer = setTimeout(() => {
+        if (!this.running || !this.scheduler.isPending(call.id)) return;
+        const s: { parts: string[]; done: boolean; promise: Promise<void> } = {
+          parts: [],
+          done: false,
+          promise: Promise.resolve(),
+        };
+        s.promise = this.world
+          .resolveWait(call, (content) => s.parts.push(content))
+          .then(() => void (s.done = true))
+          .catch(() => void (s.done = true));
+        summary = s;
+      }, Math.max(0, realMs - lead));
+      timer.unref?.();
+    }
+
     this.scheduler.schedule(call, {
       executeAt: "expected",
       run: async () => {
-        // World-LLM 认为等待时间已到：生成期间发生的事并唤醒 Bot
-        let delivered = false;
-        await this.world.resolveWait(call, (content) => {
-          delivered = true;
-          this.pushEvent("world", content, { ref: call.id });
-        });
-        if (!delivered) {
-          this.pushEvent("system", `等待结束了。当前 ${this.clock.timeLine()}`, { ref: call.id });
+        const timeNote = `等待结束了。当前 ${this.clock.timeLine()}`;
+        const s = summary;
+        if (!s) return timeNote; // 短等待 / 未启用补叙
+        if (s.done) {
+          return s.parts.length ? `${s.parts.join("\n")}\n${timeNote}` : timeNote;
         }
-        return null;
+        // 补叙尚未生成完：准时唤醒，见闻随后作为世界事件补送
+        void s.promise.then(() => {
+          if (!this.running || !s.parts.length) return;
+          for (const p of s.parts) this.pushEvent("world", p);
+        });
+        return timeNote;
       },
     });
   }
@@ -858,28 +1011,43 @@ export class BotAgent {
       });
     }
     if (resolved.kind === "chat") {
-      // 打开聊天应用：切走当前 App，并看一眼最近的消息（check_msg(10)）
+      // 打开聊天应用：切走当前 App，落在消息列表页（解锁 chat 层操作）并刷新列表
       return this.dispatchLocal(call, async () => {
         const closed = await this.apps?.closeCurrent();
-        if (closed) this.refreshAppTools();
+        const firstOpen = !this.phoneUi.chatOpen;
+        this.phoneUi = { chatOpen: true, channelKey: null, channelIsGroup: false };
+        this.refreshToolGate();
         const rich = await this.messenger.recentChannels(10);
         const prefix = closed ? `（你关掉了「${closed}」）` : "";
-        return typeof rich === "string" ? { text: prefix + rich } : { ...rich, text: prefix + rich.text };
+        const unlock = firstOpen
+          ? `（聊天应用已打开，新增可用操作（关闭应用后失效）：\n${renderToolsText(this.layerDefs("chat"))}）\n\n`
+          : "";
+        return typeof rich === "string"
+          ? { text: prefix + unlock + rich }
+          : { ...rich, text: prefix + unlock + rich.text };
       });
     }
     return this.dispatchLocal(call, async () => {
       try {
         const { closed, defs } = await this.apps!.open(resolved.app);
-        this.refreshAppTools();
+        // 手机同屏只有一个应用：打开 MCP 应用时聊天界面随之退出
+        const chatWasOpen = this.phoneUi.chatOpen;
+        this.phoneUi = { chatOpen: false, channelKey: null, channelIsGroup: false };
+        this.refreshToolGate();
         const lines = defs.length
           ? defs.map((d) => `- ${d.signature}\n  ${d.description}`).join("\n")
           : "（这个应用没有提供任何操作。）";
+        const closedNote = closed
+          ? `（「${closed}」已被关掉）`
+          : chatWasOpen
+            ? "（聊天应用已被关掉）"
+            : "";
         return (
-          `你打开了「${resolved.app.name}」。${closed ? `（「${closed}」已被关掉）` : ""}\n` +
+          `你打开了「${resolved.app.name}」。${closedNote}\n` +
           `它提供这些操作，即刻可以像普通能力一样调用（关闭应用或打开其他应用后失效）：\n${lines}`
         );
       } catch (err) {
-        this.refreshAppTools();
+        this.refreshToolGate();
         return `（「${resolved.app.name}」启动失败：${(err as Error).message ?? err}）`;
       }
     });
@@ -890,8 +1058,21 @@ export class BotAgent {
     this.scheduler.schedule(call, { executeAt: "now", run });
   }
 
+  /**
+   * 发送类工具的目标解析（在执行时刻调用）：给了别的频道 id 时先切换过去
+   * （等效先 select_channel，工具集随频道类型联动），返回规范化 key。
+   */
+  private async switchToTarget(id: string): Promise<{ key: string } | { error: string }> {
+    const resolved = await this.messenger.resolveKey(id);
+    if ("error" in resolved) return resolved;
+    if (resolved.key !== this.phoneUi.channelKey) {
+      await this.enterChannel(resolved.key, resolved.isPrivate);
+    }
+    return { key: resolved.key };
+  }
+
   private dispatchSend(call: ToolCallRecord): void {
-    const id = String(call.arguments.id ?? "");
+    const id = this.channelArg(call) ?? "";
     const msg = String(call.arguments.msg ?? "");
     const mediaRaw = call.arguments.media ?? call.arguments.images;
     const media = Array.isArray(mediaRaw) ? (mediaRaw as (string | number)[]) : [];
@@ -900,8 +1081,12 @@ export class BotAgent {
     // 引用回复默认自动 @ 原发送人（模拟 QQ 客户端），Bot 显式给 at_sender: false 时去掉
     const atRaw = call.arguments.at_sender ?? call.arguments.atSender ?? call.arguments.at;
     const atSender = !(atRaw === false || atRaw === "false" || atRaw === 0);
-    if (!id || (!msg && !media.length)) {
-      this.pushEvent("system", "（send 需要 id 和 msg（或 media）参数。）", { ref: call.id });
+    if (!id) {
+      this.pushEvent("system", "（send 需要频道：先 select_channel 进入频道，或给出 id 参数。）", { ref: call.id });
+      return;
+    }
+    if (!msg && !media.length) {
+      this.pushEvent("system", "（send 需要 msg（或 media）参数。）", { ref: call.id });
       return;
     }
     // 超长消息拦截：真人聊天单条消息很短；确需发长文时要求二次确认
@@ -932,35 +1117,47 @@ export class BotAgent {
     const insist = isTruthy(call.arguments.insist);
     this.scheduler.schedule(call, {
       executeAt: "expected", // 打字完成的那一刻消息才真正发出（此前可 cancel）
-      run: async () => this.messenger.send(id, msg, media, replyTo, atSender, insist),
+      run: async () => {
+        const target = await this.switchToTarget(id);
+        if ("error" in target) return target.error;
+        return this.messenger.send(target.key, msg, media, replyTo, atSender, insist);
+      },
     });
   }
 
   private dispatchSendFile(call: ToolCallRecord): void {
-    const id = String(call.arguments.id ?? "");
+    const id = this.channelArg(call) ?? "";
     const file = String(call.arguments.file ?? call.arguments.ref ?? "");
     if (!id || !file) {
-      this.pushEvent("system", "（send_file 需要 id 和 file 参数。）", { ref: call.id });
+      this.pushEvent("system", "（send_file 需要 file 参数，且需先进入频道或给出 id。）", { ref: call.id });
       return;
     }
     this.ackStart(call);
     this.scheduler.schedule(call, {
       executeAt: "expected",
-      run: async () => this.messenger.sendFile(id, file),
+      run: async () => {
+        const target = await this.switchToTarget(id);
+        if ("error" in target) return target.error;
+        return this.messenger.sendFile(target.key, file);
+      },
     });
   }
 
   private dispatchSendVoice(call: ToolCallRecord): void {
-    const id = String(call.arguments.id ?? "");
+    const id = this.channelArg(call) ?? "";
     const text = String(call.arguments.text ?? call.arguments.msg ?? "");
     if (!id || !text) {
-      this.pushEvent("system", "（send_voice 需要 id 和 text 参数。）", { ref: call.id });
+      this.pushEvent("system", "（send_voice 需要 text 参数，且需先进入频道或给出 id。）", { ref: call.id });
       return;
     }
     this.ackStart(call);
     this.scheduler.schedule(call, {
       executeAt: "expected", // 说完的那一刻语音才发出（此前可 cancel）
-      run: async () => this.messenger.sendVoice(id, text),
+      run: async () => {
+        const target = await this.switchToTarget(id);
+        if ("error" in target) return target.error;
+        return this.messenger.sendVoice(target.key, text);
+      },
     });
   }
 
@@ -1090,9 +1287,12 @@ export class BotAgent {
     }
     if (!this.running) return;
 
-    // 休息时手机里开着的应用自动关闭（醒来后需重新打开）
+    // 休息时手机里开着的应用（聊天界面/MCP）自动关闭，醒来后需重新打开；
+    // "手机放下"状态保留（那是 Bot 自己的选择）
     const closedApp = await this.apps?.closeCurrent().catch(() => null);
-    if (closedApp) this.refreshAppTools();
+    const chatWasOpen = this.phoneUi.chatOpen;
+    this.phoneUi = { chatOpen: false, channelKey: null, channelIsGroup: false };
+    this.refreshToolGate();
 
     // 醒来时刻更新为当前时间（这是 system 段时间唯一的合法更新时机——
     // 压缩后前缀本来就要重建，此时更新不损失缓存）
@@ -1105,7 +1305,9 @@ export class BotAgent {
     this.pushEvent(
       "system",
       `你睡了一觉，过去了 ${elapsedTU.toFixed(1)} 个 TU。醒来时头脑清明，近来的经历沉淀成了记忆。当前 ${this.clock.timeLine()}` +
-        (closedApp ? `（睡前开着的「${closedApp}」已经自动关闭）` : ""),
+        (closedApp || chatWasOpen
+          ? `（睡前开着的「${closedApp ?? "聊天应用"}」已经自动关闭）`
+          : ""),
       { ref: call?.id },
     );
     this.logger.info("休息结束，耗时 %s 秒，新上下文约 %d 字符", ((Date.now() - startReal) / 1000).toFixed(1), this.context.approxChars());

@@ -135,15 +135,15 @@ export class WorldAgent {
     return this.invokeWithTools({ task, deliver });
   }
 
-  /** wait 到期：World-LLM 认为等待时间已到，生成期间发生的事并唤醒 Bot */
+  /** wait 补叙：等待即将结束（由计时器准时唤醒），提前生成期间发生的事 */
   async resolveWait(call: ToolCallRecord, deliver: (content: string) => void): Promise<boolean> {
     const n = Number(call.arguments.n ?? call.duration ?? 0);
     const task =
-      `Bot 从 ${this.clock.timeLine(call.issuedAt)} 开始等待了 ${n} 个 TU，现在等待结束` +
-      `（当前 ${this.clock.timeLine()}）。\n` +
-      `请先 check news 和 world_status 了解期间世界的变化，然后必须调用一次 send_event 告诉 Bot：` +
-      `等待结束了，以及这段时间里发生的、它能感知到的变化——用第三人称客观叙述什么发生了变化、` +
-      `什么被怎么样了（如果无事发生，就平实地叙述周遭环境此刻的样子）。`;
+      `Bot 从 ${this.clock.timeLine(call.issuedAt)} 开始等待 ${n} 个 TU，等待即将在 ` +
+      `${this.clock.timeLine(call.expectedAt)} 结束（届时它会被自动唤醒）。\n` +
+      `请先 check news 和 world_status 了解这段等待期间世界的变化，然后必须调用一次 send_event 告诉 Bot：` +
+      `这段时间里发生的、它能感知到的变化——用第三人称客观叙述什么发生了变化、` +
+      `什么被怎么样了（如果无事发生，就平实地叙述周遭环境此刻的样子）。不必提"等待结束"，唤醒另有提示。`;
     return this.invokeWithTools({ task, deliver });
   }
 

@@ -177,30 +177,44 @@ Bot 不只能收，也能发：
 
 ## Bot 可用工具
 
-### 基础工具（始终可用）
+工具**模仿真实手机分层展开**：只有 core 层进置顶列表（省上下文），其余层在打开应用/进入频道时
+以事件展开用法，并动态加入允许列表与 GBNF 语法（关闭/离开后失效）：
+
+- **core 常驻**：世界/身体动作、收藏夹、手机的物理动作（open_app / put_down_phone 等）；
+- **chat 层**（`open_app` 打开聊天应用后）：消息列表、好友/群列表、账号设置等；
+- **channel 层**（`select_channel` 进入频道页后）：发消息、撤回、贴表情等，**id 参数缺省为当前频道**，
+  给别的频道 id 等效于先切换过去；
+- **group 层**（进入的频道是群聊时追加）：群信息与全部群管理操作。
+
+### core 常驻工具
 
 | 工具 | 说明 |
 |---|---|
-| `wait(n)` | 等待 n 个 TU，暂停生成；到期由 World-LLM 生成期间见闻并唤醒（可配置被通知打断） |
+| `wait(n)` | 等待 n 个 TU（计时器准时唤醒）；现实等待达 `waitNarrateMinRealSeconds` 时由 World-LLM 提前生成期间见闻随唤醒送达 |
 | `act(description)` | 在世界中做事，World-LLM 裁定结果 |
-| `rest(duration?)` | 休息：压缩上下文 + 预热 KV cache，醒来获知流逝的 TU |
+| `rest(duration?)` | 休息：压缩上下文 + 预热 KV cache，醒来获知流逝的 TU（打开的应用自动关闭） |
 | `check_status(target)` | 查看自身（`self`）或世界（`world`，含近期 News） |
-| `check_time()` | 看一眼现在几点（世界裁定能否得知——身边没有计时工具时可能失败；World-LLM 不可用时退化为直接报时） |
-| `check_news(n?)` | 回看世界近期新闻/见闻（最近 n 条，默认 10；与 check_status 的增量视图同步） |
-| `check_msg(n)` | 最近活跃的 n 个频道及最新一条消息 |
-| `select_channel(id, n)` | 查看频道最近 n 条消息（`id` 为 `platform:channelId`） |
-| `check_gallery()` | 浏览收藏夹（`basePath/gallery/`，Bot 或用户投放的图片/文件） |
-| `check_media(n?, type?)` | 只读翻看媒体缓存（聊天中见过的媒体，图片按需生成摘要） |
-| `gallery_save(media_id, name?)` | 把缓存媒体存进收藏夹（生成内容摘要、可起名） |
-| `gallery_remove(name)` | 把文件移出收藏夹 |
-| `send(id, msg, media?)` | 发消息，可附图片/视频、`[图片#12]` 内联混排（duration = 打字时间，发出前可撤回）；超长消息与冷频道刷屏会被拦下要求确认（`confirm_long` / `insist`） |
-| `send_file(id, file)` | 发送音频/视频/任意文件（媒体编号或 `gallery:文件名`） |
-| `send_voice(id, text)` | TTS 合成语音消息（需配置 tts，duration = 说话时间） |
-| `put_down_phone()` | 清除全部频道关注（关注机制开启时可用） |
-| `open_app(name)` | 打开手机里的一个应用：聊天应用 = 看最近消息（check_msg），其他应用展开其操作 |
-| `close_app()` | 关闭当前打开的应用（存在可展开的应用时可用） |
+| `check_time()` | 看一眼现在几点（世界裁定能否得知） |
+| `check_news(n?)` | 回看世界近期新闻/见闻 |
+| `check_gallery()` / `check_media(n?, type?)` | 浏览收藏夹 / 只读翻看媒体缓存 |
+| `gallery_save(media_id, name?)` / `gallery_remove(name)` | 收藏夹管理 |
+| `open_app(name)` | 打开应用：聊天应用 → 消息列表 + 解锁 chat 层；MCP/内置应用 → 展开其工具 |
+| `close_app()` | 关闭当前打开的应用（其操作失效） |
+| `put_down_phone()` | 把手机放到一边：关闭应用、清除关注，之后通知一律降级为"手机震了一下" |
+| `pick_up_phone()` | 拿起手机：恢复正常通知 |
 | `cancel(id)` | 取消倒计时中的工具调用 |
 | `identity_recall()` | 反思身份：角色设定以 Event 再次注入 |
+
+### chat / channel / group 层（节选）
+
+| 工具 | 层 | 说明 |
+|---|---|---|
+| `check_msg(n)` | chat | 刷新消息列表：最近活跃的 n 个频道及最新一条消息 |
+| `select_channel(id, n)` | chat | 点进一个频道查看最近 n 条消息，进入频道页（解锁 channel/group 层） |
+| `send(msg, id?, media?)` | channel | 发消息（id 缺省当前频道）；超长与冷频道刷屏会被拦下要求确认（`confirm_long` / `insist`） |
+| `send_file(file, id?)` / `send_voice(text, id?)` | channel | 发文件 / TTS 语音（需配置 tts） |
+| `channel_notify(allow, id?)` | channel | 频道免打扰/开通知（需开启 `botManagedNotifyChannels`，持久化到 notify.json） |
+| 其余 | chat/channel/group | 即上文平台扩展操作，按层展开（群管理只在群频道页可见） |
 
 ### 平台扩展操作（`platformOps.*`，每项独立开关，默认全部关闭）
 
@@ -299,6 +313,7 @@ plugins:
     world:
       baseURL: http://127.0.0.1:8080/v1
       model: Qwen3.6
+      waitNarrateMinRealSeconds: 300 # wait 的现实时长达此值时，快结束前由 World-LLM 补叙期间见闻（0 从不补叙）
     captioners:
       image:
         enabled: true
@@ -327,6 +342,7 @@ plugins:
     messaging:
       notifyChannels: ["onebot:123456789"]
       notifyPolicy: channel
+      botManagedNotifyChannels: false # 允许 Bot 自管通知频道列表（channel_notify 工具，上面的列表变为初始值）
       wakeOnNotify: true
       longMessageChars: 100 # 单条消息超长提醒阈值（0 禁用）
       coldChannelMsgs: 3 # 连发几条无人回应后拦截 send 提醒别刷屏，需 insist: true 才发出（0 禁用）

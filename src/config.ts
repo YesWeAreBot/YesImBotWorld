@@ -74,6 +74,7 @@ export interface WorldModelConfig {
   disableThinking: boolean;
   maxToolRounds: number;
   compressMaxInputChars: number;
+  waitNarrateMinRealSeconds: number;
 }
 
 export interface ClockConfigData {
@@ -92,6 +93,7 @@ export type ExternalSelfMessageMode = "off" | "simulate" | "event" | "silent";
 
 export interface MessagingConfig {
   notifyChannels: string[];
+  botManagedNotifyChannels: boolean;
   notifyPolicy: NotifyPolicy;
   wakeOnNotify: boolean;
   focusDurationUnits: number;
@@ -220,7 +222,10 @@ export const Config: Schema<Config> = Schema.intersect([
         .description("上下文预算（近似字符数）。超出后强制触发 rest() 压缩上下文"),
       minIntervalMs: Schema.natural()
         .default(1000)
-        .description("两次生成之间的最小间隔（毫秒）。防止对付费 API 过度请求；本地模型可设为 0"),
+        .description(
+          "Tool Call 生成速率限制：两次生成之间的最小间隔（毫秒），text / chat 两种模式均生效。" +
+            "云端 API 建议设为 3000 以上避免触发限速；本地模型可设为 0",
+        ),
       retryDelayMs: Schema.natural().default(5000).description("生成失败后的重试等待（毫秒）"),
       modalities: Schema.object({
         image: Schema.boolean().default(false).description("模型原生支持图片输入"),
@@ -260,6 +265,13 @@ export const Config: Schema<Config> = Schema.intersect([
         .description(
           "上下文压缩时送入 World-LLM 的意识流文本上限（字符数）。" +
             "超出部分会从最早处截断（仅保留最近内容），防止压缩请求本身超过模型上下文窗口而失败",
+        ),
+      waitNarrateMinRealSeconds: Schema.natural()
+        .default(300)
+        .description(
+          "wait 期间补叙的阈值（现实秒）：等待的现实时长达到该值时，wait 快结束时由 World-LLM " +
+            "提前生成期间见闻，随唤醒事件送达（生成不及时则先准时唤醒、见闻随后补送）。" +
+            "更短的等待到点直接唤醒，不调用 World-LLM。0 表示从不补叙",
         ),
     }).description("World-LLM：维护世界状态、裁定事件的模型（也负责上下文压缩与初始化）"),
   }),
@@ -549,6 +561,12 @@ export const Config: Schema<Config> = Schema.intersect([
       notifyChannels: Schema.array(Schema.string())
         .default([])
         .description('Allow Notification 频道列表，格式 "platform:channelId"（如 "onebot:123456"）。"*" 表示所有频道'),
+      botManagedNotifyChannels: Schema.boolean()
+        .default(false)
+        .description(
+          "允许 Bot 自己管理通知频道列表（channel_notify 工具，像真人给聊天设免打扰/开提醒）。" +
+            "开启后上面的列表只是初始值，此后的变更持久化在 notify.json",
+        ),
       notifyPolicy: Schema.union([
         Schema.const("count").description("收到一条消息"),
         Schema.const("channel").description("收到来自 channelId 的消息"),

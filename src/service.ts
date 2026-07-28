@@ -6,7 +6,7 @@ import { McpApp } from "./apps/mcp.js";
 import { WeatherApp } from "./apps/weather.js";
 import { BotAgent } from "./bot/agent.js";
 import { BotContext } from "./bot/context.js";
-import { availableTools, renderToolsText, type AppInfo } from "./bot/tools.js";
+import { availableTools, renderToolsText, toolLayer, type AppInfo } from "./bot/tools.js";
 import { describeCalendar } from "./calendar.js";
 import { WorldClock } from "./clock.js";
 import type { Config } from "./config.js";
@@ -15,14 +15,15 @@ import { FocusManager } from "./koishi/focus.js";
 import { Gateway } from "./koishi/gateway.js";
 import { MessageStore } from "./koishi/messages.js";
 import { KoishiMessenger } from "./koishi/messenger.js";
+import { NotifyManager } from "./koishi/notify.js";
 import { OwnSendTracker } from "./koishi/ownsends.js";
 import { RequestStore } from "./koishi/requests.js";
 import { CaptionService } from "./media/captioner.js";
 import { createAttachmentLoader } from "./media/parts.js";
-import { MediaRenderer } from "./media/render.js";
+import { MediaRenderer, nativeSafeMime } from "./media/render.js";
 import { MediaStore } from "./media/store.js";
 import { TtsClient } from "./media/tts.js";
-import type { MediaType } from "./types.js";
+import type { MediaRef, PhoneStatus } from "./types.js";
 import { WorldAgent } from "./world/agent.js";
 import { TingleTimer } from "./world/tingle.js";
 
@@ -45,6 +46,9 @@ export class WorldService extends Service<Config> {
   private renderer!: MediaRenderer;
   private world!: WorldAgent;
   private focus!: FocusManager;
+  private notifyMgr!: NotifyManager;
+  /** 手机物理状态（agent 与 gateway 共享）：down = Bot 把手机放到了一边 */
+  private phoneStatus: PhoneStatus = { down: false };
   private requests!: RequestStore;
   private ownSends!: OwnSendTracker;
   private botContext: BotContext | null = null;
@@ -63,8 +67,9 @@ export class WorldService extends Service<Config> {
     const assetsDir = path.resolve(ctx.baseDir, config.basePath, "assets");
     this.media = new MediaStore(ctx, assetsDir, config.media.maxBytes, ctx.logger("yesimbot-world"));
     this.captioner = new CaptionService(config.captioners, config.media, this.media, ctx.logger("yesimbot-world"));
-    const nativeSupport = (type: MediaType) =>
-      config.bot.mode === "chat" && config.bot.modalities[type];
+    // 原生附件门槛：chat 模式 + 声明了该模态 + 格式安全（GIF 等一律走解释器，避免 400）
+    const nativeSupport = (ref: MediaRef) =>
+      config.bot.mode === "chat" && config.bot.modalities[ref.type] && nativeSafeMime(ref);
     this.renderer = new MediaRenderer(
       this.media,
       this.captioner,
@@ -79,13 +84,20 @@ export class WorldService extends Service<Config> {
       config.messaging.focusDurationUnits,
     );
 
+    // Allow Notification 频道列表（botManagedNotifyChannels 开启时由 Bot 自管、持久化）
+    this.notifyMgr = new NotifyManager(
+      path.resolve(ctx.baseDir, config.basePath, "notify.json"),
+      config.messaging.notifyChannels,
+      config.messaging.botManagedNotifyChannels,
+    );
+
     // 平台请求登记处（好友申请 / 入群邀请等，Bot 用 handle_request 处理）
     this.requests = new RequestStore();
     // 本插件自身发送标记（区分外部以 Bot 账号发出的消息）
     this.ownSends = new OwnSendTracker();
 
     // 消息网关始终活跃：所有消息入库；通知事件仅在世界运行时投递
-    new Gateway(ctx, config.messaging, config.platformOps, this.store, this.media, this.renderer, this.focus, this.requests, this.ownSends, {
+    new Gateway(ctx, config.messaging, config.platformOps, this.store, this.media, this.renderer, this.focus, this.notifyMgr, this.phoneStatus, this.requests, this.ownSends, {
       notify: (content, wake) => {
         if (this.worldRunning && this.bot) this.bot.pushEvent("koishi", content, { wake });
       },
@@ -114,6 +126,7 @@ export class WorldService extends Service<Config> {
     this.clock = new WorldClock(this.config.clock, this.files.clock);
     await this.clock.load();
     await this.focus.load();
+    await this.notifyMgr.load();
 
     this.world = new WorldAgent(this.config.world, this.files, this.clock, this.logger);
 
@@ -142,6 +155,8 @@ export class WorldService extends Service<Config> {
     if (force) {
       await this.files.reset();
       await this.focus.clear();
+      await this.notifyMgr.reset();
+      this.phoneStatus.down = false;
     }
 
     const { botDef, worldDef } = await this.files.readDefinitions();
@@ -162,7 +177,7 @@ export class WorldService extends Service<Config> {
 
     // 建立全新的 Bot 上下文（角色设定来自刚生成的 Bot_Status.md）
     await fs.writeFile(this.files.stream, "");
-    const context = new BotContext(this.files, renderToolsText(this.currentTools()));
+    const context = new BotContext(this.files, this.pinnedToolsText());
     context.pinned.persona = await this.files.readBotStatus();
     await context.persistPinned();
 
@@ -176,10 +191,11 @@ export class WorldService extends Service<Config> {
       return "世界尚未初始化。请先编写定义文件并执行 world.init。";
     }
 
-    // 实际可用的工具集（如未配置 TTS 则没有 send_voice；平台扩展操作按配置开关）
+    // 实际可用的工具集（如未配置 TTS 则没有 send_voice；平台扩展操作按配置开关）。
+    // 置顶列表只放 core 层常驻工具；chat/channel/group 层在打开应用/进入频道时以事件展开
     const tools = this.currentTools();
 
-    this.botContext = new BotContext(this.files, renderToolsText(tools));
+    this.botContext = new BotContext(this.files, this.pinnedToolsText());
     // TU 换算锚点：Bot 估算 duration / wait 时长的依据（如「1 TU = 1 秒」）
     this.botContext.timeInfo =
       `1 TU = ${this.clock.unitWorldSeconds} 秒` +
@@ -189,9 +205,14 @@ export class WorldService extends Service<Config> {
       this.botContext.pinned.persona = await this.files.readBotStatus();
       await this.botContext.persistPinned();
     }
-    // 原生多模态：附件 → content part
+    // 原生多模态：附件 → content part。
+    // 加载时按【当前】模态配置与格式白名单过滤：用户纠正配置后，历史事件里
+    // 已不支持的附件（关掉的模态 / GIF 表情等）不再注入请求，避免持续 400。
     if (this.config.bot.mode === "chat") {
-      this.botContext.attachmentLoader = createAttachmentLoader(this.media, this.ctx.logger("yesimbot-world"));
+      const loader = createAttachmentLoader(this.media, this.ctx.logger("yesimbot-world"));
+      const modalities = this.config.bot.modalities;
+      this.botContext.attachmentLoader = async (ref) =>
+        modalities[ref.type] && nativeSafeMime(ref) ? loader(ref) : null;
     }
 
     const messenger = new KoishiMessenger(
@@ -232,8 +253,10 @@ export class WorldService extends Service<Config> {
       this.world,
       messenger,
       this.appManager,
+      this.notifyMgr,
+      this.phoneStatus,
       this.logger,
-      tools.map((t) => t.name),
+      tools,
     );
 
     await this.clock.resume();
@@ -334,6 +357,10 @@ export class WorldService extends Service<Config> {
       );
       const openApp = this.appManager?.currentName;
       if (openApp) lines.push(`手机里打开的应用：「${openApp}」`);
+      if (this.phoneStatus.down) lines.push("手机被 Bot 放在一边（通知已降级为震动）");
+      if (this.config.messaging.botManagedNotifyChannels) {
+        lines.push(`通知频道（Bot 自管）：${this.notifyMgr.statusText()}`);
+      }
     }
     const focused = this.focus.activeKeys();
     if (focused.length) {
@@ -346,14 +373,19 @@ export class WorldService extends Service<Config> {
     return lines.join("\n");
   }
 
-  /** 当前配置下实际可用的 Bot 工具集 */
+  /** 当前配置下实际可用的 Bot 工具集（全部层级） */
   private currentTools() {
     return availableTools({
       tts: this.config.tts.enabled,
-      focus: this.config.messaging.focusDurationUnits > 0,
       ops: this.config.platformOps,
       apps: this.appInfos(),
+      notifyManaged: this.config.messaging.botManagedNotifyChannels,
     });
+  }
+
+  /** 置顶工具列表文本：仅 core 层常驻工具（其余层按需以事件展开，节省上下文） */
+  private pinnedToolsText(): string {
+    return renderToolsText(this.currentTools().filter((t) => toolLayer(t.name) === "core"));
   }
 
   /** 手机里已安装的应用列表（聊天平台在前） */
@@ -442,6 +474,8 @@ export class WorldService extends Service<Config> {
         await this.files.reset();
         await this.clock.reset();
         await this.focus.clear();
+        await this.notifyMgr.reset();
+        this.phoneStatus.down = false;
         return "世界已重置。定义文件保留，可重新 world.init。";
       });
   }

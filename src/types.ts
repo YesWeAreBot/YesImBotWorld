@@ -47,6 +47,15 @@ export interface RichText {
   attachments?: MediaRef[];
 }
 
+/**
+ * 手机的物理状态（agent 与 gateway 共享）。
+ * down = Bot 把手机放下了：所有通知降级为"手机震了一下"，不呈现内容，
+ * 直到 pick_up_phone 拿起手机。
+ */
+export interface PhoneStatus {
+  down: boolean;
+}
+
 export interface BotEvent {
   id: string;
   source: EventSource;

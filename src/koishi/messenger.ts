@@ -52,6 +52,16 @@ export class KoishiMessenger implements MessengerApi {
 
   // ---------- 查看 ----------
 
+  /** 宽松解析频道 id → 规范化 key 与是否私聊（agent 进入频道页 / 自动切频道用） */
+  async resolveKey(id: string): Promise<{ key: string; isPrivate: boolean } | { error: string }> {
+    const resolved = await this.resolveChannel(id);
+    if ("error" in resolved) return resolved;
+    return {
+      key: `${resolved.platform}:${resolved.channelId}`,
+      isPrivate: resolved.channelId.startsWith("private:"),
+    };
+  }
+
   async recentChannels(n: number): Promise<RichText> {
     const channels = await this.store.recentChannels(n);
     if (!channels.length) return { text: "你翻了翻手机，最近没有任何频道有消息。" };
@@ -1106,9 +1116,11 @@ export class KoishiMessenger implements MessengerApi {
         do {
           const page = await bot.getFriendList(next);
           for (const friend of page.data) {
-            const uid = friend.user?.id;
+            // 兼容两种返回形态：Universal.User 本体（onebot 等适配器）或 { user: {...} } 包装
+            const user = (friend.user ?? friend) as { id?: string; name?: string; nick?: string };
+            const uid = user.id;
             if (!uid) continue;
-            const name = friend.nick || friend.user?.nick || friend.user?.name || uid;
+            const name = friend.nick || user.nick || user.name || uid;
             lines.push(`- ${name}（${bot.platform}:private:${uid}）`);
           }
           next = page.next;

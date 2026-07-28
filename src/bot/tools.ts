@@ -8,6 +8,41 @@ export interface BotToolDef {
   description: string;
 }
 
+/**
+ * 工具层级：模仿真实手机的操作逻辑，分层展开、按需可见。
+ *
+ * - core：常驻（世界/身体动作 + 收藏夹 + 手机的物理动作），进置顶工具列表；
+ * - chat：打开聊天应用后可用（消息列表、好友/群、账号设置）；
+ * - channel：进入某个频道页后可用（发消息、撤回、贴表情……id 缺省为当前频道）；
+ * - group：进入的频道是群聊时，在 channel 层之上追加（群信息与群管理）。
+ *
+ * 非 core 层的工具不进置顶列表，在打开应用/进入频道时以事件展开用法，
+ * 并动态加入允许列表与 GBNF 语法（关闭/离开后失效）。
+ */
+export type ToolLayer = "core" | "chat" | "channel" | "group";
+
+const CHAT_LAYER = new Set([
+  "check_msg", "select_channel", "list_friends", "list_groups", "handle_request",
+  "user_info", "send_like", "delete_friend", "set_profile", "set_model_show", "ocr_image",
+]);
+const CHANNEL_LAYER = new Set([
+  "send", "send_file", "send_voice", "recall", "react", "get_emoji_likes",
+  "forward_msgs", "poke", "channel_notify",
+]);
+const GROUP_LAYER = new Set([
+  "group_info", "list_members", "member_info", "group_honor", "group_files",
+  "set_group_card", "set_group_name", "set_group_portrait", "send_group_notice",
+  "get_group_notice", "set_essence", "get_essence_list", "group_sign", "group_ban",
+  "group_whole_ban", "group_kick", "group_admin", "set_special_title", "group_leave",
+]);
+
+export function toolLayer(name: string): ToolLayer {
+  if (CHAT_LAYER.has(name)) return "chat";
+  if (CHANNEL_LAYER.has(name)) return "channel";
+  if (GROUP_LAYER.has(name)) return "group";
+  return "core";
+}
+
 export const BOT_TOOLS: BotToolDef[] = [
   {
     name: "wait",
@@ -50,27 +85,42 @@ export const BOT_TOOLS: BotToolDef[] = [
   {
     name: "check_msg",
     signature: "check_msg(n: number)",
-    description: "拿起手机看一眼：列出最近活跃的 n 个频道及各自的最新一条消息。",
+    description: "刷新消息列表：列出最近活跃的 n 个频道及各自的最新一条消息。",
   },
   {
     name: "select_channel",
     signature: 'select_channel(id: string, n: number)',
     description:
-      '打开某个频道查看最近 n 条消息。id 格式为 "platform:channelId"。' +
-      "打开后的一段时间内你会持续留意这个频道，它的新消息会直接呈现在你眼前（发消息给某频道也有同样效果）。",
+      '点进消息列表中的一个频道，查看最近 n 条消息。id 格式为 "platform:channelId"。' +
+      "进入频道页后才能进行频道内的操作（发消息等，进入时会看到可用操作）。" +
+      "此后的一段时间内你会持续留意这个频道，它的新消息会直接呈现在你眼前（发消息给某频道也有同样效果）。",
   },
   {
     name: "put_down_phone",
     signature: "put_down_phone()",
     description:
-      "放下手机：不再留意之前打开过或聊过的频道。之后那些频道的新消息只会像平常一样通知你，不会直接呈现内容。",
+      "把手机放到一边：关闭打开着的应用，不再留意任何频道。之后再有消息你只会感觉到手机震了一下" +
+      "（不呈现内容也不知道来自哪里），直到你用 pick_up_phone 拿起手机。想清静时用。",
+  },
+  {
+    name: "pick_up_phone",
+    signature: "pick_up_phone()",
+    description: "把手机拿回手里：恢复正常的消息通知（不会自动打开应用）。",
+  },
+  {
+    name: "channel_notify",
+    signature: 'channel_notify(allow: boolean, id?: string)',
+    description:
+      "开启或关闭一个频道的消息通知（免打扰）。关闭后这个频道的新消息不再提醒你（消息仍会入库，翻记录可见）。" +
+      "id 缺省为当前频道。",
   },
   {
     name: "open_app",
     signature: 'open_app(name: string)',
     description:
-      "打开手机里的一个应用。打开聊天应用相当于看一眼最近的消息；打开其他应用后，" +
-      "你会看到它提供的操作，这些操作即刻可以像普通能力一样调用。一次只能打开一个应用，打开新的会自动关掉上一个。",
+      "打开手机里的一个应用。应用的操作按需展开：打开聊天应用会看到消息列表，并解锁查看好友/群、进入频道等操作；" +
+      "打开其他应用会看到它提供的操作。展开的操作即刻可以像普通能力一样调用，" +
+      "一次只能打开一个应用，打开新的会自动关掉上一个（其操作随之失效）。",
   },
   {
     name: "close_app",
@@ -105,9 +155,9 @@ export const BOT_TOOLS: BotToolDef[] = [
   },
   {
     name: "send",
-    signature: 'send(id: string, msg: string, media?: string[], resend?: boolean, confirm_long?: boolean, insist?: boolean)',
+    signature: 'send(msg: string, id?: string, media?: string[], resend?: boolean, confirm_long?: boolean, insist?: boolean)',
     description:
-      '向某个频道发送消息。id 必须是 check_msg 里看到的完整频道 id（格式 "platform:channelId"，如 "onebot:private:12345"），不要用人名代替。' +
+      "发送消息。id 缺省为当前所在频道；要发给别的频道就给出完整频道 id（格式 \"platform:channelId\"，来自消息列表，不要用人名代替），相当于先切换过去。" +
       'media 可附带图片或视频，元素为媒体编号（如 "12"，来自收藏夹或媒体缓存）。' +
       "在 msg 里写 [图片#12] 或 [视频#3] 会把对应媒体嵌在文字中间发出（图文混排，QQ 等平台可能分开显示）——" +
       "注意：msg 里写了标记这张图就会真的发出去，不想发就不要写。" +
@@ -119,15 +169,16 @@ export const BOT_TOOLS: BotToolDef[] = [
   },
   {
     name: "send_file",
-    signature: 'send_file(id: string, file: string)',
+    signature: 'send_file(file: string, id?: string)',
     description:
-      '以文件形式发送音频、视频或其他文件。file 为媒体编号（如 "7"）或收藏夹文件（如 "gallery:简历.pdf"）。图片请直接用 send 的 media 参数发送。',
+      '以文件形式发送音频、视频或其他文件。file 为媒体编号（如 "7"）或收藏夹文件（如 "gallery:简历.pdf"）；' +
+      "id 缺省为当前频道。图片请直接用 send 的 media 参数发送。",
   },
   {
     name: "send_voice",
-    signature: 'send_voice(id: string, text: string)',
+    signature: 'send_voice(text: string, id?: string)',
     description:
-      "把一段话转成你的声音，以语音消息发出。适合简短口语化的内容。duration 表示说话耗时，发出前可 cancel。",
+      "把一段话转成你的声音，以语音消息发出（id 缺省为当前频道）。适合简短口语化的内容。duration 表示说话耗时，发出前可 cancel。",
   },
   {
     name: "recall",
@@ -331,20 +382,17 @@ export interface AppInfo {
 /** 按配置过滤实际可用的工具（如未配置 TTS 时不提供 send_voice、平台扩展操作默认关闭） */
 export function availableTools(opts: {
   tts: boolean;
-  focus: boolean;
   ops: PlatformOpsConfig;
   apps?: AppInfo[];
+  /** messaging.botManagedNotifyChannels：Bot 可自管通知频道列表 */
+  notifyManaged?: boolean;
 }): BotToolDef[] {
-  // apps[0] 是聊天平台；只有存在可展开的应用（天气/MCP）时才提供 close_app
-  const hasExpandableApps = (opts.apps?.length ?? 0) > 1;
   const tools = BOT_TOOLS.filter((t) => {
     switch (t.name) {
       case "send_voice":
         return opts.tts;
-      case "put_down_phone":
-        return opts.focus;
-      case "close_app":
-        return hasExpandableApps;
+      case "channel_notify":
+        return !!opts.notifyManaged;
       case "recall":
         return opts.ops.recall;
       case "react":
