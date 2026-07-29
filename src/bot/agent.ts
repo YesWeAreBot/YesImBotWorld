@@ -1103,11 +1103,13 @@ export class BotAgent {
   /**
    * 发送类工具的目标解析（在执行时刻调用）：给了别的频道 id 时先切换过去
    * （等效先 select_channel，工具集随频道类型联动），返回规范化 key。
+   * 聊天应用已被关闭时（打字期间 close_app / 放下手机），消息照常发出，
+   * 但不改变界面状态——不把关掉的应用悄悄掀开。
    */
   private async switchToTarget(id: string): Promise<{ key: string } | { error: string }> {
     const resolved = await this.messenger.resolveKey(id);
     if ("error" in resolved) return resolved;
-    if (resolved.key !== this.phoneUi.channelKey) {
+    if (this.phoneUi.chatOpen && resolved.key !== this.phoneUi.channelKey) {
       await this.enterChannel(resolved.key, resolved.isPrivate);
     }
     return { key: resolved.key };

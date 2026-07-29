@@ -343,7 +343,7 @@ export class KoishiMessenger implements MessengerApi {
       msgIds = await target.bot.sendMessage(target.channelId, elements);
     } catch (err) {
       this.ownSends.unexpect(`${target.platform}:${target.channelId}`);
-      return `（消息发送失败：${(err as Error).message ?? err}）`;
+      return `（消息发送失败：${sendFailText(err)}）`;
     }
     await this.storeSelf(target, stored, msgIds[0]);
     await this.focus.focus(`${target.platform}:${target.channelId}`);
@@ -403,7 +403,7 @@ export class KoishiMessenger implements MessengerApi {
       msgIds = await target.bot.sendMessage(target.channelId, element);
     } catch (err) {
       this.ownSends.unexpect(`${target.platform}:${target.channelId}`);
-      return `（文件发送失败：${(err as Error).message ?? err}）`;
+      return `（文件发送失败：${sendFailText(err)}）`;
     }
     await this.storeSelf(target, stored, msgIds[0]);
     await this.focus.focus(`${target.platform}:${target.channelId}`);
@@ -431,7 +431,7 @@ export class KoishiMessenger implements MessengerApi {
       );
     } catch (err) {
       this.ownSends.unexpect(`${target.platform}:${target.channelId}`);
-      return `（语音发送失败：${(err as Error).message ?? err}）`;
+      return `（语音发送失败：${sendFailText(err)}）`;
     }
     // 入资产库留痕，历史记录中可回看
     const mediaId = await this.media.ingest(toDataUrl(audio.data, audio.mime), "audio");
@@ -721,9 +721,9 @@ export class KoishiMessenger implements MessengerApi {
   async handleRequest(requestId: string, approve: boolean, reason?: string): Promise<string> {
     const req = this.requests.get(requestId);
     if (!req) return `（找不到待处理的请求 ${requestId}，它可能已被处理过或已失效。）`;
-    const candidates = this.ctx.bots.filter((b) => b.platform === req.platform);
-    const bot = candidates.find((b) => b.selfId === req.selfId) ?? candidates.find((b) => b.isActive) ?? candidates[0];
-    if (!bot) return `（没有可用的 ${req.platform} 账号来处理这个请求。）`;
+    const candidates = this.ctx.bots.filter((b) => b.platform === req.platform && b.isActive);
+    const bot = candidates.find((b) => b.selfId === req.selfId) ?? candidates[0];
+    if (!bot) return `（手机没有信号：${req.platform} 的连接暂时断开，处理不了这个请求。稍后再试。）`;
     try {
       if (req.kind === "friend") await bot.handleFriendRequest(req.messageId, approve, reason);
       else if (req.kind === "guild") await bot.handleGuildRequest(req.messageId, approve, reason);
@@ -1261,8 +1261,8 @@ export class KoishiMessenger implements MessengerApi {
   }
 
   private findOnebot(): Bot | undefined {
-    const candidates = this.ctx.bots.filter((b) => b.platform === "onebot");
-    return candidates.find((b) => b.isActive) ?? candidates[0];
+    // 只返回在线实例（断线中的实例 internal 未就绪，见 resolveBot）
+    return this.ctx.bots.find((b) => b.platform === "onebot" && b.isActive);
   }
 
   /** 解析并校验一个 OneBot 群频道 id */
@@ -1323,8 +1323,10 @@ export class KoishiMessenger implements MessengerApi {
     if ("error" in resolved) return resolved;
     const { platform, channelId } = resolved;
     const candidates = this.ctx.bots.filter((b) => b.platform === platform);
-    const bot = candidates.find((b) => b.isActive) ?? candidates[0];
-    if (!bot) return { error: `（消息没发出去：没有可用的 ${platform} 账号。）` };
+    if (!candidates.length) return { error: `（消息没发出去：没有接入 ${platform} 平台的账号。）` };
+    // 只用在线的实例：断线/重连中的僵尸实例内部未就绪，调用会炸出费解的底层错误
+    const bot = candidates.find((b) => b.isActive);
+    if (!bot) return { error: `（手机没有信号：${platform} 的连接暂时断开了，消息没发出去。稍等片刻再试。）` };
     return { bot, platform, channelId };
   }
 
@@ -1475,6 +1477,15 @@ async function callOnebot(bot: Bot, action: string, params: Record<string, unkno
     );
   }
   return res && typeof res === "object" && "data" in res ? res.data : res;
+}
+
+/** 把底层适配器的费解报错翻译成 Bot 能理解的表述 */
+function sendFailText(err: unknown): string {
+  const msg = String((err as Error)?.message ?? err);
+  if (msg.includes("_request is not a function")) {
+    return "聊天平台的连接未就绪（可能正在重连），稍后再试";
+  }
+  return msg;
 }
 
 /** OneBot 的 id 多为数字；能转则转成数字，转不了原样传字符串 */
