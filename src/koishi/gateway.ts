@@ -165,7 +165,7 @@ export class Gateway {
     if (this.ownSends.consume(key)) return;
 
     const elements = session.elements ?? h.parse(session.content ?? "");
-    const content = await this.serializeElements(elements);
+    const content = await this.serializeElements(elements, session.messageId ?? undefined);
     if (!content.trim()) return;
 
     await this.store.store({
@@ -188,7 +188,7 @@ export class Gateway {
     if (session.userId && session.bot && session.userId === session.bot.selfId) return;
 
     const elements = session.elements ?? h.parse(session.content ?? "");
-    let content = await this.serializeElements(elements);
+    let content = await this.serializeElements(elements, session.messageId ?? undefined);
     if (!content.trim()) return;
 
     // 引用回复：适配器会把被引用消息摘到 session.quote（不在 elements 里）。
@@ -234,7 +234,7 @@ export class Gateway {
   }
 
   /** 元素树 → 存储文本：媒体下载入资产库并替换为占位符 */
-  private async serializeElements(elements: h[]): Promise<string> {
+  private async serializeElements(elements: h[], containerMsgId?: string): Promise<string> {
     let out = "";
     for (const el of elements) {
       switch (el.type) {
@@ -264,12 +264,14 @@ export class Gateway {
           // 保留标签形式：Bot 照抄即可发出同样的平台表情
           out += faceTag(String(el.attrs.id ?? ""), el.attrs.name ? String(el.attrs.name) : undefined);
           break;
-        case "forward":
-          // 不展开内容：Bot 可像真人一样用 view_forward 点开查看
-          out += el.attrs.id
-            ? `<forward id="${String(el.attrs.id).replace(/"/g, "&quot;")}"/>`
-            : "[合并转发的聊天记录]";
+        case "forward": {
+          // 不展开内容：Bot 可像真人一样用 view_forward 点开查看。
+          // id 优先用所在消息的 message_id——NapCat 的 get_forward_msg 只认它，
+          // 内层 resid 会报"内层消息无法获取"（嵌套层由 view_forward 的内联缓存处理）
+          const fid = containerMsgId || (el.attrs.id ? String(el.attrs.id) : "");
+          out += fid ? `<forward id="${fid.replace(/"/g, "&quot;")}"/>` : "[合并转发的聊天记录]";
           break;
+        }
         case "quote": {
           // 开启需要消息编号的操作时带上被引用的消息 id，Bot 能看懂引用链并可跟进引用
           const quotedId = el.attrs.id;
@@ -277,7 +279,7 @@ export class Gateway {
           break;
         }
         default:
-          if (el.children?.length) out += await this.serializeElements(el.children);
+          if (el.children?.length) out += await this.serializeElements(el.children, containerMsgId);
           break;
       }
     }

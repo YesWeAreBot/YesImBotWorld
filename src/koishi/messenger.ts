@@ -534,22 +534,45 @@ export class KoishiMessenger implements MessengerApi {
   }
 
   /**
-   * 点开一条合并转发的聊天记录（get_forward_msg），返回内部消息列表。
+   * 嵌套聊天记录的内容缓存：NapCat 不支持按内层 resid 拉取（retcode 1200），
+   * 但会把内层内容内联在外层响应里——查看外层时缓存下来，点开内层直接读缓存。
+   */
+  private forwardCache = new Map<string, Record<string, unknown>[]>();
+  private nestedSeq = 0;
+
+  private cacheForward(nodes: Record<string, unknown>[], preferId?: string): string {
+    const key = preferId?.trim() || `nested_${++this.nestedSeq}`;
+    this.forwardCache.delete(key);
+    this.forwardCache.set(key, nodes);
+    while (this.forwardCache.size > 30) {
+      const oldest = this.forwardCache.keys().next().value;
+      if (oldest === undefined) break;
+      this.forwardCache.delete(oldest);
+    }
+    return key;
+  }
+
+  /**
+   * 点开一条合并转发的聊天记录，返回内部消息列表。
    * 嵌套的聊天记录不展开，渲染为 <forward id="…"/> 供继续点开。
    */
   async viewForward(rawId: string): Promise<RichText> {
-    const bot = this.findOnebot();
-    if (!bot) return { text: "（查看聊天记录目前只支持 QQ（OneBot）平台，但没有可用的 OneBot 账号。）" };
-    let data: Record<string, unknown>;
-    try {
-      data = ((await callOnebot(bot, "get_forward_msg", {
-        id: rawId,
-        message_id: toIdValue(rawId),
-      })) ?? {}) as Record<string, unknown>;
-    } catch (err) {
-      return { text: `（点不开这份聊天记录：${(err as Error).message ?? err}。它可能已过期。）` };
+    // 嵌套层：内容已随外层响应内联缓存，直接读取
+    let nodes = this.forwardCache.get(rawId) ?? null;
+    if (!nodes) {
+      const bot = this.findOnebot();
+      if (!bot) return { text: "（查看聊天记录目前只支持 QQ（OneBot）平台，但没有可用的 OneBot 账号。）" };
+      let data: Record<string, unknown>;
+      try {
+        data = ((await callOnebot(bot, "get_forward_msg", {
+          id: rawId,
+          message_id: toIdValue(rawId),
+        })) ?? {}) as Record<string, unknown>;
+      } catch (err) {
+        return { text: `（点不开这份聊天记录：${(err as Error).message ?? err}。它可能已过期，或需要先点开包含它的那一层。）` };
+      }
+      nodes = (Array.isArray(data.messages) ? data.messages : Array.isArray(data.message) ? data.message : []) as Record<string, unknown>[];
     }
-    const nodes = (Array.isArray(data.messages) ? data.messages : Array.isArray(data.message) ? data.message : []) as Record<string, unknown>[];
     if (!nodes.length) return { text: "（这份聊天记录是空的，或格式无法解析。）" };
 
     const lines: string[] = [];
@@ -605,9 +628,20 @@ export class KoishiMessenger implements MessengerApi {
           out += faceTag(String(d.id ?? ""), d.name ? String(d.name) : undefined);
           break;
         case "forward":
-        case "node":
-          out += d.id ? `<forward id="${String(d.id).replace(/"/g, "&quot;")}"/>` : "[嵌套的聊天记录]";
+        case "node": {
+          // 嵌套的聊天记录：内联内容缓存下来（NapCat 无法按内层 resid 拉取），
+          // 渲染为标签供 view_forward 继续点开
+          const inline = Array.isArray(d.content) ? (d.content as Record<string, unknown>[]) : null;
+          if (inline?.length) {
+            const key = this.cacheForward(inline, d.id != null ? String(d.id) : undefined);
+            out += `<forward id="${key.replace(/"/g, "&quot;")}"/>`;
+          } else if (d.id != null) {
+            out += `<forward id="${String(d.id).replace(/"/g, "&quot;")}"/>`;
+          } else {
+            out += "[嵌套的聊天记录（无法点开）]";
+          }
           break;
+        }
         case "reply":
           out += "[引用了一条消息]";
           break;
