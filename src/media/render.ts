@@ -36,6 +36,8 @@ export class MediaRenderer {
     private captioner: CaptionService,
     private nativeSupport: (ref: MediaRef) => boolean,
     private maxAttachments: number,
+    /** 原生附件的括注文本（如 GIF 拼帧的阅读提示），缺省"（见附件）" */
+    private attachmentNote?: (ref: MediaRef) => string,
   ) {}
 
   async render(text: string): Promise<RichText> {
@@ -63,7 +65,7 @@ export class MediaRenderer {
 
     if (this.nativeSupport(row.ref) && attachments.length < this.maxAttachments) {
       attachments.push(row.ref);
-      return `[${label}（见附件）]`;
+      return `[${label}${this.attachmentNote?.(row.ref) ?? "（见附件）"}]`;
     }
 
     const caption = await this.captioner.describe(row.ref);

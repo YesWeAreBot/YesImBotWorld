@@ -68,7 +68,7 @@ export class KoishiMessenger implements MessengerApi {
     if (!channels.length) return { text: "你翻了翻手机，最近没有任何频道有消息。" };
     const lines = channels.map(({ key, latest }) => {
       const time = formatTime(latest.timestamp);
-      const who = latest.self ? "你" : latest.username || latest.userId;
+      const who = latest.self ? "你自己" : latest.username || latest.userId;
       // 预览只做轻量替换，不触发解释器
       return `- ${key} [${time}] ${who}: ${truncate(stripPlaceholders(latest.content), 80)}`;
     });
@@ -87,14 +87,18 @@ export class KoishiMessenger implements MessengerApi {
     const attachments: MediaRef[] = [];
     const lines: string[] = [];
     for (const row of rows) {
-      const who = row.self ? "你" : row.username || row.userId;
+      const who = row.self ? "你自己" : row.username || row.userId;
       const rendered = await this.renderer.render(row.content);
       if (rendered.attachments) attachments.push(...rendered.attachments);
       const msgTag = this.showMsgId && row.messageId ? ` (msg:${row.messageId})` : "";
       lines.push(`[${formatTime(row.timestamp)}]${msgTag} ${who}: ${rendered.text}`);
     }
+    // 最后一条是自己发的：显式点破，防止 Bot 把自己的消息当成别人的来"接话"
+    const tail = rows[rows.length - 1]?.self
+      ? "\n（最后一条是你自己发的，之后对方还没有新消息）"
+      : "";
     return {
-      text: `你打开了 ${id} 的聊天记录（最近 ${rows.length} 条）：\n${lines.join("\n")}`,
+      text: `你打开了 ${id} 的聊天记录（最近 ${rows.length} 条）：\n${lines.join("\n")}${tail}`,
       attachments: attachments.length ? attachments : undefined,
     };
   }
@@ -575,12 +579,16 @@ export class KoishiMessenger implements MessengerApi {
     }
     if (!nodes.length) return { text: "（这份聊天记录是空的，或格式无法解析。）" };
 
+    const selfId = this.findOnebot()?.selfId ?? "";
     const lines: string[] = [];
     const shown = nodes.slice(0, 50);
     for (const node of shown) {
       // NapCat/go-cqhttp 的节点形态：{ sender: {nickname}, time?, content|message: 消息段数组 }
       const sender = (node.sender ?? {}) as Record<string, unknown>;
-      const who = String(sender.nickname ?? sender.card ?? node.nickname ?? sender.user_id ?? "?");
+      const who =
+        selfId && String(sender.user_id ?? "") === String(selfId)
+          ? "你自己"
+          : String(sender.nickname ?? sender.card ?? node.nickname ?? sender.user_id ?? "?");
       const time =
         typeof node.time === "number" && node.time > 0 ? `[${formatTime(new Date(node.time * 1000))}] ` : "";
       const segments = (Array.isArray(node.content) ? node.content : Array.isArray(node.message) ? node.message : []) as Record<string, unknown>[];

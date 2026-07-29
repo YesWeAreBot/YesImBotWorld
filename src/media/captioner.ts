@@ -26,6 +26,10 @@ export class CaptionService {
     return this.cfg[type].enabled;
   }
 
+  private isGif(ref: MediaRef): boolean {
+    return ref.type === "image" && ref.mime === "image/gif";
+  }
+
   /**
    * 取得媒体的文本解释（缓存优先）。
    * 返回 null 表示无可用解释器或解释失败。
@@ -33,7 +37,11 @@ export class CaptionService {
   async describe(ref: MediaRef): Promise<string | null> {
     const row = await this.store.get(ref.id);
     if (row?.summary) return row.summary;
-    if (!this.enabledFor(ref.type)) return null;
+    // GIF 动图优先走视频解释器（都未启用则无解释）
+    const enabled = this.isGif(ref)
+      ? this.cfg.video.enabled || this.cfg.image.enabled
+      : this.enabledFor(ref.type);
+    if (!enabled) return null;
 
     const existing = this.inflight.get(ref.id);
     if (existing) return existing;
@@ -56,12 +64,24 @@ export class CaptionService {
     if (ref.type === "audio" && this.cfg.audio.api === "transcription") {
       return this.transcribe(ref, this.cfg.audio);
     }
+    // GIF 动图：优先外挂视频解释器（video_url 通道，能看到动态过程），未启用退回图片解释器
+    if (this.isGif(ref) && this.cfg.video.enabled) {
+      const data = await this.store.readFile(ref);
+      return this.describeViaChat(ref, this.cfg.video, {
+        type: "video_url",
+        video_url: { url: `data:image/gif;base64,${data.toString("base64")}` },
+      });
+    }
     return this.describeViaChat(ref, this.cfg[ref.type]);
   }
 
-  private async describeViaChat(ref: MediaRef, cfg: CaptionerConfig): Promise<string | null> {
+  private async describeViaChat(
+    ref: MediaRef,
+    cfg: CaptionerConfig,
+    partOverride?: ContentPart,
+  ): Promise<string | null> {
     const data = await this.store.readFile(ref);
-    const part = mediaToContentPart(ref, data);
+    const part = partOverride ?? mediaToContentPart(ref, data);
     const client = new ChatClient({
       baseURL: cfg.baseURL,
       apiKey: cfg.apiKey || undefined,

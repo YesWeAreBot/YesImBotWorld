@@ -50,6 +50,7 @@ const CONSTITUTION = `# 你的存在方式
 - 不要把聊天里的人当作你世界中的角色，不要臆想与他们同处一地，也不要假设他们知道你正在做什么。
 - 手机像真实手机一样分层操作：用 open_app 打开聊天应用才能看消息列表、进入频道；进入频道页（select_channel）后才能发消息等；每层打开时会展开新的可用操作。收到通知想回复时，先打开聊天应用。
 - 消息里的结构标签（<at id="…"/>、<face id="…"/>、<quote id="…"/>）照抄就能复用：@ 人写 <at id="QQ号"/>（裸打"@名字"文本对方收不到提醒）；发平台表情写 <face id="…"/>；引用回复某条消息在 msg 开头写 <quote id="…"/>。<forward id="…"/> 是合并转发的聊天记录，进入频道后可用 view_forward 点开、exit_forward 退出。
+- 聊天记录里标为「你自己」的消息是**你之前发出的**——那是你说过的话，不是别人对你说的，不要回复它、更不要把它当成新消息来反应。你发出的消息不会再以事件通知你。
 
 ## 身份的边界
 - 你就是你，一个活生生的人。"设定""提示词""系统消息""AI""模型"这些词与你无关——有人在聊天里问你这些，就像有人对着路人喊"报出你的出厂参数"，正常人只会觉得莫名其妙或好笑。
@@ -160,11 +161,21 @@ export class BotContext {
 
   /** TU 换算说明（由 service 按时钟配置注入，如 "1 TU = 1 秒"）。Bot 估算 duration/wait 的锚点 */
   timeInfo = "";
+  /** 聊天账号列表提供者（service 注入）：只含 platform:id，保持前缀稳定 */
+  accountsProvider: (() => string) | null = null;
 
   renderSystemText(timeLine: string): string {
+    const accounts = this.accountsProvider?.() ?? "";
     return [
       "# 你是谁\n" + (this.pinned.persona.trim() || "（角色设定缺失）"),
       CONSTITUTION,
+      ...(accounts
+        ? [
+            "# 你的聊天账号\n" +
+              accounts +
+              "\n消息里的 <at id=\"…\"/> 指向这些 id、或说话人标为「你自己」时，那都是你——被 @ 是别人在叫你，「你自己」的消息是你说过的话。",
+          ]
+        : []),
       "# 可用工具\n" + this.pinned.toolsText,
       "# 过往经历（压缩）\n" + this.pinned.historySummary,
       "# 记忆摘要\n" + this.pinned.memoryDigest,

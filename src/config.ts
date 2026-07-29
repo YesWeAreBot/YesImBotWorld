@@ -233,7 +233,8 @@ export const Config: Schema<Config> = Schema.intersect([
         video: Schema.boolean().default(false).description("模型原生支持视频输入"),
       }).description(
         "Bot-LLM 的原生多模态能力（仅 chat 模式生效；text 模式的 /completion 无法输入媒体，一律使用外挂解释器）。" +
-          "原生支持的模态会以 content part 附件注入上下文；未支持的模态回退到外挂解释器",
+          "原生支持的模态会以 content part 附件注入上下文；未支持的模态回退到外挂解释器。" +
+          "GIF 动图按能力路由：支持视频 → 走视频通道；仅支持图像 → 抽帧拼成一张网格图注入；都不支持 → 优先外挂视频解释器",
       ),
       template: Schema.object({
         bos: Schema.string().default("").description("BOS 文本（llama.cpp 通常自动加 BOS token，留空即可）"),

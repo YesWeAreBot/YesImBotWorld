@@ -67,14 +67,25 @@ export class WorldService extends Service<Config> {
     const assetsDir = path.resolve(ctx.baseDir, config.basePath, "assets");
     this.media = new MediaStore(ctx, assetsDir, config.media.maxBytes, ctx.logger("yesimbot-world"));
     this.captioner = new CaptionService(config.captioners, config.media, this.media, ctx.logger("yesimbot-world"));
-    // 原生附件门槛：chat 模式 + 声明了该模态 + 格式安全（GIF 等一律走解释器，避免 400）
-    const nativeSupport = (ref: MediaRef) =>
-      config.bot.mode === "chat" && config.bot.modalities[ref.type] && nativeSafeMime(ref);
+    // 原生附件门槛：chat 模式 + 声明了该模态 + 格式安全。
+    // GIF 特殊：支持视频 → 走视频通道；仅支持图像 → 抽帧拼图（loader 内完成）
+    const isGif = (ref: MediaRef) => ref.type === "image" && ref.mime === "image/gif";
+    const nativeSupport = (ref: MediaRef) => {
+      if (config.bot.mode !== "chat" || !nativeSafeMime(ref)) return false;
+      if (isGif(ref)) return config.bot.modalities.video || config.bot.modalities.image;
+      return config.bot.modalities[ref.type];
+    };
     this.renderer = new MediaRenderer(
       this.media,
       this.captioner,
       nativeSupport,
       config.media.maxAttachmentsPerEvent,
+      (ref) => {
+        if (!isGif(ref)) return "（见附件）";
+        return config.bot.modalities.video
+          ? "（GIF 动图，见附件）"
+          : "（GIF 动图，附件为其逐帧拼图，按行从左到右为播放顺序）";
+      },
     );
 
     // 关注频道管理：Bot 打开/发消息的频道在一段时间内无视通知策略，消息必定呈现内容
@@ -199,6 +210,12 @@ export class WorldService extends Service<Config> {
     const tools = this.currentTools();
 
     this.botContext = new BotContext(this.files, this.pinnedToolsText());
+    // 聊天账号列表：Bot 识别 <at id/>、引用等结构里的"自己"的依据。
+    // 惰性取值：autoStart 时适配器可能尚未连接，连上后自然出现（仅 id，保持前缀稳定）
+    this.botContext.accountsProvider = () => {
+      const ids = [...new Set(this.ctx.bots.filter((b) => b.selfId).map((b) => `${b.platform}:${b.selfId}`))];
+      return ids.sort().join("、");
+    };
     // TU 换算锚点：Bot 估算 duration / wait 时长的依据（如「1 TU = 1 秒」）
     this.botContext.timeInfo =
       `1 TU = ${this.clock.unitWorldSeconds} 秒` +
@@ -212,10 +229,14 @@ export class WorldService extends Service<Config> {
     // 加载时按【当前】模态配置与格式白名单过滤：用户纠正配置后，历史事件里
     // 已不支持的附件（关掉的模态 / GIF 表情等）不再注入请求，避免持续 400。
     if (this.config.bot.mode === "chat") {
-      const loader = createAttachmentLoader(this.media, this.ctx.logger("yesimbot-world"));
       const modalities = this.config.bot.modalities;
+      const loader = createAttachmentLoader(this.media, modalities, this.ctx.logger("yesimbot-world"));
+      const allowed = (ref: MediaRef) =>
+        ref.type === "image" && ref.mime === "image/gif"
+          ? modalities.video || modalities.image
+          : modalities[ref.type];
       this.botContext.attachmentLoader = async (ref) =>
-        modalities[ref.type] && nativeSafeMime(ref) ? loader(ref) : null;
+        allowed(ref) && nativeSafeMime(ref) ? loader(ref) : null;
     }
 
     const messenger = new KoishiMessenger(

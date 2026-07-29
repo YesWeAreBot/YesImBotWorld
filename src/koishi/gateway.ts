@@ -165,7 +165,10 @@ export class Gateway {
     if (this.ownSends.consume(key)) return;
 
     const elements = session.elements ?? h.parse(session.content ?? "");
-    const content = await this.serializeElements(elements, session.messageId ?? undefined);
+    const content = await this.serializeElements(elements, {
+      containerMsgId: session.messageId ?? undefined,
+      selfId: session.selfId ?? session.bot?.selfId ?? undefined,
+    });
     if (!content.trim()) return;
 
     await this.store.store({
@@ -187,19 +190,25 @@ export class Gateway {
     // 忽略机器人自己发出的回环消息（自己发送的消息在 send 工具中入库）
     if (session.userId && session.bot && session.userId === session.bot.selfId) return;
 
+    const selfId = session.selfId ?? session.bot?.selfId ?? undefined;
     const elements = session.elements ?? h.parse(session.content ?? "");
-    let content = await this.serializeElements(elements, session.messageId ?? undefined);
+    let content = await this.serializeElements(elements, {
+      containerMsgId: session.messageId ?? undefined,
+      selfId,
+    });
     if (!content.trim()) return;
 
     // 引用回复：适配器会把被引用消息摘到 session.quote（不在 elements 里）。
-    // 以标签形式前置：信息可读（谁、说了什么），且 Bot 照抄 <quote id="…"/> 即可自己引用回复
+    // 以标签形式前置：信息可读（谁、说了什么），且 Bot 照抄 <quote id="…"/> 即可自己引用回复。
+    // 被引用的是 Bot 自己的消息时显式点破——账号昵称未必等于它的自我认知
     const quote = session.quote;
     if (quote && (quote.id || quote.content || quote.elements)) {
       const qUser = quote.user as { name?: string; nick?: string; id?: string } | undefined;
+      const isSelf = !!selfId && qUser?.id != null && String(qUser.id) === String(selfId);
       content =
         quoteTag({
           id: needsMsgIds(this.ops) && quote.id ? quote.id : undefined,
-          name: qUser?.nick || qUser?.name || qUser?.id || undefined,
+          name: isSelf ? "你自己" : qUser?.nick || qUser?.name || qUser?.id || undefined,
           text: truncate(plainText(quote.elements ?? h.parse(quote.content ?? "")), 40) || undefined,
         }) + ` ${content}`;
     }
@@ -234,7 +243,10 @@ export class Gateway {
   }
 
   /** 元素树 → 存储文本：媒体下载入资产库并替换为占位符 */
-  private async serializeElements(elements: h[], containerMsgId?: string): Promise<string> {
+  private async serializeElements(
+    elements: h[],
+    opts: { containerMsgId?: string; selfId?: string } = {},
+  ): Promise<string> {
     let out = "";
     for (const el of elements) {
       switch (el.type) {
@@ -255,10 +267,13 @@ export class Gateway {
           break;
         }
         case "at":
-          // 保留标签形式：Bot 照抄同样的标签发出时，messenger 会还原成真正的 at 元素
+          // 保留标签形式：Bot 照抄同样的标签发出时，messenger 会还原成真正的 at 元素。
+          // @ 的是 Bot 自己时显式点破——Bot 未必认得自己的账号 id
           if (el.attrs.type === "all") out += `<at type="all"/>`;
-          else if (el.attrs.id) out += atTag(String(el.attrs.id), el.attrs.name ? String(el.attrs.name) : undefined);
-          else out += `@${el.attrs.name ?? ""}`;
+          else if (el.attrs.id) {
+            out += atTag(String(el.attrs.id), el.attrs.name ? String(el.attrs.name) : undefined);
+            if (opts.selfId && String(el.attrs.id) === opts.selfId) out += "（@的是你）";
+          } else out += `@${el.attrs.name ?? ""}`;
           break;
         case "face":
           // 保留标签形式：Bot 照抄即可发出同样的平台表情
@@ -268,7 +283,7 @@ export class Gateway {
           // 不展开内容：Bot 可像真人一样用 view_forward 点开查看。
           // id 优先用所在消息的 message_id——NapCat 的 get_forward_msg 只认它，
           // 内层 resid 会报"内层消息无法获取"（嵌套层由 view_forward 的内联缓存处理）
-          const fid = containerMsgId || (el.attrs.id ? String(el.attrs.id) : "");
+          const fid = opts.containerMsgId || (el.attrs.id ? String(el.attrs.id) : "");
           out += fid ? `<forward id="${fid.replace(/"/g, "&quot;")}"/>` : "[合并转发的聊天记录]";
           break;
         }
@@ -279,7 +294,7 @@ export class Gateway {
           break;
         }
         default:
-          if (el.children?.length) out += await this.serializeElements(el.children, containerMsgId);
+          if (el.children?.length) out += await this.serializeElements(el.children, opts);
           break;
       }
     }
