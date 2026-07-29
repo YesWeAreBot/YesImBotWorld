@@ -349,6 +349,7 @@ plugins:
       longMessageChars: 100 # 单条消息超长提醒阈值（0 禁用）
       coldChannelMsgs: 3 # 连发几条无人回应后拦截 send 提醒别刷屏，需 insist: true 才发出（0 禁用）
       externalSelfMessages: off # 非本插件产生的 Bot 账号消息：off / simulate（伪装成 send）/ event（事件告知）/ silent（只入库，翻记录时发现）
+      selfCommands: false # 允许 Bot 触发 Koishi 指令（消息以指令名开头即执行，自己玩自己；world 系列除外）
     platformOps: # 平台扩展操作，每项独立开关（默认全部 false，此处为示例）
       recall: true
       react: true

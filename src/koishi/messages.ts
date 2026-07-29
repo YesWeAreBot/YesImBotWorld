@@ -116,6 +116,17 @@ export class MessageStore {
     return rows[0] ?? null;
   }
 
+  /** 按平台消息 id 跨频道查找（view_forward 纠错：Bot 把消息编号当转发 id 时定位原消息） */
+  async findAnyByMessageId(messageId: string): Promise<WorldMessageRow | null> {
+    if (!messageId) return null;
+    const rows = await this.ctx.database.get(
+      "yesimbot_world_message",
+      { messageId },
+      { limit: 1, sort: { id: "desc" } },
+    );
+    return rows[0] ?? null;
+  }
+
   /** 某频道最近 n 条消息（时间正序返回） */
   async channelMessages(platform: string, channelId: string, n: number): Promise<WorldMessageRow[]> {
     const rows = await this.ctx.database.get(

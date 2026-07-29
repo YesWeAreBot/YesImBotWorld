@@ -46,12 +46,16 @@ export class Gateway {
       });
     });
 
-    // Bot 账号发出的、非本插件产生的消息（其他插件/指令输出等）
+    // Bot 账号发出的、非本插件产生的消息（其他插件/指令输出等）。
+    // 注意：koishi 4.18 / satori 4.6 起 "send" 事件不再被派发（session 创建后没有 dispatch），
+    // 只能用 before-send（发送前的 serial 事件，elements 已就绪）。
+    // 监听器必须同步返回 undefined——返回真值会取消发送，处理逻辑异步进行不阻塞发送。
     if (cfg.externalSelfMessages !== "off") {
-      ctx.on("send", (session) => {
+      ctx.on("before-send", (session) => {
         void this.handleSelfSent(session).catch((err) => {
           ctx.logger("yesimbot-world").warn("外发消息处理失败: %s", err);
         });
+        return undefined;
       });
     }
 
@@ -157,7 +161,7 @@ export class Gateway {
     this.callbacks.notify({ text }, this.cfg.wakeOnNotify);
   }
 
-  /** Koishi send 事件：Bot 账号发出了一条消息。区分本插件发送与外部发送 */
+  /** before-send：Bot 账号即将发出一条消息。区分本插件发送与外部发送 */
   private async handleSelfSent(session: Session): Promise<void> {
     if (!session.channelId) return;
     const key = `${session.platform}:${session.channelId}`;

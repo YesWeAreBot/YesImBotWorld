@@ -100,6 +100,7 @@ export interface MessagingConfig {
   longMessageChars: number;
   coldChannelMsgs: number;
   externalSelfMessages: ExternalSelfMessageMode;
+  selfCommands: boolean;
 }
 
 /** 聊天平台扩展操作（收发消息之外的能力），每个接口独立开关，默认全部关闭 */
@@ -608,6 +609,13 @@ export const Config: Schema<Config> = Schema.intersect([
         .description(
           "Bot 账号发出的、非本插件产生的消息（其他插件的输出、Koishi 指令回复等）是否让 Bot-LLM 看到。" +
             "开启后这类消息也会入库（消息记录中可回看）",
+        ),
+      selfCommands: Schema.boolean()
+        .default(false)
+        .description(
+          "允许 Bot 触发 Koishi 指令（自己玩自己）：它发出的消息若以某个已注册指令名开头（不带前缀），" +
+            "将以它自己的身份执行，指令输出照常发回频道（配合 externalSelfMessages 可让它看到结果）。" +
+            "能执行哪些指令取决于 Bot 账号在 Koishi 的权限等级；本插件自身的 world 系列指令除外",
         ),
     }).description("Koishi 消息接入"),
   }),

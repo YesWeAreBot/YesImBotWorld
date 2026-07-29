@@ -1,6 +1,6 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import { h, type Bot, type Context } from "koishi";
+import { h, Universal, type Bot, type Context } from "koishi";
 import type { MessengerApi } from "../bot/agent.js";
 import type { CaptionService } from "../media/captioner.js";
 import { MEDIA_PLACEHOLDER, mediaPlaceholder, type MediaRenderer } from "../media/render.js";
@@ -347,6 +347,12 @@ export class KoishiMessenger implements MessengerApi {
     }
     await this.storeSelf(target, stored, msgIds[0]);
     await this.focus.focus(`${target.platform}:${target.channelId}`);
+    // Bot 自己玩 Koishi 指令（可选）：消息以已注册指令名开头时，以它自己的身份执行
+    if (this.messaging.selfCommands) {
+      void this.tryExecuteSelfCommand(target, msg).catch((err) => {
+        this.ctx.logger("yesimbot-world").warn("自发指令执行失败: %s", err);
+      });
+    }
     let result = `消息已发送到 ${id}。`;
     if (this.showMsgId && msgIds[0]) result = `消息已发送到 ${id}（msg:${msgIds[0]}）。`;
     if (replyTo) result += `（引用回复了 msg:${replyTo}${atNote}）`;
@@ -561,23 +567,49 @@ export class KoishiMessenger implements MessengerApi {
    * 嵌套的聊天记录不展开，渲染为 <forward id="…"/> 供继续点开。
    */
   async viewForward(rawId: string): Promise<RichText> {
+    return this.viewForwardInner(rawId, true);
+  }
+
+  private async viewForwardInner(rawId: string, allowRedirect: boolean): Promise<RichText> {
     // 嵌套层：内容已随外层响应内联缓存，直接读取
     let nodes = this.forwardCache.get(rawId) ?? null;
+    let lastErr = "";
     if (!nodes) {
       const bot = this.findOnebot();
-      if (!bot) return { text: "（查看聊天记录目前只支持 QQ（OneBot）平台，但没有可用的 OneBot 账号。）" };
-      let data: Record<string, unknown>;
-      try {
-        data = ((await callOnebot(bot, "get_forward_msg", {
-          id: rawId,
-          message_id: toIdValue(rawId),
-        })) ?? {}) as Record<string, unknown>;
-      } catch (err) {
-        return { text: `（点不开这份聊天记录：${(err as Error).message ?? err}。它可能已过期，或需要先点开包含它的那一层。）` };
+      if (!bot) return { text: "（查看聊天记录目前只支持 QQ（OneBot）平台，但当前没有在线的 OneBot 账号。）" };
+      // 依次尝试：message_id（NapCat 按所在消息取）→ id（resid，go-cqhttp/旧记录）。
+      // 不能同时传：部分实现端优先读 id，resid 失效时会直接报错、轮不到 message_id
+      for (const params of [{ message_id: toIdValue(rawId) }, { id: rawId }]) {
+        try {
+          const data = ((await callOnebot(bot, "get_forward_msg", params)) ?? {}) as Record<string, unknown>;
+          const got = (Array.isArray(data.messages) ? data.messages : Array.isArray(data.message) ? data.message : []) as Record<string, unknown>[];
+          if (got.length) {
+            nodes = got;
+            break;
+          }
+        } catch (err) {
+          lastErr = String((err as Error).message ?? err);
+        }
       }
-      nodes = (Array.isArray(data.messages) ? data.messages : Array.isArray(data.message) ? data.message : []) as Record<string, unknown>[];
     }
-    if (!nodes.length) return { text: "（这份聊天记录是空的，或格式无法解析。）" };
+    if (!nodes?.length) {
+      // 纠错：Bot 可能把 (msg:xxx) 消息编号当成了转发 id——找到那条消息，
+      // 提取其中 <forward id="…"/> 标签里的真实 id 再试一次
+      if (allowRedirect) {
+        const row = await this.store.findAnyByMessageId(rawId);
+        if (row) {
+          const m = row.content.match(/<forward id="([^"]+)"\/>/);
+          const tagId = m?.[1];
+          if (tagId && tagId !== rawId) return this.viewForwardInner(tagId, false);
+          if (!m) {
+            return {
+              text: `（消息（msg:${rawId}）不是合并转发的聊天记录——view_forward 的 id 要用消息里 <forward id="…"/> 标签中的那个。）`,
+            };
+          }
+        }
+      }
+      return { text: `（点不开这份聊天记录：${lastErr || "内容为空或格式无法解析"}。它可能已过期，或需要先点开包含它的那一层。）` };
+    }
 
     const selfId = this.findOnebot()?.selfId ?? "";
     const lines: string[] = [];
@@ -1258,6 +1290,38 @@ export class KoishiMessenger implements MessengerApi {
       }
     }
     return `你在群 ${id} 打了卡。`;
+  }
+
+  /**
+   * Bot 自己触发 Koishi 指令：合成一个"以自己为发送者"的入站 session 并执行。
+   * 只在消息首个词元是已注册指令名时才执行（普通聊天不进指令解析）；
+   * 指令输出由 session.execute 自动发回频道（外部自发消息机制会让 Bot 看到）。
+   */
+  private async tryExecuteSelfCommand(
+    target: { bot: Bot; platform: string; channelId: string },
+    msg: string,
+  ): Promise<void> {
+    const text = msg.trim();
+    const token = text.split(/\s+/, 1)[0] ?? "";
+    // 本插件自身的管理指令不给 Bot 玩（world.status 等会泄露模拟器视角）
+    if (!token || token === "world" || token.startsWith("world.")) return;
+    const commander = (this.ctx as Context & { $commander?: { get(name: string): unknown } }).$commander;
+    if (!commander?.get(token)) return;
+
+    const isPrivate = target.channelId.startsWith("private:");
+    const session = target.bot.session({
+      type: "message",
+      timestamp: Date.now(),
+      channel: {
+        id: target.channelId,
+        type: isPrivate ? Universal.Channel.Type.DIRECT : Universal.Channel.Type.TEXT,
+      },
+      ...(isPrivate ? {} : { guild: { id: target.channelId } }),
+      user: { id: target.bot.selfId ?? "", name: "（我）" },
+      message: { content: text },
+    });
+    // bot.session 的静态类型是 satori Session；运行时是 koishi 扩展过的（带 execute）
+    await (session as unknown as { execute(content: string): Promise<unknown> }).execute(text);
   }
 
   private findOnebot(): Bot | undefined {
