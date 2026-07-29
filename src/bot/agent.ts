@@ -38,6 +38,7 @@ export interface MessengerApi {
   emojiLikes(id: string, msgId: string, emoji: string): Promise<string>;
   forwardMsgs(id: string, msgIds: string[]): Promise<string>;
   ocrImage(image: string): Promise<string>;
+  viewForward(id: string): Promise<RichText>;
   poke(id: string, userId?: string): Promise<string>;
   handleRequest(requestId: string, approve: boolean, reason?: string): Promise<string>;
   listFriends(): Promise<string>;
@@ -117,8 +118,14 @@ export class BotAgent {
 
   /** 配置过滤后的全部工具定义（分层展开的来源） */
   private toolDefs: BotToolDef[];
-  /** 手机界面状态：聊天应用是否打开、当前所在频道（分层解锁的依据） */
-  private phoneUi = { chatOpen: false, channelKey: null as string | null, channelIsGroup: false };
+  /** 手机界面状态：聊天应用是否打开、当前所在频道（分层解锁的依据）、聊天记录浏览栈 */
+  private phoneUi: {
+    chatOpen: boolean;
+    channelKey: string | null;
+    channelIsGroup: boolean;
+    /** 正在逐层查看的合并转发聊天记录（view_forward 压栈 / exit_forward 出栈） */
+    forwardStack: string[];
+  } = { chatOpen: false, channelKey: null, channelIsGroup: false, forwardStack: [] };
 
   constructor(
     private config: Config,
@@ -182,7 +189,7 @@ export class BotAgent {
     const prev = this.phoneUi;
     const toolsetChanged =
       !prev.channelKey || prev.channelIsGroup !== isGroup;
-    this.phoneUi = { chatOpen: true, channelKey: key, channelIsGroup: isGroup };
+    this.phoneUi = { chatOpen: true, channelKey: key, channelIsGroup: isGroup, forwardStack: [] };
     this.refreshToolGate();
     if (toolsetChanged) {
       const defs = [...this.layerDefs("channel"), ...(isGroup ? this.layerDefs("group") : [])];
@@ -520,7 +527,7 @@ export class BotAgent {
       case "put_down_phone":
         return this.dispatchLocal(call, async () => {
           const closedApp = await this.apps?.closeCurrent();
-          this.phoneUi = { chatOpen: false, channelKey: null, channelIsGroup: false };
+          this.phoneUi = { chatOpen: false, channelKey: null, channelIsGroup: false, forwardStack: [] };
           this.phone.down = true;
           this.refreshToolGate();
           const focusNote = await this.messenger.putDownPhone();
@@ -576,7 +583,7 @@ export class BotAgent {
             return `你关闭了「${closed}」，它的操作已失效。`;
           }
           if (this.phoneUi.chatOpen) {
-            this.phoneUi = { chatOpen: false, channelKey: null, channelIsGroup: false };
+            this.phoneUi = { chatOpen: false, channelKey: null, channelIsGroup: false, forwardStack: [] };
             this.refreshToolGate();
             return "你关闭了聊天应用，相关操作已失效（手机还在手里，有消息仍会通知你）。";
           }
@@ -622,6 +629,41 @@ export class BotAgent {
         }
         return this.dispatchLocal(call, async () => this.messenger.forwardMsgs(id, msgIds));
       }
+      case "view_forward": {
+        const fid = String(call.arguments.id ?? call.arguments.forward_id ?? "").trim();
+        if (!fid) {
+          this.pushEvent("system", '（view_forward 需要 id 参数，来自消息里的 <forward id="…"/> 标签。）', { ref: call.id });
+          return;
+        }
+        if (this.phoneUi.forwardStack.length >= 5) {
+          this.pushEvent("system", "（聊天记录套得太深了，先 exit_forward 退出几层再看。）", { ref: call.id });
+          return;
+        }
+        return this.dispatchLocal(call, async () => {
+          const rich = await this.messenger.viewForward(fid);
+          if (rich.text.startsWith("（")) return rich; // 打开失败：不压栈
+          this.phoneUi.forwardStack.push(fid);
+          const depth = this.phoneUi.forwardStack.length;
+          const header =
+            depth > 1
+              ? `你点开了里面嵌套的聊天记录（第 ${depth} 层）——以下是它的内容，不是当前聊天：`
+              : `你点开了这份聊天记录——以下是它的内容，**不是**当前聊天窗口里的消息：`;
+          return {
+            ...rich,
+            text: `${header}\n${rich.text}\n（看完用 exit_forward 返回${depth > 1 ? "上一层" : "聊天窗口"}）`,
+          };
+        });
+      }
+      case "exit_forward":
+        return this.dispatchLocal(call, async () => {
+          if (!this.phoneUi.forwardStack.length) return "（你没有在看聊天记录。）";
+          this.phoneUi.forwardStack.pop();
+          const depth = this.phoneUi.forwardStack.length;
+          if (depth > 0) return `你退回到上一层聊天记录（第 ${depth} 层）。`;
+          return this.phoneUi.channelKey
+            ? `你退出了聊天记录，回到 ${this.phoneUi.channelKey} 的聊天窗口。`
+            : "你退出了聊天记录。";
+        });
       case "ocr_image": {
         const image = String(call.arguments.image ?? call.arguments.media_id ?? call.arguments.id ?? "");
         if (!image) {
@@ -1015,7 +1057,7 @@ export class BotAgent {
       return this.dispatchLocal(call, async () => {
         const closed = await this.apps?.closeCurrent();
         const firstOpen = !this.phoneUi.chatOpen;
-        this.phoneUi = { chatOpen: true, channelKey: null, channelIsGroup: false };
+        this.phoneUi = { chatOpen: true, channelKey: null, channelIsGroup: false, forwardStack: [] };
         this.refreshToolGate();
         const rich = await this.messenger.recentChannels(10);
         const prefix = closed ? `（你关掉了「${closed}」）` : "";
@@ -1032,7 +1074,7 @@ export class BotAgent {
         const { closed, defs } = await this.apps!.open(resolved.app);
         // 手机同屏只有一个应用：打开 MCP 应用时聊天界面随之退出
         const chatWasOpen = this.phoneUi.chatOpen;
-        this.phoneUi = { chatOpen: false, channelKey: null, channelIsGroup: false };
+        this.phoneUi = { chatOpen: false, channelKey: null, channelIsGroup: false, forwardStack: [] };
         this.refreshToolGate();
         const lines = defs.length
           ? defs.map((d) => `- ${d.signature}\n  ${d.description}`).join("\n")
@@ -1291,7 +1333,7 @@ export class BotAgent {
     // "手机放下"状态保留（那是 Bot 自己的选择）
     const closedApp = await this.apps?.closeCurrent().catch(() => null);
     const chatWasOpen = this.phoneUi.chatOpen;
-    this.phoneUi = { chatOpen: false, channelKey: null, channelIsGroup: false };
+    this.phoneUi = { chatOpen: false, channelKey: null, channelIsGroup: false, forwardStack: [] };
     this.refreshToolGate();
 
     // 醒来时刻更新为当前时间（这是 system 段时间唯一的合法更新时机——

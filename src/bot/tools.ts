@@ -27,7 +27,7 @@ const CHAT_LAYER = new Set([
 ]);
 const CHANNEL_LAYER = new Set([
   "send", "send_file", "send_voice", "recall", "react", "get_emoji_likes",
-  "forward_msgs", "poke", "channel_notify",
+  "forward_msgs", "view_forward", "exit_forward", "poke", "channel_notify",
 ]);
 const GROUP_LAYER = new Set([
   "group_info", "list_members", "member_info", "group_honor", "group_files",
@@ -165,7 +165,9 @@ export const BOT_TOOLS: BotToolDef[] = [
       "与上一条完全相同的消息会被拦截（防止无意义复读）；确实要重复发送时加 resend: true。" +
       "像真人一样聊天：单条消息尽量简短（一般十来个字），长内容拆成多条短消息；" +
       "确需发送整段长文（如资料、文章）时须加 confirm_long: true。" +
-      "连续发了几条对方都没回应时，继续发送会被拦下——确实有必须现在说的话再加 insist: true。",
+      "连续发了几条对方都没回应时，继续发送会被拦下——确实有必须现在说的话再加 insist: true。" +
+      "消息里的结构标签照抄即可复用：<at id=\"QQ号\"/> 是真正的 @（裸打\"@名字\"文本对方收不到提醒）；" +
+      "<face id=\"…\"/> 是平台表情；在 msg 开头写 <quote id=\"…\"/> 等同引用回复那条消息。",
   },
   {
     name: "send_file",
@@ -205,6 +207,18 @@ export const BOT_TOOLS: BotToolDef[] = [
     description:
       "把几条已有消息打包成一份聊天记录，合并转发到某个频道。" +
       "msg_ids 为要转发的消息编号列表（按顺序，来自消息记录里的 (msg:xxx) 标注）。",
+  },
+  {
+    name: "view_forward",
+    signature: 'view_forward(id: string)',
+    description:
+      '点开一份合并转发的聊天记录查看内容。id 来自消息里的 <forward id="…"/> 标签；' +
+      "里面若还嵌着聊天记录，可以继续点开。看完记得 exit_forward 退出，别把记录里的内容当成当前聊天。",
+  },
+  {
+    name: "exit_forward",
+    signature: "exit_forward()",
+    description: "退出正在查看的聊天记录，返回上一层（或回到当前聊天窗口）。",
   },
   {
     name: "ocr_image",

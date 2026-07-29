@@ -8,6 +8,7 @@ import type { MediaStore } from "../media/store.js";
 import type { TtsClient } from "../media/tts.js";
 import type { MediaRef, MediaType, RichText } from "../types.js";
 import type { FocusManager } from "./focus.js";
+import { atTag, faceTag } from "./gateway.js";
 import { needsMsgIds, type MessagingConfig, type PlatformOpsConfig } from "../config.js";
 import type { KnownChannel, MessageStore } from "./messages.js";
 import type { OwnSendTracker } from "./ownsends.js";
@@ -238,6 +239,49 @@ export class KoishiMessenger implements MessengerApi {
     let stored = "";
     let atNote = "";
 
+    // 出站富文本解析：<at …/>、<face …/> 标签（入站渲染的照抄形式）与
+    // at 标记/裸 @名字（按频道参与者解析）→ 真正的消息元素，杜绝"字面假 @"。
+    // 私聊没有 at：at 一律降级为 @名字 文本，表情照常可用
+    const isGroup = !target.channelId.startsWith("private:");
+    let participants: { userId: string; username: string }[] | null = null;
+    const getParticipants = async (): Promise<{ userId: string; username: string }[]> => {
+      if (participants) return participants;
+      try {
+        const channels = await this.store.knownChannels();
+        participants =
+          channels.find((c) => c.platform === target.platform && c.channelId === target.channelId)
+            ?.participants ?? [];
+      } catch {
+        participants = [];
+      }
+      return participants;
+    };
+    const pushText = async (text: string): Promise<void> => {
+      if (!text) return;
+      const parts = renderRichParts(text, isGroup ? await getParticipants() : [], { allowAt: isGroup });
+      for (const part of parts) {
+        if (typeof part === "string") {
+          elements.push(h.text(part));
+          stored += part;
+        } else {
+          elements.push(part.el);
+          stored += part.stored;
+        }
+      }
+    };
+
+    // 引用标签（入站渲染的照抄形式）：<quote id="123" …/> → 等效 reply_to 参数。
+    // 未开启 reply 能力时静默剥离（避免把标签当文字发出去）
+    let quoteFromTag: string | undefined;
+    msg = msg
+      .replace(/<quote\s+([^<>]*?)\/?>(?:<\/quote>)?/g, (_whole, attrsRaw: string) => {
+        const attrs = parseTagAttrs(attrsRaw);
+        if (!quoteFromTag && attrs.id) quoteFromTag = attrs.id;
+        return "";
+      })
+      .trimStart();
+    if (!replyTo && quoteFromTag && this.ops.reply) replyTo = quoteFromTag;
+
     // 引用回复：模拟 QQ 客户端行为——群聊里引用时自动在开头 @ 原发送人 + 空格，
     // Bot 可用 at_sender: false 去掉（如同真人手动删掉自动加上的 @）。
     // 私聊没有 @ 的概念，强制不附加 at（QQ 私聊无法渲染 at，只会留下一个孤零零的空格）。
@@ -260,10 +304,7 @@ export class KoishiMessenger implements MessengerApi {
     for (const match of msg.matchAll(INLINE_MEDIA)) {
       const before = msg.slice(cursor, match.index);
       cursor = match.index! + match[0].length;
-      if (before) {
-        elements.push(h.text(before));
-        stored += before;
-      }
+      await pushText(before);
       const resolved = await this.resolveMediaRef(match[2]!, ["image", "video"]);
       if ("error" in resolved) {
         problems.push(resolved.error);
@@ -274,11 +315,7 @@ export class KoishiMessenger implements MessengerApi {
       inlineIds.add(resolved.ref.id);
       stored += mediaPlaceholder(resolved.ref.id, resolved.ref.type);
     }
-    const rest = msg.slice(cursor);
-    if (rest) {
-      elements.push(h.text(rest));
-      stored += rest;
-    }
+    await pushText(msg.slice(cursor));
 
     // media 参数中的媒体（未在 msg 中内联过的）追加在末尾
     for (const item of media.slice(0, 9)) {
@@ -494,6 +531,96 @@ export class KoishiMessenger implements MessengerApi {
     await this.storeSelf(target, `[合并转发了 ${ids.length} 条消息：${ids.map((m) => `msg:${m}`).join("、")}]`, newId);
     await this.focus.focus(key);
     return `你把 ${ids.length} 条消息打包成聊天记录，合并转发到了 ${id}${this.showMsgId && newId ? `（msg:${newId}）` : ""}。`;
+  }
+
+  /**
+   * 点开一条合并转发的聊天记录（get_forward_msg），返回内部消息列表。
+   * 嵌套的聊天记录不展开，渲染为 <forward id="…"/> 供继续点开。
+   */
+  async viewForward(rawId: string): Promise<RichText> {
+    const bot = this.findOnebot();
+    if (!bot) return { text: "（查看聊天记录目前只支持 QQ（OneBot）平台，但没有可用的 OneBot 账号。）" };
+    let data: Record<string, unknown>;
+    try {
+      data = ((await callOnebot(bot, "get_forward_msg", {
+        id: rawId,
+        message_id: toIdValue(rawId),
+      })) ?? {}) as Record<string, unknown>;
+    } catch (err) {
+      return { text: `（点不开这份聊天记录：${(err as Error).message ?? err}。它可能已过期。）` };
+    }
+    const nodes = (Array.isArray(data.messages) ? data.messages : Array.isArray(data.message) ? data.message : []) as Record<string, unknown>[];
+    if (!nodes.length) return { text: "（这份聊天记录是空的，或格式无法解析。）" };
+
+    const lines: string[] = [];
+    const shown = nodes.slice(0, 50);
+    for (const node of shown) {
+      // NapCat/go-cqhttp 的节点形态：{ sender: {nickname}, time?, content|message: 消息段数组 }
+      const sender = (node.sender ?? {}) as Record<string, unknown>;
+      const who = String(sender.nickname ?? sender.card ?? node.nickname ?? sender.user_id ?? "?");
+      const time =
+        typeof node.time === "number" && node.time > 0 ? `[${formatTime(new Date(node.time * 1000))}] ` : "";
+      const segments = (Array.isArray(node.content) ? node.content : Array.isArray(node.message) ? node.message : []) as Record<string, unknown>[];
+      const body = typeof node.content === "string" ? String(node.content) : await this.serializeRawSegments(segments);
+      lines.push(`${time}${who}: ${truncate(body || "（空消息）", 200)}`);
+    }
+    if (nodes.length > shown.length) lines.push(`（还有 ${nodes.length - shown.length} 条未显示）`);
+
+    // 媒体占位符 → 按当前能力渲染（原生附件 / 解释文本）
+    const rendered = await this.renderer.render(lines.join("\n"));
+    return rendered;
+  }
+
+  /** 原始 OneBot 消息段 → 存储文本（媒体入资产库，嵌套聊天记录保留为标签） */
+  private async serializeRawSegments(segments: Record<string, unknown>[]): Promise<string> {
+    let out = "";
+    for (const seg of segments) {
+      const d = (seg.data ?? {}) as Record<string, unknown>;
+      switch (seg.type) {
+        case "text":
+          out += String(d.text ?? "");
+          break;
+        case "image": {
+          const src = String(d.url ?? d.file ?? "");
+          const id = src ? await this.media.ingest(src, "image") : null;
+          out += id !== null ? mediaPlaceholder(id, "image") : "[图片（获取失败）]";
+          break;
+        }
+        case "record": {
+          const src = String(d.url ?? d.file ?? "");
+          const id = src ? await this.media.ingest(src, "audio") : null;
+          out += id !== null ? mediaPlaceholder(id, "audio") : "[语音（获取失败）]";
+          break;
+        }
+        case "video": {
+          const src = String(d.url ?? d.file ?? "");
+          const id = src ? await this.media.ingest(src, "video") : null;
+          out += id !== null ? mediaPlaceholder(id, "video") : "[视频（获取失败）]";
+          break;
+        }
+        case "at":
+          out += d.qq === "all" ? "@全体成员" : `@${d.name ?? d.qq ?? ""}`;
+          break;
+        case "face":
+          out += faceTag(String(d.id ?? ""), d.name ? String(d.name) : undefined);
+          break;
+        case "forward":
+        case "node":
+          out += d.id ? `<forward id="${String(d.id).replace(/"/g, "&quot;")}"/>` : "[嵌套的聊天记录]";
+          break;
+        case "reply":
+          out += "[引用了一条消息]";
+          break;
+        case "json":
+        case "xml":
+          out += "[卡片消息]";
+          break;
+        default:
+          out += `[${String(seg.type ?? "?")}]`;
+          break;
+      }
+    }
+    return out;
   }
 
   /** 识别图片中的文字（OCR，仅 OneBot） */
@@ -1324,6 +1451,137 @@ function parseUserId(raw: string): string | null {
 /** 群成员排序权重：群主 → 管理员 → 普通成员 */
 function roleRank(role: unknown): number {
   return role === "owner" ? 0 : role === "admin" ? 1 : 2;
+}
+
+export type RichPart = string | { el: h; stored: string };
+
+function unescTag(s: string): string {
+  return s.replace(/&quot;/g, '"').replace(/&lt;/g, "<").replace(/&amp;/g, "&");
+}
+
+/** 宽容解析标签属性：双引号 / 单引号 / 无引号（模型在 JSON 里转义失败时的变体） */
+export function parseTagAttrs(raw: string): Record<string, string> {
+  const attrs: Record<string, string> = {};
+  for (const a of raw.matchAll(/([\w-]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'/>]+))/g)) {
+    attrs[a[1]!] = unescTag(a[2] ?? a[3] ?? a[4] ?? "");
+  }
+  return attrs;
+}
+
+/**
+ * 出站富文本解析：文本中的结构标签 → 真正的消息元素（与入站渲染同构，Bot 照抄即可），
+ * 按优先级：
+ * 1. 标签形式（最精准）：<at id="10001" name="小明"/>、<at type="all"/>、<face id="212"/>；
+ * 2. at 标记形式（宽容变体）：[@名字(10001)] / [@10001] / [@名字] / [@全体成员]；
+ * 3. 裸 @名字：按频道参与者解析（参与者名是 token 前缀也算命中，如 "@小明你好"）。
+ * 解析不了的保持原文，绝不误伤普通文本。
+ * allowAt=false（私聊）时 at 一律降级为 @名字 文本（QQ 私聊没有 at）。
+ */
+export function renderRichParts(
+  text: string,
+  participants: { userId: string; username: string }[],
+  opts: { allowAt: boolean } = { allowAt: true },
+): RichPart[] {
+  const out: RichPart[] = [];
+  const atEl = (id: string, name?: string): RichPart =>
+    opts.allowAt
+      ? { el: h("at", { id, name: name || undefined }), stored: atTag(id, name) }
+      : `@${name || id}`;
+  const byName = (name: string) => participants.find((p) => p.username && p.username === name);
+
+  const pushWithBareAts = (chunk: string): void => {
+    if (!chunk) return;
+    const bare = /@([^\s@，。,.!！？?:：;；()（）[\]]{1,24})/g;
+    let cur = 0;
+    for (const m of chunk.matchAll(bare)) {
+      const token = m[1]!;
+      let hit = byName(token);
+      let rest = "";
+      if (!hit) {
+        const pre = [...participants]
+          .filter((p) => p.username)
+          .sort((a, b) => b.username.length - a.username.length)
+          .find((p) => token.startsWith(p.username));
+        if (pre) {
+          hit = pre;
+          rest = token.slice(pre.username.length);
+        }
+      }
+      if (!hit) continue; // 不是任何参与者：保持原文
+      const before = chunk.slice(cur, m.index);
+      if (before) out.push(before);
+      out.push(atEl(hit.userId, hit.username));
+      if (rest) out.push(rest);
+      cur = m.index! + m[0].length;
+    }
+    const tail = chunk.slice(cur);
+    if (tail) out.push(tail);
+  };
+
+  const atAll = (): RichPart =>
+    opts.allowAt ? { el: h("at", { type: "all" }), stored: `<at type="all"/>` } : "@全体成员";
+
+  // 标记形式（宽容变体）：[@名字(10001)] / [@10001] / [@名字] / [@全体成员]
+  const pushWithMarkers = (chunk: string): void => {
+    if (!chunk) return;
+    const marker = /\[@([^[\]\n]{1,32})\]/g;
+    let cur = 0;
+    for (const m of chunk.matchAll(marker)) {
+      pushWithBareAts(chunk.slice(cur, m.index));
+      cur = m.index! + m[0].length;
+      const inner = m[1]!.trim();
+      if (inner === "全体成员" || inner.toLowerCase() === "all") {
+        out.push(atAll());
+        continue;
+      }
+      const withId = inner.match(/^(.*?)\s*\((\d{3,})\)$/);
+      if (withId) {
+        out.push(atEl(withId[2]!, withId[1]!.trim() || undefined));
+        continue;
+      }
+      if (/^\d{3,}$/.test(inner)) {
+        out.push(atEl(inner, participants.find((p) => p.userId === inner)?.username));
+        continue;
+      }
+      const p = byName(inner);
+      if (p) out.push(atEl(p.userId, p.username));
+      else out.push(m[0]); // 解析不了：保留原文
+    }
+    pushWithBareAts(chunk.slice(cur));
+  };
+
+  // 标签形式（最高优先级）：<at …/>、<face …/>
+  const tag = /<(at|face)\s+([^<>]*?)\/?>(?:<\/(?:at|face)>)?/g;
+  let cursor = 0;
+  for (const m of text.matchAll(tag)) {
+    pushWithMarkers(text.slice(cursor, m.index));
+    cursor = m.index! + m[0].length;
+    const kind = m[1]!;
+    const attrs = parseTagAttrs(m[2]!);
+    if (kind === "face") {
+      if (attrs.id) {
+        out.push({
+          el: h("face", { id: attrs.id, name: attrs.name || undefined }),
+          stored: faceTag(attrs.id, attrs.name || undefined),
+        });
+      } else {
+        out.push(m[0]); // 没有 id 的表情标签：无法还原，保留原文
+      }
+      continue;
+    }
+    if (attrs.type === "all") {
+      out.push(atAll());
+    } else if (attrs.id) {
+      out.push(atEl(attrs.id, attrs.name || participants.find((p) => p.userId === attrs.id)?.username));
+    } else if (attrs.name && byName(attrs.name)) {
+      const p = byName(attrs.name)!;
+      out.push(atEl(p.userId, p.username));
+    } else {
+      out.push(m[0]); // 无法解析的标签：保留原文
+    }
+  }
+  pushWithMarkers(text.slice(cursor));
+  return out;
 }
 
 /** 精华消息条目的内容预览：兼容 content 为消息段数组 / 字符串 / 缺失（不同实现端返回不一） */

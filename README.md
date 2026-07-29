@@ -215,6 +215,7 @@ Bot 不只能收，也能发：
 | `send(msg, id?, media?)` | channel | 发消息（id 缺省当前频道）；超长与冷频道刷屏会被拦下要求确认（`confirm_long` / `insist`） |
 | `send_file(file, id?)` / `send_voice(text, id?)` | channel | 发文件 / TTS 语音（需配置 tts） |
 | `channel_notify(allow, id?)` | channel | 频道免打扰/开通知（需开启 `botManagedNotifyChannels`，持久化到 notify.json） |
+| `view_forward(id)` / `exit_forward()` | channel | 像真人一样点开合并转发的聊天记录（`<forward id="…"/>`，支持嵌套逐层深入）、看完退出返回聊天窗口 |
 | 其余 | chat/channel/group | 即上文平台扩展操作，按层展开（群管理只在群频道页可见） |
 
 ### 平台扩展操作（`platformOps.*`，每项独立开关，默认全部关闭）
@@ -227,7 +228,7 @@ Bot 不只能收，也能发：
 | `recall` | `recall(id, msg_id)` | `delete_msg`（通用 deleteMessage） | 撤回已发出的消息 |
 | `react` | `react(id, msg_id, emoji, remove?)` | `set_msg_emoji_like` / 通用 createReaction、deleteReaction | 贴/移除表情回应（emoji 字符或表情编号） |
 | `emojiLikes` | `get_emoji_likes(id, msg_id, emoji)` | `fetch_emoji_like`（NapCat 特有） | 查看某条消息上某个表情回应的用户列表 |
-| `reply` | `send(…, reply_to, at_sender?)` | quote + at 元素（OneBot 回复） | 引用回复：是否引用、引用哪条由 Bot 自己决定；群聊里默认模拟 QQ 客户端在开头自动 @ 原发送人，Bot 可传 `at_sender: false` 去掉（如同真人删掉自动加的 @） |
+| `reply` | `send(…, reply_to, at_sender?)` 或 msg 内 `<quote id="…"/>` 标签 | quote + at 元素（OneBot 回复） | 引用回复：是否引用、引用哪条由 Bot 自己决定（照抄入站看到的 `<quote …/>` 标签即可）；群聊里默认模拟 QQ 客户端在开头自动 @ 原发送人，Bot 可传 `at_sender: false` 去掉（如同真人删掉自动加的 @） |
 | `forwardMsgs` | `forward_msgs(id, msg_ids)` | `send_group_forward_msg` / `send_private_forward_msg` | 把几条已有消息打包成聊天记录合并转发 |
 | `poke` | `poke(id, user_id?)` | `friend_poke` / `group_poke` | 戳一戳 |
 | `handleRequests` | `handle_request(request_id, approve, reason?)` | `set_friend_add_request` / `set_group_add_request` | 处理好友申请与入群邀请/申请（请求以手机通知事件告知 Bot） |
