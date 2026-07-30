@@ -291,7 +291,20 @@ Bot 不只能收，也能发：
 - **内置天气应用**（`apps.weatherEnabled`，默认开启）：`query_weather(city?)`——
   现实世界设定查询真实天气（Open-Meteo，免费无需 key，可配置 `weatherDefaultCity`）；
   虚构世界设定由 World-LLM 生成，并把天气写进 `World_Status.md`，保证连续查询与世界裁定一致。
-  现实/虚构在创世（`world.init`）时由 World-LLM 依据 `World_Definition.md` 判定，持久化在 `meta.json`。
+  现实/虚构在创世（`world.init`）时由 World-LLM 依据 `World_Definition.md` 判定，持久化在 `meta.json`；
+- **内置浏览器应用**（`apps.browserEnabled`，默认开启）：Bot 可以上网——
+  `search(query)` 搜索、`open_url(url)` 打开网址、`open_link(n)` 点开页内链接、
+  `scroll_down()` 翻页、`go_back()` 后退、`screenshot(description?)` 截图：
+  - **现实世界设定**：对接真实互联网。零依赖 HTML→可读文本转换（标题、正文、链接 `[n]`、
+    图片 `{图n}` 编号化），搜索引擎默认 DuckDuckGo Lite（`apps.browserSearchURL` 可换成
+    SearxNG 等）；`save_image(n)` 可把网页里的图片存进媒体缓存（得到 `图片#id`，可直接
+    `send` 发送或 `gallery_save` 收藏）；
+  - **虚构世界设定**：World-LLM 扮演"这个世界的互联网"，直接生成符合世界观的完整 HTML
+    网页（与 `World_Status.md` 一致，重要新信息会沉淀回世界状态）；文本浏览与截图共用同一份
+    HTML，所见即所拍；
+  - **网页截图**（两种模式都支持）：依赖 `koishi-plugin-puppeteer` 提供的 `ctx.puppeteer`
+    服务（本插件保持零直接依赖，未安装时仅截图不可用、浏览照常）。现实模式无头浏览器实拍网址，
+    虚构模式渲染生成的 HTML；截图自动存入收藏夹「截图」分类并记下描述。
 
 ## 部署到 Koishi 实例（开发链接）
 
@@ -398,6 +411,8 @@ plugins:
       chatAppName: QQ # 聊天平台在 Bot 手机里的应用名
       weatherEnabled: true # 内置天气应用（现实设定查 Open-Meteo，虚构设定由 World-LLM 生成）
       weatherDefaultCity: "" # 真实天气默认城市（留空则要求 Bot 自己给出）
+      browserEnabled: true # 内置浏览器（现实设定上真互联网；虚构设定由 World-LLM 生成网页；截图需 koishi-plugin-puppeteer）
+      browserSearchURL: https://lite.duckduckgo.com/lite/?q=%s # 搜索引擎（%s 为搜索词占位）
       mcpServers: # 外接 MCP Server：每个都是手机里的一个 App
         - enabled: true
           name: 备忘录

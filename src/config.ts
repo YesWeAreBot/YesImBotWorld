@@ -158,6 +158,8 @@ export interface AppsConfig {
   chatAppName: string;
   weatherEnabled: boolean;
   weatherDefaultCity: string;
+  browserEnabled: boolean;
+  browserSearchURL: string;
   mcpServers: McpServerConfig[];
 }
 
@@ -458,6 +460,19 @@ export const Config: Schema<Config> = Schema.intersect([
       weatherDefaultCity: Schema.string()
         .default("")
         .description("真实天气的默认城市（Bot 查询时不指定城市则使用；留空则要求 Bot 自己给出城市）"),
+      browserEnabled: Schema.boolean()
+        .default(true)
+        .description(
+          "内置浏览器应用：现实世界设定对接真实互联网（搜索 + 打开网页 + 保存网页图片）；" +
+            "虚构世界设定由 World-LLM 生成符合世界观的网页。" +
+            "两种模式都支持网页截图并自动存入收藏夹「截图」分类（需要安装 koishi-plugin-puppeteer，未安装时仅截图不可用）",
+        ),
+      browserSearchURL: Schema.string()
+        .default("https://lite.duckduckgo.com/lite/?q=%s")
+        .description(
+          "现实世界模式的搜索引擎地址，%s 为搜索词占位（无 %s 时追加在末尾）。" +
+            "默认 DuckDuckGo Lite（纯 HTML、免 key）；可换成 SearxNG 等文本友好的引擎",
+        ),
       mcpServers: Schema.array(
         Schema.object({
           enabled: Schema.boolean().default(true).description("启用该应用"),

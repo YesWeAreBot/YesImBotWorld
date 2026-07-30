@@ -2,6 +2,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { Context, Service } from "koishi";
 import { AppManager } from "./apps/manager.js";
+import { BrowserApp } from "./apps/browser.js";
 import { McpApp } from "./apps/mcp.js";
 import { WeatherApp } from "./apps/weather.js";
 import { BotAgent } from "./bot/agent.js";
@@ -259,10 +260,24 @@ export class WorldService extends Service<Config> {
       this.requests,
       this.ownSends,
     );
-    // 手机应用（Apps / MCP）：内置天气 + 外接 MCP Server，open_app 打开后工具才展开
+    // 手机应用（Apps / MCP）：内置天气/浏览器 + 外接 MCP Server，open_app 打开后工具才展开
     const worldApps = [
       ...(this.config.apps.weatherEnabled
         ? [new WeatherApp(this.world, this.files, this.clock, this.config.apps, this.logger)]
+        : []),
+      ...(this.config.apps.browserEnabled
+        ? [
+            new BrowserApp(
+              this.ctx,
+              this.world,
+              this.files,
+              this.clock,
+              this.media,
+              this.gallery,
+              this.config.apps,
+              this.logger,
+            ),
+          ]
         : []),
       ...this.config.apps.mcpServers
         .filter((s) => s.enabled && s.name.trim())
@@ -425,6 +440,9 @@ export class WorldService extends Service<Config> {
     ];
     if (this.config.apps.weatherEnabled) {
       list.push({ name: "天气", description: "查询当前天气与未来几天的预报" });
+    }
+    if (this.config.apps.browserEnabled) {
+      list.push({ name: "浏览器", description: "上网：搜索、打开网页，可以截图保存" });
     }
     for (const s of this.config.apps.mcpServers) {
       if (s.enabled && s.name.trim()) list.push({ name: s.name.trim(), description: s.description || "外部应用" });

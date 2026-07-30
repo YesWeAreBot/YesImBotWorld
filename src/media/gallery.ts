@@ -246,6 +246,24 @@ export class GalleryStore {
     });
   }
 
+  /**
+   * 把一个外部文件导入收藏夹（复制进分类目录并记录描述），返回最终文件名。
+   * 供浏览器截图等运行时组件直接入库使用（重名自动加序号）。
+   */
+  async importFile(
+    src: string,
+    category: string,
+    preferredName: string,
+    sha256: string,
+    description: string,
+  ): Promise<string> {
+    await this.ensureDirs();
+    const name = await this.availableName(category, preferredName);
+    await fs.copyFile(src, path.join(this.dirOf(category), name));
+    await this.upsertMeta(category, name, sha256, description);
+    return name;
+  }
+
   /** 移动条目到另一个分类（可顺带更新描述），返回移动后的位置 */
   async move(
     entry: GalleryEntry,
