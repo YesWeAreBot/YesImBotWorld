@@ -307,8 +307,9 @@ Bot 不只能收，也能发：
   `scroll_down()` 翻页、`go_back()` 后退、`screenshot(description?)` 截图：
   - **现实世界设定**：对接真实互联网。零依赖 HTML→可读文本转换（标题、正文、链接 `[n]`、
     图片 `{图n}` 编号化），搜索引擎默认 DuckDuckGo Lite（`apps.browserSearchURL` 可换成
-    SearxNG 等）；`save_image(n)` 可把网页里的图片存进媒体缓存（得到 `图片#id`，可直接
-    `send` 发送或 `gallery_save` 收藏）；
+    SearxNG 等）；`view_image(n)` 点开页内图片细看内容（原生识图附原图，否则解释器详述——
+    alt 缺失/含糊时先看再选）；`save_image(n)` 把网页里的图片存进媒体缓存（得到 `图片#id`，
+    可直接 `send` 发送或 `gallery_save` 收藏）；
   - **虚构世界设定**：World-LLM 扮演"这个世界的互联网"，直接生成符合世界观的完整 HTML
     网页（与 `World_Status.md` 一致，重要新信息会沉淀回世界状态）；文本浏览与截图共用同一份
     HTML，所见即所拍；

@@ -17,8 +17,10 @@ import type { Context, Logger } from "koishi";
 import type { WorldClock } from "../clock.js";
 import type { AppsConfig } from "../config.js";
 import type { WorldFiles } from "../files.js";
+import type { CaptionService } from "../media/captioner.js";
 import type { GalleryStore } from "../media/gallery.js";
 import type { MediaStore } from "../media/store.js";
+import type { MediaRef, RichText } from "../types.js";
 import type { WorldAgent } from "../world/agent.js";
 import type { AppRawTool, WorldApp } from "./app.js";
 import { parseHtml, type ParsedPage } from "./html.js";
@@ -70,6 +72,9 @@ export class BrowserApp implements WorldApp {
     private clock: WorldClock,
     private media: MediaStore,
     private gallery: GalleryStore,
+    private captioner: CaptionService,
+    /** Bot-LLM 能否原生看到该媒体（service 注入，与渲染管线同一判定） */
+    private canAttach: (ref: MediaRef) => boolean,
     private cfg: AppsConfig,
     private logger: Logger,
   ) {}
@@ -119,34 +124,55 @@ export class BrowserApp implements WorldApp {
         description: "后退到上一个页面。",
         inputSchema: { type: "object", properties: {} },
       },
-      {
+    ];
+    // 截图组件（puppeteer）可用时才提供 screenshot：避免 Bot 反复尝试不存在的能力后拿页内图凑数
+    if (this.puppeteer) {
+      tools.push({
         name: "screenshot",
         description:
-          "把当前页面截图，自动存进你收藏夹的「截图」分类（供日后查看或发送）。" +
+          "把**浏览器当前画面**拍成一张截图（像手机截屏：网址栏下是排版好的网页，别人一看就知道是网页截图），" +
+          "自动存进你收藏夹的「截图」分类，并给出图片编号供 send 发送。" +
+          "**别人想看『这个网页/页面的样子』时用这个**——发网页内容里的某张图片（save_image）代替不了网页截图。" +
           "description 可选：给这张截图写一句描述（默认用页面标题）。",
         inputSchema: {
           type: "object",
           properties: { description: { type: "string", description: "截图描述" } },
         },
-      },
-    ];
-    if (real) {
-      tools.splice(5, 0, {
-        name: "save_image",
-        description:
-          "把当前页面里的一张图片保存下来（存入媒体缓存，得到图片编号——可直接用 send 发送，喜欢可 gallery_save 收藏）。" +
-          "n 为页面里 {图n} 标注的图片编号。",
-        inputSchema: {
-          type: "object",
-          properties: { n: { type: "number", description: "图片编号" } },
-          required: ["n"],
-        },
       });
+    }
+    if (real) {
+      tools.splice(
+        5,
+        0,
+        {
+          name: "view_image",
+          description:
+            "点开当前页面里的一张图片仔细看看内容（{图n} 的 alt 文字常常缺失或含糊，" +
+            "**决定保存/发送某张页内图之前先用它确认**，别只凭标注猜）。n 为 {图n} 标注的图片编号。",
+          inputSchema: {
+            type: "object",
+            properties: { n: { type: "number", description: "图片编号" } },
+            required: ["n"],
+          },
+        },
+        {
+          name: "save_image",
+          description:
+            "把当前页面**内容里嵌的某一张图片**（{图n} 标注）单独保存下来（存入媒体缓存，得到图片编号——" +
+            "可直接用 send 发送，喜欢可 gallery_save 收藏）。拿不准内容先 view_image 看一眼。" +
+            "注意：这保存的是网页里的插图/配图本身，**不是网页截图**；要发『网页的样子』请用 screenshot。",
+          inputSchema: {
+            type: "object",
+            properties: { n: { type: "number", description: "图片编号" } },
+            required: ["n"],
+          },
+        },
+      );
     }
     return { tools };
   }
 
-  async call(tool: string, args: Record<string, unknown>): Promise<string> {
+  async call(tool: string, args: Record<string, unknown>): Promise<string | RichText> {
     const real = await this.isRealWorld();
     switch (tool) {
       case "search": {
@@ -179,6 +205,7 @@ export class BrowserApp implements WorldApp {
         this.current.screen = 0;
         return this.renderScreen("你按了后退，回到之前的页面。");
       }
+      case "view_image":
       case "save_image": {
         if (!real) return "（这个操作不可用。）";
         const n = Number(args.n ?? args.image ?? args.index);
@@ -186,7 +213,8 @@ export class BrowserApp implements WorldApp {
         if (!Number.isFinite(n) || n < 1 || n > this.current.images.length) {
           return `（当前页面没有图片 {图${args.n}}。页面上共标注了 ${this.current.images.length} 张图。）`;
         }
-        return this.saveImage(this.current.images[n - 1]!);
+        const img = this.current.images[n - 1]!;
+        return tool === "view_image" ? this.viewImage(n, img) : this.saveImage(img);
       }
       case "screenshot": {
         if (!this.current) return "（还没有打开任何页面，没什么可截的。）";
@@ -224,7 +252,8 @@ export class BrowserApp implements WorldApp {
       footer.push(`第 ${idx + 1}/${screens.length} 屏${idx < screens.length - 1 ? "，scroll_down 继续往下看" : "（已到底）"}`);
     }
     if (page.links.length) footer.push(`链接 [n] 用 open_link 点开`);
-    if (page.images.length) footer.push(`图片 {图n} 用 save_image 保存`);
+    if (page.images.length) footer.push(`页内图片 {图n}：view_image 点开细看，save_image 单独保存`);
+    if (this.puppeteer) footer.push(`想把这个页面的样子发给别人/留档：screenshot 截图后 send 截图编号`);
     return (
       (prefix ? `${prefix}\n` : "") +
       `${header}\n----\n${body}` +
@@ -289,10 +318,30 @@ export class BrowserApp implements WorldApp {
     return this.renderScreen(prefix);
   }
 
+  /** 点开页内图片细看：原生识图 → 附原图；否则 → 解释器详述 */
+  private async viewImage(n: number, img: { url: string; alt: string }): Promise<string | RichText> {
+    const id = await this.media.ingest(img.url, "image");
+    if (id === null) return `（图片加载失败（${img.url.slice(0, 100)}），点不开。）`;
+    const row = await this.media.get(id);
+    if (!row) return "（图片加载失败。）";
+    const label = `{图${n}} [图片#${id}]${img.alt ? `（${img.alt}）` : ""}`;
+    if (this.canAttach(row.ref)) {
+      return {
+        text: `你点开了 ${label}，原图见附件。（想保存/发送就 save_image 或直接 send 这个编号）`,
+        attachments: [row.ref],
+      };
+    }
+    const detail = await this.captioner.describeDetailed(row.ref);
+    return detail
+      ? `你点开了 ${label}，仔细看了看：${detail}\n（想保存/发送就 save_image 或直接 send 这个编号）`
+      : `（你点开了 ${label}，但没有可用的识图能力，看不清内容。）`;
+  }
+
   private async saveImage(img: { url: string; alt: string }): Promise<string> {
     const id = await this.media.ingest(img.url, "image");
     if (id === null) return `（保存失败：图片下载不下来（${img.url.slice(0, 100)}）。）`;
-    if (img.alt) {
+    // alt 只在没有图片解释器时充当摘要兜底（有解释器时留空，让它产出更可靠的内容描述）
+    if (img.alt && !this.captioner.enabledFor("image")) {
       const row = await this.media.get(id);
       if (row && !row.summary) await this.media.setSummary(id, `网页图片：${img.alt}`);
     }

@@ -7,6 +7,8 @@
  * （聊天平台 Koishi 也是一个 App，只是它的能力常驻工具位，打开它 = 看一眼最近消息。）
  */
 
+import type { RichText } from "../types.js";
+
 /** App 提供的一个原始工具（未渲染签名） */
 export interface AppRawTool {
   name: string;
@@ -31,8 +33,8 @@ export interface WorldApp {
   readonly description: string;
   /** 打开应用：建立连接并列出可用工具 */
   open(): Promise<{ tools: AppRawTool[] }>;
-  /** 调用应用的一个工具，返回呈现给 Bot 的文本结果 */
-  call(tool: string, args: Record<string, unknown>): Promise<string>;
+  /** 调用应用的一个工具，返回呈现给 Bot 的结果（可带原生附件，如浏览器点开的图片） */
+  call(tool: string, args: Record<string, unknown>): Promise<string | RichText>;
   /** 关闭应用（断开连接/释放资源） */
   close(): Promise<void>;
 }

@@ -295,6 +295,8 @@ export class WorldService extends Service<Config> {
               this.clock,
               this.media,
               this.gallery,
+              this.captioner,
+              (ref) => this.renderer.canAttach(ref),
               this.config.apps,
               this.logger,
             ),

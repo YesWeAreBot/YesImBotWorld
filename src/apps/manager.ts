@@ -1,4 +1,5 @@
 import type { Logger } from "koishi";
+import type { RichText } from "../types.js";
 import { renderSignature, type AppToolDef, type WorldApp } from "./app.js";
 
 /** open_app 的解析结果：聊天平台（常驻能力，打开 = 看消息）或一个可展开的 App */
@@ -98,7 +99,7 @@ export class AppManager {
   }
 
   /** 调用当前 App 的一个工具 */
-  async call(exposedName: string, args: Record<string, unknown>): Promise<string> {
+  async call(exposedName: string, args: Record<string, unknown>): Promise<string | RichText> {
     if (!this.current) throw new Error("当前没有打开的应用");
     const real = this.current.toolMap.get(exposedName);
     if (!real) throw new Error(`当前应用没有 ${exposedName} 这个操作`);
