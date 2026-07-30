@@ -12,8 +12,17 @@ import type { MediaStore } from "./store.js";
  * - audio：语音转写 API（/v1/audio/transcriptions）或多模态 chat（input_audio）
  * - 解释结果按媒体缓存（summary 字段），同一文件只解释一次
  */
+/** 细看（view_media）用的详述提示词：比常规摘要更完整，覆盖挑图所需的全部信息 */
+const DETAIL_PROMPT_IMAGE =
+  "请用中文仔细描述这张图片的完整内容：画面主体与细节、图中出现的所有文字（逐字）、人物或角色的表情与情绪；" +
+  "如果它像表情包或梗图，说明它表达的情绪、梗的含义，以及适合在什么聊天场景下发送。";
+const DETAIL_PROMPT_VIDEO =
+  "请用中文仔细描述这段视频/动图的完整内容：发生了什么、出现的文字、传达的情绪或笑点，以及适合在什么聊天场景下发送。";
+
 export class CaptionService {
   private inflight = new Map<number, Promise<string | null>>();
+  /** 详述缓存（仅内存）：细看同一媒体不重复调用解释器 */
+  private detailCache = new Map<number, string>();
 
   constructor(
     private cfg: CaptionersConfig,
@@ -60,6 +69,53 @@ export class CaptionService {
     return task;
   }
 
+  /**
+   * 细看一个媒体：产出比常规摘要更完整的详述（发图前确认内容用）。
+   * 用于 Bot-LLM 没有对应原生模态、无法直接看附件的场合。
+   * 结果仅缓存在内存（不覆盖 summary 摘要缓存）。
+   */
+  async describeDetailed(ref: MediaRef): Promise<string | null> {
+    // 音频：转写本身已是完整内容，直接复用常规通道（含缓存）
+    if (ref.type === "audio") return this.describe(ref);
+    const cached = this.detailCache.get(ref.id);
+    if (cached) return cached;
+
+    let result: string | null = null;
+    try {
+      if (this.isGif(ref) && this.cfg.video.enabled) {
+        const data = await this.store.readFile(ref);
+        result = await this.describeViaChat(
+          ref,
+          this.cfg.video,
+          {
+            type: "video_url",
+            video_url: { url: `data:image/gif;base64,${data.toString("base64")}` },
+          },
+          DETAIL_PROMPT_VIDEO,
+        );
+      } else if (this.enabledFor(ref.type)) {
+        result = await this.describeViaChat(
+          ref,
+          this.cfg[ref.type],
+          undefined,
+          ref.type === "video" ? DETAIL_PROMPT_VIDEO : DETAIL_PROMPT_IMAGE,
+        );
+      }
+    } catch (err) {
+      this.logger.warn("媒体详述失败 (%s#%d): %s", ref.type, ref.id, err);
+    }
+    if (result) {
+      if (this.detailCache.size >= 64) {
+        const oldest = this.detailCache.keys().next().value;
+        if (oldest !== undefined) this.detailCache.delete(oldest);
+      }
+      this.detailCache.set(ref.id, result);
+      return result;
+    }
+    // 无详述能力/失败：退回常规摘要（可能来自缓存）
+    return this.describe(ref);
+  }
+
   private async doDescribe(ref: MediaRef): Promise<string | null> {
     if (ref.type === "audio" && this.cfg.audio.api === "transcription") {
       return this.transcribe(ref, this.cfg.audio);
@@ -79,6 +135,7 @@ export class CaptionService {
     ref: MediaRef,
     cfg: CaptionerConfig,
     partOverride?: ContentPart,
+    promptOverride?: string,
   ): Promise<string | null> {
     const data = await this.store.readFile(ref);
     const part = partOverride ?? mediaToContentPart(ref, data);
@@ -89,7 +146,7 @@ export class CaptionService {
       temperature: 0.2,
       maxTokens: cfg.maxTokens,
     });
-    const content: ContentPart[] = [{ type: "text", text: cfg.prompt }, part];
+    const content: ContentPart[] = [{ type: "text", text: promptOverride ?? cfg.prompt }, part];
     const result = await client.complete(
       [{ role: "user", content }],
       { signal: AbortSignal.timeout(this.media.captionTimeoutMs) },

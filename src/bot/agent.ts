@@ -18,10 +18,12 @@ export interface MessengerApi {
   resolveKey(id: string): Promise<{ key: string; isPrivate: boolean } | { error: string }>;
   recentChannels(n: number): Promise<RichText>;
   channelMessages(id: string, n: number): Promise<RichText>;
-  gallery(): Promise<string>;
+  gallery(category?: string): Promise<RichText>;
   checkMedia(n: number, type?: "image" | "audio" | "video"): Promise<string>;
-  gallerySave(mediaId: string, name?: string): Promise<string>;
+  gallerySave(mediaId: string, category: string, description: string, name?: string): Promise<string>;
+  galleryMove(name: string, category: string, description?: string): Promise<string>;
   galleryRemove(name: string): Promise<string>;
+  viewMedia(refs: string[]): Promise<RichText>;
   send(
     id: string,
     msg: string,
@@ -492,8 +494,11 @@ export class BotAgent {
           return this.messenger.channelMessages(resolved.key, clampInt(call.arguments.n, 1, 50, 10));
         });
       }
-      case "check_gallery":
-        return this.dispatchLocal(call, async () => this.messenger.gallery());
+      case "check_gallery": {
+        const catRaw = call.arguments.category ?? call.arguments.cat;
+        const category = catRaw != null && String(catRaw).trim() ? String(catRaw).trim() : undefined;
+        return this.dispatchLocal(call, async () => this.messenger.gallery(category));
+      }
       case "check_media": {
         const typeRaw = String(call.arguments.type ?? "");
         const type = typeRaw === "image" || typeRaw === "audio" || typeRaw === "video" ? typeRaw : undefined;
@@ -503,12 +508,36 @@ export class BotAgent {
       }
       case "gallery_save": {
         const mediaId = String(call.arguments.media_id ?? call.arguments.mediaId ?? call.arguments.id ?? "");
-        if (!mediaId) {
-          this.pushEvent("system", "（gallery_save 需要 media_id 参数（媒体编号）。）", { ref: call.id });
+        const category = String(call.arguments.category ?? call.arguments.cat ?? "");
+        const description = String(call.arguments.description ?? call.arguments.desc ?? "");
+        if (!mediaId || !category.trim() || !description.trim()) {
+          this.pushEvent(
+            "system",
+            "（gallery_save 需要 media_id（媒体编号）、category（分类：表情包 / meme / 截图 / 照片）" +
+              "和 description（你自己写的描述：这是什么、什么梗/情绪、适合什么场合发）。）",
+            { ref: call.id },
+          );
           return;
         }
         const name = call.arguments.name != null ? String(call.arguments.name) : undefined;
-        return this.dispatchLocal(call, async () => this.messenger.gallerySave(mediaId, name));
+        return this.dispatchLocal(call, async () =>
+          this.messenger.gallerySave(mediaId, category, description, name),
+        );
+      }
+      case "gallery_move": {
+        const name = String(call.arguments.name ?? call.arguments.file ?? "");
+        const category = String(call.arguments.category ?? call.arguments.cat ?? "");
+        if (!name || !category.trim()) {
+          this.pushEvent(
+            "system",
+            "（gallery_move 需要 name（收藏夹文件名，可带分类前缀如 \"未整理/xx.png\"）和 category（目标分类）参数。）",
+            { ref: call.id },
+          );
+          return;
+        }
+        const descRaw = call.arguments.description ?? call.arguments.desc;
+        const description = descRaw != null && String(descRaw).trim() ? String(descRaw) : undefined;
+        return this.dispatchLocal(call, async () => this.messenger.galleryMove(name, category, description));
       }
       case "gallery_remove": {
         const name = String(call.arguments.name ?? "");
@@ -517,6 +546,23 @@ export class BotAgent {
           return;
         }
         return this.dispatchLocal(call, async () => this.messenger.galleryRemove(name));
+      }
+      case "view_media": {
+        const raw = call.arguments.media ?? call.arguments.refs ?? call.arguments.image ?? call.arguments.id;
+        const refs = Array.isArray(raw)
+          ? raw.map(String)
+          : raw != null && String(raw).trim()
+            ? [String(raw)]
+            : [];
+        if (!refs.length) {
+          this.pushEvent(
+            "system",
+            '（view_media 需要 media 参数：媒体编号或收藏夹文件的列表，如 ["12", "gallery:表情包/xx.png"]。）',
+            { ref: call.id },
+          );
+          return;
+        }
+        return this.dispatchLocal(call, async () => this.messenger.viewMedia(refs));
       }
       case "send":
         return this.dispatchSend(call);

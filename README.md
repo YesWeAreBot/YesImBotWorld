@@ -39,7 +39,7 @@ YesImBot World：让 Bot 生活在一个由 LLM 独立维护的虚拟世界中�
 | `Bot_Status.md` | Bot-LLM（经压缩流程） | Bot 当前状态，作为角色设定置顶注入 |
 | `World_Status.md` | World-LLM | 世界当前状态 |
 | `News.db` | World-LLM | 世界事件列表（JSONL 格式，一行一个事件） |
-| `gallery/` | **用户** | 收藏夹：投放供 Bot 使用的表情包、图片与文件 |
+| `gallery/` | **用户 + Bot** | 收藏夹，按分类子目录存放：`表情包/`、`meme/`、`截图/`、`照片/`、`未整理/`。用户手动投放的文件放进 `未整理/`（或直接丢根目录，会被自动清扫进去），Bot 有空时会看图、写描述、归类 |
 | `assets/` | 运行时 | 媒体资产库（收到/发出的图片、音频、视频，sha256 去重） |
 | `stream.jsonl` | 运行时 | Bot 工作窗口（Tool Call 流）持久化 |
 | `pinned.json` | 运行时 | 置顶上下文 + id 计数器 |
@@ -141,11 +141,18 @@ Bot 不只能收，也能发：
 - **发图/发视频**：`send` 的 `media` 参数附带媒体编号（如 `media: ["12"]`），支持图片与视频；
   在 `msg` 里写 `[图片#12]` / `[视频#3]` 可把媒体**嵌在文字中间**发出（图文混排，支持混排的
   平台原样呈现，QQ 等平台由平台自行分开显示）；
-- **挑图流程**：优先翻**收藏夹**（`check_gallery`）；收藏夹里没有，再用 `check_media` 翻看
-  媒体缓存——聊天中见过的所有图片/语音/视频都留在缓存里（**对 Bot 只读**），图片会按需生成
-  内容摘要（缓存，同一媒体只解释一次）。喜欢的东西 Bot 可用 `gallery_save` 存进收藏夹
-  （存入时生成摘要、可起名），不要的用 `gallery_remove` 移出；用户也可以直接向
-  `basePath/gallery/` 目录投放文件；
+- **挑图流程**：优先翻**收藏夹**（`check_gallery`）——收藏夹按 `表情包 / meme / 截图 / 照片 / 未整理`
+  分类，每项都带着 Bot 收藏时**亲笔写下的描述**（内容、梗、情绪、适用场景），描述存数据库、
+  按文件哈希关联（用户手动移动/改名文件后仍能对上）。分类浏览时若 Bot-LLM 原生识图，
+  会附上前几张原图直接看；光凭描述拿不准的图，Bot 会在发出前用 `view_media` 细看确认
+  （原生识图 → 附原图；否则用解释器产出比常规摘要更完整的详述），避免发不合时宜的图。
+  收藏夹里没有合适的，再用 `check_media` 翻看媒体缓存——聊天中见过的所有图片/语音/视频都留在
+  缓存里（**对 Bot 只读**），图片会按需生成内容摘要（缓存，同一媒体只解释一次）。
+  喜欢的东西 Bot 可用 `gallery_save` 存进收藏夹——**必须选定分类并写好描述**；
+  不要的用 `gallery_remove` 移出；
+- **用户投放**：用户可以直接把文件丢进 `basePath/gallery/未整理/`（或 gallery 根目录，会被自动
+  清扫进未整理），**无须自己写描述、做分类**——Bot 之后翻收藏夹时会被提醒：有空 `view_media`
+  看清内容，再用 `gallery_move` 归类并补上描述；
 - **发文件**：音频、视频文件和其他文件统一走 `send_file`（引用媒体编号或
   `gallery:文件名`），按类型映射为 audio / video / file 元素（audio 在 QQ 即语音）；
 - **发语音**：配置 TTS（OpenAI 兼容 `/v1/audio/speech`，如 kokoro / fish-speech / openai）后
@@ -197,8 +204,10 @@ Bot 不只能收，也能发：
 | `check_status(target)` | 查看自身（`self`）或世界（`world`，含近期 News） |
 | `check_time()` | 看一眼现在几点（世界裁定能否得知） |
 | `check_news(n?)` | 回看世界近期新闻/见闻 |
-| `check_gallery()` / `check_media(n?, type?)` | 浏览收藏夹 / 只读翻看媒体缓存 |
-| `gallery_save(media_id, name?)` / `gallery_remove(name)` | 收藏夹管理 |
+| `check_gallery(category?)` / `check_media(n?, type?)` | 浏览收藏夹（分类总览 / 打开某一类）/ 只读翻看媒体缓存 |
+| `view_media(media[])` | 发图前细看：原生识图附原图，否则解释器详述 |
+| `gallery_save(media_id, category, description, name?)` | 收藏进分类（表情包 / meme / 截图 / 照片），描述必填 |
+| `gallery_move(name, category, description?)` / `gallery_remove(name)` | 整理归类（「未整理」→ 分类，无描述时必须先看图补描述）/ 移出收藏夹 |
 | `open_app(name)` | 打开应用：聊天应用 → 消息列表 + 解锁 chat 层；MCP/内置应用 → 展开其工具 |
 | `close_app()` | 关闭当前打开的应用（其操作失效） |
 | `put_down_phone()` | 把手机放到一边：关闭应用、清除关注，之后通知一律降级为"手机震了一下" |

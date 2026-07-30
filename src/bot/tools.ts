@@ -129,10 +129,11 @@ export const BOT_TOOLS: BotToolDef[] = [
   },
   {
     name: "check_gallery",
-    signature: "check_gallery()",
+    signature: "check_gallery(category?: string)",
     description:
-      "翻看你的收藏夹（表情包、图片、文件等）。会列出每一项的引用编号与内容描述，供 send 的 media 参数或 send_file 使用。" +
-      "发图时优先从这里挑；收藏夹用 gallery_save / gallery_remove 管理。",
+      "翻看你的收藏夹。收藏夹按分类存放：表情包、meme、截图、照片、未整理。不带参数看总览（各分类的数量），" +
+      "带 category 打开某一类，列出每项的引用编号、文件名和描述（供 send 的 media 参数或 send_file 使用）。" +
+      "发图先来这里挑；「未整理」里是主人放进来还没归类的东西，有空时看看（view_media）并用 gallery_move 整理。",
   },
   {
     name: "check_media",
@@ -142,16 +143,32 @@ export const BOT_TOOLS: BotToolDef[] = [
       "列出最近 n 项（默认 10）的编号、大小与内容摘要。用于翻找没存进收藏夹的东西；想留下的用 gallery_save 收藏。",
   },
   {
+    name: "view_media",
+    signature: 'view_media(media: string[])',
+    description:
+      '把几张图/几段媒体拿起来仔细看看。media 填媒体编号或收藏夹文件（如 ["12", "gallery:表情包/xx.png"]，最多 6 个）。' +
+      "**发图前拿不准内容时，先用它确认再发**——光凭文件名和一句摘要挑图很容易发错。整理「未整理」时也先用它看清内容。",
+  },
+  {
     name: "gallery_save",
-    signature: 'gallery_save(media_id: string, name?: string)',
+    signature: 'gallery_save(media_id: string, category: string, description: string, name?: string)',
     description:
       '把缓存里的媒体存进你的收藏夹（比如看到喜欢的表情包就存下来）。media_id 为媒体编号（如 "12"）；' +
-      "name 可选，给它起个好记的文件名。存入时会附上内容摘要。",
+      "category 必须是：表情包 / meme / 截图 / 照片；description 用你自己的话写清这是什么、什么梗/情绪、适合什么场合发" +
+      "——以后挑图全靠这段描述，别偷懒。name 可选，给它起个好记的文件名。",
+  },
+  {
+    name: "gallery_move",
+    signature: 'gallery_move(name: string, category: string, description?: string)',
+    description:
+      "把收藏夹里的文件移到某个分类，主要用来整理「未整理」里主人放进来的东西。" +
+      'name 为文件名（可带分类前缀，如 "未整理/xx.png"）；category 为目标分类（表情包 / meme / 截图 / 照片）。' +
+      "还没有描述的文件必须先 view_media 看清内容，再带上 description 一起移动。",
   },
   {
     name: "gallery_remove",
     signature: 'gallery_remove(name: string)',
-    description: "把一个文件移出你的收藏夹。name 为 check_gallery 里看到的文件名。",
+    description: '把一个文件移出你的收藏夹。name 为 check_gallery 里看到的文件名（可带分类前缀，如 "meme/xx.png"）。',
   },
   {
     name: "send",

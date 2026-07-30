@@ -3,6 +3,14 @@ import path from "node:path";
 import { h, Universal, type Bot, type Context } from "koishi";
 import type { MessengerApi } from "../bot/agent.js";
 import type { CaptionService } from "../media/captioner.js";
+import {
+  MAIN_CATEGORIES,
+  UNSORTED_CATEGORY,
+  ALL_CATEGORIES,
+  normalizeCategory,
+  sanitizeFileName,
+  type GalleryStore,
+} from "../media/gallery.js";
 import { MEDIA_PLACEHOLDER, mediaPlaceholder, type MediaRenderer } from "../media/render.js";
 import type { MediaStore } from "../media/store.js";
 import type { TtsClient } from "../media/tts.js";
@@ -37,7 +45,7 @@ export class KoishiMessenger implements MessengerApi {
     private renderer: MediaRenderer,
     private media: MediaStore,
     private captioner: CaptionService,
-    private galleryDir: string,
+    private galleryStore: GalleryStore,
     private tts: TtsClient | null,
     private focus: FocusManager,
     private ops: PlatformOpsConfig,
@@ -103,45 +111,89 @@ export class KoishiMessenger implements MessengerApi {
     };
   }
 
-  /** 浏览收藏夹：图片入资产库并附内容描述，其他文件列出名称与大小 */
-  async gallery(): Promise<string> {
-    let names: string[];
-    try {
-      names = (await fs.readdir(this.galleryDir)).filter((n) => !n.startsWith(".")).sort();
-    } catch {
-      return "（收藏夹还不存在。）";
+  /**
+   * 浏览收藏夹。
+   * - 不带分类：总览（各分类的条目数），未整理有存货时提醒 Bot 找空整理；
+   * - 带分类：列出该分类的条目（编号、名字、描述），Bot-LLM 原生识图时附上前几张原图。
+   * 描述优先用 Bot 自己写下的（gallery_save / gallery_move 时记录），没有则退回解释器摘要。
+   */
+  async gallery(category?: string): Promise<RichText> {
+    await this.galleryStore.sweepRoot();
+
+    if (!category?.trim()) {
+      const counts = await this.galleryStore.counts();
+      const total = counts.reduce((s, c) => s + c.count, 0);
+      if (!total) {
+        return { text: "你的收藏夹空空如也。（看到喜欢的图可以用 gallery_save 分类存进来）" };
+      }
+      const lines = counts.map(({ category: c, count }) => {
+        const note = c === UNSORTED_CATEGORY && count > 0 ? "（主人放进来的，等你整理）" : "";
+        return `- ${c}：${count} 项${note}`;
+      });
+      const unsorted = counts.find((c) => c.category === UNSORTED_CATEGORY)?.count ?? 0;
+      const tip =
+        unsorted > 0
+          ? `\n（「未整理」里有 ${unsorted} 项：有空时打开看看，view_media 看清内容后用 gallery_move 归类并写好描述。）`
+          : "";
+      return {
+        text:
+          `你翻了翻自己的收藏夹：\n${lines.join("\n")}\n` +
+          `（用 category 参数打开某一类查看具体内容，如 check_gallery 的 category: "表情包"）${tip}`,
+      };
     }
-    if (!names.length) return "你的收藏夹空空如也。";
+
+    const cat = normalizeCategory(category);
+    if (!cat) {
+      return { text: `（收藏夹里没有「${category}」这个分类。分类有：${ALL_CATEGORIES.join("、")}。）` };
+    }
+    const names = await this.galleryStore.listNames(cat);
+    if (!names.length) return { text: `「${cat}」分类是空的。` };
 
     const lines: string[] = [];
+    const attachments: MediaRef[] = [];
     for (const name of names.slice(0, 50)) {
-      const file = path.join(this.galleryDir, name);
+      const file = path.join(this.galleryStore.dirOf(cat), name);
       const stat = await fs.stat(file).catch(() => null);
       if (!stat?.isFile()) continue;
       const type = typeByExt(name);
       if (type === "image") {
         const id = await this.media.ingest(`file://${file}`, "image");
         if (id === null) {
-          lines.push(`- [图片] ${name}（读取失败）`);
+          lines.push(`- [图片] ${cat}/${name}（读取失败）`);
           continue;
         }
         const row = await this.media.get(id);
-        const caption = row ? await this.captioner.describe(row.ref) : null;
-        lines.push(`- [图片#${id}] ${name}${caption ? `：${caption}` : ""}`);
+        const meta = row ? await this.galleryStore.findMeta(cat, name, row.sha256) : null;
+        const desc =
+          meta?.description || (row ? ((await this.captioner.describe(row.ref)) ?? "") : "");
+        let attachNote = "";
+        if (row && this.renderer.canAttach(row.ref) && attachments.length < this.renderer.maxAttach) {
+          attachments.push(row.ref);
+          attachNote = "（原图见附件）";
+        }
+        lines.push(`- [图片#${id}] ${cat}/${name}${attachNote}${desc ? `：${truncate(desc, 120)}` : ""}`);
       } else if (type === "audio" || type === "video") {
         const id = await this.media.ingest(`file://${file}`, type);
         const label = type === "audio" ? "音频" : "视频";
+        const meta = id !== null ? await this.galleryStore.findMeta(cat, name) : null;
         lines.push(
           id !== null
-            ? `- [${label}#${id}] ${name}（${formatSize(stat.size)}，可用 send_file 发送）`
-            : `- [${label}] ${name}（读取失败）`,
+            ? `- [${label}#${id}] ${cat}/${name}（${formatSize(stat.size)}）${meta?.description ? `：${truncate(meta.description, 120)}` : ""}`
+            : `- [${label}] ${cat}/${name}（读取失败）`,
         );
       } else {
-        lines.push(`- [文件] gallery:${name}（${formatSize(stat.size)}，可用 send_file 发送）`);
+        lines.push(`- [文件] gallery:${cat}/${name}（${formatSize(stat.size)}，可用 send_file 发送）`);
       }
     }
     if (names.length > 50) lines.push(`（还有 ${names.length - 50} 项未显示）`);
-    return `你翻了翻自己的收藏夹：\n${lines.join("\n")}`;
+    const tail =
+      cat === UNSORTED_CATEGORY
+        ? "\n（这些是主人放进来还没整理的：先 view_media 看清内容，再用 gallery_move 移到合适的分类并写好描述。）"
+        : "\n（发送用 send 的 media 参数填编号；光看描述拿不准的图，发出前先用 view_media 仔细看一眼。）";
+    return {
+      text: `你打开了收藏夹的「${cat}」分类：\n${lines.join("\n")}${tail}`,
+      attachments: attachments.length ? attachments : undefined,
+    };
   }
 
   /**
@@ -166,47 +218,128 @@ export class KoishiMessenger implements MessengerApi {
     }
     return (
       `你翻看了最近的媒体缓存（最新在前，缓存只读）：\n${lines.join("\n")}\n` +
-      `（想留下的可以用 gallery_save 存进收藏夹）`
+      `（想留下的用 gallery_save 存进收藏夹——记得选好分类、写清描述）`
     );
   }
 
-  /** 把缓存里的媒体存进收藏夹（存入时生成内容摘要） */
-  async gallerySave(mediaId: string, name?: string): Promise<string> {
+  /** 把缓存里的媒体存进收藏夹：必须选定分类并由 Bot 亲自写下描述（日后挑图全靠它） */
+  async gallerySave(mediaId: string, category: string, description: string, name?: string): Promise<string> {
     const match = mediaId.match(/(\d+)\s*$/);
     if (!match) return `（无法理解的媒体编号："${mediaId}"）`;
     const row = await this.media.get(Number(match[1]));
     if (!row) return `（找不到媒体 #${match[1]}，可先用 check_media 查看缓存。）`;
 
+    const cat = normalizeCategory(category);
+    if (!cat || cat === UNSORTED_CATEGORY) {
+      return `（category 必须是这几类之一：${MAIN_CATEGORIES.join(" / ")}。「${UNSORTED_CATEGORY}」是留给主人放东西的，你收藏时要自己分好类。）`;
+    }
+    const desc = description.trim();
+    if (!desc) return "（description 不能为空：用你自己的话写清这是什么、什么梗/情绪、适合什么场合发。）";
+
     const ext = path.extname(row.file) || "";
     let filename: string;
     if (name?.trim()) {
-      const safe = sanitizeName(name.trim());
+      const safe = sanitizeFileName(name.trim());
       if (!safe) return `（文件名不合法："${name}"）`;
       // 扩展名缺失或与媒体实际类型不符时，补上正确的扩展名（避免收藏夹误判类型）
       filename = path.extname(safe) && typeByExt(safe) === row.type ? safe : safe + ext;
     } else {
       filename = `${row.type}-${row.id}${ext}`;
     }
-    await fs.mkdir(this.galleryDir, { recursive: true });
-    const dest = path.join(this.galleryDir, filename);
+    await this.galleryStore.ensureDirs();
+    const dest = path.join(this.galleryStore.dirOf(cat), filename);
     if (await fs.stat(dest).then((s) => s.isFile()).catch(() => false)) {
-      return `（收藏夹里已经有 "${filename}" 了，换个名字试试。）`;
+      return `（「${cat}」里已经有 "${filename}" 了，换个名字试试。）`;
     }
     await fs.copyFile(row.ref.file, dest);
-    const caption = row.summary || (await this.captioner.describe(row.ref));
+    await this.galleryStore.upsertMeta(cat, filename, row.sha256, desc);
     const label = LABEL[row.type as MediaType] ?? row.type;
-    return `你把${label}#${row.id} 存进了收藏夹：${filename}${caption ? `（内容：${truncate(caption, 80)}）` : ""}`;
+    return `你把${label}#${row.id} 存进了收藏夹 ${cat}/${filename}，并记下：${truncate(desc, 100)}`;
+  }
+
+  /** 整理收藏夹：把文件移到某个分类（主要用于「未整理」的归类），可顺带写描述 */
+  async galleryMove(name: string, category: string, description?: string): Promise<string> {
+    const entry = await this.galleryStore.resolve(name);
+    if (!entry) return `（收藏夹里没有 "${name}"，可先用 check_gallery 看看。名字可带分类前缀，如 "未整理/xx.png"。）`;
+    const cat = normalizeCategory(category);
+    if (!cat || cat === UNSORTED_CATEGORY) {
+      return `（category 必须是这几类之一：${MAIN_CATEGORIES.join(" / ")}。）`;
+    }
+    if (entry.category === cat) return `（"${entry.name}" 本来就在「${cat}」里。）`;
+
+    const desc = description?.trim();
+    if (!desc) {
+      // 没带新描述：必须已有 Bot 写下的描述，否则要求先看图再写
+      const sha = await this.galleryStore.hashFile(entry.file).catch(() => undefined);
+      const meta = entry.category
+        ? await this.galleryStore.findMeta(entry.category, entry.name, sha)
+        : null;
+      if (!meta?.description) {
+        return (
+          `（"${entry.name}" 还没有描述。先用 view_media 看清它的内容，` +
+          `再带上 description 参数（这是什么、什么梗/情绪、适合什么场合发）一起移动。）`
+        );
+      }
+    }
+    const moved = await this.galleryStore.move(entry, cat, desc || undefined);
+    return (
+      `你把 ${entry.category ? `${entry.category}/` : ""}${entry.name} 移进了「${cat}」` +
+      `${moved.name !== entry.name ? `（重名，改叫 ${moved.name}）` : ""}` +
+      `${desc ? `，并记下：${truncate(desc, 100)}` : "。"}`
+    );
   }
 
   /** 把文件移出收藏夹 */
   async galleryRemove(name: string): Promise<string> {
-    const safe = sanitizeName(name.trim());
-    if (!safe) return `（文件名不合法："${name}"）`;
-    const file = path.join(this.galleryDir, safe);
-    const stat = await fs.stat(file).catch(() => null);
-    if (!stat?.isFile()) return `（收藏夹里没有 "${safe}"，可先用 check_gallery 看看。）`;
-    await fs.unlink(file);
-    return `你把 "${safe}" 移出了收藏夹。`;
+    const entry = await this.galleryStore.resolve(name);
+    if (!entry) return `（收藏夹里没有 "${name}"，可先用 check_gallery 看看。名字可带分类前缀，如 "表情包/xx.png"。）`;
+    await this.galleryStore.remove(entry);
+    return `你把 ${entry.category ? `${entry.category}/` : ""}${entry.name} 移出了收藏夹。`;
+  }
+
+  /**
+   * 细看媒体（发图前确认内容用）：
+   * - Bot-LLM 原生支持该模态 → 附原始媒体（直接看）；
+   * - 否则 → 用解释器产出比常规摘要更完整的详述。
+   * 同时带出收藏夹里已记下的描述（如果有）。
+   */
+  async viewMedia(refs: string[]): Promise<RichText> {
+    const list = refs.filter((r) => String(r).trim()).slice(0, 6);
+    if (!list.length) return { text: "（view_media 需要 media 参数：媒体编号或收藏夹文件名的列表。）" };
+
+    const lines: string[] = [];
+    const attachments: MediaRef[] = [];
+    for (const refText of list) {
+      const resolved = await this.resolveMediaRef(String(refText));
+      if ("error" in resolved) {
+        lines.push(`- ${refText}：${resolved.error}`);
+        continue;
+      }
+      const { ref } = resolved;
+      const label = `${LABEL[ref.type]}#${ref.id}`;
+      // 收藏夹里已记下的描述（按 sha 反查，用户手动放的文件也能对上）
+      const row = await this.media.get(ref.id);
+      const meta = row ? await this.galleryStore.findBySha(row.sha256) : null;
+      const noted = meta?.description
+        ? `你之前记下的描述：${truncate(meta.description, 100)}`
+        : "";
+      const savedAt = meta ? `（已收藏于 ${meta.category}/${meta.name}）` : "";
+
+      if (this.renderer.canAttach(ref) && attachments.length < this.renderer.maxAttach) {
+        attachments.push(ref);
+        lines.push(`- [${label}]${savedAt}（原图见附件，仔细看看）${noted ? ` ${noted}` : ""}`);
+        continue;
+      }
+      const detail = await this.captioner.describeDetailed(ref);
+      lines.push(
+        `- [${label}]${savedAt}${detail ? `：${detail}` : "（没有可用的识图能力，看不清内容）"}` +
+          (noted ? `\n  ${noted}` : ""),
+      );
+    }
+    return {
+      text: `你把这几样东西拿起来仔细看了看：\n${lines.join("\n")}`,
+      attachments: attachments.length ? attachments : undefined,
+    };
   }
 
   // ---------- 发送 ----------
@@ -378,21 +511,18 @@ export class KoishiMessenger implements MessengerApi {
     const gallery = parseGalleryRef(refText);
     if (gallery !== null) {
       // 收藏夹文件（媒体类型也会顺带入资产库，以便留痕）
-      const safe = sanitizeName(gallery);
-      if (!safe) return `（文件名不合法："${gallery}"）`;
-      const file = path.join(this.galleryDir, safe);
-      const stat = await fs.stat(file).catch(() => null);
-      if (!stat?.isFile()) return `（收藏夹里没有 "${safe}"，可先用 check_gallery 查看。）`;
-      const data = await fs.readFile(file);
-      const ext = path.extname(safe).toLowerCase();
+      const entry = await this.galleryStore.resolve(gallery);
+      if (!entry) return `（收藏夹里没有 "${gallery}"，可先用 check_gallery 查看。）`;
+      const data = await fs.readFile(entry.file);
+      const ext = path.extname(entry.name).toLowerCase();
       const mime = MIME_BY_EXT[ext] ?? "application/octet-stream";
-      const type = typeByExt(safe);
-      element = this.fileElement(type, data, mime, safe);
+      const type = typeByExt(entry.name);
+      element = this.fileElement(type, data, mime, entry.name);
       if (type === "audio" || type === "video" || type === "image") {
         const mediaId = await this.media.ingest(toDataUrl(data, mime), type);
-        stored = mediaId !== null ? mediaPlaceholder(mediaId, type) : `[文件 ${safe}]`;
+        stored = mediaId !== null ? mediaPlaceholder(mediaId, type) : `[文件 ${entry.name}]`;
       } else {
-        stored = `[文件 ${safe}]`;
+        stored = `[文件 ${entry.name}]`;
       }
     } else {
       const resolved = await this.resolveMediaRef(refText);
@@ -1458,25 +1588,24 @@ export class KoishiMessenger implements MessengerApi {
     return { platform, channelId };
   }
 
-  /** 解析媒体引用："12" / "media:12" / "图片#12" / "gallery:name.png"，可限定允许的媒体类型 */
+  /** 解析媒体引用："12" / "media:12" / "图片#12" / "gallery:分类/name.png"，可限定允许的媒体类型 */
   private async resolveMediaRef(
     refText: string,
     allowTypes?: MediaType[],
   ): Promise<{ ref: MediaRef } | { error: string }> {
     const galleryName = parseGalleryRef(refText);
     if (galleryName !== null) {
-      const safe = sanitizeName(galleryName);
-      if (!safe) return { error: `（文件名不合法："${galleryName}"）` };
-      const file = path.join(this.galleryDir, safe);
-      const type = typeByExt(safe);
-      if (type === "file") return { error: `（"${safe}" 不是媒体文件，请用 send_file 发送）` };
+      const entry = await this.galleryStore.resolve(galleryName);
+      if (!entry) return { error: `（收藏夹里没有 "${galleryName}"，可先用 check_gallery 确认它存在。）` };
+      const type = typeByExt(entry.name);
+      if (type === "file") return { error: `（"${entry.name}" 不是媒体文件，请用 send_file 发送）` };
       if (allowTypes && !allowTypes.includes(type)) {
-        return { error: `（"${safe}" 是${LABEL[type]}，不能放进普通消息；请用 send_file${type === "audio" ? " 或 send_voice" : ""} 发送）` };
+        return { error: `（"${entry.name}" 是${LABEL[type]}，不能放进普通消息；请用 send_file${type === "audio" ? " 或 send_voice" : ""} 发送）` };
       }
-      const id = await this.media.ingest(`file://${file}`, type);
-      if (id === null) return { error: `（读取 "${safe}" 失败，可先用 check_gallery 确认它存在。）` };
+      const id = await this.media.ingest(`file://${entry.file}`, type);
+      if (id === null) return { error: `（读取 "${entry.name}" 失败，可先用 check_gallery 确认它存在。）` };
       const row = await this.media.get(id);
-      if (!row) return { error: `（读取 "${safe}" 失败。）` };
+      if (!row) return { error: `（读取 "${entry.name}" 失败。）` };
       return { ref: row.ref };
     }
     const match = refText.match(/(\d+)\s*$/);
@@ -1743,11 +1872,6 @@ function parseChannelKey(id: string): { platform: string; channelId: string; err
 function parseGalleryRef(refText: string): string | null {
   const m = refText.match(/^gallery:(.+)$/);
   return m ? m[1]!.trim() : null;
-}
-
-function sanitizeName(name: string): string | null {
-  if (!name || name.includes("/") || name.includes("\\") || name.includes("..")) return null;
-  return name;
 }
 
 function typeByExt(name: string): MediaType | "file" {

@@ -40,6 +40,16 @@ export class MediaRenderer {
     private attachmentNote?: (ref: MediaRef) => string,
   ) {}
 
+  /** 该媒体能否作为原生附件注入（供 messenger 在列表/细看场景直接附原图时判断） */
+  canAttach(ref: MediaRef): boolean {
+    return this.nativeSupport(ref);
+  }
+
+  /** 单事件原生附件数上限 */
+  get maxAttach(): number {
+    return this.maxAttachments;
+  }
+
   async render(text: string): Promise<RichText> {
     const matches = [...text.matchAll(MEDIA_PLACEHOLDER)];
     if (!matches.length) return { text };

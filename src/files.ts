@@ -40,6 +40,7 @@ const WORLD_DEF_TEMPLATE = `# 世界定义
  * ├── focus.json           # Bot 正在关注的频道
  * ├── pinned.json          # Bot-LLM 置顶上下文 + 计数器
  * ├── stream.jsonl         # Bot-LLM 工作窗口（Tool Call 流）
+ * ├── gallery/             # 收藏夹（分类子目录见 media/gallery.ts；描述元数据存数据库）
  * └── archive/             # 压缩时归档的历史流
  * ```
  */

@@ -19,6 +19,7 @@ import { NotifyManager } from "./koishi/notify.js";
 import { OwnSendTracker } from "./koishi/ownsends.js";
 import { RequestStore } from "./koishi/requests.js";
 import { CaptionService } from "./media/captioner.js";
+import { GalleryStore } from "./media/gallery.js";
 import { createAttachmentLoader } from "./media/parts.js";
 import { MediaRenderer, nativeSafeMime } from "./media/render.js";
 import { MediaStore } from "./media/store.js";
@@ -43,6 +44,7 @@ export class WorldService extends Service<Config> {
   private store!: MessageStore;
   private media!: MediaStore;
   private captioner!: CaptionService;
+  private gallery!: GalleryStore;
   private renderer!: MediaRenderer;
   private world!: WorldAgent;
   private focus!: FocusManager;
@@ -67,6 +69,8 @@ export class WorldService extends Service<Config> {
     const assetsDir = path.resolve(ctx.baseDir, config.basePath, "assets");
     this.media = new MediaStore(ctx, assetsDir, config.media.maxBytes, ctx.logger("yesimbot-world"));
     this.captioner = new CaptionService(config.captioners, config.media, this.media, ctx.logger("yesimbot-world"));
+    // 收藏夹：分类子目录（表情包/meme/截图/照片/未整理）+ 描述元数据表
+    this.gallery = new GalleryStore(ctx, path.resolve(ctx.baseDir, config.basePath, "gallery"));
     // 原生附件门槛：chat 模式 + 声明了该模态 + 格式安全。
     // GIF 特殊：支持视频 → 走视频通道；仅支持图像 → 抽帧拼图（loader 内完成）
     const isGif = (ref: MediaRef) => ref.type === "image" && ref.mime === "image/gif";
@@ -133,6 +137,8 @@ export class WorldService extends Service<Config> {
     const base = path.resolve(this.ctx.baseDir, this.config.basePath);
     this.files = new WorldFiles(base);
     await this.files.ensure();
+    // 建好收藏夹分类目录（用户可直接把图丢进「未整理」，散落在根目录的文件也会被自动清扫进去）
+    await this.gallery.ensureDirs();
 
     this.clock = new WorldClock(this.config.clock, this.files.clock);
     await this.clock.load();
@@ -245,7 +251,7 @@ export class WorldService extends Service<Config> {
       this.renderer,
       this.media,
       this.captioner,
-      this.files.galleryDir,
+      this.gallery,
       this.config.tts.enabled ? new TtsClient(this.config.tts) : null,
       this.focus,
       this.config.platformOps,
