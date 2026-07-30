@@ -2,7 +2,7 @@ import { promises as fs } from "node:fs";
 import type { TextTemplateConfig } from "../config.js";
 import type { WorldFiles } from "../files.js";
 import type { ChatMessage, ContentPart } from "../llm/chat.js";
-import type { AttachmentLoader } from "../media/parts.js";
+import type { AttachmentLoadFn } from "../media/parts.js";
 import type {
   BotEvent,
   CompressionResult,
@@ -90,9 +90,17 @@ export class BotContext {
   };
   stream: StreamEntry[] = [];
   /** 附件加载器（chat 模式 + 原生多模态时由 service 注入） */
-  attachmentLoader: AttachmentLoader | null = null;
+  attachmentLoader: AttachmentLoadFn | null = null;
   /** 运行时熔断：生成请求 400/413（模型不支持附件/请求体过大）后停用附件注入，避免持续报错 */
   attachmentsDisabled = false;
+  /**
+   * 最近一次渲染实际注入的附件 content part 类型集合。
+   * agent 据此对 400 精准降级：请求里有 video_url / input_audio 时先只关掉对应模态
+   * （GIF 会改走拼帧图的 image_url 通道），不殃及正常的图片附件。
+   */
+  lastAttachmentPartTypes = new Set<string>();
+  /** 运行时降级回调（service 注入）：关闭指定模态的附件注入并重建附件缓存 */
+  degradeModalities: ((kinds: ("video" | "audio")[]) => void) | null = null;
   /** 单次请求注入的附件总数预算（service 按配置注入；历史附件每次请求都会重发，必须设上限） */
   maxAttachmentsPerRequest = 8;
   /** 单次请求注入的附件总体积预算（base64 后的字符数） */
@@ -236,6 +244,7 @@ export class BotContext {
   async toChatMessages(timeLine: string): Promise<ChatMessage[]> {
     const loader = this.attachmentLoader && !this.attachmentsDisabled ? this.attachmentLoader : null;
     const allowed = new Set<unknown>();
+    this.lastAttachmentPartTypes = new Set();
     if (loader) {
       // 1. 收集锚点之后的候选附件（单个超预算的永久跳过——决策稳定，不影响前缀）
       const cands: { pos: number; skip: number; ref: unknown; size: number }[] = [];
@@ -290,7 +299,10 @@ export class BotContext {
         for (const ref of entry.event.attachments) {
           if (!allowed.has(ref)) continue;
           const part = await loader(ref);
-          if (part) parts.push(part);
+          if (part) {
+            parts.push(part);
+            this.lastAttachmentPartTypes.add(part.type);
+          }
         }
       }
       const last = built[built.length - 1]!;

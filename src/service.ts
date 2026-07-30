@@ -10,7 +10,7 @@ import { BotContext } from "./bot/context.js";
 import { availableTools, renderToolsText, toolLayer, type AppInfo } from "./bot/tools.js";
 import { describeCalendar } from "./calendar.js";
 import { WorldClock } from "./clock.js";
-import type { Config } from "./config.js";
+import type { Config, ModalitySupport } from "./config.js";
 import { WorldFiles } from "./files.js";
 import { FocusManager } from "./koishi/focus.js";
 import { Gateway } from "./koishi/gateway.js";
@@ -52,6 +52,11 @@ export class WorldService extends Service<Config> {
   private notifyMgr!: NotifyManager;
   /** 手机物理状态（agent 与 gateway 共享）：down = Bot 把手机放到了一边 */
   private phoneStatus: PhoneStatus = { down: false };
+  /**
+   * 会话级"有效模态"：以配置为初始值，运行时可降级（服务端 400 拒收 video_url/input_audio 时
+   * 只关对应模态，GIF 改走拼帧图）。渲染器与附件加载器共用此对象（原地修改，勿整体替换）。
+   */
+  private effectiveModalities: ModalitySupport = { image: false, audio: false, video: false };
   private requests!: RequestStore;
   private ownSends!: OwnSendTracker;
   private botContext: BotContext | null = null;
@@ -73,12 +78,14 @@ export class WorldService extends Service<Config> {
     // 收藏夹：分类子目录（表情包/meme/截图/照片/未整理）+ 描述元数据表
     this.gallery = new GalleryStore(ctx, path.resolve(ctx.baseDir, config.basePath, "gallery"));
     // 原生附件门槛：chat 模式 + 声明了该模态 + 格式安全。
-    // GIF 特殊：支持视频 → 走视频通道；仅支持图像 → 抽帧拼图（loader 内完成）
+    // 模态读会话级 effectiveModalities（可运行时降级）；GIF 特殊：
+    // 支持视频 → 走视频通道；仅支持图像 → 抽帧拼图（loader 内完成）
+    Object.assign(this.effectiveModalities, config.bot.modalities);
     const isGif = (ref: MediaRef) => ref.type === "image" && ref.mime === "image/gif";
     const nativeSupport = (ref: MediaRef) => {
       if (config.bot.mode !== "chat" || !nativeSafeMime(ref)) return false;
-      if (isGif(ref)) return config.bot.modalities.video || config.bot.modalities.image;
-      return config.bot.modalities[ref.type];
+      if (isGif(ref)) return this.effectiveModalities.video || this.effectiveModalities.image;
+      return this.effectiveModalities[ref.type];
     };
     this.renderer = new MediaRenderer(
       this.media,
@@ -87,7 +94,7 @@ export class WorldService extends Service<Config> {
       config.media.maxAttachmentsPerEvent,
       (ref) => {
         if (!isGif(ref)) return "（见附件）";
-        return config.bot.modalities.video
+        return this.effectiveModalities.video
           ? "（GIF 动图，见附件）"
           : "（GIF 动图，附件为其逐帧拼图，按行从左到右为播放顺序）";
       },
@@ -236,7 +243,9 @@ export class WorldService extends Service<Config> {
     // 加载时按【当前】模态配置与格式白名单过滤：用户纠正配置后，历史事件里
     // 已不支持的附件（关掉的模态 / GIF 表情等）不再注入请求，避免持续 400。
     if (this.config.bot.mode === "chat") {
-      const modalities = this.config.bot.modalities;
+      // 新会话：有效模态从配置重置（上次会话的运行时降级不跨会话生效）
+      Object.assign(this.effectiveModalities, this.config.bot.modalities);
+      const modalities = this.effectiveModalities;
       const loader = createAttachmentLoader(this.media, modalities, this.ctx.logger("yesimbot-world"));
       const allowed = (ref: MediaRef) =>
         ref.type === "image" && ref.mime === "image/gif"
@@ -244,6 +253,12 @@ export class WorldService extends Service<Config> {
           : modalities[ref.type];
       this.botContext.attachmentLoader = async (ref) =>
         allowed(ref) && nativeSafeMime(ref) ? loader(ref) : null;
+      // 运行时降级：服务端 400 拒收 video_url / input_audio 时只关对应模态，
+      // 附件缓存重建（GIF 从 video_url 改为拼帧图的 image_url）
+      this.botContext.degradeModalities = (kinds) => {
+        for (const k of kinds) modalities[k] = false;
+        loader.clearCache();
+      };
       // 每次请求的附件总预算（数量 + 体积）：历史附件每次请求都会重发，不设预算会撑爆请求体（413）
       this.botContext.maxAttachmentsPerRequest = this.config.media.maxAttachmentsPerRequest;
       this.botContext.maxAttachmentBytesPerRequest = Math.max(

@@ -347,15 +347,35 @@ export class BotAgent {
             continue;
           }
           // 400/413 且上下文含原生附件：
-          // - 400：几乎必然是模型实际不支持声明的模态（或附件格式不被接受）；
-          // - 413：请求体超过服务端上限（base64 附件把请求撑爆了）。
-          // 熔断附件注入后立即重试，否则同一附件会让之后每一次请求都失败。
+          // - 400：模型/服务端不接受某种附件（content part 类型不支持或格式不被接受）。
+          //   先精准降级：失败请求里注入过 video_url / input_audio 时，只关掉对应模态
+          //   （GIF 自动改走拼帧图的 image_url 通道），正常的图片附件不受牵连；
+          //   纯图片附件仍 400 才整体熔断（模型实际不具备视觉能力）。
+          // - 413：请求体超过服务端上限（base64 附件把请求撑爆了）→ 整体熔断并提示调预算。
+          // 处理后立即重试，否则同一附件会让之后每一次请求都失败。
           if (
             this.config.bot.mode === "chat" &&
             !this.context.attachmentsDisabled &&
             /\((400|413)\)/.test(String(err)) &&
             this.context.hasAttachments()
           ) {
+            if (/\(400\)/.test(String(err))) {
+              const kinds: ("video" | "audio")[] = [];
+              if (this.context.lastAttachmentPartTypes.has("video_url")) kinds.push("video");
+              if (this.context.lastAttachmentPartTypes.has("input_audio")) kinds.push("audio");
+              if (kinds.length && this.context.degradeModalities) {
+                this.context.degradeModalities(kinds);
+                this.logger.warn(
+                  "生成请求返回 400，失败请求含 %s 附件：服务端很可能不支持这类 content part，" +
+                    "已降级停用对应模态（本次会话内；GIF 动图改用拼帧图注入，图片附件不受影响）。" +
+                    "请核对 bot.modalities.%s 配置与模型的实际能力。原始错误：%s",
+                  kinds.map((k) => (k === "video" ? "video_url" : "input_audio")).join("/"),
+                  kinds.join("/"),
+                  err,
+                );
+                continue;
+              }
+            }
             this.context.attachmentsDisabled = true;
             this.logger.warn(
               /\(413\)/.test(String(err))

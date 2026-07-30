@@ -35,13 +35,19 @@ export function mediaToContentPart(ref: MediaRef, data: Buffer): ContentPart {
   }
 }
 
-export type AttachmentLoader = (ref: MediaRef) => Promise<ContentPart | null>;
+/** 附件加载函数：媒体引用 → content part（BotContext 注入用的最小接口） */
+export type AttachmentLoadFn = (ref: MediaRef) => Promise<ContentPart | null>;
+
+export interface AttachmentLoader extends AttachmentLoadFn {
+  /** 清空缓存：运行时降级模态后 content part 需要重建（如 GIF 从 video_url 改为拼帧图） */
+  clearCache(): void;
+}
 
 /**
  * 附件加载器：媒体文件 → content part，带内存缓存
  * （上下文每次生成都会重新渲染，避免反复读盘与 base64 编码）。
  *
- * GIF 动图按模型能力路由：
+ * GIF 动图按模型能力路由（modalities 按引用动态读取，支持运行时降级）：
  * - 原生支持视频 → 走视频通道（video_url，原样 GIF）；
  * - 仅原生图像 → 解码抽帧拼成一张网格图（PNG）注入；拼帧失败退回原样 GIF。
  */
@@ -67,7 +73,7 @@ export function createAttachmentLoader(
     }
     return mediaToContentPart(ref, data);
   };
-  return async (ref) => {
+  const loader = (async (ref: MediaRef) => {
     const cached = cache.get(ref.id);
     if (cached) return cached;
     try {
@@ -83,5 +89,7 @@ export function createAttachmentLoader(
       logger.warn("附件加载失败 (#%d): %s", ref.id, err);
       return null;
     }
-  };
+  }) as AttachmentLoader;
+  loader.clearCache = () => cache.clear();
+  return loader;
 }
