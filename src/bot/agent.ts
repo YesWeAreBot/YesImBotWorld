@@ -1348,9 +1348,9 @@ export class BotAgent {
     const elapsedTU = (Date.now() - startReal) / 1000 / this.clock.unitRealSeconds;
     this.pushEvent(
       "system",
-      `你睡了一觉，过去了 ${elapsedTU.toFixed(1)} 个 TU。醒来时头脑清明，近来的经历沉淀成了记忆。当前 ${this.clock.timeLine()}` +
+      `你休息了一会儿，过去了 ${elapsedTU.toFixed(1)} 个 TU。休息让你的头脑更清明了些，近来的经历沉淀成了记忆。当前 ${this.clock.timeLine()}` +
         (closedApp || chatWasOpen
-          ? `（睡前开着的「${closedApp ?? "聊天应用"}」已经自动关闭）`
+          ? `（休息前开着的「${closedApp ?? "聊天应用"}」已经自动关闭）`
           : ""),
       { ref: call?.id },
     );
