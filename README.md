@@ -125,7 +125,17 @@ YesImBot World：让 Bot 生活在一个由 LLM 独立维护的虚拟世界中�
 1. **原生模态**（`bot.modalities.image/audio/video`）：声明 Bot-LLM 自身支持的模态。
    仅 chat 模式生效（text 模式的 `/completion` 无法输入媒体）。原生支持的模态在事件中
    以 content part 附件注入（image_url / input_audio / video_url），文本侧显示
-   `[图片#12（见附件）]`。受 `media.maxAttachmentsPerEvent` 上限约束，超出部分回退解释器。
+   `[图片#12（见附件）]`。附件注入受三级预算约束（都可配置）：
+   - `media.maxAttachmentsPerEvent`（默认 4）：单个事件的附件数上限，超出部分回退解释器；
+   - `media.maxAttachmentsPerRequest`（默认 8）：单次生成请求的附件**总数**上限——
+     工作窗口里的历史附件每次请求都会重发，必须设总预算；
+   - `media.maxAttachmentMbPerRequest`（默认 6 MB）：单次请求附件**总体积**上限（按 base64 计），
+     决定请求体大小；单个超过此值的附件（过大截图等）不注入。
+     生成请求报 **413** 时调小这两项，或提高服务端/反代的请求体上限
+     （nginx `client_max_body_size` 默认仅 1MB）。
+   超出请求级预算时，较早的附件被**整批**淘汰为文字标记（水位降到一半再稳定运行，
+   保护前缀缓存：允许集平时只增不改，缓存重算摊薄到每 N/2 张新图一次）；
+   400/413 还有兜底熔断——本次会话停用附件注入并告警，绝不卡死推理循环。
 2. **外挂解释器**（`captioners.image/audio/video`）：模型不具备某模态时，外挂另一个模型
    把媒体解释为文本，Bot 看到 `[图片#12：一只橘猫瘫在键盘上]`。
    - image / video：多模态 chat completion（video 需支持 video_url 的模型，如 Qwen-VL 系）；

@@ -574,14 +574,15 @@ export const Config: Schema<Config> = Schema.intersect([
       maxAttachmentsPerRequest: Schema.natural()
         .default(8)
         .description(
-          "单次生成请求注入的原生附件**总数**上限：工作窗口里的历史附件每次请求都会重发，" +
-            "从最新的事件往前挑选，超出预算的旧附件退化为文字标记。生成请求报 413（请求体过大）时调小",
+          "单次生成请求注入的原生附件**总数**上限：工作窗口里的历史附件每次请求都会重发，必须设预算。" +
+            "越限时较早的附件被整批淘汰为文字标记（水位降到一半，保护前缀缓存）。生成请求报 413（请求体过大）时调小",
         ),
       maxAttachmentMbPerRequest: Schema.number()
         .default(6)
         .description(
-          "单次生成请求注入的原生附件**总体积**上限（MB，按 base64 编码后计）。" +
-            "超出预算的附件（含单个过大的截图/大图）不注入，退化为文字标记。生成请求报 413 时调小",
+          "单次生成请求注入的原生附件**总体积**上限（MB，按 base64 编码后计）：" +
+            "决定请求体大小的主要因素。单个超过此值的附件（过大的截图/大图）不注入。" +
+            "生成请求报 413 时调小；注意反向代理的请求体上限（如 nginx client_max_body_size 默认仅 1MB）",
         ),
       captionTimeoutMs: Schema.natural().default(60000).description("单次解释调用的超时（毫秒）"),
     }).description("媒体处理"),
