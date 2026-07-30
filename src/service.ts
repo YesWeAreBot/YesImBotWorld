@@ -244,6 +244,12 @@ export class WorldService extends Service<Config> {
           : modalities[ref.type];
       this.botContext.attachmentLoader = async (ref) =>
         allowed(ref) && nativeSafeMime(ref) ? loader(ref) : null;
+      // 每次请求的附件总预算（数量 + 体积）：历史附件每次请求都会重发，不设预算会撑爆请求体（413）
+      this.botContext.maxAttachmentsPerRequest = this.config.media.maxAttachmentsPerRequest;
+      this.botContext.maxAttachmentBytesPerRequest = Math.max(
+        1,
+        Math.round(this.config.media.maxAttachmentMbPerRequest * 1024 * 1024),
+      );
     }
 
     const messenger = new KoishiMessenger(

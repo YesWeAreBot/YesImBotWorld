@@ -51,6 +51,8 @@ export interface CaptionersConfig {
 export interface MediaConfig {
   maxBytes: number;
   maxAttachmentsPerEvent: number;
+  maxAttachmentsPerRequest: number;
+  maxAttachmentMbPerRequest: number;
   captionTimeoutMs: number;
 }
 
@@ -569,6 +571,18 @@ export const Config: Schema<Config> = Schema.intersect([
       maxAttachmentsPerEvent: Schema.natural()
         .default(4)
         .description("单个事件中原生注入的媒体附件数量上限，超出部分回退为文本解释"),
+      maxAttachmentsPerRequest: Schema.natural()
+        .default(8)
+        .description(
+          "单次生成请求注入的原生附件**总数**上限：工作窗口里的历史附件每次请求都会重发，" +
+            "从最新的事件往前挑选，超出预算的旧附件退化为文字标记。生成请求报 413（请求体过大）时调小",
+        ),
+      maxAttachmentMbPerRequest: Schema.number()
+        .default(6)
+        .description(
+          "单次生成请求注入的原生附件**总体积**上限（MB，按 base64 编码后计）。" +
+            "超出预算的附件（含单个过大的截图/大图）不注入，退化为文字标记。生成请求报 413 时调小",
+        ),
       captionTimeoutMs: Schema.natural().default(60000).description("单次解释调用的超时（毫秒）"),
     }).description("媒体处理"),
   }),

@@ -346,18 +346,24 @@ export class BotAgent {
             this.pushEvent("system", `（意识有些恍惚，刚才的想法没有成形：${err.message}。请重新输出一个合法的工具调用。）`);
             continue;
           }
-          // 400 且上下文含原生附件：几乎必然是模型实际不支持声明的模态（或附件格式不被接受）。
-          // 熔断附件注入后立即重试，否则同一附件会让之后每一次请求都 400。
+          // 400/413 且上下文含原生附件：
+          // - 400：几乎必然是模型实际不支持声明的模态（或附件格式不被接受）；
+          // - 413：请求体超过服务端上限（base64 附件把请求撑爆了）。
+          // 熔断附件注入后立即重试，否则同一附件会让之后每一次请求都失败。
           if (
             this.config.bot.mode === "chat" &&
             !this.context.attachmentsDisabled &&
-            /\(400\)/.test(String(err)) &&
+            /\((400|413)\)/.test(String(err)) &&
             this.context.hasAttachments()
           ) {
             this.context.attachmentsDisabled = true;
             this.logger.warn(
-              "生成请求返回 400 且上下文含原生媒体附件：已停用附件注入（本次会话内）。" +
-                "请核对 bot.modalities 配置与模型的实际多模态能力。原始错误：%s",
+              /\(413\)/.test(String(err))
+                ? "生成请求返回 413（请求体过大）：已停用附件注入（本次会话内）。" +
+                    "请调小 media.maxAttachmentsPerRequest / maxAttachmentMbPerRequest，" +
+                    "或提高 API 服务端的请求体大小上限。原始错误：%s"
+                : "生成请求返回 400 且上下文含原生媒体附件：已停用附件注入（本次会话内）。" +
+                    "请核对 bot.modalities 配置与模型的实际多模态能力。原始错误：%s",
               err,
             );
             continue;

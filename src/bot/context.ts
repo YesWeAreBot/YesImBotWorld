@@ -91,8 +91,21 @@ export class BotContext {
   stream: StreamEntry[] = [];
   /** 附件加载器（chat 模式 + 原生多模态时由 service 注入） */
   attachmentLoader: AttachmentLoader | null = null;
-  /** 运行时熔断：生成请求 400（模型实际不支持附件）后停用附件注入，避免持续报错 */
+  /** 运行时熔断：生成请求 400/413（模型不支持附件/请求体过大）后停用附件注入，避免持续报错 */
   attachmentsDisabled = false;
+  /** 单次请求注入的附件总数预算（service 按配置注入；历史附件每次请求都会重发，必须设上限） */
+  maxAttachmentsPerRequest = 8;
+  /** 单次请求注入的附件总体积预算（base64 后的字符数） */
+  maxAttachmentBytesPerRequest = 6 * 1024 * 1024;
+  /**
+   * 附件注入锚点：锚点之前的附件永久退化为文字（仅内存态，压缩/重启后自然重置）。
+   *
+   * 预算控制采用"锚点 + 批量淘汰"而非滑动窗口：滑动窗口每来一张新图就会改动一条旧消息
+   * （最老的入选附件被挤出），前缀缓存从那里断裂、几乎每次生成都要重算；
+   * 锚点方案只在越限时整批前移一次（水位降到一半），其余时间允许集只增不改，
+   * 新附件全部出现在流的末尾——前缀稳定，缓存重算被摊薄到每 N/2 张新图一次。
+   */
+  private attachAnchor = { pos: 0, skip: 0 };
   private counters = { tool: 0, event: 0 };
   private toolsText: string;
 
@@ -118,6 +131,7 @@ export class BotContext {
       this.pinned.persona = await this.files.readBotStatus();
     }
     this.stream = [];
+    this.attachAnchor = { pos: 0, skip: 0 };
     const raw = await this.files.readText(this.files.stream);
     for (const line of raw.split("\n")) {
       if (!line.trim()) continue;
@@ -214,8 +228,54 @@ export class BotContext {
   /**
    * chat 模式：置顶区为 system，工具调用为 assistant，事件为 user（连续同角色合并）。
    * 事件的原生多模态附件通过 attachmentLoader 转为 content part 注入。
+   *
+   * 附件按**每次请求的总预算**（数量 + 体积）注入：历史事件的附件每次请求都会重发，
+   * 不设总预算的话 base64 会无限累积，最终撑爆服务端的请求体上限（413）。
+   * 预算从最新的事件往前分配，更早的附件退化为纯文字标记。
    */
   async toChatMessages(timeLine: string): Promise<ChatMessage[]> {
+    const loader = this.attachmentLoader && !this.attachmentsDisabled ? this.attachmentLoader : null;
+    const allowed = new Set<unknown>();
+    if (loader) {
+      // 1. 收集锚点之后的候选附件（单个超预算的永久跳过——决策稳定，不影响前缀）
+      const cands: { pos: number; skip: number; ref: unknown; size: number }[] = [];
+      for (let i = this.attachAnchor.pos; i < this.stream.length; i++) {
+        const entry = this.stream[i]!;
+        if (entry.kind !== "event" || !entry.event.attachments?.length) continue;
+        const from = i === this.attachAnchor.pos ? this.attachAnchor.skip : 0;
+        for (let k = from; k < entry.event.attachments.length; k++) {
+          const ref = entry.event.attachments[k]!;
+          const part = await loader(ref);
+          if (!part) continue;
+          const size = partPayloadSize(part);
+          if (size > this.maxAttachmentBytesPerRequest) continue;
+          cands.push({ pos: i, skip: k, ref, size });
+        }
+      }
+      // 2. 越限时整批前移锚点：把水位降到一半，换取之后一段时间允许集只增不改
+      const total = cands.reduce((s, c) => s + c.size, 0);
+      if (cands.length > this.maxAttachmentsPerRequest || total > this.maxAttachmentBytesPerRequest) {
+        const halfCount = Math.max(1, Math.floor(this.maxAttachmentsPerRequest / 2));
+        const halfBytes = Math.max(1, Math.floor(this.maxAttachmentBytesPerRequest / 2));
+        let keep = 0;
+        let bytes = 0;
+        for (let j = cands.length - 1; j >= 0; j--) {
+          if (keep + 1 > halfCount || bytes + cands[j]!.size > halfBytes) break;
+          keep++;
+          bytes += cands[j]!.size;
+        }
+        if (keep === 0 && cands.length) keep = 1; // 至少保留最新一个（其体积已 ≤ 总预算）
+        const kept = cands.slice(cands.length - keep);
+        const first = kept[0];
+        this.attachAnchor = first
+          ? { pos: first.pos, skip: first.skip }
+          : { pos: this.stream.length, skip: 0 };
+        for (const c of kept) allowed.add(c.ref);
+      } else {
+        for (const c of cands) allowed.add(c.ref);
+      }
+    }
+
     const built: { role: ChatMessage["role"]; parts: ContentPart[] }[] = [
       { role: "system", parts: [{ type: "text", text: this.renderSystemText(timeLine) }] },
     ];
@@ -226,9 +286,10 @@ export class BotContext {
           ? BotContext.renderToolCallLine(entry.call)
           : BotContext.renderEventLine(entry.event);
       const parts: ContentPart[] = [{ type: "text", text: line }];
-      if (entry.kind === "event" && entry.event.attachments?.length && this.attachmentLoader && !this.attachmentsDisabled) {
+      if (entry.kind === "event" && entry.event.attachments?.length && loader) {
         for (const ref of entry.event.attachments) {
-          const part = await this.attachmentLoader(ref);
+          if (!allowed.has(ref)) continue;
+          const part = await loader(ref);
           if (part) parts.push(part);
         }
       }
@@ -317,6 +378,7 @@ export class BotContext {
   async applyCompression(result: CompressionResult, worldTime: number): Promise<void> {
     await this.files.archiveStream();
     this.stream = [];
+    this.attachAnchor = { pos: 0, skip: 0 };
     this.pinned = {
       persona: await this.files.readBotStatus(),
       historySummary: result.historySummary,
@@ -325,6 +387,20 @@ export class BotContext {
       updatedAt: worldTime,
     };
     await this.persistPinned();
+  }
+}
+
+/** 附件 content part 的近似载荷大小（base64 字符数） */
+function partPayloadSize(part: ContentPart): number {
+  switch (part.type) {
+    case "image_url":
+      return part.image_url.url.length;
+    case "video_url":
+      return part.video_url.url.length;
+    case "input_audio":
+      return part.input_audio.data.length;
+    case "text":
+      return part.text.length;
   }
 }
 
