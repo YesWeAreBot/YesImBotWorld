@@ -441,12 +441,15 @@ export class KoishiMessenger implements MessengerApi {
     for (const match of msg.matchAll(INLINE_MEDIA)) {
       const before = msg.slice(cursor, match.index);
       cursor = match.index! + match[0].length;
-      await pushText(before);
       const resolved = await this.resolveMediaRef(match[2]!, ["image", "video"]);
       if ("error" in resolved) {
         problems.push(resolved.error);
+        await pushText(before); // 标记未被替换：保留原空白，避免两侧文字粘连
         continue;
       }
+      // 标记被替换成媒体后，紧邻它的空格会孤立地留在相邻文本段的首尾——一并吃掉（换行保留，可能是有意排版）
+      await pushText(before.replace(/[ \t]+$/, ""));
+      while (cursor < msg.length && (msg[cursor] === " " || msg[cursor] === "\t")) cursor++;
       elements.push(await this.mediaElement(resolved.ref));
       sentRefs.push(resolved.ref);
       inlineIds.add(resolved.ref.id);

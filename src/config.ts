@@ -470,10 +470,13 @@ export const Config: Schema<Config> = Schema.intersect([
             "两种模式都支持网页截图并自动存入收藏夹「截图」分类（需要安装 koishi-plugin-puppeteer，未安装时仅截图不可用）",
         ),
       browserSearchURL: Schema.string()
-        .default("https://lite.duckduckgo.com/lite/?q=%s")
+        .default("https://www.so.com/s?q=%s")
         .description(
           "现实世界模式的搜索引擎地址，%s 为搜索词占位（无 %s 时追加在末尾）。" +
-            "默认 DuckDuckGo Lite（纯 HTML、免 key）；可换成 SearxNG 等文本友好的引擎",
+            "默认 360 搜索（中国大陆可直连、结果页可解析、跳转链可还原）。可选：" +
+            "DuckDuckGo Lite https://lite.duckduckgo.com/lite/?q=%s（需能访问外网）、" +
+            "自建 SearxNG 实例 http://…/search?q=%s（最干净可控）。" +
+            "百度/搜狗/必应不推荐：页面过大、反爬或对无 cookie 请求返回不相关结果",
         ),
       mcpServers: Schema.array(
         Schema.object({

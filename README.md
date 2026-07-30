@@ -306,8 +306,9 @@ Bot 不只能收，也能发：
   `search(query)` 搜索、`open_url(url)` 打开网址、`open_link(n)` 点开页内链接、
   `scroll_down()` 翻页、`go_back()` 后退、`screenshot(description?)` 截图：
   - **现实世界设定**：对接真实互联网。零依赖 HTML→可读文本转换（标题、正文、链接 `[n]`、
-    图片 `{图n}` 编号化），搜索引擎默认 DuckDuckGo Lite（`apps.browserSearchURL` 可换成
-    SearxNG 等）；`view_image(n)` 点开页内图片细看内容（原生识图附原图，否则解释器详述——
+    图片 `{图n}` 编号化），搜索引擎默认 360 搜索（大陆可直连；`apps.browserSearchURL` 可换成
+    DuckDuckGo Lite / 自建 SearxNG 等，360/DDG/Bing 的跳转链会自动还原为真实目标）；
+    `view_image(n)` 点开页内图片细看内容（原生识图附原图，否则解释器详述——
     alt 缺失/含糊时先看再选）；`save_image(n)` 把网页里的图片存进媒体缓存（得到 `图片#id`，
     可直接 `send` 发送或 `gallery_save` 收藏）；
   - **虚构世界设定**：World-LLM 扮演"这个世界的互联网"，直接生成符合世界观的完整 HTML
@@ -423,7 +424,7 @@ plugins:
       weatherEnabled: true # 内置天气应用（现实设定查 Open-Meteo，虚构设定由 World-LLM 生成）
       weatherDefaultCity: "" # 真实天气默认城市（留空则要求 Bot 自己给出）
       browserEnabled: true # 内置浏览器（现实设定上真互联网；虚构设定由 World-LLM 生成网页；截图需 koishi-plugin-puppeteer）
-      browserSearchURL: https://lite.duckduckgo.com/lite/?q=%s # 搜索引擎（%s 为搜索词占位）
+      browserSearchURL: https://www.so.com/s?q=%s # 搜索引擎（%s 为搜索词占位；默认 360，大陆可直连）
       mcpServers: # 外接 MCP Server：每个都是手机里的一个 App
         - enabled: true
           name: 备忘录

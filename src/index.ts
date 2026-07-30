@@ -3,7 +3,11 @@ import type { Config } from "./config.js";
 import { WorldService } from "./service.js";
 
 export const name = "yesimbot-world";
-export const inject = ["database"];
+// puppeteer 为可选依赖：装了 koishi-plugin-puppeteer 时浏览器 App 才提供网页截图
+export const inject = {
+  database: { required: true },
+  puppeteer: { required: false },
+};
 export { Config } from "./config.js";
 export * from "./types.js";
 

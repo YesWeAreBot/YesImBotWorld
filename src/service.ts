@@ -38,7 +38,11 @@ declare module "koishi" {
 const DEF_PLACEHOLDER = "（尚未编写）";
 
 export class WorldService extends Service<Config> {
-  static readonly inject = ["database"];
+  // puppeteer 可选：未安装时浏览器 App 不提供截图（其余功能照常），安装后无需改动即可用
+  static readonly inject = {
+    database: { required: true },
+    puppeteer: { required: false },
+  };
 
   private files!: WorldFiles;
   private clock!: WorldClock;

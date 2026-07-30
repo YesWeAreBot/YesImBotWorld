@@ -273,7 +273,7 @@ export class BrowserApp implements WorldApp {
   // ---------- 现实模式：真实互联网 ----------
 
   private async realSearch(query: string): Promise<string> {
-    const base = this.cfg.browserSearchURL.trim() || "https://lite.duckduckgo.com/lite/?q=%s";
+    const base = this.cfg.browserSearchURL.trim() || "https://www.so.com/s?q=%s";
     const url = base.includes("%s")
       ? base.replace("%s", encodeURIComponent(query))
       : base + encodeURIComponent(query);
@@ -456,13 +456,30 @@ function normalizeUrl(url: string): string {
   return /^[a-z][a-z0-9+.-]*:\/\//i.test(url) ? url : `https://${url}`;
 }
 
-/** 还原搜索引擎的跳转链接（DuckDuckGo 的 /l/?uddg=<目标>） */
-function unwrapRedirect(url: string): string {
+/** 还原搜索引擎的跳转链接为真实目标（360 /jump?u=、DuckDuckGo /l/?uddg=、Bing /ck/a?u=a1…） */
+export function unwrapRedirect(url: string): string {
   try {
     const u = new URL(url);
+    // 360 搜索：/jump?u=<目标>
+    if (u.hostname.endsWith("so.com") && u.pathname === "/jump") {
+      const target = u.searchParams.get("u");
+      if (target && /^https?:\/\//i.test(target)) return target;
+    }
+    // DuckDuckGo：/l/?uddg=<目标>
     if (u.hostname.endsWith("duckduckgo.com") && u.pathname.startsWith("/l/")) {
       const target = u.searchParams.get("uddg");
-      if (target) return decodeURIComponent(target);
+      if (target && /^https?:\/\//i.test(target)) return target;
+    }
+    // Bing：/ck/a?...&u=a1<base64url(目标)>
+    if (u.hostname.endsWith("bing.com") && u.pathname.startsWith("/ck/")) {
+      const packed = u.searchParams.get("u");
+      if (packed?.startsWith("a1")) {
+        const decoded = Buffer.from(
+          packed.slice(2).replace(/-/g, "+").replace(/_/g, "/"),
+          "base64",
+        ).toString("utf8");
+        if (/^https?:\/\//i.test(decoded)) return decoded;
+      }
     }
   } catch {
     /* 保留原样 */
