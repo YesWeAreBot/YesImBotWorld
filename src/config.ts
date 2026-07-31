@@ -219,8 +219,9 @@ export const Config: Schema<Config> = Schema.intersect([
       blockingAct: Schema.boolean()
         .default(false)
         .description(
-          "act() 是否阻塞后续生成：开启后 Bot 在动作完成前不会生成下一个工具调用" +
-            "（一个人同时只能专注做一件事）。期间收到重要通知仍会被唤醒，动作会继续在后台进行",
+          "act() 是否阻塞后续生成：开启后 Bot 从发出动作起到动作完成（结果交付）为止不生成任何工具调用" +
+            "（一个人同时只能专注做一件事）。世界裁定在动作发出时立即开始（不等倒计时），结果压到预计完成时刻交付；" +
+            "阻塞期间的消息通知会积压，动作完成回过神来时一并看到",
         ),
       maxWindowChars: Schema.natural()
         .default(32000)

@@ -251,28 +251,23 @@ export class BotAgent {
   ): void {
     const rich: RichText = typeof content === "string" ? { text: content } : content;
     const isWaitResult = this.waiting !== null && opts.ref === this.waiting.callId;
-    const shouldWake = this.waiting !== null && (isWaitResult || opts.wake === true);
+    // 唤醒规则：等待中的工具结果必定唤醒；wake 事件只能唤醒 wait（等待本来就是"直到有事发生"）。
+    // 阻塞中的 act 不受 wake 打断——一个人专注做事时就是顾不上别的（blockingAct 的本意），
+    // 期间的通知留在邮箱里，动作完成回过神来时一并看到。
+    const shouldWake =
+      this.waiting !== null &&
+      (isWaitResult || (opts.wake === true && this.waiting.kind === "wait"));
 
     if (shouldWake && !isWaitResult) {
-      const { callId, kind } = this.waiting!;
-      if (kind === "wait") {
-        // 提前唤醒：取消等待到期任务，并在事件前插入打断说明
-        this.scheduler.cancel(callId);
-        this.mailbox.push({
-          source: "system",
-          content: "你的等待被打断了。",
-          refToolCallId: callId,
-          worldTime: this.clock.now(),
-        });
-      } else {
-        // 阻塞中的 act：注意力被吸引，但动作不中止，结果照常在完成时交付
-        this.mailbox.push({
-          source: "system",
-          content: `（这动静吸引了你的注意。你手头的动作（${callId}）仍在继续，完成时你会知道结果。）`,
-          refToolCallId: callId,
-          worldTime: this.clock.now(),
-        });
-      }
+      // 提前唤醒 wait：取消等待到期任务，并在事件前插入打断说明
+      const { callId } = this.waiting!;
+      this.scheduler.cancel(callId);
+      this.mailbox.push({
+        source: "system",
+        content: "你的等待被打断了。",
+        refToolCallId: callId,
+        worldTime: this.clock.now(),
+      });
     }
 
     this.mailbox.push({
