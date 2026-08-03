@@ -3,6 +3,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import type { Context, Logger } from "koishi";
 import type { MediaRef, MediaType } from "../types.js";
+import { fetchWithProxy } from "../fetch.js";
 
 declare module "koishi" {
   interface Tables {
@@ -77,9 +78,9 @@ export class MediaStore {
    * 摄取一个媒体资源（http(s):// 或 data: URL），返回媒体 id。
    * 下载失败 / 超限时返回 null。
    */
-  async ingest(src: string, type: MediaType, mimeHint?: string): Promise<number | null> {
+  async ingest(src: string, type: MediaType, mimeHint?: string, proxy?: string): Promise<number | null> {
     try {
-      const fetched = await this.fetchSource(src, mimeHint);
+      const fetched = await this.fetchSource(src, mimeHint, proxy);
       if (!fetched) return null;
       const { data } = fetched;
       let { mime } = fetched;
@@ -155,6 +156,7 @@ export class MediaStore {
   private async fetchSource(
     src: string,
     mimeHint?: string,
+    proxy?: string,
   ): Promise<{ data: Buffer; mime: string } | null> {
     if (src.startsWith("data:")) {
       const match = src.match(/^data:([^;,]+)?(;base64)?,(.*)$/s);
@@ -174,7 +176,7 @@ export class MediaStore {
       return { data, mime: mimeHint || sniffMime(data) };
     }
     if (src.startsWith("http://") || src.startsWith("https://")) {
-      const res = await fetch(src, { signal: AbortSignal.timeout(30000) });
+      const res = await fetchWithProxy(src, { signal: AbortSignal.timeout(30000), proxy });
       if (!res.ok) {
         this.logger.warn("媒体下载失败 (%d): %s", res.status, src.slice(0, 120));
         return null;

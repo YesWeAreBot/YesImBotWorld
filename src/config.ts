@@ -162,6 +162,7 @@ export interface AppsConfig {
   weatherDefaultCity: string;
   browserEnabled: boolean;
   browserSearchURL: string;
+  browserProxy: string;
   mcpServers: McpServerConfig[];
 }
 
@@ -500,6 +501,12 @@ export const Config: Schema<Config> = Schema.intersect([
             "DuckDuckGo Lite https://lite.duckduckgo.com/lite/?q=%s（需能访问外网）、" +
             "自建 SearxNG 实例 http://…/search?q=%s（最干净可控）。" +
             "百度/搜狗/必应不推荐：页面过大、反爬或对无 cookie 请求返回不相关结果",
+        ),
+      browserProxy: Schema.string()
+        .default("")
+        .description(
+          "浏览器访问真实互联网时使用的代理 URL（如 http://127.0.0.1:7890）。" +
+            "留空时依次读取 HTTPS_PROXY / HTTP_PROXY 环境变量；都没有则不代理。",
         ),
       mcpServers: Schema.array(
         Schema.object({

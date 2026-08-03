@@ -22,6 +22,9 @@
     "build": "pkgroll --sourcemap",
     "check": "tsc --noEmit"
   },
+  "dependencies": {
+    "undici": "^8.4.1"
+  },
   "keywords": [
     "koishi",
     "plugin",

@@ -442,6 +442,7 @@ plugins:
       weatherDefaultCity: "" # 真实天气默认城市（留空则要求 Bot 自己给出）
       browserEnabled: true # 内置浏览器（现实设定上真互联网；虚构设定由 World-LLM 生成网页；截图需 koishi-plugin-puppeteer）
       browserSearchURL: https://www.so.com/s?q=%s # 搜索引擎（%s 为搜索词占位；默认 360，大陆可直连）
+      browserProxy: "" # 代理 URL，如 http://127.0.0.1:7890；留空读取 HTTPS_PROXY / HTTP_PROXY
       mcpServers: # 外接 MCP Server：每个都是手机里的一个 App
         - enabled: true
           name: 备忘录

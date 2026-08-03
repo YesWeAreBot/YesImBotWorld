@@ -23,6 +23,7 @@ import type { MediaStore } from "../media/store.js";
 import type { MediaRef, RichText } from "../types.js";
 import type { WorldAgent } from "../world/agent.js";
 import type { AppRawTool, WorldApp } from "./app.js";
+import { fetchWithProxy } from "../fetch.js";
 import { parseHtml, type ParsedPage } from "./html.js";
 
 const HTTP_TIMEOUT_MS = 20_000;
@@ -283,10 +284,11 @@ export class BrowserApp implements WorldApp {
   private async realOpen(url: string, prefix?: string): Promise<string> {
     let res: Response;
     try {
-      res = await fetch(url, {
+      res = await fetchWithProxy(url, {
         headers: { "user-agent": USER_AGENT, accept: "text/html,application/xhtml+xml,*/*" },
         redirect: "follow",
         signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
+        proxy: this.cfg.browserProxy,
       });
     } catch (err) {
       return `（打不开 ${url}：${(err as Error).message ?? err}。检查网址，或稍后再试。）`;
@@ -296,7 +298,7 @@ export class BrowserApp implements WorldApp {
     const ctype = res.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase() ?? "";
     // 直接打开的是图片：顺手存进媒体缓存
     if (ctype.startsWith("image/")) {
-      const id = await this.media.ingest(res.url || url, "image");
+      const id = await this.media.ingest(res.url || url, "image", undefined, this.cfg.browserProxy);
       return id !== null
         ? `这个网址是一张图片，已存入你的媒体缓存：[图片#${id}]（可用 send 发送，喜欢可 gallery_save 收藏）。`
         : "（这个网址是一张图片，但下载失败了。）";
@@ -320,7 +322,7 @@ export class BrowserApp implements WorldApp {
 
   /** 点开页内图片细看：原生识图 → 附原图；否则 → 解释器详述 */
   private async viewImage(n: number, img: { url: string; alt: string }): Promise<string | RichText> {
-    const id = await this.media.ingest(img.url, "image");
+    const id = await this.media.ingest(img.url, "image", undefined, this.cfg.browserProxy);
     if (id === null) return `（图片加载失败（${img.url.slice(0, 100)}），点不开。）`;
     const row = await this.media.get(id);
     if (!row) return "（图片加载失败。）";
@@ -338,7 +340,7 @@ export class BrowserApp implements WorldApp {
   }
 
   private async saveImage(img: { url: string; alt: string }): Promise<string> {
-    const id = await this.media.ingest(img.url, "image");
+    const id = await this.media.ingest(img.url, "image", undefined, this.cfg.browserProxy);
     if (id === null) return `（保存失败：图片下载不下来（${img.url.slice(0, 100)}）。）`;
     // alt 只在没有图片解释器时充当摘要兜底（有解释器时留空，让它产出更可靠的内容描述）
     if (img.alt && !this.captioner.enabledFor("image")) {
