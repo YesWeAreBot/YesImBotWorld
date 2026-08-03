@@ -224,6 +224,7 @@ Bot 不只能收，也能发：
 | `pick_up_phone()` | 拿起手机：恢复正常通知 |
 | `cancel(id)` | 取消倒计时中的工具调用 |
 | `identity_recall()` | 反思身份：角色设定以 Event 再次注入 |
+| `run_command(command, cwd?)` | 执行本地命令行；默认关闭，需开启 `shell.enabled` |
 
 ### chat / channel / group 层（节选）
 
@@ -430,6 +431,11 @@ plugins:
       groupAdmin: false
       specialTitle: false
       groupLeave: false
+    shell: # 本地命令行权限：默认关闭，开启后 Bot 获得 run_command
+      enabled: false
+      cwd: ../Blog # run_command 的默认工作目录，相对 Koishi baseDir
+      timeoutMs: 30000
+      maxOutputChars: 20000
     apps: # 手机应用（Apps / MCP）：open_app 打开后工具才展开，一次只开一个
       chatAppName: QQ # 聊天平台在 Bot 手机里的应用名
       weatherEnabled: true # 内置天气应用（现实设定查 Open-Meteo，虚构设定由 World-LLM 生成）
@@ -457,4 +463,5 @@ plugins:
 - 无法主动发起好友申请（OneBot 协议无此接口）；
 - 好友申请/入群邀请的待处理请求（`req_N`）只保存在内存中，重启后失效；
 - 视频解释走 video_url content part（Qwen-VL 系约定），不做本地抽帧；
-- 文件/媒体发送以 base64 data URL 传给适配器，超大文件受平台限制。
+- 文件/媒体发送以 base64 data URL 传给适配器，超大文件受平台限制；
+- `run_command` 默认关闭；开启后 Bot 可执行任意本机命令，请自行承担安全风险。

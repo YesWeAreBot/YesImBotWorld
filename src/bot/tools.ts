@@ -399,6 +399,13 @@ export const BOT_TOOLS: BotToolDef[] = [
     signature: "identity_recall()",
     description: "静下心反思自己是谁：你的角色设定会被重新注入你的意识。感到迷失或行为偏离人设时使用。",
   },
+  {
+    name: "run_command",
+    signature: 'run_command(command: string, cwd?: string)',
+    description:
+      "在本机执行一条命令行命令，返回 stdout/stderr。cwd 缺省使用配置里的 shell.cwd；" +
+      "仅当插件配置 shell.enabled 为 true 时才可用。",
+  },
 ];
 
 /** 全部工具名（宽松解析用的允许列表上限） */
@@ -417,9 +424,13 @@ export function availableTools(opts: {
   apps?: AppInfo[];
   /** messaging.botManagedNotifyChannels：Bot 可自管通知频道列表 */
   notifyManaged?: boolean;
+  /** shell.enabled：允许 Bot 执行本地命令行 */
+  shellEnabled?: boolean;
 }): BotToolDef[] {
   const tools = BOT_TOOLS.filter((t) => {
     switch (t.name) {
+      case "run_command":
+        return !!opts.shellEnabled;
       case "send_voice":
         return opts.tts;
       case "channel_notify":

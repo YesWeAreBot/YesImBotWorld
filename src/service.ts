@@ -329,6 +329,7 @@ export class WorldService extends Service<Config> {
       this.phoneStatus,
       this.logger,
       tools,
+      this.ctx.baseDir,
     );
 
     await this.clock.resume();
@@ -452,6 +453,7 @@ export class WorldService extends Service<Config> {
       ops: this.config.platformOps,
       apps: this.appInfos(),
       notifyManaged: this.config.messaging.botManagedNotifyChannels,
+      shellEnabled: this.config.shell.enabled,
     });
   }
 

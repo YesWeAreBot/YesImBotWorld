@@ -165,6 +165,14 @@ export interface AppsConfig {
   mcpServers: McpServerConfig[];
 }
 
+/** 本地命令行权限：默认关闭，开启后 Bot 获得 run_command */
+export interface ShellConfig {
+  enabled: boolean;
+  cwd: string;
+  timeoutMs: number;
+  maxOutputChars: number;
+}
+
 /** 这些平台操作需要引用消息编号：开启任意一项时，消息记录会附带 (msg:xxx) 标注 */
 export function needsMsgIds(ops: PlatformOpsConfig): boolean {
   return ops.recall || ops.react || ops.reply || ops.forwardMsgs || ops.emojiLikes || ops.essence;
@@ -179,6 +187,7 @@ export interface Config {
   messaging: MessagingConfig;
   platformOps: PlatformOpsConfig;
   apps: AppsConfig;
+  shell: ShellConfig;
   captioners: CaptionersConfig;
   media: MediaConfig;
   tts: TtsConfig;
@@ -193,6 +202,19 @@ export const Config: Schema<Config> = Schema.intersect([
       .default(false)
       .description("Koishi 启动后自动恢复世界运行（需先执行 world.init 初始化）"),
   }).description("基础配置"),
+
+  Schema.object({
+    shell: Schema.object({
+      enabled: Schema.boolean()
+        .default(false)
+        .description("允许 Bot 调用 run_command 执行本地命令行。默认关闭，开启后 Bot 可读写本机文件并运行命令，有较高风险"),
+      cwd: Schema.string()
+        .default(".")
+        .description("run_command 的默认工作目录，相对 Koishi baseDir；例如 ../Blog"),
+      timeoutMs: Schema.natural().default(30000).description("命令超时（毫秒）"),
+      maxOutputChars: Schema.natural().default(20000).description("返回给 Bot 的最大输出字符数"),
+    }).description("本地命令行权限：默认关闭"),
+  }),
 
   Schema.object({
     bot: Schema.object({
