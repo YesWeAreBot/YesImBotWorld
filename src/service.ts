@@ -3,6 +3,7 @@ import path from "node:path";
 import { Context, Service } from "koishi";
 import { AppManager } from "./apps/manager.js";
 import { BrowserApp } from "./apps/browser.js";
+import { FilesApp } from "./apps/files.js";
 import { McpApp } from "./apps/mcp.js";
 import { WeatherApp } from "./apps/weather.js";
 import { BotAgent } from "./bot/agent.js";
@@ -306,6 +307,9 @@ export class WorldService extends Service<Config> {
             ),
           ]
         : []),
+      ...(this.config.apps.filesEnabled
+        ? [new FilesApp(this.ctx.baseDir, this.config.apps.filesCwd, this.logger)]
+        : []),
       ...this.config.apps.mcpServers
         .filter((s) => s.enabled && s.name.trim())
         .map((s) => new McpApp(s, this.logger)),
@@ -472,6 +476,9 @@ export class WorldService extends Service<Config> {
     }
     if (this.config.apps.browserEnabled) {
       list.push({ name: "浏览器", description: "上网：搜索、打开网页，可以截图保存" });
+    }
+    if (this.config.apps.filesEnabled) {
+      list.push({ name: "文件", description: "查看和编辑本地工作目录中的文件" });
     }
     for (const s of this.config.apps.mcpServers) {
       if (s.enabled && s.name.trim()) list.push({ name: s.name.trim(), description: s.description || "外部应用" });

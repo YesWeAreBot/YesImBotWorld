@@ -43,19 +43,26 @@ export interface ChatResult {
   toolCalls: RawToolCall[];
 }
 
+export interface ChatCompleteOptions {
+  tools?: ChatToolDef[];
+  signal?: AbortSignal;
+  /** 覆盖配置里的 maxTokens；用于解析失败后对“疑似截断”的 JSON 放大一次输出上限 */
+  maxTokens?: number;
+}
+
 export class ChatClient {
   constructor(private cfg: ChatClientConfig) {}
 
   async complete(
     messages: ChatMessage[],
-    opts: { tools?: ChatToolDef[]; signal?: AbortSignal } = {},
+    opts: ChatCompleteOptions = {},
   ): Promise<ChatResult> {
     const url = this.cfg.baseURL.replace(/\/+$/, "") + "/chat/completions";
     const body: Record<string, unknown> = {
       model: this.cfg.model,
       messages,
       temperature: this.cfg.temperature ?? 0.7,
-      max_tokens: this.cfg.maxTokens ?? 2048,
+      max_tokens: opts.maxTokens ?? this.cfg.maxTokens ?? 2048,
     };
     if (opts.tools?.length) body.tools = opts.tools;
     if (this.cfg.disableThinking) {

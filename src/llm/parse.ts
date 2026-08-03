@@ -1,6 +1,14 @@
 import type { ParsedToolCall } from "../types.js";
 
-export class ToolCallParseError extends Error {}
+export class ToolCallParseError extends Error {
+  constructor(
+    message: string,
+    readonly raw?: string,
+  ) {
+    super(message);
+    this.name = "ToolCallParseError";
+  }
+}
 
 /**
  * 从模型输出中宽松地提取一个工具调用 JSON。
@@ -8,6 +16,7 @@ export class ToolCallParseError extends Error {}
  */
 export function extractToolCall(raw: string, allowedNames: string[]): ParsedToolCall {
   let text = raw
+    .replace(/^\uFEFF/, "")
     .replace(/<think>[\s\S]*?<\/think>/g, "")
     .replace(/<thinking>[\s\S]*?<\/thinking>/g, "")
     .trim();
@@ -15,15 +24,27 @@ export function extractToolCall(raw: string, allowedNames: string[]): ParsedTool
   text = text.replace(/```(?:json)?/g, "");
 
   const json = findFirstJsonObject(text);
-  if (!json) throw new ToolCallParseError("输出中找不到 JSON 对象");
+  if (!json) {
+    if (text.includes("{")) {
+      throw new ToolCallParseError("JSON 对象未闭合（输出可能被截断），请保证工具调用完整闭合", raw);
+    }
+    throw new ToolCallParseError("输出中找不到 JSON 对象", raw);
+  }
 
   let parsed: unknown;
   try {
-    parsed = JSON.parse(json);
+    parsed = JSON.parse(normalizeJsonLiterals(json));
   } catch (e) {
-    throw new ToolCallParseError(`JSON 解析失败: ${(e as Error).message}`);
+    throw new ToolCallParseError(`JSON 解析失败: ${(e as Error).message}`, raw);
   }
-  return validateToolCall(parsed, allowedNames);
+  try {
+    return validateToolCall(parsed, allowedNames);
+  } catch (err) {
+    if (err instanceof ToolCallParseError) {
+      throw new ToolCallParseError(err.message, raw);
+    }
+    throw err;
+  }
 }
 
 export function validateToolCall(parsed: unknown, allowedNames: string[]): ParsedToolCall {
@@ -84,4 +105,46 @@ function findFirstJsonObject(text: string): string | null {
     }
   }
   return null;
+}
+
+/** 模型常把 JSON 字符串里的换行写成真实换行；JSON.parse 之前把它们转成 \n / \r / \t。 */
+function normalizeJsonLiterals(json: string): string {
+  let out = "";
+  let inString = false;
+  let escaped = false;
+  for (const ch of json) {
+    if (inString) {
+      if (escaped) {
+        out += ch;
+        escaped = false;
+        continue;
+      }
+      if (ch === "\\") {
+        out += ch;
+        escaped = true;
+        continue;
+      }
+      if (ch === '"') {
+        out += ch;
+        inString = false;
+        continue;
+      }
+      if (ch === "\n") {
+        out += "\\n";
+        continue;
+      }
+      if (ch === "\r") {
+        out += "\\r";
+        continue;
+      }
+      if (ch === "\t") {
+        out += "\\t";
+        continue;
+      }
+    } else if (ch === '"') {
+      inString = true;
+    }
+    out += ch;
+  }
+  return out;
 }

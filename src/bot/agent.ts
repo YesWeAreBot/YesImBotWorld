@@ -109,8 +109,10 @@ export class BotAgent {
   private lastNewsT: number | null = null;
   /** 上一次 send 的签名（频道+内容+图片），用于拦截连续的重复发送 */
   private lastSendSig: string | null = null;
-  /** 上一次 act 的描述与调用编号，用于拦截"结果未出就重复做同一件事" */
+  /** 上一次 act 的描述与调用编号，用于拦截“结果未出就重复做同一件事” */
   private lastAct: { sig: string; callId: string } | null = null;
+  /** 连续几次模型输出不是合法工具调用，用于在反馈里提示模型直接输出 JSON */
+  private parseFailures = 0;
   /**
    * 注入 system 段的"醒来时刻"：仅在 start() 与 rest 结束时更新。
    * 决不能用实时时间——那会让 system 段随时间不断变化，
@@ -337,10 +339,28 @@ export class BotAgent {
         let parsed: ParsedToolCall;
         try {
           parsed = await this.backend.generate(this.context, this.wakeTimeLine, this.abort!.signal);
+          this.parseFailures = 0;
         } catch (err) {
           if (!this.running) break;
           if (err instanceof ToolCallParseError) {
-            this.pushEvent("system", `（意识有些恍惚，刚才的想法没有成形：${err.message}。请重新输出一个合法的工具调用。）`);
+            this.parseFailures++;
+            const raw = err.raw?.trim();
+            const excerpt = raw
+              ? `\n你刚才的原始输出：\n${raw.slice(0, 1200)}${raw.length > 1200 ? "\n…（已截断）" : ""}`
+              : "";
+            this.logger.warn(
+              "Bot-LLM 输出未解析（第 %d 次）: %s",
+              this.parseFailures,
+              truncate(err.raw ?? err.message, 1200),
+            );
+            const emphasis =
+              this.parseFailures >= 3
+                ? "不要写正文或解释，先想清楚要调用哪个工具，然后只输出那一个 JSON。"
+                : "";
+            this.pushEvent(
+              "system",
+              `（意识有些恍惚，刚才的想法没有成形：${err.message}。${excerpt}${emphasis}请重新输出一个合法的工具调用。）`,
+            );
             continue;
           }
           // 400/413 且上下文含原生附件：

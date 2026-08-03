@@ -163,6 +163,8 @@ export interface AppsConfig {
   browserEnabled: boolean;
   browserSearchURL: string;
   browserProxy: string;
+  filesEnabled: boolean;
+  filesCwd: string;
   mcpServers: McpServerConfig[];
 }
 
@@ -231,7 +233,11 @@ export const Config: Schema<Config> = Schema.intersect([
       apiKey: Schema.string().role("secret").default("").description("API Key（本地部署可留空）"),
       model: Schema.string().default("").description("模型名（text 模式下 llama.cpp 单模型部署可留空）"),
       temperature: Schema.number().min(0).max(2).default(0.8).description("采样温度"),
-      maxTokens: Schema.natural().default(1024).description("单次生成的最大 token 数（一个工具调用通常很小，思考型模型可调大）"),
+      maxTokens: Schema.natural()
+        .default(4096)
+        .description(
+          "单次生成的最大 token 数。普通工具调用很小，但文件 App 的 write/patch 可能携带较长内容，调低后 JSON 容易在闭合前被截断。",
+        ),
       disableThinking: Schema.boolean()
         .default(false)
         .description(
@@ -508,6 +514,14 @@ export const Config: Schema<Config> = Schema.intersect([
           "浏览器访问真实互联网时使用的代理 URL（如 http://127.0.0.1:7890）。" +
             "留空时依次读取 HTTPS_PROXY / HTTP_PROXY 环境变量；都没有则不代理。",
         ),
+      filesEnabled: Schema.boolean()
+        .default(false)
+        .description(
+          "内置文件应用：Bot 可以用 open_app 打开「文件」后查看/修改本地文件。默认关闭，开启后请设置 filesCwd 限制工作目录。",
+        ),
+      filesCwd: Schema.string()
+        .default(".")
+        .description("文件应用的工作目录，相对 Koishi baseDir；例如 ../Blog"),
       mcpServers: Schema.array(
         Schema.object({
           enabled: Schema.boolean().default(true).description("启用该应用"),

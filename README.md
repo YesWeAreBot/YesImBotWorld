@@ -318,6 +318,14 @@ Bot 不只能收，也能发：
   - **网页截图**（两种模式都支持）：依赖 `koishi-plugin-puppeteer` 提供的 `ctx.puppeteer`
     服务（本插件保持零直接依赖，未安装时仅截图不可用、浏览照常）。现实模式无头浏览器实拍网址，
     虚构模式渲染生成的 HTML；截图自动存入收藏夹「截图」分类并记下描述。
+- **内置文件应用**（`apps.filesEnabled`，默认关闭）：`open_app("文件")` 后可以在
+  `apps.filesCwd` 限定的工作目录里操作本地文件，提供 `list` / `show` / `write` / `patch` /
+  `mkdir` / `delete`。`patch` 接受 apply_patch 块（`*** Begin Patch` / `Add File` /
+  `Update File` / `Delete File` / `*** End Patch`）或 unified diff，适合精确增删改；
+  这类文件操作不要再靠 `run_command` 拼 shell，避免引号、换行和平台差异把文件改坏。
+  工作目录之外的路径（包括经符号链接逃逸）会被拒绝。内容较长时不要一次把整份文件塞进
+  `write` / `patch`：先写开头，再用 `write(path, content, append: true)` 分块追加，或只 patch 局部；
+  同时建议把 `bot.maxTokens` 调到 4096 以上，避免 JSON 在闭合前被截断。
 
 ## 部署到 Koishi 实例（开发链接）
 
@@ -348,6 +356,7 @@ plugins:
       mode: text
       baseURL: http://127.0.0.1:8080
       model: Qwen3.6
+      maxTokens: 4096 # write/patch 内容较长时避免 JSON 在闭合前被截断
       minIntervalMs: 0
       maxWindowChars: 262144
       modalities: # text 模式下不生效，媒体一律走解释器
@@ -443,6 +452,8 @@ plugins:
       browserEnabled: true # 内置浏览器（现实设定上真互联网；虚构设定由 World-LLM 生成网页；截图需 koishi-plugin-puppeteer）
       browserSearchURL: https://www.so.com/s?q=%s # 搜索引擎（%s 为搜索词占位；默认 360，大陆可直连）
       browserProxy: "" # 代理 URL，如 http://127.0.0.1:7890；留空读取 HTTPS_PROXY / HTTP_PROXY
+      filesEnabled: false # 内置文件应用：Bot 打开「文件」后可查看/修改本地文件；默认关闭
+      filesCwd: . # 文件应用的工作目录，相对 Koishi baseDir；例如 ../Blog
       mcpServers: # 外接 MCP Server：每个都是手机里的一个 App
         - enabled: true
           name: 备忘录
@@ -465,4 +476,5 @@ plugins:
 - 好友申请/入群邀请的待处理请求（`req_N`）只保存在内存中，重启后失效；
 - 视频解释走 video_url content part（Qwen-VL 系约定），不做本地抽帧；
 - 文件/媒体发送以 base64 data URL 传给适配器，超大文件受平台限制；
+- 文件应用默认关闭；开启后 Bot 也只能访问 `apps.filesCwd` 工作目录内的文件，但写/删操作仍有风险；
 - `run_command` 默认关闭；开启后 Bot 可执行任意本机命令，请自行承担安全风险。

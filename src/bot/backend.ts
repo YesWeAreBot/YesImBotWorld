@@ -1,7 +1,7 @@
 import type { BotModelConfig } from "../config.js";
-import { ChatClient } from "../llm/chat.js";
+import { ChatClient, type ChatResult } from "../llm/chat.js";
 import { buildToolCallGrammar } from "../llm/grammar.js";
-import { extractToolCall } from "../llm/parse.js";
+import { extractToolCall, ToolCallParseError } from "../llm/parse.js";
 import { TextClient } from "../llm/text.js";
 import type { ParsedToolCall } from "../types.js";
 import type { BotContext } from "./context.js";
@@ -23,9 +23,11 @@ export interface BotBackend {
 export class ChatBackend implements BotBackend {
   private client: ChatClient;
   private toolNames: string[];
+  private maxTokens: number;
 
   constructor(cfg: BotModelConfig, toolNames: string[] = BOT_TOOL_NAMES) {
     this.toolNames = toolNames;
+    this.maxTokens = cfg.maxTokens;
     this.client = new ChatClient({
       baseURL: cfg.baseURL,
       apiKey: cfg.apiKey || undefined,
@@ -43,6 +45,21 @@ export class ChatBackend implements BotBackend {
   async generate(context: BotContext, timeLine: string, signal?: AbortSignal): Promise<ParsedToolCall> {
     const messages = await context.toChatMessages(timeLine);
     const result = await this.client.complete(messages, { signal });
+    try {
+      return this.parseResult(result);
+    } catch (err) {
+      if (err instanceof ToolCallParseError && isLikelyTruncated(err)) {
+        const retry = await this.client.complete(messages, {
+          signal,
+          maxTokens: Math.max(this.maxTokens, 4096),
+        });
+        return this.parseResult(retry);
+      }
+      throw err;
+    }
+  }
+
+  private parseResult(result: ChatResult): ParsedToolCall {
     // 兼容意外走了原生 tool_calls 的模型
     const native = result.toolCalls[0];
     if (native) {
@@ -91,7 +108,19 @@ export class TextBackend implements BotBackend {
   async generate(context: BotContext, timeLine: string, signal?: AbortSignal): Promise<ParsedToolCall> {
     const prompt = context.toTextPrompt(this.cfg.template, timeLine);
     const content = await this.client.complete(prompt, { grammar: this.grammar, signal });
-    return extractToolCall(content, this.toolNames);
+    try {
+      return extractToolCall(content, this.toolNames);
+    } catch (err) {
+      if (err instanceof ToolCallParseError && isLikelyTruncated(err)) {
+        const retry = await this.client.complete(prompt, {
+          grammar: this.grammar,
+          signal,
+          nPredict: Math.max(this.cfg.maxTokens, 4096),
+        });
+        return extractToolCall(retry, this.toolNames);
+      }
+      throw err;
+    }
   }
 
   /** n_predict=0 的请求只做 prompt 评估，用于压缩后重建 llama.cpp 的 KV cache */
@@ -107,6 +136,12 @@ function safeParse(raw: string): unknown {
   } catch {
     return {};
   }
+}
+
+function isLikelyTruncated(err: ToolCallParseError): boolean {
+  if (err.message.includes("未闭合")) return true;
+  const text = (err.raw ?? "").replace(/^\uFEFF/, "").trim();
+  return err.message.includes("找不到 JSON") && text.startsWith("{");
 }
 
 export function createBackend(cfg: BotModelConfig, toolNames?: string[]): BotBackend {
