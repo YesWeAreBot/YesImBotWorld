@@ -320,6 +320,17 @@ Bot 不只能收，也能发：
 
 ## 部署到 Koishi 实例（开发链接）
 
+> [!IMPORTANT]
+> 本插件加载入口是 `dist/index.cjs`，但 `dist/` 已被 `.gitignore` 忽略。
+> 克隆或更新源码后必须先在项目目录构建一次，否则 Koishi 会报
+> `Cannot find module .../koishi-plugin-yesimbot-world/dist/index.cjs`：
+>
+> ```bash
+> cd /home/username/App/YesImBotWorld # 此项目的位置
+> yarn install # 首次拉取源码时执行
+> yarn build
+> ```
+
 ```bash
 cd /home/username/App/Koishi # 你的Koishi实例位置
 yarn add koishi-plugin-yesimbot-world@portal:/home/username/App/YesImBotWorld # 此项目的位置
