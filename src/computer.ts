@@ -41,11 +41,11 @@ export class BotComputer {
   /** 电脑是否就绪（容器已创建并启动）；失败时给出原因 */
   async ensureReady(): Promise<{ ok: boolean; error?: string }> {
     if (this.ready === true) return { ok: true };
-    if (!this.cfg.docker) return { ok: false, error: "这台电脑没有配置 Docker（apps.computer.docker 为空）。" };
+    if (!this.cfg.docker.cli) return { ok: false, error: "这台电脑没有配置 Docker 实现（apps.computer.mode 需选 docker，且 apps.computer.docker.cli 需填写）。" };
     try {
       await this.ensureContainer();
       this.ready = true;
-      this.logger.info("Bot 的个人电脑已就绪：容器 %s", this.cfg.containerName);
+      this.logger.info("Bot 的个人电脑已就绪：容器 %s", this.cfg.docker.containerName);
       return { ok: true };
     } catch (err) {
       this.logger.warn("Bot 的个人电脑初始化失败: %s", err);
@@ -61,17 +61,17 @@ export class BotComputer {
   ): Promise<ComputerExecResult> {
     const ready = await this.ensureReady();
     if (!ready.ok) return { code: null, output: `（${ready.error}）` };
-    const timeoutMs = opts.timeoutMs ?? this.cfg.commandTimeoutMs;
-    const maxOutputChars = opts.maxOutputChars ?? this.cfg.maxOutputChars;
-    const cwd = path.resolve(this.cfg.workdir, opts.cwd || ".");
+    const timeoutMs = opts.timeoutMs ?? this.cfg.docker.commandTimeoutMs;
+    const maxOutputChars = opts.maxOutputChars ?? this.cfg.docker.maxOutputChars;
+    const cwd = path.resolve(this.cfg.docker.workdir, opts.cwd || ".");
     const envArgs = opts.env
       ? Object.entries(opts.env).flatMap(([k, v]) => ["-e", `${k}=${v}`])
       : [];
-    const userArgs = this.cfg.user.trim() ? ["--user", this.cfg.user.trim()] : [];
+    const userArgs = this.cfg.docker.user.trim() ? ["--user", this.cfg.docker.user.trim()] : [];
     try {
       const res = await execDocker(
-        this.cfg.docker,
-        ["exec", ...userArgs, "-w", cwd, ...envArgs, this.cfg.containerName, "sh", "-c", command],
+        this.cfg.docker.cli,
+        ["exec", ...userArgs, "-w", cwd, ...envArgs, this.cfg.docker.containerName, "sh", "-c", command],
         { timeoutMs },
       );
       const out = clip([res.stdout, res.stderr].filter(Boolean).join("\n").trim(), maxOutputChars);
@@ -87,7 +87,7 @@ export class BotComputer {
 
   /** 主目录路径（在电脑内） */
   get homeDir(): string {
-    return this.cfg.workdir;
+    return this.cfg.docker.workdir;
   }
 
   /** 电脑关机：本插件自建的容器会一并关闭，下次打开再自动启动 */
@@ -95,9 +95,9 @@ export class BotComputer {
     const m = selfManaged;
     selfManaged = null;
     this.ready = null;
-    if (!m || !this.cfg.docker) return;
+    if (!m || !this.cfg.docker.cli) return;
     try {
-      await execDocker(this.cfg.docker, ["stop", "--time=5", m.name], { timeoutMs: 15000 });
+      await execDocker(this.cfg.docker.cli, ["stop", "--time=5", m.name], { timeoutMs: 15000 });
     } catch (err) {
       this.logger.warn("关闭 Bot 的个人电脑失败: %s", err);
     }
@@ -111,8 +111,8 @@ export class BotComputer {
   // ---------- 容器生命周期 ----------
 
   private async ensureContainer(): Promise<void> {
-    const docker = this.cfg.docker;
-    const { containerName: name, image, pullPolicy } = this.cfg;
+    const docker = this.cfg.docker.cli;
+    const { containerName: name, image, pullPolicy } = this.cfg.docker;
 
     // 1. 容器是否已存在（运行或停止）
     const inspect = await execDocker(docker, ["inspect", "-f", "{{.State.Running}}", name], { timeoutMs: 10000 });
@@ -140,8 +140,8 @@ export class BotComputer {
       await execDocker(docker, ["pull", image], { timeoutMs: 120000 }).catch(() => {});
     }
 
-    const mounts = this.cfg.mounts.map((m) => `${m.host}:${m.container}${m.readonly ? ":ro" : ""}`);
-    const uidArg = this.cfg.user.trim() && /^\d+$/.test(this.cfg.user.trim()) ? this.cfg.user.trim() : "";
+    const mounts = this.cfg.docker.mounts.map((m) => `${m.host}:${m.container}${m.readonly ? ":ro" : ""}`);
+    const uidArg = this.cfg.docker.user.trim() && /^\d+$/.test(this.cfg.docker.user.trim()) ? this.cfg.docker.user.trim() : "";
     // 容器主进程 = 保活脚本：创建主目录并交给执行用户，然后一直待命。
     // 主进程以镜像默认用户（node:20-slim 即 root）启动，才能 chown；真正的命令经 exec 以 user 执行。
     const keepAliveScript =
@@ -153,14 +153,14 @@ export class BotComputer {
       [
         "create",
         "--name", name,
-        "--network", this.cfg.network,
-        "--hostname", this.cfg.hostname,
-        "-e", `TZ=${this.cfg.timezone}`,
-        "-e", `YBT_WORKDIR=${this.cfg.workdir}`,
+        "--network", this.cfg.docker.network,
+        "--hostname", this.cfg.docker.hostname,
+        "-e", `TZ=${this.cfg.docker.timezone}`,
+        "-e", `YBT_WORKDIR=${this.cfg.docker.workdir}`,
         ...(uidArg ? ["-e", `YBT_UID=${uidArg}`] : []),
-        "--workdir", this.cfg.workdir,
+        "--workdir", this.cfg.docker.workdir,
         ...(mounts.length ? ["-v", ...mounts] : []),
-        ...this.cfg.extraArgs,
+        ...this.cfg.docker.extraArgs,
         image,
         "sh", "-c", keepAliveScript,
       ],

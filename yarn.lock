@@ -2011,7 +2011,9 @@ __metadata:
     "@types/node": "npm:^22.7.5"
     koishi: "npm:^4.18.11"
     pkgroll: "npm:^2.6.1"
+    rfb2: "npm:0.2.2"
     typescript: "npm:^5.9.3"
+    undici: "npm:^8.4.1"
   peerDependencies:
     koishi: ^4.18.11
   languageName: unknown
@@ -2401,6 +2403,13 @@ __metadata:
   version: 1.1.0
   resolution: "reusify@npm:1.1.0"
   checksum: 10c0/4eff0d4a5f9383566c7d7ec437b671cc51b25963bd61bf127c3f3d3f68e44a026d99b8d2f1ad344afff8d278a8fe70a8ea092650a716d22287e8bef7126bb2fa
+  languageName: node
+  linkType: hard
+
+"rfb2@npm:0.2.2":
+  version: 0.2.2
+  resolution: "rfb2@npm:0.2.2"
+  checksum: 10c0/7f17b9f698cc1e947417000d1220e76cd0e5faf3e68b4a70913baad44a9598bb507c301daae1d0066ad81f0303182d1eb166a6adfa2dc6c2cfdc3193cf4181c2
   languageName: node
   linkType: hard
 

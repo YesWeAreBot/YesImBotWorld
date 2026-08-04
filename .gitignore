@@ -2,3 +2,5 @@ node_modules/
 dist/
 .yarn/
 *.tsbuildinfo
+scripts/.smoke-*.cjs
+scripts/.vnc-events.jsonl

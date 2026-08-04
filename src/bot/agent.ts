@@ -1,4 +1,5 @@
 import type { Logger } from "koishi";
+import type { ComputerDevice } from "../apps/computerDevice.js";
 import type { AppManager } from "../apps/manager.js";
 import type { WorldClock } from "../clock.js";
 import type { Config } from "../config.js";
@@ -139,6 +140,7 @@ export class BotAgent {
     private world: WorldAgent,
     private messenger: MessengerApi,
     private apps: AppManager | null,
+    private computer: ComputerDevice | null,
     private notifyList: NotifyManager | null,
     private phone: PhoneStatus,
     private logger: Logger,
@@ -174,6 +176,7 @@ export class BotAgent {
       }
     }
     names.push(...(this.apps?.activeToolNames() ?? []));
+    names.push(...(this.computer?.activeToolNames() ?? []));
     this.backend.setToolNames(names);
   }
 
@@ -676,6 +679,24 @@ export class BotAgent {
           }
           return "（当前没有打开的应用。）";
         });
+      case "open_computer":
+        return this.dispatchLocal(call, async () => {
+          const res = await this.computer?.open();
+          if (!res) return "（这台电脑不可用。）";
+          if ("error" in res) return `（你走到桌前想打开电脑，但打不开：${res.error}）`;
+          this.refreshToolGate();
+          const lines = res.defs.length
+            ? res.defs.map((d) => `- ${d.signature}\n  ${d.description}`).join("\n")
+            : "（这台电脑没有提供任何操作。）";
+          return `${res.opening}\n接下来可以像普通能力一样调用（close_computer 关机后失效）：\n${lines}`;
+        });
+      case "close_computer":
+        return this.dispatchLocal(call, async () => {
+          if (!this.computer?.isOpen) return "（电脑本来就关着。）";
+          await this.computer.close();
+          this.refreshToolGate();
+          return "你关掉了电脑，它提供的操作已失效。";
+        });
       case "recall": {
         const id = this.channelArg(call) ?? "";
         const msgId = String(call.arguments.msg_id ?? call.arguments.msgId ?? "");
@@ -1012,6 +1033,16 @@ export class BotAgent {
               return await this.apps!.call(call.name, call.arguments);
             } catch (err) {
               return `（「${appName}」的 ${call.name} 操作失败：${(err as Error).message ?? err}）`;
+            }
+          });
+        }
+        // 电脑（open_computer 打开的设备）展开的工具
+        if (this.computer?.hasTool(call.name)) {
+          return this.dispatchLocal(call, async () => {
+            try {
+              return await this.computer!.call(call.name, call.arguments);
+            } catch (err) {
+              return `（电脑的 ${call.name} 操作失败：${(err as Error).message ?? err}）`;
             }
           });
         }
@@ -1423,8 +1454,10 @@ export class BotAgent {
     if (!this.running) return;
 
     // 休息时手机里开着的应用（聊天界面/MCP）自动关闭，醒来后需重新打开；
-    // "手机放下"状态保留（那是 Bot 自己的选择）
+    // 电脑也一并关机（与手机平级，但不打断"手机放下"状态——那是 Bot 自己的选择）
     const closedApp = await this.apps?.closeCurrent().catch(() => null);
+    const computerWasOn = this.computer?.isOpen ?? false;
+    await this.computer?.close().catch(() => null);
     const chatWasOpen = this.phoneUi.chatOpen;
     this.phoneUi = { chatOpen: false, channelKey: null, channelIsGroup: false, forwardStack: [] };
     this.refreshToolGate();
@@ -1437,12 +1470,13 @@ export class BotAgent {
     await this.backend.warmup?.(this.context, this.wakeTimeLine).catch(() => {});
 
     const elapsedTU = (Date.now() - startReal) / 1000 / this.clock.unitRealSeconds;
+    const closedNotes: string[] = [];
+    if (closedApp || chatWasOpen) closedNotes.push(`「${closedApp ?? "聊天应用"}」已经自动关闭`);
+    if (computerWasOn) closedNotes.push("电脑已经自动关机");
     this.pushEvent(
       "system",
       `你休息了一会儿，过去了 ${elapsedTU.toFixed(1)} 个 TU。休息让你的头脑更清明了些，近来的经历沉淀成了记忆。当前 ${this.clock.timeLine()}` +
-        (closedApp || chatWasOpen
-          ? `（休息前开着的「${closedApp ?? "聊天应用"}」已经自动关闭）`
-          : ""),
+        (closedNotes.length ? `（休息前开着的${closedNotes.join("，")}）` : ""),
       { ref: call?.id },
     );
     this.logger.info("休息结束，耗时 %s 秒，新上下文约 %d 字符", ((Date.now() - startReal) / 1000).toFixed(1), this.context.approxChars());

@@ -1,11 +1,11 @@
 /**
- * 内置终端 App：Bot 的个人电脑上的一扇命令行窗口。
+ * 内置终端：Bot 的个人电脑（与手机平级的设备）上的命令行窗口。
  *
  * 双模式（创世时判定的世界性质，meta.json）：
- * - 现实世界：命令真正执行在 Docker 容器里（Bot 的个人电脑），与主机隔离；
+ * - 现实世界：命令真正执行在 Docker 容器里（Bot 的个人电脑，mode=docker），与主机隔离；
  * - 虚构世界：World-LLM 扮演"这台电脑"，直接生成符合世界观的终端画面与输出。
  *
- * 打开终端才会坐到电脑前，之后才能敲命令；关闭后屏幕熄掉，下次打开重新坐下。
+ * 打开电脑（open_computer）才会坐到电脑前，之后才能敲命令；关闭电脑后屏幕熄掉，下次打开重新坐下。
  */
 
 import type { Logger } from "koishi";
@@ -63,8 +63,8 @@ export class TerminalApp implements WorldApp {
     if (real) {
       const res = await this.computer.exec(command, {
         cwd,
-        timeoutMs: this.cfg.computer.commandTimeoutMs,
-        maxOutputChars: this.cfg.computer.maxOutputChars,
+        timeoutMs: this.cfg.computer.docker.commandTimeoutMs,
+        maxOutputChars: this.cfg.computer.docker.maxOutputChars,
       });
       return `你在终端里敲下了 ${command}，屏幕上显示：\n${res.output}${PROMPT_HINT}`;
     }

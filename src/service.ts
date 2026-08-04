@@ -3,8 +3,10 @@ import path from "node:path";
 import { Context, Service } from "koishi";
 import { AppManager } from "./apps/manager.js";
 import { BrowserApp } from "./apps/browser.js";
+import { ComputerDevice } from "./apps/computerDevice.js";
 import { FileManagerApp } from "./apps/files.js";
 import { McpApp } from "./apps/mcp.js";
+import { RemoteDesktopApp } from "./apps/remoteDesktop.js";
 import { TerminalApp } from "./apps/terminal.js";
 import { WeatherApp } from "./apps/weather.js";
 import { BotAgent } from "./bot/agent.js";
@@ -72,6 +74,8 @@ export class WorldService extends Service<Config> {
   private appManager: AppManager | null = null;
   /** Bot 的个人电脑（Docker 容器）：终端与资源管理器共用 */
   private computer: BotComputer | null = null;
+  /** Bot 的个人电脑设备（与手机平级的设备）：open_computer 打开 */
+  private computerDevice: ComputerDevice | null = null;
   private worldRunning = false;
 
   constructor(ctx: Context, config: Config) {
@@ -290,9 +294,30 @@ export class WorldService extends Service<Config> {
       this.requests,
       this.ownSends,
     );
-    // Bot 的个人电脑：终端 / 资源管理器共用的 Docker 容器（与运行 Koishi 的主机隔离）
+    // Bot 的个人电脑：与手机平级的设备。实现方式由 apps.computer.mode 选择——
+    // docker（容器，终端/资源管理器）或 remote_desktop（VNC，屏幕/鼠标/键盘，需图片多模态）；
+    // 仅现实世界以真实实现生效，虚构世界由 World-LLM 扮演这台电脑
     this.computer = new BotComputer(this.config.apps.computer, this.logger);
-    // 手机应用（Apps / MCP）：内置天气/浏览器 + 个人电脑（终端/资源管理器）+ 外接 MCP Server
+    const terminalApp = new TerminalApp(this.computer, this.world, this.files, this.clock, this.config.apps, this.logger);
+    const filesApp = this.config.apps.filesEnabled
+      ? new FileManagerApp(this.computer, this.world, this.files, this.clock, this.config.apps, this.logger)
+      : null;
+    const remoteDesktopApp =
+      this.config.apps.computer.mode === "remote_desktop" && this.config.bot.modalities.image
+        ? new RemoteDesktopApp(this.config.apps.computer.remoteDesktop, this.media, this.logger)
+        : null;
+    this.computerDevice = new ComputerDevice(
+      terminalApp,
+      filesApp,
+      remoteDesktopApp,
+      this.computer,
+      this.files,
+      this.clock,
+      this.config.apps.computer,
+      new Set(tools.map((t) => t.name)),
+      this.logger,
+    );
+    // 手机应用（Apps / MCP）：内置天气/浏览器 + 外接 MCP Server（电脑不在手机里，是平级的另一台设备）
     const worldApps = [
       ...(this.config.apps.weatherEnabled
         ? [new WeatherApp(this.world, this.files, this.clock, this.config.apps, this.logger)]
@@ -313,12 +338,6 @@ export class WorldService extends Service<Config> {
             ),
           ]
         : []),
-      // 终端：Bot 的个人电脑上的命令行窗口。现实世界设定未配置 Docker 时电脑开不了机（不会执行任何命令）；
-      // 虚构世界设定由 World-LLM 扮演这台电脑
-      new TerminalApp(this.computer, this.world, this.files, this.clock, this.config.apps, this.logger),
-      ...(this.config.apps.filesEnabled
-        ? [new FileManagerApp(this.computer, this.world, this.files, this.clock, this.config.apps, this.logger)]
-        : []),
       ...this.config.apps.mcpServers
         .filter((s) => s.enabled && s.name.trim())
         .map((s) => new McpApp(s, this.logger)),
@@ -338,6 +357,7 @@ export class WorldService extends Service<Config> {
       this.world,
       messenger,
       this.appManager,
+      this.computerDevice,
       this.notifyMgr,
       this.phoneStatus,
       this.logger,
@@ -402,7 +422,9 @@ export class WorldService extends Service<Config> {
     this.bot = null;
     await this.appManager?.closeAll().catch(() => {});
     this.appManager = null;
-    // 关机：本插件自建的容器一并关闭（下次打开终端/资源管理器时自动再开机）
+    // 关闭电脑设备（断开远程桌面等连接）并关机：本插件自建的容器一并关闭（下次打开电脑时自动再开机）
+    await this.computerDevice?.close().catch(() => {});
+    this.computerDevice = null;
     await this.computer?.shutdown().catch(() => {});
     this.computer = null;
     if (opts.suspend) {
@@ -445,6 +467,8 @@ export class WorldService extends Service<Config> {
       );
       const openApp = this.appManager?.currentName;
       if (openApp) lines.push(`手机里打开的应用：「${openApp}」`);
+      const computerOn = this.computerDevice?.currentName;
+      if (computerOn) lines.push(`电脑已开机：「${computerOn}」`);
       if (this.phoneStatus.down) lines.push("手机被 Bot 放在一边（通知已降级为震动）");
       if (this.config.messaging.botManagedNotifyChannels) {
         lines.push(`通知频道（Bot 自管）：${this.notifyMgr.statusText()}`);
@@ -487,12 +511,7 @@ export class WorldService extends Service<Config> {
     if (this.config.apps.browserEnabled) {
       list.push({ name: "浏览器", description: "上网：搜索、打开网页，可以截图保存" });
     }
-    // Bot 的个人电脑：终端 / 资源管理器共用的 Docker 容器（与运行 Koishi 的主机隔离）。
-    // 终端始终在应用列表里（Bot 有一台电脑是它的设定）；现实世界设定下未配置 Docker 时开不了机，不会执行任何命令
-    list.push({ name: "终端", description: "这台电脑上的命令行窗口，打开后可以执行命令" });
-    if (this.config.apps.filesEnabled) {
-      list.push({ name: "资源管理器", description: "这台电脑里的文件管理器：查看和编辑文件" });
-    }
+    // 电脑不在这里：它是与手机平级的另一台设备（open_computer / close_computer 开关）
     for (const s of this.config.apps.mcpServers) {
       if (s.enabled && s.name.trim()) list.push({ name: s.name.trim(), description: s.description || "外部应用" });
     }

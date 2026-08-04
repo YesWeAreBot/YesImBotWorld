@@ -125,7 +125,7 @@ interface FsResult<T = unknown> {
 }
 
 /**
- * 内置资源管理器：操作 Bot 个人电脑里的文件。
+ * 内置资源管理器：操作 Bot 个人电脑（与手机平级的设备）里的文件。
  * 现实模式所有操作都执行在 Docker 容器里（BotComputer），与主机隔离。
  */
 export class FileManagerApp implements WorldApp {
@@ -430,7 +430,7 @@ export class FileManagerApp implements WorldApp {
   private async nodeOp(op: string, vars: Record<string, string>): Promise<FsResult> {
     // 脚本经环境变量传入（YR_SCRIPT），避免把代码嵌入 shell 命令造成引号/转义问题
     const res = await this.computer.exec('node -e "$YR_SCRIPT" 2>/dev/null', {
-      timeoutMs: this.cfg.computer.commandTimeoutMs,
+      timeoutMs: this.cfg.computer.docker.commandTimeoutMs,
       maxOutputChars: 1_000_000,
       cwd: undefined,
       env: { YR_SCRIPT: NODE_FS_SCRIPT, YR_OP: op, ...vars },

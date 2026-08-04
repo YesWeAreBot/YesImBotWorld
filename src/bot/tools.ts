@@ -128,6 +128,19 @@ export const BOT_TOOLS: BotToolDef[] = [
     description: "关闭当前打开的应用，它提供的操作随之失效。",
   },
   {
+    name: "open_computer",
+    signature: "open_computer()",
+    description:
+      "打开你自己的电脑：一台与手机平级的另一台设备，不是手机里的应用。打开后电脑上的工具会展开" +
+      "（取决于它的实现方式：终端/文件管理器，或远程桌面的屏幕/鼠标/键盘），" +
+      "关闭手机里的应用不影响电脑，反之亦然；用 close_computer 关机后这些工具随之失效。",
+  },
+  {
+    name: "close_computer",
+    signature: "close_computer()",
+    description: "关闭你的电脑（关机），它提供的工具随之失效。",
+  },
+  {
     name: "check_gallery",
     signature: "check_gallery(category?: string)",
     description:

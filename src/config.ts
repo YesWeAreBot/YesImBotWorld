@@ -155,10 +155,13 @@ export interface McpServerConfig {
   headers: Record<string, string>;
 }
 
-/** Bot 的个人电脑：一个 Docker 容器，指令只在这台电脑里执行 */
-export interface ComputerConfig {
-  /** 留空禁用：Bot 打开终端/资源管理器时提示未配置，不会触碰主机 */
-  docker: string;
+/** Bot 的电脑：实现方式（由用户在下拉选框选择；仅现实世界以真实实现生效，虚构世界由 World-LLM 扮演） */
+export type ComputerMode = "off" | "docker" | "remote_desktop";
+
+/** Bot 的电脑：Docker 容器实现（mode=docker 时生效） */
+export interface DockerComputerConfig {
+  /** Docker CLI 可执行文件路径（如 docker，或 /usr/bin/docker） */
+  cli: string;
   /** 容器名：Bot 的这台电脑（容器会复用，重启仍在） */
   containerName: string;
   image: string;
@@ -174,6 +177,29 @@ export interface ComputerConfig {
   extraArgs: string[];
   commandTimeoutMs: number;
   maxOutputChars: number;
+}
+
+/** Bot 的电脑：远程桌面实现（VNC / GUI Agent，mode=remote_desktop 时生效） */
+export interface RemoteDesktopConfig {
+  /** VNC 服务器地址 */
+  host: string;
+  port: number;
+  /** VNC 登录密码（留空使用无密码认证） */
+  password: string;
+  /** 截屏最大宽度（像素）：超过后等比缩小，控制注入模型的图片体积、保护上下文预算 */
+  maxWidth: number;
+  /** 连接超时（毫秒） */
+  connectTimeoutMs: number;
+}
+
+/** Bot 的个人电脑：与手机平级的另一台设备，实现方式二选一（仅现实世界生效） */
+export interface ComputerConfig {
+  /** 电脑的实现方式：off 关闭 / docker 容器 / remote_desktop 远程桌面 */
+  mode: ComputerMode;
+  /** Docker 容器实现（mode=docker 时生效） */
+  docker: DockerComputerConfig;
+  /** 远程桌面实现（VNC，mode=remote_desktop 时生效） */
+  remoteDesktop: RemoteDesktopConfig;
 }
 
 /** 手机应用（Apps）：聊天平台之外，Bot 可以用 open_app 打开的应用 */
@@ -517,57 +543,87 @@ export const Config: Schema<Config> = Schema.intersect([
       filesEnabled: Schema.boolean()
         .default(false)
         .description(
-          "内置资源管理器（文件应用）：Bot 可以用 open_app 打开「文件」后查看/修改这台电脑主目录里的文件。默认关闭，需配合 apps.computer 一起使用。",
+          "内置资源管理器（文件）：Bot 打开电脑后可以用它查看/修改这台电脑主目录里的文件。电脑为 Docker 实现（apps.computer.mode 选 docker）或虚构世界时可用。",
         ),
       filesCwd: Schema.string()
         .default(".")
         .description("资源管理器在电脑里打开的工作目录，相对电脑主目录；留空为主目录根"),
       computer: Schema.object({
-        docker: Schema.string()
-          .default("")
-          .description(
-            "Docker CLI 可执行文件路径（如 docker，或 /usr/bin/docker）。留空禁用：Bot 打开终端/资源管理器会提示未配置，不会执行任何主机命令",
-          ),
-        containerName: Schema.string()
-          .default("yesimbot_bot_pc")
-          .description("Bot 的这台电脑的容器名。容器创建一次可复用，重启仍在（镜像升级后重命名即可换新机）"),
-        image: Schema.string()
-          .default("node:20-slim")
-          .description("电脑的镜像（首次开机时按需拉取）。带常用命令的通用镜像更接近真实电脑"),
-        pullPolicy: Schema.union([
-          Schema.const("missing").description("本地没有该镜像时才拉取"),
-          Schema.const("always").description("每次开机都重新拉取"),
-          Schema.const("never").description("不拉取，只使用本地已有的镜像"),
+        mode: Schema.union([
+          Schema.const("off").description("不启用真实的电脑（虚构世界里仍由 World-LLM 扮演这台电脑）"),
+          Schema.const("docker").description("Docker 容器：本地创建一台电脑，命令只在这台容器里执行"),
+          Schema.const("remote_desktop").description("VNC 远程桌面：连到另一台机器，看屏幕、动鼠标键盘"),
         ])
-          .default("missing")
-          .description("镜像拉取策略"),
-        workdir: Schema.string()
-          .default("/workspace")
-          .description("电脑内的固定主目录（终端与资源管理器的根）"),
-        user: Schema.string().default("1000").description("容器内执行命令的用户（uid:gid 或用户名；留空用镜像默认用户）"),
-        network: Schema.string().default("none").description("容器网络模式：默认 none 断网，Bot 的电脑连不上外网（需联网时改为 bridge 或 host）"),
-        hostname: Schema.string().default("bot-pc").description("这台电脑的主机名"),
-        timezone: Schema.string().default("Asia/Shanghai").description("电脑的系统时区"),
-        mounts: Schema.array(
-          Schema.object({
-            host: Schema.string().description("主机目录（绝对路径）"),
-            container: Schema.string().description("映射进电脑的路径"),
-            readonly: Schema.boolean().default(false).description("只读挂载（防止 Bot 修改主机文件）"),
-          }),
-        )
-          .default([])
+          .default("off")
           .description(
-            "显式映射到电脑里的主机目录。默认不映射任何主机路径，Bot 无法访问主机文件；" +
-              "需要把某个目录交给它时（如相册、文档）在此声明",
+            "电脑的实现方式，由你从下拉框选择。电脑是 Bot 与手机平级的另一台设备，Docker 与远程桌面是平级的两种实现，选哪种就开哪种；" +
+              "它**仅在世界类型为「现实世界」时以选定的实现生效**，虚构世界里由 World-LLM 扮演这台电脑",
           ),
-        extraArgs: Schema.array(Schema.string())
-          .default([])
-          .description("docker create 的附加参数（如 --memory、--cpus 限制电脑资源）"),
-        commandTimeoutMs: Schema.natural().default(30000).description("单条命令的超时（毫秒）"),
-        maxOutputChars: Schema.natural().default(20000).description("返回给 Bot 的单条命令最大输出字符数"),
+        docker: Schema.object({
+          cli: Schema.string()
+            .default("")
+            .description("Docker CLI 可执行文件路径（如 docker，或 /usr/bin/docker）"),
+          containerName: Schema.string()
+            .default("yesimbot_bot_pc")
+            .description("Bot 的这台电脑的容器名。容器创建一次可复用，重启仍在（镜像升级后重命名即可换新机）"),
+          image: Schema.string()
+            .default("node:20-slim")
+            .description("电脑的镜像（首次开机时按需拉取）。带常用命令的通用镜像更接近真实电脑"),
+          pullPolicy: Schema.union([
+            Schema.const("missing").description("本地没有该镜像时才拉取"),
+            Schema.const("always").description("每次开机都重新拉取"),
+            Schema.const("never").description("不拉取，只使用本地已有的镜像"),
+          ])
+            .default("missing")
+            .description("镜像拉取策略"),
+          workdir: Schema.string()
+            .default("/workspace")
+            .description("电脑内的固定主目录（终端与资源管理器的根）"),
+          user: Schema.string().default("1000").description("容器内执行命令的用户（uid:gid 或用户名；留空用镜像默认用户）"),
+          network: Schema.string().default("none").description("容器网络模式：默认 none 断网，Bot 的电脑连不上外网（需联网时改为 bridge 或 host）"),
+          hostname: Schema.string().default("bot-pc").description("这台电脑的主机名"),
+          timezone: Schema.string().default("Asia/Shanghai").description("电脑的系统时区"),
+          mounts: Schema.array(
+            Schema.object({
+              host: Schema.string().description("主机目录（绝对路径）"),
+              container: Schema.string().description("映射进电脑的路径"),
+              readonly: Schema.boolean().default(false).description("只读挂载（防止 Bot 修改主机文件）"),
+            }),
+          )
+            .default([])
+            .description(
+              "显式映射到电脑里的主机目录。默认不映射任何主机路径，Bot 无法访问主机文件；" +
+                "需要把某个目录交给它时（如相册、文档）在此声明",
+            ),
+          extraArgs: Schema.array(Schema.string())
+            .default([])
+            .description("docker create 的附加参数（如 --memory、--cpus 限制电脑资源）"),
+          commandTimeoutMs: Schema.natural().default(30000).description("单条命令的超时（毫秒）"),
+          maxOutputChars: Schema.natural().default(20000).description("返回给 Bot 的单条命令最大输出字符数"),
+        }).description(
+          "Docker 容器实现（mode 选 docker 时生效）：终端 / 资源管理器的操作都在这台容器里执行，与运行 Koishi 的主机隔离",
+        ),
+        remoteDesktop: Schema.object({
+          host: Schema.string().default("127.0.0.1").description("VNC 服务器地址（如 192.168.1.5）"),
+          port: Schema.natural().default(5900).description("VNC 端口（默认 5900）"),
+          password: Schema.string()
+            .role("secret")
+            .default("")
+            .description("VNC 登录密码（留空使用无密码认证）"),
+          maxWidth: Schema.natural()
+            .default(1024)
+            .description(
+              "截屏的最大宽度（像素）：更大的屏幕等比缩小到该宽度。" +
+                "控制注入模型的图片体积，越小越省 token、前缀缓存越稳定；太大会挤爆请求体预算（见 media.maxAttachmentMbPerRequest）",
+            ),
+          connectTimeoutMs: Schema.natural().default(10000).description("连接远程桌面的超时（毫秒）"),
+        }).description(
+          "VNC 远程桌面实现（mode 选 remote_desktop 时生效）：Bot 的电脑连上另一台机器，像操作本地电脑一样看屏幕、动鼠标键盘。" +
+            "需 Bot-LLM 开启图片多模态（bot.modalities.image）才能注入截屏；目标机器需安装并运行 VNC 服务端（TightVNC / TigerVNC / x11vnc / macOS 自带「远程管理」等）",
+        ),
       }).description(
-        "Bot 的个人电脑：一个真实存在的 Docker 容器，终端/资源管理器的操作都在这台电脑里执行，" +
-          "与运行 Koishi 的主机隔离",
+        "Bot 的个人电脑：与手机平级的另一台设备，由 mode 选择实现方式（Docker 容器 / VNC 远程桌面），" +
+          "仅在世界类型为「现实世界」时以真实实现生效；虚构世界里由 World-LLM 扮演这台电脑",
       ),
       mcpServers: Schema.array(
         Schema.object({
@@ -591,8 +647,8 @@ export const Config: Schema<Config> = Schema.intersect([
         .default([])
         .description("外接 MCP Server 列表：每个 Server 对 Bot 来说是手机里的一个 App"),
     }).description(
-      "手机应用（Apps / MCP）：MCP Server、内置应用（天气/浏览器）与 Bot 的个人电脑（终端/资源管理器）" +
-        "不占用常驻工具位，Bot 用 open_app 打开后其操作才展开可用（一次只开一个，切换/关闭/rest 后失效）",
+      "手机应用（Apps / MCP）：MCP Server 与内置应用（天气/浏览器）不占用常驻工具位，Bot 用 open_app 打开后其操作才展开可用（一次只开一个，切换/关闭/rest 后失效）。" +
+        "Bot 的电脑是另一台平级的设备，不在这里，用 open_computer / close_computer 开关",
     ),
   }),
 
