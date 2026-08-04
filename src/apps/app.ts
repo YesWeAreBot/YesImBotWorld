@@ -31,8 +31,8 @@ export interface WorldApp {
   readonly name: string;
   /** 一句话介绍（展示在应用列表里） */
   readonly description: string;
-  /** 打开应用：建立连接并列出可用工具 */
-  open(): Promise<{ tools: AppRawTool[] }>;
+  /** 打开应用：建立连接并列出可用工具；opening 为拟人化的开场描述（如“你坐到电脑前点开终端…”，可选） */
+  open(): Promise<{ tools: AppRawTool[]; opening?: string }>;
   /** 调用应用的一个工具，返回呈现给 Bot 的结果（可带原生附件，如浏览器点开的图片） */
   call(tool: string, args: Record<string, unknown>): Promise<string | RichText>;
   /** 关闭应用（断开连接/释放资源） */

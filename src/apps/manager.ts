@@ -40,10 +40,10 @@ export class AppManager {
     return names.join("、");
   }
 
-  /** 打开一个 App：关闭上一个，连接并展开工具。返回关闭的 App 名与暴露的工具定义 */
-  async open(app: WorldApp): Promise<{ closed: string | null; defs: AppToolDef[] }> {
+  /** 打开一个 App：关闭上一个，连接并展开工具。返回关闭的 App 名、拟人化开场与暴露的工具定义 */
+  async open(app: WorldApp): Promise<{ closed: string | null; opening?: string; defs: AppToolDef[] }> {
     const closed = await this.closeCurrent();
-    const { tools } = await app.open();
+    const { tools, opening } = await app.open();
     const toolMap = new Map<string, string>();
     const defs: AppToolDef[] = [];
     for (const t of tools) {
@@ -59,7 +59,7 @@ export class AppManager {
     }
     this.current = { app, toolMap, defs };
     this.logger.info("打开应用「%s」：%d 个工具（%s）", app.name, defs.length, defs.map((d) => d.name).join(", "));
-    return { closed, defs };
+    return { closed, opening, defs };
   }
 
   /** 关闭当前打开的 App，返回其名字（没有打开的返回 null） */

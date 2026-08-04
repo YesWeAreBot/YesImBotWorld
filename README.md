@@ -224,7 +224,6 @@ Bot 不只能收，也能发：
 | `pick_up_phone()` | 拿起手机：恢复正常通知 |
 | `cancel(id)` | 取消倒计时中的工具调用 |
 | `identity_recall()` | 反思身份：角色设定以 Event 再次注入 |
-| `run_command(command, cwd?)` | 执行本地命令行；默认关闭，需开启 `shell.enabled` |
 
 ### chat / channel / group 层（节选）
 
@@ -318,14 +317,35 @@ Bot 不只能收，也能发：
   - **网页截图**（两种模式都支持）：依赖 `koishi-plugin-puppeteer` 提供的 `ctx.puppeteer`
     服务（本插件保持零直接依赖，未安装时仅截图不可用、浏览照常）。现实模式无头浏览器实拍网址，
     虚构模式渲染生成的 HTML；截图自动存入收藏夹「截图」分类并记下描述。
-- **内置文件应用**（`apps.filesEnabled`，默认关闭）：`open_app("文件")` 后可以在
-  `apps.filesCwd` 限定的工作目录里操作本地文件，提供 `list` / `show` / `write` / `patch` /
-  `mkdir` / `delete`。`patch` 接受 apply_patch 块（`*** Begin Patch` / `Add File` /
-  `Update File` / `Delete File` / `*** End Patch`）或 unified diff，适合精确增删改；
-  这类文件操作不要再靠 `run_command` 拼 shell，避免引号、换行和平台差异把文件改坏。
+- **内置文件应用**（`apps.filesEnabled`，默认关闭）：`open_app("资源管理器")` 后在
+  **这台电脑**（Docker 容器）里浏览/编辑文件，提供 `list` / `show` / `write` / `patch` /
+  `mkdir` / `delete`，对应真人电脑上的"文件资源管理器"。`patch` 接受 apply_patch 块
+  （`*** Begin Patch` / `Add File` / `Update File` / `Delete File` / `*** End Patch`）或
+  unified diff，适合精确增删改；文件操作不要再靠终端拼 shell，避免引号、换行和平台差异把文件改坏。
   工作目录之外的路径（包括经符号链接逃逸）会被拒绝。内容较长时不要一次把整份文件塞进
   `write` / `patch`：先写开头，再用 `write(path, content, append: true)` 分块追加，或只 patch 局部；
   同时建议把 `bot.maxTokens` 调到 4096 以上，避免 JSON 在闭合前被截断。
+
+### Bot 的个人电脑（`apps.computer`）
+
+把"指令执行"具象化成 Bot 自己的一台**电脑**：一个真实存在的 Docker 容器，替代旧的
+`run_command`（直接在 Koishi 所在主机上执行命令，有较大安全风险）。指令只在这台电脑里执行，
+与主机天然隔离。
+
+- **终端应用**：`open_app("终端")` 才会坐到电脑前，之后用 `run_command(command, cwd?)` 在终端里敲命令——
+  每一次执行都有拟人化的场景（打开终端、敲下命令、屏幕上显示输出），且必须打开终端 App 才能用，关闭后失效。
+  现实世界设定下若未配置 `apps.computer.docker`，这台电脑只会"开不了机"，不会在主机上执行任何命令；
+- **资源管理器**（`apps.filesEnabled`）与终端共用同一台电脑、同一个 `apps.computer.workdir` 主目录：
+  写出来的文件在终端里也能看到，反之亦然。它在电脑内用 node 脚本执行文件操作，因此电脑镜像需要带 node
+  （默认 `node:20-slim` 自带；换其他镜像时请选含 node 的，否则文件操作会报错，终端命令不受影响）；
+- **隔离与权限**：默认不映射任何主机目录（`apps.computer.mounts` 留空时 Bot 完全碰不到主机文件）、
+  网络默认 `none`（连不上外网，需要联网时改为 `bridge`/`host`）。主机目录只有显式在 `mounts` 里声明
+  才会被映射进电脑（建议加 `readonly`），资源上限可用 `extraArgs`（如 `--memory`、`--cpus`）限制；
+- **双模式**（与其他内置应用一致）：现实世界设定命令真实执行在这台 Docker 电脑里；虚构世界设定
+  由 World-LLM 扮演这台电脑直接生成符合世界观的终端输出与文件内容，不会真的动 Docker。
+  现实/虚构在创世（`world.init`）时判定，持久化在 `meta.json`；
+- 容器创建一次可复用（`apps.computer.containerName`，改名即换新机），本插件自建的容器会在世界停止时
+  一并关机、下次打开再自动开机。
 
 ## 部署到 Koishi 实例（开发链接）
 
@@ -440,10 +460,19 @@ plugins:
       groupAdmin: false
       specialTitle: false
       groupLeave: false
-    shell: # 本地命令行权限：默认关闭，开启后 Bot 获得 run_command
-      enabled: false
-      cwd: ../Blog # run_command 的默认工作目录，相对 Koishi baseDir
-      timeoutMs: 30000
+    computer: # Bot 的个人电脑：一个真实存在的 Docker 容器（终端与资源管理器共用）
+      docker: docker # Docker CLI（可执行文件路径）；留空禁用，Bot 无法执行任何命令
+      containerName: yesimbot_bot_pc # 容器名（创建一次可复用，改名即换新机）
+      image: node:20-slim # 电脑的镜像（首次开机按需拉取）
+      pullPolicy: missing # missing / always / never
+      workdir: /workspace # 电脑内固定主目录（终端与资源管理器的根）
+      user: "1000" # 容器内执行命令的用户
+      network: none # 默认断网（需要联网时改为 bridge / host）
+      hostname: bot-pc
+      timezone: Asia/Shanghai
+      mounts: [] # 显式映射进电脑的主机目录，默认不映射（Bot 碰不到主机文件）；建议 readonly
+      extraArgs: [] # docker create 附加参数，如 --memory=512m --cpus=0.5 限制资源
+      commandTimeoutMs: 30000
       maxOutputChars: 20000
     apps: # 手机应用（Apps / MCP）：open_app 打开后工具才展开，一次只开一个
       chatAppName: QQ # 聊天平台在 Bot 手机里的应用名
@@ -452,8 +481,8 @@ plugins:
       browserEnabled: true # 内置浏览器（现实设定上真互联网；虚构设定由 World-LLM 生成网页；截图需 koishi-plugin-puppeteer）
       browserSearchURL: https://www.so.com/s?q=%s # 搜索引擎（%s 为搜索词占位；默认 360，大陆可直连）
       browserProxy: "" # 代理 URL，如 http://127.0.0.1:7890；留空读取 HTTPS_PROXY / HTTP_PROXY
-      filesEnabled: false # 内置文件应用：Bot 打开「文件」后可查看/修改本地文件；默认关闭
-      filesCwd: . # 文件应用的工作目录，相对 Koishi baseDir；例如 ../Blog
+      filesEnabled: false # 内置资源管理器：Bot 打开「资源管理器」后可查看/修改这台电脑里的文件；默认关闭
+      filesCwd: . # 资源管理器打开的工作目录，相对电脑主目录；例如 work
       mcpServers: # 外接 MCP Server：每个都是手机里的一个 App
         - enabled: true
           name: 备忘录
@@ -476,5 +505,6 @@ plugins:
 - 好友申请/入群邀请的待处理请求（`req_N`）只保存在内存中，重启后失效；
 - 视频解释走 video_url content part（Qwen-VL 系约定），不做本地抽帧；
 - 文件/媒体发送以 base64 data URL 传给适配器，超大文件受平台限制；
-- 文件应用默认关闭；开启后 Bot 也只能访问 `apps.filesCwd` 工作目录内的文件，但写/删操作仍有风险；
-- `run_command` 默认关闭；开启后 Bot 可执行任意本机命令，请自行承担安全风险。
+- 终端与资源管理器只在 `apps.computer.docker` 配置了 Docker 且世界性质为现实世界时才真正执行命令；
+  即使如此，Bot 的操作范围也被限定在这台 Docker 电脑里（默认不映射主机目录、断网、`mounts`/`extraArgs`
+  显式控制权限与资源），不会触碰运行 Koishi 的主机。

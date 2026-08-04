@@ -11,7 +11,6 @@ import { createBackend, type BotBackend } from "./backend.js";
 import type { BotContext } from "./context.js";
 import { Scheduler } from "./scheduler.js";
 import { BOT_TOOLS, renderToolsText, toolLayer, type BotToolDef } from "./tools.js";
-import { runShellCommand } from "../shell.js";
 
 /** Koishi 侧能力（消息查询与发送），由 service 层实现注入 */
 export interface MessengerApi {
@@ -144,7 +143,6 @@ export class BotAgent {
     private phone: PhoneStatus,
     private logger: Logger,
     tools?: BotToolDef[],
-    private shellBaseDir?: string,
   ) {
     this.toolDefs = tools ?? BOT_TOOLS;
     this.backend = createBackend(config.bot, this.layerNames("core"));
@@ -1001,8 +999,6 @@ export class BotAgent {
         }
         return this.dispatchLocal(call, async () => this.messenger.groupLeave(id));
       }
-      case "run_command":
-        return this.dispatchRunCommand(call);
       case "cancel":
         return this.dispatchCancel(call);
       case "identity_recall":
@@ -1162,7 +1158,7 @@ export class BotAgent {
     }
     return this.dispatchLocal(call, async () => {
       try {
-        const { closed, defs } = await this.apps!.open(resolved.app);
+        const { closed, opening, defs } = await this.apps!.open(resolved.app);
         // 手机同屏只有一个应用：打开 MCP 应用时聊天界面随之退出
         const chatWasOpen = this.phoneUi.chatOpen;
         this.phoneUi = { chatOpen: false, channelKey: null, channelIsGroup: false, forwardStack: [] };
@@ -1175,9 +1171,13 @@ export class BotAgent {
           : chatWasOpen
             ? "（聊天应用已被关掉）"
             : "";
+        // 拟人化应用（终端 / 资源管理器等）自带开场描述，覆盖通用的“你打开了「xx」”
+        const head = opening
+          ? `${opening}${closedNote ? `\n${closedNote}` : ""}`
+          : `你打开了「${resolved.app.name}」。${closedNote}`;
         return (
-          `你打开了「${resolved.app.name}」。${closedNote}\n` +
-          `它提供这些操作，即刻可以像普通能力一样调用（关闭应用或打开其他应用后失效）：\n${lines}`
+          `${head}\n` +
+          `接下来可以像普通能力一样调用（关闭应用或打开其他应用后失效）：\n${lines}`
         );
       } catch (err) {
         this.refreshToolGate();
@@ -1308,27 +1308,6 @@ export class BotAgent {
           ? `（找不到进行中的 ${target}，它可能已经完成了。）`
           : `（来不及了，${target} 已经完成。）`;
     this.pushEvent("system", text, { ref: call.id });
-  }
-
-  private dispatchRunCommand(call: ToolCallRecord): void {
-    if (!this.config.shell.enabled) {
-      this.pushEvent("system", "（run_command 未启用：请在插件配置中开启 shell.enabled。）", { ref: call.id });
-      return;
-    }
-    const command = String(call.arguments.command ?? "").trim();
-    if (!command) {
-      this.pushEvent("system", "（run_command 需要 command 参数。）", { ref: call.id });
-      return;
-    }
-    const cwd = call.arguments.cwd != null ? String(call.arguments.cwd).trim() : "";
-    return this.dispatchLocal(call, async () =>
-      runShellCommand(command, {
-        cwd,
-        baseDir: this.shellBaseDir ?? process.cwd(),
-        timeoutMs: this.config.shell.timeoutMs,
-        maxOutputChars: this.config.shell.maxOutputChars,
-      }),
-    );
   }
 
   private async dispatchIdentityRecall(call: ToolCallRecord): Promise<void> {

@@ -155,6 +155,27 @@ export interface McpServerConfig {
   headers: Record<string, string>;
 }
 
+/** Bot 的个人电脑：一个 Docker 容器，指令只在这台电脑里执行 */
+export interface ComputerConfig {
+  /** 留空禁用：Bot 打开终端/资源管理器时提示未配置，不会触碰主机 */
+  docker: string;
+  /** 容器名：Bot 的这台电脑（容器会复用，重启仍在） */
+  containerName: string;
+  image: string;
+  pullPolicy: "missing" | "always" | "never";
+  /** 电脑内固定工作目录（终端/资源管理器的根） */
+  workdir: string;
+  user: string;
+  network: string;
+  hostname: string;
+  timezone: string;
+  /** 显式映射到电脑里的主机目录（默认不映射，Bot 无法访问主机文件） */
+  mounts: { host: string; container: string; readonly: boolean }[];
+  extraArgs: string[];
+  commandTimeoutMs: number;
+  maxOutputChars: number;
+}
+
 /** 手机应用（Apps）：聊天平台之外，Bot 可以用 open_app 打开的应用 */
 export interface AppsConfig {
   chatAppName: string;
@@ -165,15 +186,8 @@ export interface AppsConfig {
   browserProxy: string;
   filesEnabled: boolean;
   filesCwd: string;
+  computer: ComputerConfig;
   mcpServers: McpServerConfig[];
-}
-
-/** 本地命令行权限：默认关闭，开启后 Bot 获得 run_command */
-export interface ShellConfig {
-  enabled: boolean;
-  cwd: string;
-  timeoutMs: number;
-  maxOutputChars: number;
 }
 
 /** 这些平台操作需要引用消息编号：开启任意一项时，消息记录会附带 (msg:xxx) 标注 */
@@ -190,7 +204,6 @@ export interface Config {
   messaging: MessagingConfig;
   platformOps: PlatformOpsConfig;
   apps: AppsConfig;
-  shell: ShellConfig;
   captioners: CaptionersConfig;
   media: MediaConfig;
   tts: TtsConfig;
@@ -205,19 +218,6 @@ export const Config: Schema<Config> = Schema.intersect([
       .default(false)
       .description("Koishi 启动后自动恢复世界运行（需先执行 world.init 初始化）"),
   }).description("基础配置"),
-
-  Schema.object({
-    shell: Schema.object({
-      enabled: Schema.boolean()
-        .default(false)
-        .description("允许 Bot 调用 run_command 执行本地命令行。默认关闭，开启后 Bot 可读写本机文件并运行命令，有较高风险"),
-      cwd: Schema.string()
-        .default(".")
-        .description("run_command 的默认工作目录，相对 Koishi baseDir；例如 ../Blog"),
-      timeoutMs: Schema.natural().default(30000).description("命令超时（毫秒）"),
-      maxOutputChars: Schema.natural().default(20000).description("返回给 Bot 的最大输出字符数"),
-    }).description("本地命令行权限：默认关闭"),
-  }),
 
   Schema.object({
     bot: Schema.object({
@@ -517,11 +517,58 @@ export const Config: Schema<Config> = Schema.intersect([
       filesEnabled: Schema.boolean()
         .default(false)
         .description(
-          "内置文件应用：Bot 可以用 open_app 打开「文件」后查看/修改本地文件。默认关闭，开启后请设置 filesCwd 限制工作目录。",
+          "内置资源管理器（文件应用）：Bot 可以用 open_app 打开「文件」后查看/修改这台电脑主目录里的文件。默认关闭，需配合 apps.computer 一起使用。",
         ),
       filesCwd: Schema.string()
         .default(".")
-        .description("文件应用的工作目录，相对 Koishi baseDir；例如 ../Blog"),
+        .description("资源管理器在电脑里打开的工作目录，相对电脑主目录；留空为主目录根"),
+      computer: Schema.object({
+        docker: Schema.string()
+          .default("")
+          .description(
+            "Docker CLI 可执行文件路径（如 docker，或 /usr/bin/docker）。留空禁用：Bot 打开终端/资源管理器会提示未配置，不会执行任何主机命令",
+          ),
+        containerName: Schema.string()
+          .default("yesimbot_bot_pc")
+          .description("Bot 的这台电脑的容器名。容器创建一次可复用，重启仍在（镜像升级后重命名即可换新机）"),
+        image: Schema.string()
+          .default("node:20-slim")
+          .description("电脑的镜像（首次开机时按需拉取）。带常用命令的通用镜像更接近真实电脑"),
+        pullPolicy: Schema.union([
+          Schema.const("missing").description("本地没有该镜像时才拉取"),
+          Schema.const("always").description("每次开机都重新拉取"),
+          Schema.const("never").description("不拉取，只使用本地已有的镜像"),
+        ])
+          .default("missing")
+          .description("镜像拉取策略"),
+        workdir: Schema.string()
+          .default("/workspace")
+          .description("电脑内的固定主目录（终端与资源管理器的根）"),
+        user: Schema.string().default("1000").description("容器内执行命令的用户（uid:gid 或用户名；留空用镜像默认用户）"),
+        network: Schema.string().default("none").description("容器网络模式：默认 none 断网，Bot 的电脑连不上外网（需联网时改为 bridge 或 host）"),
+        hostname: Schema.string().default("bot-pc").description("这台电脑的主机名"),
+        timezone: Schema.string().default("Asia/Shanghai").description("电脑的系统时区"),
+        mounts: Schema.array(
+          Schema.object({
+            host: Schema.string().description("主机目录（绝对路径）"),
+            container: Schema.string().description("映射进电脑的路径"),
+            readonly: Schema.boolean().default(false).description("只读挂载（防止 Bot 修改主机文件）"),
+          }),
+        )
+          .default([])
+          .description(
+            "显式映射到电脑里的主机目录。默认不映射任何主机路径，Bot 无法访问主机文件；" +
+              "需要把某个目录交给它时（如相册、文档）在此声明",
+          ),
+        extraArgs: Schema.array(Schema.string())
+          .default([])
+          .description("docker create 的附加参数（如 --memory、--cpus 限制电脑资源）"),
+        commandTimeoutMs: Schema.natural().default(30000).description("单条命令的超时（毫秒）"),
+        maxOutputChars: Schema.natural().default(20000).description("返回给 Bot 的单条命令最大输出字符数"),
+      }).description(
+        "Bot 的个人电脑：一个真实存在的 Docker 容器，终端/资源管理器的操作都在这台电脑里执行，" +
+          "与运行 Koishi 的主机隔离",
+      ),
       mcpServers: Schema.array(
         Schema.object({
           enabled: Schema.boolean().default(true).description("启用该应用"),
@@ -544,8 +591,8 @@ export const Config: Schema<Config> = Schema.intersect([
         .default([])
         .description("外接 MCP Server 列表：每个 Server 对 Bot 来说是手机里的一个 App"),
     }).description(
-      "手机应用（Apps / MCP）：MCP Server 与内置应用不占用常驻工具位，" +
-        "Bot 用 open_app 打开后其操作才展开可用（一次只开一个，切换/关闭/rest 后失效）",
+      "手机应用（Apps / MCP）：MCP Server、内置应用（天气/浏览器）与 Bot 的个人电脑（终端/资源管理器）" +
+        "不占用常驻工具位，Bot 用 open_app 打开后其操作才展开可用（一次只开一个，切换/关闭/rest 后失效）",
     ),
   }),
 

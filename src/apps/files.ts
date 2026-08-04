@@ -1,6 +1,20 @@
-import { promises as fs } from "node:fs";
+/**
+ * 内置资源管理器 App：Bot 的个人电脑上的文件管理器（对应真实电脑的“文件资源管理器”）。
+ *
+ * 双模式（创世时判定的世界性质，meta.json）：
+ * - 现实世界：文件真的存在这台电脑（Docker 容器）里，操作通过容器执行，与主机隔离；
+ * - 虚构世界：World-LLM 扮演这台电脑，直接生成符合世界观的目录/文件内容与操作结果。
+ *
+ * 与终端共用同一台电脑、同一个主目录：写出来的文件在终端里也能看到。
+ */
+
 import path from "node:path";
 import type { Logger } from "koishi";
+import type { BotComputer } from "../computer.js";
+import type { WorldClock } from "../clock.js";
+import type { AppsConfig } from "../config.js";
+import type { WorldFiles } from "../files.js";
+import type { WorldAgent } from "../world/agent.js";
 import type { AppRawTool, WorldApp } from "./app.js";
 
 const MAX_LIST_ITEMS = 200;
@@ -15,18 +29,18 @@ const READ_ONLY_HINT =
 const TOOLS: AppRawTool[] = [
   {
     name: "list",
-    description: "列出文件应用工作目录（或指定子目录）里的文件和文件夹。这是只读结果，看完后继续输出 JSON 工具调用。",
+    description: "列出资源管理器当前目录（或指定子目录）里的文件和文件夹。这是只读结果，看完后继续输出 JSON 工具调用。",
     inputSchema: {
       type: "object",
       properties: {
-        path: { type: "string", description: "相对于工作目录的路径；省略为工作目录根" },
+        path: { type: "string", description: "相对于当前目录的路径；省略为当前目录" },
       },
     },
   },
   {
     name: "show",
     description:
-      "显示一个文本文件的内容并带行号。默认从第 1 行开始最多 200 行；修改文件前先用它确认当前内容。看到内容后不要复述，继续用 write 或 patch 修改时仍然只输出 JSON 工具调用。",
+      "打开一个文本文件查看内容并带行号。默认从第 1 行开始最多 200 行；修改文件前先用它确认当前内容。看到内容后不要复述，继续用 write 或 patch 修改时仍然只输出 JSON 工具调用。",
     inputSchema: {
       type: "object",
       properties: {
@@ -104,95 +118,79 @@ interface PreparedPatch {
   content?: string;
 }
 
-/** 内置文件 App：把本地文件操作拆成独立工具，避免 Bot 只能用 run_command 拼 shell 改文件。 */
-export class FilesApp implements WorldApp {
+interface FsResult<T = unknown> {
+  ok: boolean;
+  data?: T;
+  error?: string;
+}
+
+/**
+ * 内置资源管理器：操作 Bot 个人电脑里的文件。
+ * 现实模式所有操作都执行在 Docker 容器里（BotComputer），与主机隔离。
+ */
+export class FileManagerApp implements WorldApp {
   readonly id = "files";
-  readonly name = "文件";
-  readonly description = "查看和编辑本地工作目录中的文件，支持 list/show/write/patch/mkdir/delete";
+  readonly name = "资源管理器";
+  readonly description = "这台电脑里的文件管理器：查看和编辑文件";
 
   constructor(
-    private baseDir: string,
-    private cwd: string,
+    private computer: BotComputer,
+    private world: WorldAgent,
+    private files: WorldFiles,
+    private clock: WorldClock,
+    private cfg: AppsConfig,
     private logger: Logger,
   ) {}
 
-  async open(): Promise<{ tools: AppRawTool[] }> {
-    await this.ensureRoot();
-    return { tools: TOOLS };
+  async open(): Promise<{ tools: AppRawTool[]; opening?: string }> {
+    const real = await this.isRealWorld();
+    if (real) {
+      const ready = await this.computer.ensureReady();
+      if (ready.ok) {
+        return {
+          tools: TOOLS,
+          opening: `你坐到电脑前，点开了文件资源管理器，窗口里是这台电脑 ${this.displayPath(".") === "." ? "主目录" : `的 ${this.displayPath(".")} 目录`} 的文件。`,
+        };
+      }
+      return {
+        tools: TOOLS,
+        opening: `你坐到电脑前想打开文件资源管理器，但电脑没有开机（${ready.error}）。`,
+      };
+    }
+    return {
+      tools: TOOLS,
+      opening: "你坐到电脑前，点开了文件资源管理器，窗口里是这台电脑的文件。",
+    };
   }
 
   async call(tool: string, args: Record<string, unknown>): Promise<string> {
+    const real = await this.isRealWorld();
     switch (tool) {
       case "list":
-        return this.list(args);
+        return real ? this.list(args) : this.virtualList(args);
       case "show":
-        return this.show(args);
+        return real ? this.show(args) : this.virtualShow(args);
       case "write":
-        return this.write(args);
+        return real ? this.write(args) : this.virtualWrite(args, "write");
       case "patch":
-        return this.patch(args);
+        return real ? this.patch(args) : this.virtualWrite(args, "patch");
       case "mkdir":
-        return this.mkdir(args);
+        return real ? this.mkdir(args) : this.virtualWrite(args, "mkdir");
       case "delete":
-        return this.remove(args);
+        return real ? this.remove(args) : this.virtualWrite(args, "delete");
       default:
-        throw new Error(`文件应用没有 ${tool} 这个操作`);
+        throw new Error(`资源管理器没有 ${tool} 这个操作`);
     }
   }
 
   async close(): Promise<void> {
-    /* 本地文件 App 没有连接需要释放 */
+    /* 本地资源管理器没有连接需要释放 */
   }
 
-  // ---------- 路径安全 ----------
+  // ---------- 路径安全（现实模式） ----------
 
   private rootPath(): string {
-    return path.resolve(this.baseDir, this.cwd || ".");
-  }
-
-  private async ensureRoot(): Promise<string> {
-    await fs.mkdir(this.rootPath(), { recursive: true });
-    return fs.realpath(this.rootPath());
-  }
-
-  private resolveLexical(raw: unknown): string {
-    const root = this.rootPath();
-    const input = raw == null ? "." : String(raw).trim();
-    const target = path.resolve(root, input || ".");
-    if (!isInside(root, target)) {
-      throw new Error(`路径超出文件应用工作目录：${this.displayPath(target)}`);
-    }
-    return target;
-  }
-
-  private async resolveExisting(raw: unknown): Promise<string> {
-    const target = this.resolveLexical(raw);
-    const root = await this.ensureRoot();
-    if (!(await exists(target))) {
-      throw new Error(`文件不存在：${this.displayPath(target)}`);
-    }
-    const real = await fs.realpath(target);
-    if (!isInside(root, real)) {
-      throw new Error(`路径指向文件应用工作目录外：${this.displayPath(target)}`);
-    }
-    return target;
-  }
-
-  private async resolveWritable(raw: unknown): Promise<string> {
-    const target = this.resolveLexical(raw);
-    const root = await this.ensureRoot();
-    await fs.mkdir(path.dirname(target), { recursive: true });
-    const realDir = await fs.realpath(path.dirname(target));
-    if (!isInside(root, realDir)) {
-      throw new Error(`路径指向文件应用工作目录外：${this.displayPath(target)}`);
-    }
-    if (await exists(target)) {
-      const realTarget = await fs.realpath(target);
-      if (!isInside(root, realTarget)) {
-        throw new Error(`路径指向文件应用工作目录外：${this.displayPath(target)}`);
-      }
-    }
-    return target;
+    return path.resolve(this.computer.homeDir, this.cfg.filesCwd || ".");
   }
 
   private displayPath(target: string): string {
@@ -201,24 +199,65 @@ export class FilesApp implements WorldApp {
     return rel.split(path.sep).join("/");
   }
 
-  // ---------- 工具实现 ----------
+  private resolveLexical(raw: unknown): string {
+    const root = this.rootPath();
+    const input = raw == null ? "." : String(raw).trim();
+    const target = path.resolve(root, input || ".");
+    if (!isInside(root, target)) {
+      throw new Error(`路径超出资源管理器所在目录：${this.displayPath(target)}`);
+    }
+    return target;
+  }
+
+  /** 确认路径存在且（经符号链接解析后）仍在工作目录内 */
+  private async resolveExisting(raw: unknown): Promise<string> {
+    const target = this.resolveLexical(raw);
+    const root = this.rootPath();
+    const ex = await this.nodeOp("exists", { YR_P: target });
+    if (!ex.ok) throw new Error(`文件系统操作失败：${ex.error}`);
+    if (!ex.data) throw new Error(`文件不存在：${this.displayPath(target)}`);
+    const rp = await this.nodeOp("realpath", { YR_P: target });
+    if (!rp.ok) throw new Error(`文件系统操作失败：${rp.error}`);
+    if (!isInside(root, rp.data as string)) {
+      throw new Error(`路径指向资源管理器所在目录外：${this.displayPath(target)}`);
+    }
+    return target;
+  }
+
+  /** 确认路径可写（父目录可建、目标及父目录解析后都在工作目录内） */
+  private async resolveWritable(raw: unknown): Promise<string> {
+    const target = this.resolveLexical(raw);
+    const root = this.rootPath();
+    const parent = path.dirname(target);
+    const mk = await this.nodeOp("mkdir", { YR_P: parent });
+    if (!mk.ok) throw new Error(`无法创建父目录：${mk.error}`);
+    const rpDir = await this.nodeOp("realpath", { YR_P: parent });
+    if (!rpDir.ok) throw new Error(`文件系统操作失败：${rpDir.error}`);
+    if (!isInside(root, rpDir.data as string)) {
+      throw new Error(`路径指向资源管理器所在目录外：${this.displayPath(target)}`);
+    }
+    const ex = await this.nodeOp("exists", { YR_P: target });
+    if (ex.ok && ex.data) {
+      const rpT = await this.nodeOp("realpath", { YR_P: target });
+      if (rpT.ok && !isInside(root, rpT.data as string)) {
+        throw new Error(`路径指向资源管理器所在目录外：${this.displayPath(target)}`);
+      }
+    }
+    return target;
+  }
+
+  // ---------- 工具实现（现实模式：执行在这台电脑里） ----------
 
   private async list(args: Record<string, unknown>): Promise<string> {
     const target = await this.resolveExisting(args.path);
-    const entries = await fs.readdir(target, { withFileTypes: true });
+    const res = await this.nodeOp("list", { YR_P: target });
+    if (!res.ok) return `（读取失败：${res.error}）`;
+    const entries = (res.data as [string, string, string][]).map(([name, kind, detail]) => ({ name, kind, detail }));
     const rows: { name: string; kind: "dir" | "file" | "link"; detail: string }[] = [];
-    for (const entry of entries) {
-      const full = path.join(target, entry.name);
-      if (entry.isDirectory()) {
-        rows.push({ name: `${entry.name}/`, kind: "dir", detail: "" });
-      } else if (entry.isFile()) {
-        const st = await fs.stat(full);
-        rows.push({ name: entry.name, kind: "file", detail: formatSize(st.size) });
-      } else if (entry.isSymbolicLink()) {
-        rows.push({ name: `${entry.name} ->`, kind: "link", detail: "符号链接" });
-      } else {
-        rows.push({ name: entry.name, kind: "file", detail: "其他" });
-      }
+    for (const e of entries) {
+      if (e.kind === "dir") rows.push({ name: `${e.name}/`, kind: "dir", detail: "" });
+      else if (e.kind === "link") rows.push({ name: `${e.name} ->`, kind: "link", detail: e.detail });
+      else rows.push({ name: e.name, kind: "file", detail: e.detail ? formatSize(Number(e.detail)) : "" });
     }
     rows.sort(
       (a, b) =>
@@ -239,23 +278,28 @@ export class FilesApp implements WorldApp {
     const rawPath = args.path ?? args.file;
     if (rawPath == null || !String(rawPath).trim()) return "（show 需要 path 参数。）";
     const target = await this.resolveExisting(rawPath);
-    const st = await fs.stat(target);
-    if (st.isDirectory()) return `（${this.displayPath(target)} 是目录，请用 list 查看。）`;
-    const content = (await fs.readFile(target, "utf8")).replace(/^\uFEFF/, "");
-    if (content.includes("\0")) return `（${this.displayPath(target)} 看起来不是文本文件。）`;
-    const lines = content.split(/\r?\n/);
-    const start = clampInt(args.start, 1, Math.max(1, lines.length), 1);
+    const st = await this.nodeOp("stat", { YR_P: target });
+    if (!st.ok) return `（读取失败：${st.error}）`;
+    if ((st.data as { dir?: boolean } | undefined)?.dir) return `（${this.displayPath(target)} 是目录，请用 list 查看。）`;
+    const start = clampInt(args.start, 1, Number.MAX_SAFE_INTEGER, 1);
     const maxLines = clampInt(
       args.max_lines ?? args.maxLines,
       1,
       MAX_SHOW_LINES,
       DEFAULT_SHOW_LINES,
     );
-    const end = Math.min(lines.length, start - 1 + maxLines);
+    const res = await this.nodeOp("read-lines", {
+      YR_P: target,
+      YR_START: String(start),
+      YR_MAX: String(maxLines),
+    });
+    if (!res.ok) return `（读取失败：${res.error}）`;
+    const { total, window } = res.data as { total: number; window: string[] };
+    const end = Math.min(total, start - 1 + maxLines);
     const width = String(end).length;
     const bodyLines: string[] = [];
-    for (let i = start - 1; i < end; i++) {
-      bodyLines.push(`${String(i + 1).padStart(width)}| ${lines[i] ?? ""}`);
+    for (let i = 0; i < window.length; i++) {
+      bodyLines.push(`${String(start + i).padStart(width)}| ${window[i] ?? ""}`);
     }
     const fullBody = bodyLines.join("\n");
     const body =
@@ -263,8 +307,8 @@ export class FilesApp implements WorldApp {
         ? `${fullBody.slice(0, MAX_TEXT_CHARS)}\n…（已截断，剩余 ${fullBody.length - MAX_TEXT_CHARS} 字符）`
         : fullBody;
     const remaining =
-      lines.length > end ? `\n----\n（还有 ${lines.length - end} 行；可用 start/max_lines 继续查看）` : "";
-    return `${this.displayPath(target)} (${lines.length} 行)\n----\n${body}${remaining}${READ_ONLY_HINT}`;
+      total > end ? `\n----\n（还有 ${total - end} 行；可用 start/max_lines 继续查看）` : "";
+    return `${this.displayPath(target)} (${total} 行)\n----\n${body}${remaining}${READ_ONLY_HINT}`;
   }
 
   private async write(args: Record<string, unknown>): Promise<string> {
@@ -277,12 +321,12 @@ export class FilesApp implements WorldApp {
       return `（write 内容过长：${content.length} 字符。单次 JSON 容易截断，请先 write 创建/写开头，再用 append: true 分块追加。）`;
     }
     const target = await this.resolveWritable(rawPath);
-    await fs.mkdir(path.dirname(target), { recursive: true });
-    if (isTruthy(args.append)) {
-      await fs.appendFile(target, content, "utf8");
-    } else {
-      await atomicWrite(target, content);
-    }
+    const res = await this.nodeOp("write", {
+      YR_P: target,
+      YR_DATA: content,
+      YR_APPEND: isTruthy(args.append) ? "1" : "0",
+    });
+    if (!res.ok) return `（写入失败：${res.error}）`;
     return `已写入 ${this.displayPath(target)}（${content.length} 字符）。`;
   }
 
@@ -290,7 +334,8 @@ export class FilesApp implements WorldApp {
     const rawPath = args.path ?? args.dir;
     if (rawPath == null || !String(rawPath).trim()) return "（mkdir 需要 path 参数。）";
     const target = await this.resolveWritable(rawPath);
-    await fs.mkdir(target, { recursive: true });
+    const res = await this.nodeOp("mkdir", { YR_P: target });
+    if (!res.ok) return `（创建失败：${res.error}）`;
     return `已创建目录 ${this.displayPath(target)}。`;
   }
 
@@ -299,14 +344,14 @@ export class FilesApp implements WorldApp {
     if (rawPath == null || !String(rawPath).trim()) return "（delete 需要 path 参数。）";
     const target = await this.resolveExisting(rawPath);
     if (isRootPath(this.rootPath(), target)) {
-      return "（不能删除文件应用工作目录本身。）";
+      return "（不能删除资源管理器所在目录本身。）";
     }
-    const st = await fs.lstat(target);
     const recursive = isTruthy(args.recursive);
-    if (st.isDirectory() && !recursive) {
+    const res = await this.nodeOp("delete", { YR_P: target, YR_REC: recursive ? "1" : "0" });
+    if (!res.ok) return `（删除失败：${res.error}）`;
+    if ((res.data as { needRecursive?: boolean } | undefined)?.needRecursive) {
       return `（${this.displayPath(target)} 是目录；如确认删除整棵树，请传 recursive: true。）`;
     }
-    await fs.rm(target, { recursive, force: false });
     return `已删除 ${this.displayPath(target)}。`;
   }
 
@@ -323,7 +368,8 @@ export class FilesApp implements WorldApp {
       switch (op.type) {
         case "add": {
           const target = await this.resolveWritable(op.path);
-          if (await exists(target)) {
+          const ex = await this.nodeOp("exists", { YR_P: target });
+          if (ex.ok && ex.data) {
             throw new Error(`Add File 目标已存在：${this.displayPath(target)}，请改用 Update File`);
           }
           prepared.push({ op, target, content: addFileLines(op.lines).join("\n") });
@@ -331,7 +377,9 @@ export class FilesApp implements WorldApp {
         }
         case "update": {
           const target = await this.resolveExisting(op.path);
-          const before = await fs.readFile(target, "utf8");
+          const read = await this.nodeOp("read-raw", { YR_P: target });
+          if (!read.ok) throw new Error(`读取 ${this.displayPath(target)} 失败：${read.error}`);
+          const before = read.data as string;
           const hadBom = before.startsWith("\uFEFF");
           const after = applyPatchHunks(before.replace(/^\uFEFF/, ""), parseUpdateHunks(op.lines));
           prepared.push({ op, target, content: hadBom ? `\uFEFF${after}` : after });
@@ -340,10 +388,10 @@ export class FilesApp implements WorldApp {
         case "delete": {
           const target = await this.resolveExisting(op.path);
           if (isRootPath(this.rootPath(), target)) {
-            throw new Error("Delete File 不能删除文件应用工作目录本身");
+            throw new Error("Delete File 不能删除资源管理器所在目录本身");
           }
-          const st = await fs.lstat(target);
-          if (st.isDirectory()) {
+          const st = await this.nodeOp("stat", { YR_P: target });
+          if (st.ok && (st.data as { dir?: boolean } | undefined)?.dir) {
             throw new Error("Delete File 只能删除文件；目录请用 delete 工具");
           }
           prepared.push({ op, target });
@@ -356,23 +404,165 @@ export class FilesApp implements WorldApp {
       const label = this.displayPath(item.target);
       switch (item.op.type) {
         case "add":
-          await fs.mkdir(path.dirname(item.target), { recursive: true });
-          await atomicWrite(item.target, item.content ?? "");
-          applied.push(`新增 ${label}`);
+        case "update": {
+          const res = await this.nodeOp("write", {
+            YR_P: item.target,
+            YR_DATA: item.content ?? "",
+            YR_APPEND: "0",
+          });
+          if (!res.ok) throw new Error(`写入 ${label} 失败：${res.error}`);
+          applied.push(`${item.op.type === "add" ? "新增" : "更新"} ${label}`);
           break;
-        case "update":
-          await atomicWrite(item.target, item.content ?? "");
-          applied.push(`更新 ${label}`);
-          break;
-        case "delete":
-          await fs.rm(item.target, { recursive: false, force: false });
+        }
+        case "delete": {
+          const res = await this.nodeOp("delete", { YR_P: item.target, YR_REC: "0" });
+          if (!res.ok) throw new Error(`删除 ${label} 失败：${res.error}`);
           applied.push(`删除 ${label}`);
           break;
+        }
       }
     }
     return `已应用 patch：\n- ${applied.join("\n- ")}`;
   }
+
+  // ---------- 电脑文件系统操作（docker exec node -e） ----------
+
+  private async nodeOp(op: string, vars: Record<string, string>): Promise<FsResult> {
+    // 脚本经环境变量传入（YR_SCRIPT），避免把代码嵌入 shell 命令造成引号/转义问题
+    const res = await this.computer.exec('node -e "$YR_SCRIPT" 2>/dev/null', {
+      timeoutMs: this.cfg.computer.commandTimeoutMs,
+      maxOutputChars: 1_000_000,
+      cwd: undefined,
+      env: { YR_SCRIPT: NODE_FS_SCRIPT, YR_OP: op, ...vars },
+    });
+    const text = res.output.trim();
+    try {
+      const parsed = JSON.parse(text) as { ok?: boolean; d?: unknown; error?: string };
+      if (parsed.ok) return { ok: true, data: parsed.d };
+      return { ok: false, error: parsed.error || "未知错误" };
+    } catch {
+      return { ok: false, error: text || "电脑没有响应" };
+    }
+  }
+
+  // ---------- 虚构模式：World-LLM 扮演这台电脑 ----------
+
+  private async virtualList(args: Record<string, unknown>): Promise<string> {
+    const where = args.path != null && String(args.path).trim() ? `目录 ${String(args.path).trim()}` : "当前目录";
+    const task =
+      `Bot 打开了自己电脑上的文件资源管理器，查看${where}（当前 ${this.clock.timeLine()}）。\n` +
+      `请扮演这台电脑，输出资源管理器窗口里显示的目录内容：\n` +
+      `1. check world_status（必要时也看 bot_status）：这台电脑符合世界观；如果这个世界没有电脑，或该路径不存在，就如实显示空白或对应的报错/空目录；\n` +
+      `2. 一行一个条目，目录以 / 结尾，文件可附大小；最多列 ${MAX_LIST_ITEMS} 条；与世界状态中已有的设定保持一致，不要凭空出现这个世界不该有的文件；\n` +
+      `3. 只输出资源管理器屏幕上的内容，不要任何解释、旁白或代码围栏。`;
+    try {
+      return await this.world.query(task);
+    } catch (err) {
+      this.logger.warn("虚构资源管理器目录生成失败: %s", err);
+      return "（资源管理器好像卡住了，窗口里什么都没有。）";
+    }
+  }
+
+  private async virtualShow(args: Record<string, unknown>): Promise<string> {
+    const file = String(args.path ?? args.file ?? "");
+    if (!file.trim()) return "（show 需要 path 参数。）";
+    const task =
+      `Bot 在自己电脑上的资源管理器里打开了文件 ${file.trim()}（当前 ${this.clock.timeLine()}）。\n` +
+      `请扮演这台电脑，输出文件在屏幕上显示的内容：\n` +
+      `1. check world_status：文件内容必须符合世界观；文件不存在或不是文本时，如实输出对应的画面（文件不存在/打不开）；\n` +
+      `2. 这是只读查看，内容会显示行号；输出文件内容本身（带行号），不要太长；\n` +
+      `3. 只输出屏幕上显示的内容，不要解释或旁白。`;
+    try {
+      return (await this.world.query(task)) + READ_ONLY_HINT;
+    } catch (err) {
+      this.logger.warn("虚构资源管理器文件内容生成失败: %s", err);
+      return "（文件打不开，窗口里什么都没有。）" + READ_ONLY_HINT;
+    }
+  }
+
+  private async virtualWrite(args: Record<string, unknown>, action: string): Promise<string> {
+    const rawPath = args.path ?? args.file ?? args.patch;
+    const what = String(rawPath ?? "").trim() || "目标文件";
+    const actText =
+      action === "write"
+        ? `写入/修改文件 ${what}`
+        : action === "patch"
+          ? `对文件 ${what} 应用补丁`
+          : action === "mkdir"
+            ? `新建目录 ${what}`
+            : `删除 ${what}`;
+    const task =
+      `Bot 在自己电脑上的资源管理器里执行了「${actText}」（当前 ${this.clock.timeLine()}）。\n` +
+      `请扮演这台电脑，用一两句符合世界观的话描述屏幕上反馈的结果（成功/失败/权限不足等）：\n` +
+      `1. check world_status 保持设定一致（这个世界有没有电脑、这个目录/文件是否应该存在、Bot 有没有权限）；\n` +
+      `2. 只输出屏幕上显示的内容，不要解释或旁白。`;
+    try {
+      return await this.world.query(task);
+    } catch (err) {
+      this.logger.warn("虚构资源管理器操作结果生成失败: %s", err);
+      return "（资源管理器好像没有反应。）";
+    }
+  }
+
+  private async isRealWorld(): Promise<boolean> {
+    const meta = await this.files.readMeta();
+    return meta.realWorld ?? this.clock.syncRealTime;
+  }
 }
+
+/** 电脑内执行的文件系统操作（node -e 运行的固定脚本，路径/内容经环境变量传入避免转义） */
+const NODE_FS_SCRIPT = `
+const fs=require('fs'),path=require('path');
+const op=process.env.YR_OP||'';
+const P=process.env.YR_P||'';
+const send=(d)=>console.log(JSON.stringify({ok:true,d}));
+try{
+  if(op==='list'){
+    const es=fs.readdirSync(P,{withFileTypes:true});
+    const rows=[];
+    for(const e of es){
+      let kind='file',detail='';
+      try{
+        const s=fs.lstatSync(path.join(P,e.name));
+        if(s.isDirectory())kind='dir';
+        else if(s.isSymbolicLink()){kind='link';detail='符号链接';}
+        else detail=String(s.size);
+      }catch(_){kind='link';detail='符号链接';}
+      rows.push([e.name,kind,detail]);
+    }
+    send(rows);
+  } else if(op==='read-lines'){
+    const s=fs.readFileSync(P,'utf8');
+    const lines=s.replace(/^\\uFEFF/,'').split(/\\r?\\n/);
+    const start=Number(process.env.YR_START||1),max=Number(process.env.YR_MAX||1000000);
+    send({total:lines.length,window:lines.slice(start-1,start-1+max)});
+  } else if(op==='read-raw'){
+    send(fs.readFileSync(P,'utf8'));
+  } else if(op==='stat'){
+    const s=fs.lstatSync(P);
+    send({dir:s.isDirectory(),size:s.size});
+  } else if(op==='exists'){
+    fs.accessSync(P);
+    send(true);
+  } else if(op==='realpath'){
+    send(fs.realpathSync(P));
+  } else if(op==='write'){
+    const data=process.env.YR_DATA||'';
+    fs.mkdirSync(path.dirname(P),{recursive:true});
+    if(process.env.YR_APPEND==='1')fs.appendFileSync(P,data);else fs.writeFileSync(P,data);
+    send(true);
+  } else if(op==='mkdir'){
+    fs.mkdirSync(P,{recursive:true});
+    send(true);
+  } else if(op==='delete'){
+    const s=fs.lstatSync(P);
+    if(s.isDirectory()&&process.env.YR_REC!=='1'){send({needRecursive:true});}
+    else{fs.rmSync(P,{recursive:process.env.YR_REC==='1',force:false});send(true);}
+  } else {
+    send({error:"unknown op "+op});
+  }
+}catch(e){console.log(JSON.stringify({ok:false,error:(e&&e.message)?e.message:String(e)}));}
+`;
 
 // ---------- patch 解析与应用 ----------
 
@@ -552,21 +742,6 @@ function isInside(root: string, target: string): boolean {
 
 function isRootPath(root: string, target: string): boolean {
   return path.resolve(root) === path.resolve(target);
-}
-
-async function exists(file: string): Promise<boolean> {
-  try {
-    await fs.access(file);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-async function atomicWrite(file: string, content: string): Promise<void> {
-  const tmp = `${file}.tmp`;
-  await fs.writeFile(tmp, content, "utf8");
-  await fs.rename(tmp, file);
 }
 
 function clampInt(raw: unknown, min: number, max: number, fallback: number): number {

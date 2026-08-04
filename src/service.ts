@@ -3,14 +3,16 @@ import path from "node:path";
 import { Context, Service } from "koishi";
 import { AppManager } from "./apps/manager.js";
 import { BrowserApp } from "./apps/browser.js";
-import { FilesApp } from "./apps/files.js";
+import { FileManagerApp } from "./apps/files.js";
 import { McpApp } from "./apps/mcp.js";
+import { TerminalApp } from "./apps/terminal.js";
 import { WeatherApp } from "./apps/weather.js";
 import { BotAgent } from "./bot/agent.js";
 import { BotContext } from "./bot/context.js";
 import { availableTools, renderToolsText, toolLayer, type AppInfo } from "./bot/tools.js";
 import { describeCalendar } from "./calendar.js";
 import { WorldClock } from "./clock.js";
+import { BotComputer } from "./computer.js";
 import type { Config, ModalitySupport } from "./config.js";
 import { WorldFiles } from "./files.js";
 import { FocusManager } from "./koishi/focus.js";
@@ -68,6 +70,8 @@ export class WorldService extends Service<Config> {
   private bot: BotAgent | null = null;
   private tingle: TingleTimer | null = null;
   private appManager: AppManager | null = null;
+  /** Bot 的个人电脑（Docker 容器）：终端与资源管理器共用 */
+  private computer: BotComputer | null = null;
   private worldRunning = false;
 
   constructor(ctx: Context, config: Config) {
@@ -286,7 +290,9 @@ export class WorldService extends Service<Config> {
       this.requests,
       this.ownSends,
     );
-    // 手机应用（Apps / MCP）：内置天气/浏览器 + 外接 MCP Server，open_app 打开后工具才展开
+    // Bot 的个人电脑：终端 / 资源管理器共用的 Docker 容器（与运行 Koishi 的主机隔离）
+    this.computer = new BotComputer(this.config.apps.computer, this.logger);
+    // 手机应用（Apps / MCP）：内置天气/浏览器 + 个人电脑（终端/资源管理器）+ 外接 MCP Server
     const worldApps = [
       ...(this.config.apps.weatherEnabled
         ? [new WeatherApp(this.world, this.files, this.clock, this.config.apps, this.logger)]
@@ -307,8 +313,11 @@ export class WorldService extends Service<Config> {
             ),
           ]
         : []),
+      // 终端：Bot 的个人电脑上的命令行窗口。现实世界设定未配置 Docker 时电脑开不了机（不会执行任何命令）；
+      // 虚构世界设定由 World-LLM 扮演这台电脑
+      new TerminalApp(this.computer, this.world, this.files, this.clock, this.config.apps, this.logger),
       ...(this.config.apps.filesEnabled
-        ? [new FilesApp(this.ctx.baseDir, this.config.apps.filesCwd, this.logger)]
+        ? [new FileManagerApp(this.computer, this.world, this.files, this.clock, this.config.apps, this.logger)]
         : []),
       ...this.config.apps.mcpServers
         .filter((s) => s.enabled && s.name.trim())
@@ -333,7 +342,6 @@ export class WorldService extends Service<Config> {
       this.phoneStatus,
       this.logger,
       tools,
-      this.ctx.baseDir,
     );
 
     await this.clock.resume();
@@ -394,6 +402,9 @@ export class WorldService extends Service<Config> {
     this.bot = null;
     await this.appManager?.closeAll().catch(() => {});
     this.appManager = null;
+    // 关机：本插件自建的容器一并关闭（下次打开终端/资源管理器时自动再开机）
+    await this.computer?.shutdown().catch(() => {});
+    this.computer = null;
     if (opts.suspend) {
       // 插件停止：世界时间不冻结，离线期间继续按现实流速流逝
       await this.clock.suspend();
@@ -457,7 +468,6 @@ export class WorldService extends Service<Config> {
       ops: this.config.platformOps,
       apps: this.appInfos(),
       notifyManaged: this.config.messaging.botManagedNotifyChannels,
-      shellEnabled: this.config.shell.enabled,
     });
   }
 
@@ -477,8 +487,11 @@ export class WorldService extends Service<Config> {
     if (this.config.apps.browserEnabled) {
       list.push({ name: "浏览器", description: "上网：搜索、打开网页，可以截图保存" });
     }
+    // Bot 的个人电脑：终端 / 资源管理器共用的 Docker 容器（与运行 Koishi 的主机隔离）。
+    // 终端始终在应用列表里（Bot 有一台电脑是它的设定）；现实世界设定下未配置 Docker 时开不了机，不会执行任何命令
+    list.push({ name: "终端", description: "这台电脑上的命令行窗口，打开后可以执行命令" });
     if (this.config.apps.filesEnabled) {
-      list.push({ name: "文件", description: "查看和编辑本地工作目录中的文件" });
+      list.push({ name: "资源管理器", description: "这台电脑里的文件管理器：查看和编辑文件" });
     }
     for (const s of this.config.apps.mcpServers) {
       if (s.enabled && s.name.trim()) list.push({ name: s.name.trim(), description: s.description || "外部应用" });
