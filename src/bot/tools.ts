@@ -430,6 +430,8 @@ export function availableTools(opts: {
   apps?: AppInfo[];
   /** messaging.botManagedNotifyChannels：Bot 可自管通知频道列表 */
   notifyManaged?: boolean;
+  /** bot.blockingAct：act 专注模式（上一个动作未完成前拒绝新的 act） */
+  blockingAct?: boolean;
 }): BotToolDef[] {
   const tools = BOT_TOOLS.filter((t) => {
     switch (t.name) {
@@ -508,6 +510,16 @@ export function availableTools(opts: {
     }
   });
   return tools.map((t) => {
+    // blockingAct 专注模式：上一个动作未完成前新的 act 会被拒绝（不可绕过）——只有开启时才在描述里说明
+    if (t.name === "act" && opts.blockingAct) {
+      return {
+        ...t,
+        description:
+          t.description +
+          "开启 blockingAct（同时只能专注做一件事）时：上一个动作还没完成前，新的 act 会被直接拒绝，" +
+          "也不能用 repeat 绕过——先专心等它做完，或者先做点别的。",
+      };
+    }
     // 开启引用回复时，send 增加 reply_to / at_sender 参数说明
     if (t.name === "send" && opts.ops.reply) {
       return {

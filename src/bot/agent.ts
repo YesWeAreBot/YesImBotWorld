@@ -100,7 +100,7 @@ export class BotAgent {
   private running = false;
   private loopPromise: Promise<void> | null = null;
   private abort: AbortController | null = null;
-  private waiting: { callId: string; kind: "wait" | "act" } | null = null;
+  private waiting: { callId: string } | null = null;
   private wakeFn: (() => void) | null = null;
   private lastGenAt = 0;
   /** check_status 增量返回：上次查看时的状态文件快照（target → 全文） */
@@ -256,12 +256,9 @@ export class BotAgent {
   ): void {
     const rich: RichText = typeof content === "string" ? { text: content } : content;
     const isWaitResult = this.waiting !== null && opts.ref === this.waiting.callId;
-    // 唤醒规则：等待中的工具结果必定唤醒；wake 事件只能唤醒 wait（等待本来就是"直到有事发生"）。
-    // 阻塞中的 act 不受 wake 打断——一个人专注做事时就是顾不上别的（blockingAct 的本意），
-    // 期间的通知留在邮箱里，动作完成回过神来时一并看到。
-    const shouldWake =
-      this.waiting !== null &&
-      (isWaitResult || (opts.wake === true && this.waiting.kind === "wait"));
+    // 唤醒规则：等待中的工具结果必定唤醒；wake 事件可以提前唤醒 wait（等待本来就是"直到有事发生"）。
+    // act 不再阻塞生成（blockingAct 只管住下一个 act），因此没有"专注做事顾不上别的"的暂停态。
+    const shouldWake = this.waiting !== null && (isWaitResult || opts.wake === true);
 
     if (shouldWake && !isWaitResult) {
       // 提前唤醒 wait：取消等待到期任务，并在事件前插入打断说明
@@ -1082,7 +1079,7 @@ export class BotAgent {
       this.pushEvent("system", "（等待时长必须大于 0。）", { ref: call.id });
       return;
     }
-    this.waiting = { callId: call.id, kind: "wait" };
+    this.waiting = { callId: call.id };
 
     // 长等待：提前 lead 启动 World-LLM 补叙（结果收集到 parts，不直接推事件）
     const realMs = this.clock.realMsUntil(call.expectedAt);
@@ -1127,6 +1124,15 @@ export class BotAgent {
 
   private dispatchAct(call: ToolCallRecord): void {
     const desc = String(call.arguments.description ?? call.arguments.str ?? "");
+    // blockingAct：一个人同时只能专注做一件事。上一个动作还没完成时，新的 act 直接拒绝并提示，
+    // 不调用 World-LLM 裁定；也不像 repeat 那样给 Bot 留绕过口（专注模式不可无视）。
+    if (this.config.bot.blockingAct) {
+      const busy = actBusyMessage(this.scheduler.pendingByName("act"));
+      if (busy) {
+        this.pushEvent("system", busy, { ref: call.id });
+        return;
+      }
+    }
     // 拦截"上一个相同的动作还没出结果就再做一遍"（模型常见的复读行为），除非显式声明 repeat
     const sig = desc.trim();
     if (
@@ -1156,10 +1162,6 @@ export class BotAgent {
           : `（${desc || "刚才的动作"}完成了。）`;
       },
     });
-    // 阻塞模式：一个人同时只能专注做一件事，动作完成（结果交付）前暂停生成
-    if (this.config.bot.blockingAct) {
-      this.waiting = { callId: call.id, kind: "act" };
-    }
   }
 
   /** open_app：打开聊天平台 = 看一眼最近消息；打开其他 App = 展开其工具 */
@@ -1490,6 +1492,19 @@ function sleep(ms: number): Promise<void> {
 function truncate(text: string, max: number): string {
   const single = text.replace(/\n/g, "\\n");
   return single.length > max ? single.slice(0, max) + "…" : single;
+}
+
+/**
+ * blockingAct 专注模式的拦截提示：存在未完成的 act 时返回提示文本（Bot 不可绕过），否则返回 null。
+ * 供 dispatchAct 使用，也便于冒烟测试覆盖。
+ */
+export function actBusyMessage(pendingActs: ToolCallRecord[]): string | null {
+  if (!pendingActs.length) return null;
+  const pdesc = String(pendingActs[0]?.arguments.description ?? "").trim();
+  return (
+    `（你正在做${pdesc ? `「${truncate(pdesc, 60)}」` : "上一件事"}，它还没有完成——` +
+    `先专心等它的结果，或者先做点别的。同时只能专注做一件事，别急着开新的动作。）`
+  );
 }
 
 function clampInt(value: unknown, min: number, max: number, fallback: number): number {

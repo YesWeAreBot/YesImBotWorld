@@ -274,9 +274,9 @@ export const Config: Schema<Config> = Schema.intersect([
       blockingAct: Schema.boolean()
         .default(false)
         .description(
-          "act() 是否阻塞后续生成：开启后 Bot 从发出动作起到动作完成（结果交付）为止不生成任何工具调用" +
-            "（一个人同时只能专注做一件事）。世界裁定在动作发出时立即开始（不等倒计时），结果压到预计完成时刻交付；" +
-            "阻塞期间的消息通知会积压，动作完成回过神来时一并看到",
+          "act() 的专注模式：开启后，上一个动作还没完成（结果交付）前，新的 act 会被直接拒绝并提示等待——" +
+            "不能被 repeat 等参数绕过；但其他工具调用（发消息、等待、看状态等）不受影响、照常进行。" +
+            "一个人同时只能专注做一件事，做别的不受影响",
         ),
       maxWindowChars: Schema.natural()
         .default(32000)

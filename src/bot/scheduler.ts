@@ -122,6 +122,11 @@ export class Scheduler {
     return this.tasks.has(id);
   }
 
+  /** 仍在进行中（未交付、未取消）的指定工具调用（如 act），用于专注模式的前置拦截 */
+  pendingByName(name: string): ToolCallRecord[] {
+    return [...this.tasks.values()].filter((t) => t.call.name === name).map((t) => t.call);
+  }
+
   /** 是否存在未完成的任务 */
   get pendingCount(): number {
     return this.tasks.size;

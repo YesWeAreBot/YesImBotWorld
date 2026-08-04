@@ -492,6 +492,7 @@ export class WorldService extends Service<Config> {
       ops: this.config.platformOps,
       apps: this.appInfos(),
       notifyManaged: this.config.messaging.botManagedNotifyChannels,
+      blockingAct: this.config.bot.blockingAct,
     });
   }
 
