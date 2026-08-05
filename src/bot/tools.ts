@@ -61,7 +61,8 @@ export const BOT_TOOLS: BotToolDef[] = [
     name: "rest",
     signature: "rest(duration?: number)",
     description:
-      "休息一段时间，整理思绪与记忆（你的近期经历会被总结沉淀）。休息后会被告知过去了多少 Time Unit。感到疲惫（上下文冗长）时应主动休息。",
+      "休息一段时间。真正疲惫（经历了很多事）时，休息会整理思绪、把近期经历总结沉淀为记忆；" +
+      "还不疲惫时只是小憩，有动静会醒。休息后会被告知过去了多少 Time Unit。感到疲惫（上下文冗长）时应主动休息。",
   },
   {
     name: "check_status",

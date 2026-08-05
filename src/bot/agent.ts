@@ -100,7 +100,7 @@ export class BotAgent {
   private running = false;
   private loopPromise: Promise<void> | null = null;
   private abort: AbortController | null = null;
-  private waiting: { callId: string } | null = null;
+  private waiting: { callId: string; kind?: "wait" | "nap" } | null = null;
   private wakeFn: (() => void) | null = null;
   private lastGenAt = 0;
   /** check_status 增量返回：上次查看时的状态文件快照（target → 全文） */
@@ -111,6 +111,8 @@ export class BotAgent {
   private lastSendSig: string | null = null;
   /** 上一次 act 的描述与调用编号，用于拦截“结果未出就重复做同一件事” */
   private lastAct: { sig: string; callId: string } | null = null;
+  /** 连续 wait 的次数（任何其他工具调用都会清零），用于"频繁短等"的提醒 */
+  private waitStreak = 0;
   /** 连续几次模型输出不是合法工具调用，用于在反馈里提示模型直接输出 JSON */
   private parseFailures = 0;
   /**
@@ -273,12 +275,12 @@ export class BotAgent {
     const shouldWake = this.waiting !== null && (isWaitResult || opts.wake === true);
 
     if (shouldWake && !isWaitResult) {
-      // 提前唤醒 wait：取消等待到期任务，并在事件前插入打断说明
-      const { callId } = this.waiting!;
+      // 提前唤醒 wait/小憩：取消到期任务，并在事件前插入打断说明
+      const { callId, kind } = this.waiting!;
       this.scheduler.cancel(callId);
       this.mailbox.push({
         source: "system",
-        content: "你的等待被打断了。",
+        content: kind === "nap" ? "动静把你从小憩中弄醒了。" : "你的等待被打断了。",
         refToolCallId: callId,
         worldTime: this.clock.now(),
       });
@@ -508,13 +510,15 @@ export class BotAgent {
   // ---------- 工具派发 ----------
 
   private async dispatch(call: ToolCallRecord): Promise<void> {
+    // 连续 wait 计数：做了任何别的事就清零
+    if (call.name !== "wait") this.waitStreak = 0;
     switch (call.name) {
       case "wait":
         return this.dispatchWait(call);
       case "act":
         return this.dispatchAct(call);
       case "rest":
-        return this.doRest(call, false);
+        return this.dispatchRest(call);
       case "check_status":
         return this.dispatchLocal(call, async () => this.readStatus(call));
       case "check_time":
@@ -1093,6 +1097,18 @@ export class BotAgent {
       this.pushEvent("system", "（等待时长必须大于 0。）", { ref: call.id });
       return;
     }
+    // 频繁短等提醒：连续 wait（期间没做任何别的事）达到阈值时轻推一下，
+    // 之后每再连续等待同样次数提醒一次（不拦截，等待照常进行；醒来时会看到）
+    this.waitStreak++;
+    const remindAt = this.config.bot.waitRemindThreshold;
+    if (remindAt > 0 && this.waitStreak >= remindAt && this.waitStreak % remindAt === 0) {
+      this.pushEvent(
+        "system",
+        `（你已经连续等了 ${this.waitStreak} 次，中间什么也没做。等待不会让生活自己发生——` +
+          `可以找点事做：act 做点什么、翻翻手机消息、打开某个应用、写写笔记；` +
+          `确实无事可做的话，就一次等久一点（几百上千 TU 都很正常），而不是频繁地短等。）`,
+      );
+    }
     this.waiting = { callId: call.id };
 
     // 长等待：提前 lead 启动 World-LLM 补叙（结果收集到 parts，不直接推事件）
@@ -1420,6 +1436,34 @@ export class BotAgent {
   }
 
   // ---------- rest：上下文压缩 ----------
+
+  /**
+   * rest 的分流：上下文达到 restCompressMinChars 时才真正总结沉淀（doRest，不可打断）；
+   * 还不够"疲惫"时只是小憩——像 wait 一样可被消息唤醒打断，不压缩、不清空上下文。
+   */
+  private dispatchRest(call: ToolCallRecord): void | Promise<void> {
+    const threshold = this.config.bot.restCompressMinChars;
+    if (threshold > 0 && this.context.approxChars() < threshold) {
+      return this.dispatchLightRest(call);
+    }
+    return this.doRest(call, false);
+  }
+
+  /** 小憩：纯计时暂停（语义同 wait），到点或被动静唤醒 */
+  private dispatchLightRest(call: ToolCallRecord): void {
+    const raw = Number(call.arguments.duration ?? call.duration ?? 0);
+    const n = Number.isFinite(raw) && raw > 0 ? raw : 300; // 未指定时长：默认打个盹
+    // expectedAt 只影响调度不进入上下文渲染，可安全修正（duration 可能写在 arguments 里）
+    call.expectedAt = call.issuedAt + n;
+    this.waiting = { callId: call.id, kind: "nap" };
+    this.scheduler.schedule(call, {
+      executeAt: "expected",
+      run: async () =>
+        `你小憩了一会儿，回过神来。当前 ${this.clock.timeLine()}` +
+        `（这只是打个盹——你的经历还不算多，还没到需要沉淀记忆的程度；` +
+        `等真正疲惫（意识流冗长）时，rest 才会整理思绪、把经历沉淀为记忆。）`,
+    });
+  }
 
   /**
    * 休息：由 World-LLM 压缩总结上下文，刷新置顶区，重建（text 模式预热）KV cache。

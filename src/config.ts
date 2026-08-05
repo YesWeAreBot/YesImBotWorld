@@ -22,6 +22,8 @@ export interface BotModelConfig {
   maxTokens: number;
   disableThinking: boolean;
   blockingAct: boolean;
+  waitRemindThreshold: number;
+  restCompressMinChars: number;
   maxWindowChars: number;
   minIntervalMs: number;
   retryDelayMs: number;
@@ -289,6 +291,20 @@ export const Config: Schema<Config> = Schema.intersect([
           "act() 的专注模式：开启后，上一个动作还没完成（结果交付）前，新的 act 会被直接拒绝并提示等待——" +
             "不能被 repeat 等参数绕过；但其他工具调用（发消息、等待、看状态等）不受影响、照常进行。" +
             "一个人同时只能专注做一件事，做别的不受影响",
+        ),
+      waitRemindThreshold: Schema.natural()
+        .default(3)
+        .description(
+          "连续 wait 提醒阈值：Bot 不做任何别的事、连续调用 wait 达到该次数时，" +
+            "以系统事件提醒它可以做点什么（act、翻手机、记笔记），或无事可做时一次等更久，" +
+            "别频繁地碎片化短等。达到阈值后每再连续等待该次数提醒一次。0 表示禁用",
+        ),
+      restCompressMinChars: Schema.natural()
+        .default(8000)
+        .description(
+          "rest 真正执行总结压缩的上下文阈值（近似字符数）：达到阈值时 rest 才会调用 World-LLM " +
+            "总结沉淀记忆（期间不可打断）；低于阈值时 rest 只是小憩——像 wait 一样可被消息唤醒打断，" +
+            "不压缩、不清空上下文。上下文满导致的强制休息不受此限。0 表示 rest 总是压缩",
         ),
       maxWindowChars: Schema.natural()
         .default(32000)
