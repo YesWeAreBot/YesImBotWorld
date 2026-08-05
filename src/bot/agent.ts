@@ -200,11 +200,23 @@ export class BotAgent {
     this.refreshToolGate();
     if (toolsetChanged) {
       const defs = [...this.layerDefs("channel"), ...(isGroup ? this.layerDefs("group") : [])];
+      const lines: string[] = [];
       if (defs.length) {
+        lines.push(
+          `频道内可用操作（id 参数可省略，缺省即当前频道；离开频道或关闭应用后失效）：\n${renderToolsText(defs)}`,
+        );
+      }
+      // @全体成员是群聊页专属的消息写法（不是独立工具）：进群页时告知
+      if (isGroup) {
+        lines.push(
+          `在群聊页里发消息还可以 @全体成员：在 msg 中写 <at type="all"/>（或 [@全体成员]）。` +
+            `这需要你是群管理员/群主，且每天次数有限——只在真正需要通知所有人时才用。`,
+        );
+      }
+      if (lines.length) {
         this.pushEvent(
           "system",
-          `（你正在 ${key} 的${isGroup ? "群聊" : "私聊"}页面里。频道内可用操作` +
-            `（id 参数可省略，缺省即当前频道；离开频道或关闭应用后失效）：\n${renderToolsText(defs)}）`,
+          `（你正在 ${key} 的${isGroup ? "群聊" : "私聊"}页面里。${lines.join("\n")}）`,
         );
       }
     }
