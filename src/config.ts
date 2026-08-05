@@ -210,6 +210,7 @@ export interface AppsConfig {
   browserEnabled: boolean;
   browserSearchURL: string;
   browserProxy: string;
+  notesEnabled: boolean;
   filesEnabled: boolean;
   filesCwd: string;
   computer: ComputerConfig;
@@ -551,6 +552,13 @@ export const Config: Schema<Config> = Schema.intersect([
         .description(
           "浏览器访问真实互联网时使用的代理 URL（如 http://127.0.0.1:7890）。" +
             "留空时依次读取 HTTPS_PROXY / HTTP_PROXY 环境变量；都没有则不代理。",
+        ),
+      notesEnabled: Schema.boolean()
+        .default(true)
+        .description(
+          "内置记事本应用：Bot 的私人笔记（备忘、值得注意的事、对群友的印象、日记）。" +
+            "由 Bot 主动记录、随时翻看，不受上下文压缩影响。存储为世界数据目录 Notes/ 下的 Markdown 文件" +
+            "（文件名即标题），你可以直接翻看/编辑，也可以自己放 .md 进去给 Bot 看；创世重置时整个文件夹随其他状态归档",
         ),
       filesEnabled: Schema.boolean()
         .default(false)

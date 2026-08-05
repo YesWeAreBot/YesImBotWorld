@@ -40,6 +40,7 @@ const WORLD_DEF_TEMPLATE = `# 世界定义
  * ├── focus.json           # Bot 正在关注的频道
  * ├── pinned.json          # Bot-LLM 置顶上下文 + 计数器
  * ├── stream.jsonl         # Bot-LLM 工作窗口（Tool Call 流）
+ * ├── Notes/               # Bot 的记事本：一篇笔记一个 Markdown 文件（文件名即标题）
  * ├── gallery/             # 收藏夹（分类子目录见 media/gallery.ts；描述元数据存数据库）
  * └── archive/             # 压缩时归档的历史流
  * ```
@@ -56,6 +57,7 @@ export class WorldFiles {
   readonly notify: string;
   readonly pinned: string;
   readonly stream: string;
+  readonly notesDir: string;
   readonly archiveDir: string;
   readonly galleryDir: string;
 
@@ -71,6 +73,7 @@ export class WorldFiles {
     this.notify = path.join(base, "notify.json");
     this.pinned = path.join(base, "pinned.json");
     this.stream = path.join(base, "stream.jsonl");
+    this.notesDir = path.join(base, "Notes");
     this.archiveDir = path.join(base, "archive");
     this.galleryDir = path.join(base, "gallery");
   }
@@ -79,6 +82,7 @@ export class WorldFiles {
     await fs.mkdir(this.base, { recursive: true });
     await fs.mkdir(this.archiveDir, { recursive: true });
     await fs.mkdir(this.galleryDir, { recursive: true });
+    await fs.mkdir(this.notesDir, { recursive: true });
     if (!(await this.exists(this.botDef))) await fs.writeFile(this.botDef, BOT_DEF_TEMPLATE);
     if (!(await this.exists(this.worldDef))) await fs.writeFile(this.worldDef, WORLD_DEF_TEMPLATE);
   }
@@ -179,6 +183,12 @@ export class WorldFiles {
         const dest = path.join(this.archiveDir, `${stamp}-${path.basename(file)}`);
         await fs.rename(file, dest).catch(() => fs.rm(file, { force: true }));
       }
+    }
+    // 记事本目录整体归档（"这辈子"的笔记跟着世界走）
+    if (await this.exists(this.notesDir)) {
+      await fs
+        .rename(this.notesDir, path.join(this.archiveDir, `${stamp}-Notes`))
+        .catch(() => fs.rm(this.notesDir, { recursive: true, force: true }));
     }
   }
 

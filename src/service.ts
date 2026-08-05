@@ -6,6 +6,7 @@ import { BrowserApp } from "./apps/browser.js";
 import { ComputerDevice } from "./apps/computerDevice.js";
 import { FileManagerApp } from "./apps/files.js";
 import { McpApp } from "./apps/mcp.js";
+import { NotesApp } from "./apps/notes.js";
 import { RemoteDesktopApp } from "./apps/remoteDesktop.js";
 import { TerminalApp } from "./apps/terminal.js";
 import { WeatherApp } from "./apps/weather.js";
@@ -335,6 +336,7 @@ export class WorldService extends Service<Config> {
       ...(this.config.apps.weatherEnabled
         ? [new WeatherApp(this.world, this.files, this.clock, this.config.apps, this.logger)]
         : []),
+      ...(this.config.apps.notesEnabled ? [new NotesApp(this.files, this.clock, this.logger)] : []),
       ...(this.config.apps.browserEnabled
         ? [
             new BrowserApp(
@@ -521,6 +523,9 @@ export class WorldService extends Service<Config> {
     ];
     if (this.config.apps.weatherEnabled) {
       list.push({ name: "天气", description: "查询当前天气与未来几天的预报" });
+    }
+    if (this.config.apps.notesEnabled) {
+      list.push({ name: "记事本", description: "你的私人笔记：备忘、值得注意的事、对人的印象、日记" });
     }
     if (this.config.apps.browserEnabled) {
       list.push({ name: "浏览器", description: "上网：搜索、打开网页，可以截图保存" });
