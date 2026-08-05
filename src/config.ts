@@ -224,6 +224,7 @@ export function needsMsgIds(ops: PlatformOpsConfig): boolean {
 export interface Config {
   basePath: string;
   autoStart: boolean;
+  serializeSameEndpoint: boolean;
   bot: BotModelConfig;
   world: WorldModelConfig;
   clock: ClockConfigData;
@@ -243,6 +244,15 @@ export const Config: Schema<Config> = Schema.intersect([
     autoStart: Schema.boolean()
       .default(false)
       .description("Koishi 启动后自动恢复世界运行（需先执行 world.init 初始化）"),
+    serializeSameEndpoint: Schema.boolean()
+      .default(true)
+      .description(
+        "同源推理端点互斥：Bot-LLM 与 World-LLM 的 baseURL 同源（协议+主机+端口相同）时，" +
+          "双方的请求排队执行、绝不并发——World 任务（act 裁定、Tingle 等）期间 Bot 的生成会短暂等待。" +
+          "适用于并发请求下会饿死请求甚至崩溃的后端（模型换载层、单实例本地部署等）。" +
+          "若你的后端能真正并发处理多个请求，关闭本项可让两个 LLM 并行工作。" +
+          "两个 baseURL 不同源时本项没有任何影响",
+      ),
   }).description("基础配置"),
 
   Schema.object({

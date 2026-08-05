@@ -1,5 +1,7 @@
 /** 极简 OpenAI 兼容 chat completion 客户端（fetch 实现，零依赖） */
 
+import { llmFetch } from "./http.js";
+
 export type ContentPart =
   | { type: "text"; text: string }
   | { type: "image_url"; image_url: { url: string } }
@@ -74,7 +76,7 @@ export class ChatClient {
       body.chat_template_kwargs = { enable_thinking: false };
     }
 
-    const res = await fetch(url, {
+    const res = await llmFetch(url, {
       method: "POST",
       headers: {
         "content-type": "application/json",

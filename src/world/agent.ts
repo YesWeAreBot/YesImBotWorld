@@ -4,6 +4,7 @@ import type { WorldClock } from "../clock.js";
 import type { WorldModelConfig } from "../config.js";
 import type { WorldFiles } from "../files.js";
 import { ChatClient, type ChatMessage, type ChatToolDef } from "../llm/chat.js";
+import { withEndpointLock } from "../llm/lock.js";
 import type { CompressionResult, ToolCallRecord } from "../types.js";
 
 const WORLD_TOOLS: ChatToolDef[] = [
@@ -103,10 +104,16 @@ export class WorldAgent {
     });
   }
 
-  /** 串行化执行，避免并发写状态文件 */
+  /**
+   * 串行化执行，避免并发写状态文件。
+   * 同时以"整个任务"为粒度持有推理端点锁：当 World-LLM 与 Bot-LLM 共用一个
+   * 只能驻留单模型的端点（llama-swap 等换载层）时，任务期间 Bot 的生成请求
+   * 排队等待，避免跨模型并发把请求饿死或把推理进程搞崩；不同源时无影响。
+   */
   private enqueue<T>(fn: () => Promise<T>): Promise<T> {
     this.pending++;
-    const wrapped = () => fn().finally(() => this.pending--);
+    const wrapped = () =>
+      withEndpointLock(this.cfg.baseURL, fn).finally(() => this.pending--);
     const next = this.tail.then(wrapped, wrapped);
     this.tail = next.then(
       () => undefined,
@@ -441,7 +448,26 @@ export class WorldAgent {
     let finalContent = "";
     let lastCallSig = "";
     for (let round = 0; round < this.cfg.maxToolRounds; round++) {
-      const result = await this.client.complete(messages, { tools });
+      // 每轮耗时观测：非流式响应在服务端生成完毕前不会返回任何字节，
+      // 失败时把"第几轮、悬挂了多久"带进错误信息——这是区分病因的关键数据
+      // （悬挂 ~300s = 被 undici 响应头超时掐断；瞬间失败 = 连接层问题）
+      const startedAt = Date.now();
+      let result: Awaited<ReturnType<ChatClient["complete"]>>;
+      try {
+        result = await this.client.complete(messages, { tools });
+      } catch (err) {
+        const elapsed = ((Date.now() - startedAt) / 1000).toFixed(1);
+        throw new Error(
+          `第 ${round + 1} 轮请求失败（悬挂 ${elapsed}s，${messages.length} 条消息）: ${(err as Error).message ?? err}`,
+          { cause: err },
+        );
+      }
+      this.logger.debug(
+        "World-LLM 第 %d 轮完成，耗时 %ss（%d 条消息）",
+        round + 1,
+        ((Date.now() - startedAt) / 1000).toFixed(1),
+        messages.length,
+      );
       finalContent = result.content ?? "";
       if (!result.toolCalls.length) break;
       messages.push({

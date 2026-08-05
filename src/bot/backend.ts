@@ -1,6 +1,7 @@
 import type { BotModelConfig } from "../config.js";
 import { ChatClient, type ChatResult } from "../llm/chat.js";
 import { buildToolCallGrammar } from "../llm/grammar.js";
+import { withEndpointLock } from "../llm/lock.js";
 import { extractToolCall, ToolCallParseError } from "../llm/parse.js";
 import { TextClient } from "../llm/text.js";
 import type { ParsedToolCall } from "../types.js";
@@ -24,10 +25,12 @@ export class ChatBackend implements BotBackend {
   private client: ChatClient;
   private toolNames: string[];
   private maxTokens: number;
+  private baseURL: string;
 
   constructor(cfg: BotModelConfig, toolNames: string[] = BOT_TOOL_NAMES) {
     this.toolNames = toolNames;
     this.maxTokens = cfg.maxTokens;
+    this.baseURL = cfg.baseURL;
     this.client = new ChatClient({
       baseURL: cfg.baseURL,
       apiKey: cfg.apiKey || undefined,
@@ -44,19 +47,26 @@ export class ChatBackend implements BotBackend {
 
   async generate(context: BotContext, timeLine: string, signal?: AbortSignal): Promise<ParsedToolCall> {
     const messages = await context.toChatMessages(timeLine);
-    const result = await this.client.complete(messages, { signal });
-    try {
-      return this.parseResult(result);
-    } catch (err) {
-      if (err instanceof ToolCallParseError && isLikelyTruncated(err)) {
-        const retry = await this.client.complete(messages, {
-          signal,
-          maxTokens: Math.max(this.maxTokens, 4096),
-        });
-        return this.parseResult(retry);
-      }
-      throw err;
-    }
+    // 端点锁：与 World-LLM 共用同一换载端点时排队执行（不同源时无影响）
+    return withEndpointLock(
+      this.baseURL,
+      async () => {
+        const result = await this.client.complete(messages, { signal });
+        try {
+          return this.parseResult(result);
+        } catch (err) {
+          if (err instanceof ToolCallParseError && isLikelyTruncated(err)) {
+            const retry = await this.client.complete(messages, {
+              signal,
+              maxTokens: Math.max(this.maxTokens, 4096),
+            });
+            return this.parseResult(retry);
+          }
+          throw err;
+        }
+      },
+      signal,
+    );
   }
 
   private parseResult(result: ChatResult): ParsedToolCall {
@@ -107,26 +117,33 @@ export class TextBackend implements BotBackend {
 
   async generate(context: BotContext, timeLine: string, signal?: AbortSignal): Promise<ParsedToolCall> {
     const prompt = context.toTextPrompt(this.cfg.template, timeLine);
-    const content = await this.client.complete(prompt, { grammar: this.grammar, signal });
-    try {
-      return extractToolCall(content, this.toolNames);
-    } catch (err) {
-      if (err instanceof ToolCallParseError && isLikelyTruncated(err)) {
-        const retry = await this.client.complete(prompt, {
-          grammar: this.grammar,
-          signal,
-          nPredict: Math.max(this.cfg.maxTokens, 4096),
-        });
-        return extractToolCall(retry, this.toolNames);
-      }
-      throw err;
-    }
+    // 端点锁：与 World-LLM 共用同一换载端点时排队执行（不同源时无影响）
+    return withEndpointLock(
+      this.cfg.baseURL,
+      async () => {
+        const content = await this.client.complete(prompt, { grammar: this.grammar, signal });
+        try {
+          return extractToolCall(content, this.toolNames);
+        } catch (err) {
+          if (err instanceof ToolCallParseError && isLikelyTruncated(err)) {
+            const retry = await this.client.complete(prompt, {
+              grammar: this.grammar,
+              signal,
+              nPredict: Math.max(this.cfg.maxTokens, 4096),
+            });
+            return extractToolCall(retry, this.toolNames);
+          }
+          throw err;
+        }
+      },
+      signal,
+    );
   }
 
   /** n_predict=0 的请求只做 prompt 评估，用于压缩后重建 llama.cpp 的 KV cache */
   async warmup(context: BotContext, timeLine: string): Promise<void> {
     const prompt = context.toTextPrompt(this.cfg.template, timeLine);
-    await this.client.complete(prompt, { nPredict: 0 });
+    await withEndpointLock(this.cfg.baseURL, () => this.client.complete(prompt, { nPredict: 0 }));
   }
 }
 

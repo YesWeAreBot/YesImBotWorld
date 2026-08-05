@@ -9,6 +9,8 @@
  * 由于上下文渲染是确定性的、追加式的，每次请求几乎全量命中缓存。
  */
 
+import { llmFetch } from "./http.js";
+
 export interface TextClientConfig {
   baseURL: string;
   apiKey?: string;
@@ -41,7 +43,7 @@ export class TextClient {
     if (opts.grammar) body.grammar = opts.grammar;
     if (opts.stop?.length) body.stop = opts.stop;
 
-    const res = await fetch(this.endpoint(), {
+    const res = await llmFetch(this.endpoint(), {
       method: "POST",
       headers: {
         "content-type": "application/json",

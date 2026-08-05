@@ -24,6 +24,7 @@ import { KoishiMessenger } from "./koishi/messenger.js";
 import { NotifyManager } from "./koishi/notify.js";
 import { OwnSendTracker } from "./koishi/ownsends.js";
 import { RequestStore } from "./koishi/requests.js";
+import { setEndpointLockEnabled } from "./llm/lock.js";
 import { CaptionService } from "./media/captioner.js";
 import { GalleryStore } from "./media/gallery.js";
 import { createAttachmentLoader } from "./media/parts.js";
@@ -81,6 +82,9 @@ export class WorldService extends Service<Config> {
   constructor(ctx: Context, config: Config) {
     super(ctx, "yesimbotWorld", true);
     this.config = config;
+
+    // 同源推理端点互斥开关：并发下会饿死请求/崩溃的后端保持开启；能真正并发的后端可关闭
+    setEndpointLockEnabled(config.serializeSameEndpoint);
 
     this.store = new MessageStore(ctx);
 
