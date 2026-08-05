@@ -68,12 +68,14 @@ export class ChatClient {
     };
     if (opts.tools?.length) body.tools = opts.tools;
     if (this.cfg.disableThinking) {
-      // 覆盖主流后端的"关闭思考"写法：
+      // 覆盖主流后端/模型的"关闭思考"写法：
       // - enable_thinking: false —— DashScope / SGLang / Ollama(OpenAI 兼容) 等
-      // - chat_template_kwargs.enable_thinking —— vLLM / llama.cpp server
-      // 不支持的后端一般会忽略未知字段；本开关默认关闭，不影响现有部署
+      // - chat_template_kwargs.enable_thinking —— vLLM / llama.cpp（Qwen3、GLM 等模板的变量名）
+      // - chat_template_kwargs.thinking —— DeepSeek V3.1+ 系模板的变量名
+      // Jinja 模板会忽略未使用的变量，不支持的后端一般会忽略未知字段；
+      // 本开关默认关闭，不影响现有部署
       body.enable_thinking = false;
-      body.chat_template_kwargs = { enable_thinking: false };
+      body.chat_template_kwargs = { enable_thinking: false, thinking: false };
     }
 
     const res = await llmFetch(url, {

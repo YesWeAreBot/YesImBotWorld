@@ -277,8 +277,9 @@ export const Config: Schema<Config> = Schema.intersect([
       disableThinking: Schema.boolean()
         .default(false)
         .description(
-          "关闭模型思维链（对支持开关思考模式的模型生效，如 Qwen3 系）。" +
-            "请求会附带 enable_thinking: false 与 chat_template_kwargs.enable_thinking: false。" +
+          "关闭模型思维链（对支持开关思考模式的模型生效，如 Qwen3 / DeepSeek V3.1+ / GLM 系）。" +
+            "请求会附带 enable_thinking: false，以及 chat_template_kwargs 里的 " +
+            "enable_thinking: false（Qwen/GLM 系模板）与 thinking: false（DeepSeek 系模板）。" +
             "生成工具调用不需要深度思考，关闭可显著提速省钱。仅 chat 模式生效",
         ),
       blockingAct: Schema.boolean()
@@ -328,8 +329,9 @@ export const Config: Schema<Config> = Schema.intersect([
       disableThinking: Schema.boolean()
         .default(false)
         .description(
-          "关闭模型思维链（对支持开关思考模式的模型生效，如 Qwen3 系）。" +
-            "请求会附带 enable_thinking: false 与 chat_template_kwargs.enable_thinking: false",
+          "关闭模型思维链（对支持开关思考模式的模型生效，如 Qwen3 / DeepSeek V3.1+ / GLM 系）。" +
+            "请求会附带 enable_thinking: false，以及 chat_template_kwargs 里的 " +
+            "enable_thinking: false（Qwen/GLM 系模板）与 thinking: false（DeepSeek 系模板）",
         ),
       maxToolRounds: Schema.natural().default(8).description("单次响应中允许的最大工具调用轮数"),
       compressMaxInputChars: Schema.natural()

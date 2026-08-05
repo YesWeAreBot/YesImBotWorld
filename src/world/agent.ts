@@ -430,8 +430,10 @@ export class WorldAgent {
       "尤其 Bot 的位置、状态、正在做的事、随身物品发生变化时，一定要更新 bot_status，不要让它过时\n" +
       "- News 是世界的大事记，不是流水账：只记录重要、之后可能被提起或产生影响的事件，日常背景动静不要写入\n" +
       "- 修改状态文件时保持 Markdown 结构稳定，只改需要改的部分\n\n" +
-      `当前时刻：${this.clock.timeLine()}\n\n` +
-      `<world_definition>（用户给出的世界定义，最高准则）\n${worldDef}\n</world_definition>`
+      `<world_definition>（用户给出的世界定义，最高准则）\n${worldDef}\n</world_definition>\n\n` +
+      // 易变内容放在系统提示最末尾：前面的原则与世界定义保持逐字稳定，
+      // 服务端的前缀缓存（KV cache）可以跨调用复用，只重算这一行之后的部分
+      `当前时刻：${this.clock.timeLine()}`
     );
   }
 
