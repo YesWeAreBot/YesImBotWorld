@@ -15,12 +15,13 @@ import { availableTools, renderToolsText, toolLayer, type AppInfo } from "./bot/
 import { describeCalendar } from "./calendar.js";
 import { WorldClock } from "./clock.js";
 import { BotComputer } from "./computer.js";
-import type { Config, ModalitySupport } from "./config.js";
+import { needsMsgIds, type Config, type ModalitySupport } from "./config.js";
 import { WorldFiles } from "./files.js";
 import { FocusManager } from "./koishi/focus.js";
 import { Gateway } from "./koishi/gateway.js";
 import { MessageStore } from "./koishi/messages.js";
 import { KoishiMessenger } from "./koishi/messenger.js";
+import { ChannelNameResolver } from "./koishi/names.js";
 import { NotifyManager } from "./koishi/notify.js";
 import { OwnSendTracker } from "./koishi/ownsends.js";
 import { RequestStore } from "./koishi/requests.js";
@@ -53,6 +54,7 @@ export class WorldService extends Service<Config> {
   private files!: WorldFiles;
   private clock!: WorldClock;
   private store!: MessageStore;
+  private names!: ChannelNameResolver;
   private media!: MediaStore;
   private captioner!: CaptionService;
   private gallery!: GalleryStore;
@@ -87,6 +89,8 @@ export class WorldService extends Service<Config> {
     setEndpointLockEnabled(config.serializeSameEndpoint);
 
     this.store = new MessageStore(ctx);
+    // 频道显示名解析（私聊对方昵称 / 群名），供通知事件与消息列表使用
+    this.names = new ChannelNameResolver(ctx, this.store);
 
     // 媒体管道：资产库 → 外挂解释器 → 渲染（原生附件 / 文本转述）
     const assetsDir = path.resolve(ctx.baseDir, config.basePath, "assets");
@@ -137,20 +141,23 @@ export class WorldService extends Service<Config> {
     this.ownSends = new OwnSendTracker();
 
     // 消息网关始终活跃：所有消息入库；通知事件仅在世界运行时投递
-    new Gateway(ctx, config.messaging, config.platformOps, this.store, this.media, this.renderer, this.focus, this.notifyMgr, this.phoneStatus, this.requests, this.ownSends, {
+    new Gateway(ctx, config.messaging, config.platformOps, this.store, this.media, this.renderer, this.focus, this.notifyMgr, this.phoneStatus, this.requests, this.ownSends, this.names, () => this.clock ?? null, {
       notify: (content, wake) => {
         if (this.worldRunning && this.bot) this.bot.pushEvent("koishi", content, { wake });
       },
-      selfMessage: (key, content) => {
+      selfMessage: (key, content, msgId) => {
         if (!this.worldRunning || !this.bot) return;
         const mode = config.messaging.externalSelfMessages;
         if (mode === "simulate") {
-          this.bot.simulateExternalSend(key, content);
+          this.bot.simulateExternalSend(key, content, msgId);
         } else if (mode === "event") {
-          this.bot.pushEvent(
-            "koishi",
-            `你注意到自己的账号在 ${key} 发出了一条消息——但那不是你发的（大概是手机里某个应用的自动回复）：${content}`,
-          );
+          void this.names.display(key).then((display) => {
+            const msgTag = msgId && needsMsgIds(config.platformOps) ? `(msg:${msgId}) ` : "";
+            this.bot?.pushEvent(
+              "koishi",
+              `你注意到自己的账号在 ${display} 发出了一条消息——但那不是你发的（大概是手机里某个应用的自动回复）：${msgTag}${content}`,
+            );
+          });
         }
       },
     });
@@ -297,6 +304,8 @@ export class WorldService extends Service<Config> {
       this.config.messaging,
       this.requests,
       this.ownSends,
+      this.names,
+      () => this.clock ?? null,
     );
     // Bot 的个人电脑：与手机平级的设备。实现方式由 apps.computer.mode 选择——
     // docker（容器，终端/资源管理器）或 remote_desktop（VNC，屏幕/鼠标/键盘，需图片多模态）；

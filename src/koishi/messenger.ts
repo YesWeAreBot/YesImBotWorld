@@ -16,9 +16,10 @@ import type { MediaStore } from "../media/store.js";
 import type { TtsClient } from "../media/tts.js";
 import type { MediaRef, MediaType, RichText } from "../types.js";
 import type { FocusManager } from "./focus.js";
-import { atTag, faceTag } from "./gateway.js";
+import { atTag, faceTag, formatBanDuration } from "./gateway.js";
 import { needsMsgIds, type MessagingConfig, type PlatformOpsConfig } from "../config.js";
 import type { KnownChannel, MessageStore } from "./messages.js";
+import type { ChannelNameResolver } from "./names.js";
 import type { OwnSendTracker } from "./ownsends.js";
 import type { RequestStore } from "./requests.js";
 
@@ -52,7 +53,48 @@ export class KoishiMessenger implements MessengerApi {
     private messaging: MessagingConfig,
     private requests: RequestStore,
     private ownSends: OwnSendTracker,
+    private names: ChannelNameResolver,
+    /** 世界时钟的惰性访问器（禁言剩余时长按历法模式渲染；未就绪时为 null） */
+    private clockInfo: () => { syncRealTime: boolean; unitRealSeconds: number } | null,
   ) {}
+
+  /**
+   * 禁言自查：查自己在这个群里的禁言状态。用于发送失败与打开群聊页时的惰性感知——
+   * 即使禁言发生在插件离线期间（当刻的 group_ban notice 没被捕获）也能发现。
+   * 两级检查：
+   * 1. 个人禁言：get_group_member_info 的 shut_up_timestamp（禁言解除时间戳）；
+   * 2. 全员禁言：get_group_info 的 group_all_shut（NapCat 扩展字段，非 0 即开启；
+   *    其他实现端没有该字段时自然跳过）。管理员/群主不受全员禁言影响，不提示。
+   * 未被禁言、私聊、非 OneBot 或查询失败返回 ""。
+   */
+  private async muteHint(target: { bot: Bot; platform: string; channelId: string }): Promise<string> {
+    if (target.platform !== "onebot" || target.channelId.startsWith("private:")) return "";
+    try {
+      const member = (await callOnebot(target.bot, "get_group_member_info", {
+        group_id: toIdValue(target.channelId),
+        user_id: toIdValue(target.bot.selfId),
+        no_cache: true,
+      })) as { shut_up_timestamp?: number; role?: string } | undefined;
+      const until = Number(member?.shut_up_timestamp ?? 0) * 1000;
+      if (until > Date.now()) {
+        const remain = formatBanDuration(Math.round((until - Date.now()) / 1000), this.clockInfo());
+        return `你在这个群里被禁言了${remain ? `（还剩 ${remain}）` : ""}`;
+      }
+      // 全员禁言只约束普通成员，管理员/群主照常说话
+      if ((member?.role ?? "member") === "member") {
+        const group = (await callOnebot(target.bot, "get_group_info", {
+          group_id: toIdValue(target.channelId),
+          no_cache: true,
+        })) as { group_all_shut?: number } | undefined;
+        if (Number(group?.group_all_shut ?? 0) !== 0) {
+          return "这个群正处于全员禁言中";
+        }
+      }
+    } catch {
+      /* 查询失败不误报，退回调用方的原始报错 */
+    }
+    return "";
+  }
 
   /** 是否需要在消息记录中展示平台消息 id（撤回/回应/引用/转发/精华等操作需要引用消息编号） */
   private get showMsgId(): boolean {
@@ -74,12 +116,14 @@ export class KoishiMessenger implements MessengerApi {
   async recentChannels(n: number): Promise<RichText> {
     const channels = await this.store.recentChannels(n);
     if (!channels.length) return { text: "你翻了翻手机，最近没有任何频道有消息。" };
-    const lines = channels.map(({ key, latest }) => {
-      const time = formatTime(latest.timestamp);
-      const who = latest.self ? "你自己" : latest.username || latest.userId;
-      // 预览只做轻量替换，不触发解释器
-      return `- ${key} [${time}] ${who}: ${truncate(stripPlaceholders(latest.content), 80)}`;
-    });
+    const lines = await Promise.all(
+      channels.map(async ({ key, latest }) => {
+        const time = formatTime(latest.timestamp);
+        const who = latest.self ? "你自己" : latest.username || latest.userId;
+        // 预览只做轻量替换，不触发解释器
+        return `- ${await this.names.display(key)} [${time}] ${who}: ${truncate(stripPlaceholders(latest.content), 80)}`;
+      }),
+    );
     return { text: `你翻了翻手机，最近活跃的频道：\n${lines.join("\n")}` };
   }
 
@@ -89,8 +133,9 @@ export class KoishiMessenger implements MessengerApi {
     const { platform, channelId } = resolved;
     // 打开频道 = 开始关注：一段时间内该频道的新消息会直接呈现内容
     await this.focus.focus(`${platform}:${channelId}`);
+    const display = await this.names.display(`${platform}:${channelId}`);
     const rows = await this.store.channelMessages(platform, channelId, n);
-    if (!rows.length) return { text: `频道 ${id} 里还没有任何消息记录。` };
+    if (!rows.length) return { text: `频道 ${display} 里还没有任何消息记录。` };
 
     const attachments: MediaRef[] = [];
     const lines: string[] = [];
@@ -102,11 +147,18 @@ export class KoishiMessenger implements MessengerApi {
       lines.push(`[${formatTime(row.timestamp)}]${msgTag} ${who}: ${rendered.text}`);
     }
     // 最后一条是自己发的：显式点破，防止 Bot 把自己的消息当成别人的来"接话"
-    const tail = rows[rows.length - 1]?.self
+    let tail = rows[rows.length - 1]?.self
       ? "\n（最后一条是你自己发的，之后对方还没有新消息）"
       : "";
+    // 打开群聊页时自查禁言状态（像 QQ 顶部的禁言横幅）：
+    // 即使禁言发生在插件离线期间（notice 没被捕获），Bot 也能在这里发现
+    const bot = this.ctx.bots.find((b) => b.platform === platform);
+    if (bot) {
+      const mute = await this.muteHint({ bot, platform, channelId });
+      if (mute) tail += `\n（${mute}，禁言解除前没法在这个群里发消息）`;
+    }
     return {
-      text: `你打开了 ${id} 的聊天记录（最近 ${rows.length} 条）：\n${lines.join("\n")}${tail}`,
+      text: `你打开了 ${display} 的聊天记录（最近 ${rows.length} 条）：\n${lines.join("\n")}${tail}`,
       attachments: attachments.length ? attachments : undefined,
     };
   }
@@ -479,6 +531,8 @@ export class KoishiMessenger implements MessengerApi {
       msgIds = await target.bot.sendMessage(target.channelId, elements);
     } catch (err) {
       this.ownSends.unexpect(`${target.platform}:${target.channelId}`);
+      const mute = await this.muteHint(target);
+      if (mute) return `（消息没发出去：${mute}，禁言解除前没法在这个群里说话。）`;
       return `（消息发送失败：${sendFailText(err)}）`;
     }
     await this.storeSelf(target, stored, msgIds[0]);
@@ -542,6 +596,8 @@ export class KoishiMessenger implements MessengerApi {
       msgIds = await target.bot.sendMessage(target.channelId, element);
     } catch (err) {
       this.ownSends.unexpect(`${target.platform}:${target.channelId}`);
+      const mute = await this.muteHint(target);
+      if (mute) return `（文件没发出去：${mute}，禁言解除前没法在这个群里发东西。）`;
       return `（文件发送失败：${sendFailText(err)}）`;
     }
     await this.storeSelf(target, stored, msgIds[0]);
@@ -570,6 +626,8 @@ export class KoishiMessenger implements MessengerApi {
       );
     } catch (err) {
       this.ownSends.unexpect(`${target.platform}:${target.channelId}`);
+      const mute = await this.muteHint(target);
+      if (mute) return `（语音没发出去：${mute}，禁言解除前没法在这个群里发东西。）`;
       return `（语音发送失败：${sendFailText(err)}）`;
     }
     // 入资产库留痕，历史记录中可回看

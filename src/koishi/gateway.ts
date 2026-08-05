@@ -6,6 +6,7 @@ import type { MediaStore } from "../media/store.js";
 import type { PhoneStatus, RichText } from "../types.js";
 import type { FocusManager } from "./focus.js";
 import type { MessageStore } from "./messages.js";
+import type { ChannelNameResolver } from "./names.js";
 import type { NotifyManager } from "./notify.js";
 import type { OwnSendTracker } from "./ownsends.js";
 import type { RequestStore } from "./requests.js";
@@ -13,8 +14,8 @@ import type { RequestStore } from "./requests.js";
 export interface GatewayCallbacks {
   /** 向 Bot-LLM 投递通知事件；wake 表示是否唤醒 wait() 中的 Bot */
   notify(content: RichText, wake: boolean): void;
-  /** 外部（其他插件/指令输出）以 Bot 账号发出的消息（externalSelfMessages 开启时） */
-  selfMessage(channelKey: string, content: string): void;
+  /** 外部（其他插件/指令输出）以 Bot 账号发出的消息（externalSelfMessages 开启时）；msgId 为平台消息 id（可能为空） */
+  selfMessage(channelKey: string, content: string, msgId: string): void;
 }
 
 /**
@@ -36,6 +37,9 @@ export class Gateway {
     private phone: PhoneStatus,
     private requests: RequestStore,
     private ownSends: OwnSendTracker,
+    private names: ChannelNameResolver,
+    /** 世界时钟的惰性访问器（Gateway 先于时钟创建；世界未就绪时为 null） */
+    private clockInfo: () => { syncRealTime: boolean; unitRealSeconds: number } | null,
     private callbacks: GatewayCallbacks,
   ) {
     // 用 message 事件而非中间件：保证他人的指令消息（会被指令系统处理）也一样被当作普通消息
@@ -61,16 +65,20 @@ export class Gateway {
 
     // 平台请求事件（好友申请 / 入群邀请 / 入群申请）：登记后以手机通知的形式告知 Bot
     if (ops.handleRequests) {
-      ctx.on("friend-request", (session) => this.handleRequestEvent(session, "friend"));
-      ctx.on("guild-request", (session) => this.handleRequestEvent(session, "guild"));
-      ctx.on("guild-member-request", (session) => this.handleRequestEvent(session, "member"));
+      ctx.on("friend-request", (session) => void this.handleRequestEvent(session, "friend"));
+      ctx.on("guild-request", (session) => void this.handleRequestEvent(session, "guild"));
+      ctx.on("guild-member-request", (session) => void this.handleRequestEvent(session, "member"));
     }
 
     // 戳一戳：OneBot 的 notify/poke 是 notice 而非 message，不会走 message 事件。
-    // NapCat 系适配器把这类 notice 以 internal/session 派发（type: "notice", subtype: "poke"）
+    // NapCat 系适配器把这类 notice 以 internal/session 派发（type: "notice", subtype: "poke"）。
+    // 禁言（group_ban）同理：适配器把它映射为 guild-member 会话，也从 internal/session 感知
     ctx.on("internal/session" as never, ((session: Session) => {
       void this.handlePoke(session).catch((err) => {
         ctx.logger("yesimbot-world").warn("戳一戳处理失败: %s", err);
+      });
+      void this.handleGroupBan(session).catch((err) => {
+        ctx.logger("yesimbot-world").warn("禁言通知处理失败: %s", err);
       });
     }) as never);
   }
@@ -113,8 +121,67 @@ export class Gateway {
       return;
     }
     const text = groupId
-      ? `手机提示：${who} 在群 ${key} 里戳了戳你。`
+      ? `手机提示：${who} 在群 ${await this.names.display(key)} 里戳了戳你。`
       : `手机提示：${who} 戳了戳你。`;
+    this.callbacks.notify({ text }, this.cfg.wakeOnNotify);
+  }
+
+  /**
+   * 禁言感知：自己被禁言/解除禁言、全员禁言开关（OneBot notice: group_ban）。
+   * 适配器把它映射为 type="guild-member"（ban 与 lift_ban 的 subtype 都被归为 "ban"），
+   * 因此从原始 payload 判断类型与对象；别人被禁言不理会。
+   */
+  private async handleGroupBan(session: Session): Promise<void> {
+    const raw = ((session as unknown as { onebot?: Record<string, unknown> }).onebot ??
+      (session.event as unknown as { _data?: Record<string, unknown> })?._data ??
+      {}) as Record<string, unknown>;
+    if (String(raw.notice_type ?? "") !== "group_ban") return;
+
+    const selfId = String(session.selfId ?? session.bot?.selfId ?? "");
+    const targetId = String(raw.user_id ?? "");
+    const whole = !targetId || targetId === "0"; // user_id=0 表示全员禁言开关
+    if (!selfId || (!whole && targetId !== selfId)) return;
+
+    const platform = session.platform ?? "onebot";
+    const groupId = String(raw.group_id ?? session.guildId ?? "");
+    if (!groupId) return;
+    const key = `${platform}:${groupId}`;
+    const lift = String(raw.sub_type ?? "") === "lift_ban" || Number(raw.duration ?? 0) <= 0;
+    const operatorId = String(raw.operator_id ?? "");
+    const who = operatorId ? await this.lookupUsername(platform, groupId, operatorId) : "管理员";
+    const dur = formatBanDuration(Number(raw.duration ?? 0), this.clockInfo());
+
+    // 入库：翻聊天记录时也能看到这条动态
+    await this.store.store({
+      platform,
+      channelId: groupId,
+      guildId: groupId,
+      userId: operatorId,
+      username: who,
+      content: whole
+        ? lift
+          ? `[${who} 关闭了全员禁言]`
+          : `[${who} 开启了全员禁言]`
+        : lift
+          ? `[${who} 解除了对你的禁言]`
+          : `[${who} 禁言了你${dur ? `（${dur}）` : ""}]`,
+      timestamp: new Date(),
+      self: false,
+      messageId: "",
+    });
+
+    if (this.phone.down) {
+      this.callbacks.notify({ text: "放在一边的手机震了一下。" }, this.cfg.wakeOnNotify);
+      return;
+    }
+    const display = await this.names.display(key);
+    const text = whole
+      ? lift
+        ? `手机提示：群 ${display} 的全员禁言解除了，可以说话了。`
+        : `手机提示：${who} 在群 ${display} 开启了全员禁言，你暂时没法在这个群里发消息。`
+      : lift
+        ? `手机提示：你在群 ${display} 的禁言被${who}解除了，可以说话了。`
+        : `手机提示：你在群 ${display} 被${who}禁言了${dur ? `（${dur}）` : ""}，期间没法在这个群里发消息。`;
     this.callbacks.notify({ text }, this.cfg.wakeOnNotify);
   }
 
@@ -133,7 +200,7 @@ export class Gateway {
     return userId;
   }
 
-  private handleRequestEvent(session: Session, kind: "friend" | "guild" | "member"): void {
+  private async handleRequestEvent(session: Session, kind: "friend" | "guild" | "member"): Promise<void> {
     const req = this.requests.add({
       kind,
       platform: session.platform ?? "unknown",
@@ -152,12 +219,13 @@ export class Gateway {
     const who = req.username && req.username !== req.userId ? `${req.username}（${req.userId}）` : req.userId;
     const note = req.comment ? `，附言：「${req.comment}」` : "";
     const hint = `（请求编号 ${req.id}，可用 handle_request 同意或拒绝）`;
+    const guild = req.guildId ? await this.names.display(`${req.platform}:${req.guildId}`) : req.guildId;
     const text =
       kind === "friend"
         ? `手机弹出提示：${req.platform} 上 ${who} 请求添加你为好友${note}。${hint}`
         : kind === "guild"
-          ? `手机弹出提示：${who} 邀请你加入群 ${req.guildId}${note}。${hint}`
-          : `手机弹出提示：${who} 申请加入你管理的群 ${req.guildId}${note}。${hint}`;
+          ? `手机弹出提示：${who} 邀请你加入群 ${guild}${note}。${hint}`
+          : `手机弹出提示：${who} 申请加入你管理的群 ${guild}${note}。${hint}`;
     this.callbacks.notify({ text }, this.cfg.wakeOnNotify);
   }
 
@@ -175,6 +243,11 @@ export class Gateway {
     });
     if (!content.trim()) return;
 
+    // before-send 时消息尚未真正发出，平台消息 id 还没生成；适配器发送成功后会把
+    // messageId 写回同一个 session 对象（satori 的 MessageEncoder 全程复用 this.session），
+    // 短暂轮询等它就绪——拿到 id 才能让 Bot 对这条消息 recall / react / 引用
+    const msgId = await this.waitMessageId(session, 3000);
+
     await this.store.store({
       platform: session.platform ?? "unknown",
       channelId: session.channelId,
@@ -184,9 +257,20 @@ export class Gateway {
       content,
       timestamp: new Date(),
       self: true,
-      messageId: session.messageId ?? "",
+      messageId: msgId,
     });
-    this.callbacks.selfMessage(key, toMarkerText(content));
+    this.callbacks.selfMessage(key, toMarkerText(content), msgId);
+  }
+
+  /** 等待发送完成后适配器写回的平台消息 id（拿不到时返回空串，不阻塞投递） */
+  private async waitMessageId(session: Session, timeoutMs: number): Promise<string> {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      const id = session.messageId;
+      if (id) return String(id);
+      if (Date.now() >= deadline) return "";
+      await new Promise((r) => setTimeout(r, 150));
+    }
   }
 
   private async handle(session: Session): Promise<void> {
@@ -319,7 +403,7 @@ export class Gateway {
     const msgTag =
       needsMsgIds(this.ops) && session.messageId ? `(msg:${session.messageId}) ` : "";
     return {
-      text: `你正留意着 ${key}，看到新消息——${msgTag}${session.username ?? session.userId}说：${rendered.text}`,
+      text: `你正留意着 ${await this.names.display(key)}，看到新消息——${msgTag}${session.username ?? session.userId}说：${rendered.text}`,
       attachments: rendered.attachments,
     };
   }
@@ -329,11 +413,11 @@ export class Gateway {
       case "count":
         return { text: "手机响了一下：收到一条新消息。" };
       case "channel":
-        return { text: `手机响了一下：收到来自 ${key} 的消息。` };
+        return { text: `手机响了一下：收到来自 ${await this.names.display(key)} 的消息。` };
       case "content": {
         const rendered = await this.renderer.render(content);
         return {
-          text: `手机响了一下：收到来自 ${key} 的消息，${session.username ?? session.userId}说：${rendered.text}`,
+          text: `手机响了一下：收到来自 ${await this.names.display(key)} 的消息，${session.username ?? session.userId}说：${rendered.text}`,
           attachments: rendered.attachments,
         };
       }
@@ -401,6 +485,32 @@ function plainText(elements: h[]): string {
 function truncate(text: string, max: number): string {
   const single = text.replace(/\s+/g, " ").trim();
   return single.length > max ? single.slice(0, max) + "…" : single;
+}
+
+/**
+ * 禁言时长（平台给的现实秒）→ Bot 视角的时长文本：
+ * - 现实历法（世界时间与现实同步）：用人类单位（"30 分钟"、"1 天 12 小时"）；
+ * - 独立时间线的世界：现实秒按流速换算成 TU（Bot 的计时单位，自定义历法下
+ *   "分钟/小时"未必存在）。时钟未就绪时退回人类单位。
+ */
+export function formatBanDuration(
+  seconds: number,
+  clock: { syncRealTime: boolean; unitRealSeconds: number } | null,
+): string {
+  if (seconds <= 0) return "";
+  if (clock && !clock.syncRealTime) {
+    const tu = seconds / clock.unitRealSeconds;
+    const text = Number.isInteger(tu) ? String(tu) : tu.toFixed(1);
+    return `${text} TU`;
+  }
+  const d = Math.floor(seconds / 86400);
+  const h = Math.floor((seconds % 86400) / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const parts: string[] = [];
+  if (d) parts.push(`${d} 天`);
+  if (h) parts.push(`${h} 小时`);
+  if (m) parts.push(`${m} 分钟`);
+  return parts.join(" ") || `${seconds} 秒`;
 }
 
 const MARKER_LABEL: Record<string, string> = { image: "图片", audio: "音频", video: "视频" };

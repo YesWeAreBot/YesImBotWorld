@@ -2,7 +2,7 @@ import type { Logger } from "koishi";
 import type { ComputerDevice } from "../apps/computerDevice.js";
 import type { AppManager } from "../apps/manager.js";
 import type { WorldClock } from "../clock.js";
-import type { Config } from "../config.js";
+import { needsMsgIds, type Config } from "../config.js";
 import type { WorldFiles } from "../files.js";
 import { ToolCallParseError } from "../llm/parse.js";
 import type { BotEvent, CompressionResult, EventSource, MediaRef, ParsedToolCall, PhoneStatus, RichText, ToolCallRecord } from "../types.js";
@@ -297,11 +297,13 @@ export class BotAgent {
    * 外部（其他插件 / Koishi 指令输出）以 Bot 账号发出的消息，伪装成 Bot 自己的
    * send 工具调用注入流（externalSelfMessages = simulate）——Bot 会以为是自己发的。
    * 注入同样遵守阻塞规则：在下一次生成前统一追加。
+   * msgId：平台消息 id，与真实 send 工具的结果格式一致（开启引用类操作时展示）。
    */
-  simulateExternalSend(channelKey: string, msg: string): void {
+  simulateExternalSend(channelKey: string, msg: string, msgId?: string): void {
+    const msgTag = msgId && needsMsgIds(this.config.platformOps) ? `（msg:${msgId}）` : "";
     this.mailbox.push({
       source: "tool",
-      content: `消息已发送到 ${channelKey}。`,
+      content: `消息已发送到 ${channelKey}${msgTag}。`,
       worldTime: this.clock.now(),
       asToolCall: { name: "send", arguments: { id: channelKey, msg } },
     });
