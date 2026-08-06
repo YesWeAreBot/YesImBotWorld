@@ -435,9 +435,15 @@ export function availableTools(opts: {
   blockingAct?: boolean;
   /** bot.waitRateThreshold > 0：等待占比过高时新的 wait 需要 confirm: true */
   waitConfirm?: boolean;
+  /** bot.disableWait：移除 wait 工具 */
+  disableWait?: boolean;
+  /** bot.ignoreSendDuration：send 系工具的 duration 被忽略，消息立即发出 */
+  ignoreSendDuration?: boolean;
 }): BotToolDef[] {
   const tools = BOT_TOOLS.filter((t) => {
     switch (t.name) {
+      case "wait":
+        return !opts.disableWait;
       case "send_voice":
         return opts.tts;
       case "channel_notify":
@@ -512,51 +518,69 @@ export function availableTools(opts: {
         return true;
     }
   });
+  // 各分支按顺序叠加（同一工具可能命中多条，如 send 同时受 ignoreSendDuration 与 reply 影响）
   return tools.map((t) => {
-    // 等待占比拦截：只有开启时才在 wait 描述里说明 confirm 参数
-    if (t.name === "wait" && opts.waitConfirm) {
-      return {
-        ...t,
+    let def = t;
+    // 无视 send 系 duration：描述同步改口（与 agent.gateSendDuration 的行为对应）
+    if (opts.ignoreSendDuration && (def.name === "send" || def.name === "send_voice")) {
+      def = {
+        ...def,
         description:
-          t.description +
+          def.name === "send"
+            ? def.description.replace(
+                /duration 表示打字耗时[\s\S]*?（发出前可 cancel）。/,
+                "duration 会被忽略，消息立即发出。",
+              )
+            : def.description.replace(
+                /duration 表示说话耗时[\s\S]*?可 cancel。/,
+                "duration 会被忽略，语音立即发出。",
+              ),
+      };
+    }
+    // 等待占比拦截：只有开启时才在 wait 描述里说明 confirm 参数
+    if (def.name === "wait" && opts.waitConfirm) {
+      def = {
+        ...def,
+        description:
+          def.description +
           "最近大部分时间都在干等时，新的等待会被拦下——先考虑做点别的；确实要等的话，按拦截提示操作即可。",
       };
     }
     // blockingAct 专注模式：上一个动作未完成前新的 act 会被拒绝（不可绕过）——只有开启时才在描述里说明
-    if (t.name === "act" && opts.blockingAct) {
-      return {
-        ...t,
+    if (def.name === "act" && opts.blockingAct) {
+      def = {
+        ...def,
         description:
-          t.description +
+          def.description +
           "开启 blockingAct（同时只能专注做一件事）时：上一个动作还没完成前，新的 act 会被直接拒绝，" +
           "也不能用 repeat 绕过——先专心等它做完，或者先做点别的。",
       };
     }
     // 开启引用回复时，send 增加 reply_to / at_sender 参数说明
-    if (t.name === "send" && opts.ops.reply) {
-      return {
-        ...t,
-        signature: t.signature.replace(
+    if (def.name === "send" && opts.ops.reply) {
+      def = {
+        ...def,
+        signature: def.signature.replace(
           "media?: string[]",
           "media?: string[], reply_to?: string, at_sender?: boolean",
         ),
         description:
-          t.description +
+          def.description +
           "reply_to 可引用回复某条消息，填消息记录里 (msg:xxx) 的编号；由你决定要不要引用、引用哪条。" +
           "群聊里引用回复会像 QQ 一样自动在开头 @ 对方——大多数时候保留即可；" +
           "如果不想 @（比如只是顺带提到、或不想打扰对方），加 at_sender: false 去掉，就像真人删掉自动加上的 @。",
       };
     }
     // open_app 的描述里列出已安装的应用
-    if (t.name === "open_app" && opts.apps?.length) {
-      return {
-        ...t,
+    if (def.name === "open_app" && opts.apps?.length) {
+      def = {
+        ...def,
         description:
-          t.description +
+          def.description +
           `已安装的应用：${opts.apps.map((a) => `${a.name}（${a.description}）`).join("、")}。`,
       };
     }
-    return t;
+    return def;
   });
 }
 

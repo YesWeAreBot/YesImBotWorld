@@ -1107,7 +1107,8 @@ export class BotAgent {
    * 且不引入任何等待延迟。带 duration 的调用额外附上编号（可 cancel）与预计完成时刻。
    */
   private ackStart(call: ToolCallRecord): void {
-    if ((call.duration ?? 0) > 0) {
+    // 按 expectedAt 判断（而非 duration）：ignoreSendDuration 会把 expectedAt 拉回当下，此时按即时调用确认
+    if (call.expectedAt - call.issuedAt > 0) {
       this.pushEvent(
         "system",
         `${call.id} ${call.name} 已开始，预计 T=${call.expectedAt.toFixed(1)} 完成。`,
@@ -1330,19 +1331,29 @@ export class BotAgent {
   }
 
   /**
-   * send 系工具的 duration 语义校验：它表示打字/说话耗时（真人也就几秒到几十秒），
-   * 不是"过一会儿再发"的定时器。超过上限（按世界秒换算成 TU）时拦下并纠正。
+   * send 系工具的 duration 策略：
+   * - ignoreSendDuration 开启：无视 duration，消息立即发出（expectedAt 拉回当下；
+   *   expectedAt 只影响调度，不进入上下文渲染，可安全修改）；
+   * - 否则做语义校验：duration 表示打字/说话耗时（真人也就几秒到几十秒），
+   *   不是"过一会儿再发"的定时器，超过上限（按世界秒换算成 TU）时拦下并纠正。
    * 返回 true 表示已拦截（调用方直接 return）。
    */
-  private rejectAbsurdSendDuration(call: ToolCallRecord, verb: string): boolean {
+  private gateSendDuration(call: ToolCallRecord, verb: string): boolean {
+    if (this.config.bot.ignoreSendDuration) {
+      call.expectedAt = call.issuedAt;
+      return false;
+    }
     const n = call.duration ?? 0;
     // 打字/说话最多按 120 世界秒计；TU 粒度很粗的世界里至少放宽到 10 TU
     const cap = Math.max(10, Math.ceil(120 / this.clock.unitWorldSeconds));
     if (n <= cap) return false;
+    const later = this.config.bot.disableWait
+      ? "想过一会儿再发，到时候再调用即可。"
+      : `想过一会儿再发，就先 wait 到那个时候再 ${call.name}。`;
     this.pushEvent(
       "system",
       `（${call.name} 的 duration 是${verb}耗时——真人也就几秒到几十秒，${n} TU 太久了（上限 ${cap} TU）。` +
-        `想过一会儿再发，就先 wait 到那个时候再 ${call.name}。什么都没有发生，请改正后重试。）`,
+        `${later}什么都没有发生，请改正后重试。）`,
       { ref: call.id },
     );
     return true;
@@ -1364,7 +1375,7 @@ export class BotAgent {
   }
 
   private dispatchSend(call: ToolCallRecord): void {
-    if (this.rejectAbsurdSendDuration(call, "打字")) return;
+    if (this.gateSendDuration(call, "打字")) return;
     const id = this.channelArg(call) ?? "";
     const msg = String(call.arguments.msg ?? "");
     const mediaRaw = call.arguments.media ?? call.arguments.images;
@@ -1428,7 +1439,7 @@ export class BotAgent {
   }
 
   private dispatchSendFile(call: ToolCallRecord): void {
-    if (this.rejectAbsurdSendDuration(call, "挑选并发送文件的")) return;
+    if (this.gateSendDuration(call, "挑选并发送文件的")) return;
     const id = this.channelArg(call) ?? "";
     const file = String(call.arguments.file ?? "");
     if (!id) {
@@ -1462,7 +1473,7 @@ export class BotAgent {
   }
 
   private dispatchSendVoice(call: ToolCallRecord): void {
-    if (this.rejectAbsurdSendDuration(call, "说话")) return;
+    if (this.gateSendDuration(call, "说话")) return;
     const id = this.channelArg(call) ?? "";
     const text = String(call.arguments.text ?? "");
     if (!id) {
@@ -1559,7 +1570,8 @@ export class BotAgent {
     if (noChange) {
       return target === "world"
         ? `你环顾四周——世界和你上次查看时没有任何变化，也没有新的事件。` +
-            `（状态不会频繁变化，不必反复 check_status；需要重看全文可加 full: true，或者用 wait 等世界自己发生变化。）`
+            `（状态不会频繁变化，不必反复 check_status；需要重看全文可加 full: true` +
+            `${this.config.bot.disableWait ? "" : "，或者用 wait 等世界自己发生变化"}。）`
         : `你审视了一下自己——和上次查看时没什么两样。当前 ${this.clock.timeLine()}\n` +
             `（状态不会频繁变化，不必反复 check_status；需要重看全文可加 full: true。）`;
     }

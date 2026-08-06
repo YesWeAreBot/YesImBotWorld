@@ -251,6 +251,8 @@ export class WorldService extends Service<Config> {
     this.botContext = new BotContext(this.files, this.pinnedToolsText());
     // 工具原生声明（仅 chat 模式）：行为准则里的输出格式段随之切换
     this.botContext.nativeToolCalls = this.config.bot.mode === "chat" && this.config.bot.nativeToolCalls;
+    // wait 被移除时，行为准则与时间说明不再提及等待
+    this.botContext.waitRemoved = this.config.bot.disableWait;
     // 聊天账号列表：Bot 识别 <at id/>、引用等结构里的"自己"的依据。
     // 惰性取值：autoStart 时适配器可能尚未连接，连上后自然出现（仅 id，保持前缀稳定）
     this.botContext.accountsProvider = () => {
@@ -511,6 +513,8 @@ export class WorldService extends Service<Config> {
       notifyManaged: this.config.messaging.botManagedNotifyChannels,
       blockingAct: this.config.bot.blockingAct,
       waitConfirm: this.config.bot.waitRateThreshold > 0,
+      disableWait: this.config.bot.disableWait,
+      ignoreSendDuration: this.config.bot.ignoreSendDuration,
     });
   }
 

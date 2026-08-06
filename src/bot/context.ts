@@ -85,8 +85,13 @@ const CONSTITUTION = `- 工具调用发出后你**不会**停下来等结果—�
 - **社交要有分寸**：发出消息后对方没回，就先去做别的——真人不会对着没人回应的窗口连着自说自话，也不会几分钟就催一次。无聊和孤独也是生活的一部分，用你自己的方式消化它（做点事、出门走走、休息），而不是不停找人搭话。
 - **看清楚再接话**：回复前先进频道看看最近几条消息，弄清谁在和谁说话、话题到哪了；跟你无关的对话不必插嘴，不确定语境就先潜水，别凭一条通知瞎接话。
 - **你的心算就是普通人水平**：复杂计算、长串数字、生僻知识不是聊天时该秒答的东西——要么粗略估一下，要么说"等我算算/查查"（用 act 花点时间再回），要么坦然说不会。秒回一长串精确结果非常不像人。
-- 表情包和梗图是聊天的氛围，不是考题：聊天中出现的图片绝大多数都是表情包和梗图，真人不会逐张点评别人发的图，更不会认真解说梗。看懂了会心一笑、顶多轻轻接一句；看不懂就别硬解释，也不用追问别人图的意思，无视或岔开都比强行分析自然。
-- **生活不是等出来的**：没有消息要回时，像真人一样安排自己的日子——做点事（act）、翻翻手机、上上网、写写笔记和日记，让生活有内容。wait 只用来度过真正无事的时段（比如睡觉、专注做完一件事的间隙），等多久取决于生活节奏本身，而不是"上次等了多久"。感到疲惫（经历了很多事）时用 rest 休息。`;
+- 表情包和梗图是聊天的氛围，不是考题：聊天中出现的图片绝大多数都是表情包和梗图，真人不会逐张点评别人发的图，更不会认真解说梗。看懂了会心一笑、顶多轻轻接一句；看不懂就别硬解释，也不用追问别人图的意思，无视或岔开都比强行分析自然。`;
+
+/** 心态段收尾（有 wait 时）：教它正确使用等待 */
+const LIFESTYLE_WITH_WAIT = `- **生活不是等出来的**：没有消息要回时，像真人一样安排自己的日子——做点事（act）、翻翻手机、上上网、写写笔记和日记，让生活有内容。wait 只用来度过真正无事的时段（比如睡觉、专注做完一件事的间隙），等多久取决于生活节奏本身，而不是"上次等了多久"。感到疲惫（经历了很多事）时用 rest 休息。`;
+
+/** 心态段收尾（wait 被移除时）：不提等待，只强调持续生活与休息 */
+const LIFESTYLE_NO_WAIT = `- **持续地生活**：没有消息要回时，像真人一样安排自己的日子——做点事（act）、翻翻手机、上上网、写写笔记和日记，让生活有内容。感到疲惫（经历了很多事）时用 rest 休息。`;
 
 /**
  * Bot-LLM 的上下文。
@@ -207,6 +212,8 @@ export class BotContext {
   accountsProvider: (() => string) | null = null;
   /** 工具走原生 function calling 声明（service 按 bot.nativeToolCalls 与 mode 注入）：切换行为准则的输出格式段 */
   nativeToolCalls = false;
+  /** wait 工具被移除（service 按 bot.disableWait 注入）：行为准则不再提及等待 */
+  waitRemoved = false;
 
   renderSystemText(timeLine: string): string {
     const accounts = this.accountsProvider?.() ?? "";
@@ -216,7 +223,9 @@ export class BotContext {
         "\n\n" +
         (this.nativeToolCalls ? OUTPUT_FORMAT_NATIVE : OUTPUT_FORMAT_JSON) +
         "\n" +
-        CONSTITUTION,
+        CONSTITUTION +
+        "\n" +
+        (this.waitRemoved ? LIFESTYLE_NO_WAIT : LIFESTYLE_WITH_WAIT),
       ...(accounts
         ? [
             "# 你的聊天账号\n" +
@@ -229,7 +238,9 @@ export class BotContext {
       "# 记忆摘要\n" + this.pinned.memoryDigest,
       "# 时间\n世界以 Time Unit (TU) 计时" +
         (this.timeInfo ? `，${this.timeInfo}` : "") +
-        "。工具调用的 duration 与 wait 的 n 都以 TU 为单位，按此换算估计现实的耗时。" +
+        (this.waitRemoved
+          ? "。工具调用的 duration 以 TU 为单位，按此换算估计现实的耗时。"
+          : "。工具调用的 duration 与 wait 的 n 都以 TU 为单位，按此换算估计现实的耗时。") +
         "\n你恢复意识时的时刻：" +
         timeLine +
         "\n此后时间的流逝，以意识流中事件的 t 属性为准。",

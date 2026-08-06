@@ -22,6 +22,8 @@ export interface BotModelConfig {
   maxTokens: number;
   disableThinking: boolean;
   nativeToolCalls: boolean;
+  disableWait: boolean;
+  ignoreSendDuration: boolean;
   blockingAct: boolean;
   waitRateThreshold: number;
   waitRateWindow: number;
@@ -295,6 +297,18 @@ export const Config: Schema<Config> = Schema.intersect([
             "声明是全量且稳定的（不随进频道/开应用变化，请求前缀不受影响）；" +
             "分层解锁照旧只以事件通知，调用尚未解锁的工具会被拦下并提示。" +
             "关闭时沿用文本协议：工具列在置顶区，模型在正文输出 JSON",
+        ),
+      disableWait: Schema.boolean()
+        .default(false)
+        .description(
+          "移除 wait 工具：Bot 不再拥有\"暂停等待\"的能力，会以 minIntervalMs 的节奏持续行动" +
+            "（小憩式的 rest 与压缩休息不受影响）。行为准则与相关提示中关于 wait 的说明会一并消失",
+        ),
+      ignoreSendDuration: Schema.boolean()
+        .default(false)
+        .description(
+          "无视 send 系工具（send / send_file / send_voice）的 duration：消息不再按\"打字耗时\"延迟发出，" +
+            "而是立即发送（也不再有超大 duration 的拦截与发出前的 cancel 窗口）。工具描述会同步说明",
         ),
       blockingAct: Schema.boolean()
         .default(false)

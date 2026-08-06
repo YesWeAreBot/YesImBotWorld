@@ -20,6 +20,16 @@ export function extractToolCall(raw: string, allowedNames: string[]): ParsedTool
     .replace(/<think>[\s\S]*?<\/think>/g, "")
     .replace(/<thinking>[\s\S]*?<\/thinking>/g, "")
     .trim();
+
+  // 模板强制开启思考（prompt 里预置了 <think>）时，输出的思考段没有配对的开标签，
+  // 只以 </think> 结尾——若它出现在第一个 JSON 之前，裁掉前导思考段
+  const thinkEnd = text.indexOf("</think>");
+  if (thinkEnd >= 0) {
+    const firstBrace = text.indexOf("{");
+    if (firstBrace === -1 || thinkEnd < firstBrace) {
+      text = text.slice(thinkEnd + "</think>".length).trim();
+    }
+  }
   // 去掉 markdown 代码块围栏
   text = text.replace(/```(?:json)?/g, "");
 
