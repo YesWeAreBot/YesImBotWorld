@@ -508,6 +508,7 @@ export class WorldService extends Service<Config> {
       apps: this.appInfos(),
       notifyManaged: this.config.messaging.botManagedNotifyChannels,
       blockingAct: this.config.bot.blockingAct,
+      waitConfirm: this.config.bot.waitRateThreshold > 0,
     });
   }
 

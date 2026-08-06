@@ -22,7 +22,8 @@ export interface BotModelConfig {
   maxTokens: number;
   disableThinking: boolean;
   blockingAct: boolean;
-  waitRemindThreshold: number;
+  waitRateThreshold: number;
+  waitRateWindow: number;
   restCompressMinChars: number;
   maxWindowChars: number;
   minIntervalMs: number;
@@ -292,13 +293,18 @@ export const Config: Schema<Config> = Schema.intersect([
             "不能被 repeat 等参数绕过；但其他工具调用（发消息、等待、看状态等）不受影响、照常进行。" +
             "一个人同时只能专注做一件事，做别的不受影响",
         ),
-      waitRemindThreshold: Schema.natural()
-        .default(3)
+      waitRateThreshold: Schema.natural()
+        .max(100)
+        .default(80)
         .description(
-          "连续 wait 提醒阈值：Bot 不做任何别的事、连续调用 wait 达到该次数时，" +
-            "以系统事件提醒它可以做点什么（act、翻手机、记笔记），或无事可做时一次等更久，" +
-            "别频繁地碎片化短等。达到阈值后每再连续等待该次数提醒一次。0 表示禁用",
+          "等待时长占比拦截阈值（百分比）：最近一个观察窗口内，实际处于 wait 中的世界时间占比达到该值后，" +
+            "新的 wait 会被拦下并提示它做点别的（act、翻手机、记笔记）；确实要等必须加 confirm: true 二次确认" +
+            "（开启时 wait 的工具描述会说明该参数）。少量多次的短等不受影响，针对的是「几乎全部时间都在干等」。" +
+            "0 表示禁用",
         ),
+      waitRateWindow: Schema.natural()
+        .default(3600)
+        .description("等待时长占比的观察窗口（TU）：统计最近多少 TU 内的等待占比。默认 3600（同步模式下即最近 1 小时）"),
       restCompressMinChars: Schema.natural()
         .default(8000)
         .description(

@@ -100,7 +100,7 @@ export class BotAgent {
   private running = false;
   private loopPromise: Promise<void> | null = null;
   private abort: AbortController | null = null;
-  private waiting: { callId: string; kind?: "wait" | "nap" } | null = null;
+  private waiting: { callId: string; kind?: "wait" | "nap"; startedTU?: number } | null = null;
   private wakeFn: (() => void) | null = null;
   private lastGenAt = 0;
   /** check_status 增量返回：上次查看时的状态文件快照（target → 全文） */
@@ -111,8 +111,17 @@ export class BotAgent {
   private lastSendSig: string | null = null;
   /** 上一次 act 的描述与调用编号，用于拦截“结果未出就重复做同一件事” */
   private lastAct: { sig: string; callId: string } | null = null;
-  /** 连续 wait 的次数（任何其他工具调用都会清零），用于"频繁短等"的提醒 */
-  private waitStreak = 0;
+  /**
+   * 已完成的等待区间（世界 TU，被打断的按实际时长计），用于"等待时长占比过高"的拦截。
+   * 少量多次的短等是正常的；要治的是「几乎全部时间都在干等」——所以按时长不按次数。
+   */
+  private waitLog: { from: number; to: number }[] = [];
+  /**
+   * wait 确认通行证：只有刚被拦下过，confirm: true 才有效（单次，用后失效）。
+   * 静态的绕过参数会被模型货物崇拜——每次都习惯性带上 confirm，拦截就形同虚设；
+   * 单次通行证保证每一次高占比等待都要经过一轮显式的"拦下 → 确认"。
+   */
+  private waitConfirmArmed = false;
   /** 连续几次模型输出不是合法工具调用，用于在反馈里提示模型直接输出 JSON */
   private parseFailures = 0;
   /**
@@ -280,8 +289,10 @@ export class BotAgent {
 
     if (shouldWake && !isWaitResult) {
       // 提前唤醒 wait/小憩：取消到期任务，并在事件前插入打断说明
-      const { callId, kind } = this.waiting!;
+      const { callId, kind, startedTU } = this.waiting!;
       this.scheduler.cancel(callId);
+      // 被打断的等待按实际时长计入等待占比（小憩不算 wait）
+      if (kind !== "nap" && startedTU !== undefined) this.recordWait(startedTU);
       this.mailbox.push({
         source: "system",
         content: kind === "nap" ? "动静把你从小憩中弄醒了。" : "你的等待被打断了。",
@@ -514,8 +525,6 @@ export class BotAgent {
   // ---------- 工具派发 ----------
 
   private async dispatch(call: ToolCallRecord): Promise<void> {
-    // 连续 wait 计数：做了任何别的事就清零
-    if (call.name !== "wait") this.waitStreak = 0;
     // 目标参数误写拦截（频道类工具）：Bot 幻觉出 OneBot API 风格的 detail/channel_id
     // 等写法且没给 id 时，绝不静默回退到当前频道（那会把消息发进无关频道）——
     // 拦下并告知正确格式，让它重试。不打捞：打捞会让错误格式被强化
@@ -1115,19 +1124,36 @@ export class BotAgent {
       this.pushEvent("system", "（等待时长必须大于 0。）", { ref: call.id });
       return;
     }
-    // 频繁短等提醒：连续 wait（期间没做任何别的事）达到阈值时轻推一下，
-    // 之后每再连续等待同样次数提醒一次（不拦截，等待照常进行；醒来时会看到）
-    this.waitStreak++;
-    const remindAt = this.config.bot.waitRemindThreshold;
-    if (remindAt > 0 && this.waitStreak >= remindAt && this.waitStreak % remindAt === 0) {
-      this.pushEvent(
-        "system",
-        `（你已经连续等了 ${this.waitStreak} 次，中间什么也没做。等待不会让生活自己发生——` +
-          `可以找点事做：act 做点什么、翻翻手机消息、打开某个应用、写写笔记；` +
-          `确实无事可做的话，就一次等久一点（几百上千 TU 都很正常），而不是频繁地短等。）`,
-      );
+    // 干等占比拦截：最近一个窗口内实际处于等待中的世界时间占比过高时，新的 wait 直接拦下。
+    // confirm: true 只在"刚被拦下"后的下一次生效（单次通行证）——习惯性地每次都带上没有任何作用，
+    // 每一次高占比等待都必须经过一轮显式的"拦下 → 确认"。
+    // 按时长不按次数：少量多次的短等是正常的，要治的是「几乎全部时间都在干等」
+    const threshold = this.config.bot.waitRateThreshold;
+    const windowTU = this.config.bot.waitRateWindow;
+    if (threshold > 0 && windowTU > 0) {
+      const nowTU = this.clock.now();
+      const waited = this.waitedWithin(nowTU - windowTU, nowTU);
+      const rate = Math.round((waited / windowTU) * 100);
+      if (rate >= threshold) {
+        if (isTruthy(call.arguments.confirm) && this.waitConfirmArmed) {
+          this.waitConfirmArmed = false; // 通行证单次有效
+        } else {
+          this.waitConfirmArmed = true;
+          const confirmNote = isTruthy(call.arguments.confirm)
+            ? "你带了 confirm: true，但它只在被拦下之后的下一次等待里才生效——每次都习惯性地带上是没有意义的，不要那样做。"
+            : "";
+          this.pushEvent(
+            "system",
+            `（最近 ${windowTU} TU 里，你有 ${Math.round(waited)} TU（${rate}%）都在干等——这次等待没有开始。${confirmNote}` +
+              `等待不会让生活自己发生：act 做点什么、翻翻手机消息、打开某个应用、写写笔记，都比干等强。` +
+              `想清楚确实无事可做的话，紧接着再调用一次 wait 并带上 confirm: true。）`,
+            { ref: call.id },
+          );
+          return;
+        }
+      }
     }
-    this.waiting = { callId: call.id };
+    this.waiting = { callId: call.id, startedTU: this.clock.now() };
 
     // 长等待：提前 lead 启动 World-LLM 补叙（结果收集到 parts，不直接推事件）
     const realMs = this.clock.realMsUntil(call.expectedAt);
@@ -1154,6 +1180,8 @@ export class BotAgent {
     this.scheduler.schedule(call, {
       executeAt: "expected",
       run: async () => {
+        // 自然到点的等待：整段计入等待占比（提前打断的在 pushEvent 的唤醒路径里记录）
+        this.recordWait(call.issuedAt);
         const timeNote = `等待结束了。当前 ${this.clock.timeLine()}`;
         const s = summary;
         if (!s) return timeNote; // 短等待 / 未启用补叙
@@ -1272,6 +1300,45 @@ export class BotAgent {
     this.scheduler.schedule(call, { executeAt: "now", run });
   }
 
+  /** 记录一段实际发生的等待（从 fromTU 到现在），并顺手清理窗口外的旧区间 */
+  private recordWait(fromTU: number): void {
+    const to = this.clock.now();
+    if (to <= fromTU) return;
+    this.waitLog.push({ from: fromTU, to });
+    const keepAfter = to - this.config.bot.waitRateWindow * 2;
+    if (this.waitLog[0] && this.waitLog[0].to < keepAfter) {
+      this.waitLog = this.waitLog.filter((iv) => iv.to >= keepAfter);
+    }
+  }
+
+  /** 窗口 [fromTU, toTU] 内实际处于等待中的世界时长（区间重叠部分求和） */
+  private waitedWithin(fromTU: number, toTU: number): number {
+    let sum = 0;
+    for (const iv of this.waitLog) {
+      sum += Math.max(0, Math.min(iv.to, toTU) - Math.max(iv.from, fromTU));
+    }
+    return sum;
+  }
+
+  /**
+   * send 系工具的 duration 语义校验：它表示打字/说话耗时（真人也就几秒到几十秒），
+   * 不是"过一会儿再发"的定时器。超过上限（按世界秒换算成 TU）时拦下并纠正。
+   * 返回 true 表示已拦截（调用方直接 return）。
+   */
+  private rejectAbsurdSendDuration(call: ToolCallRecord, verb: string): boolean {
+    const n = call.duration ?? 0;
+    // 打字/说话最多按 120 世界秒计；TU 粒度很粗的世界里至少放宽到 10 TU
+    const cap = Math.max(10, Math.ceil(120 / this.clock.unitWorldSeconds));
+    if (n <= cap) return false;
+    this.pushEvent(
+      "system",
+      `（${call.name} 的 duration 是${verb}耗时——真人也就几秒到几十秒，${n} TU 太久了（上限 ${cap} TU）。` +
+        `想过一会儿再发，就先 wait 到那个时候再 ${call.name}。什么都没有发生，请改正后重试。）`,
+      { ref: call.id },
+    );
+    return true;
+  }
+
   /**
    * 发送类工具的目标解析（在执行时刻调用）：给了别的频道 id 时先切换过去
    * （等效先 select_channel，工具集随频道类型联动），返回规范化 key。
@@ -1288,6 +1355,7 @@ export class BotAgent {
   }
 
   private dispatchSend(call: ToolCallRecord): void {
+    if (this.rejectAbsurdSendDuration(call, "打字")) return;
     const id = this.channelArg(call) ?? "";
     const msg = String(call.arguments.msg ?? "");
     const mediaRaw = call.arguments.media ?? call.arguments.images;
@@ -1351,6 +1419,7 @@ export class BotAgent {
   }
 
   private dispatchSendFile(call: ToolCallRecord): void {
+    if (this.rejectAbsurdSendDuration(call, "挑选并发送文件的")) return;
     const id = this.channelArg(call) ?? "";
     const file = String(call.arguments.file ?? "");
     if (!id) {
@@ -1384,6 +1453,7 @@ export class BotAgent {
   }
 
   private dispatchSendVoice(call: ToolCallRecord): void {
+    if (this.rejectAbsurdSendDuration(call, "说话")) return;
     const id = this.channelArg(call) ?? "";
     const text = String(call.arguments.text ?? "");
     if (!id) {

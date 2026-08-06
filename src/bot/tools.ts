@@ -192,7 +192,7 @@ export const BOT_TOOLS: BotToolDef[] = [
       'media 可附带图片或视频，元素为媒体编号（如 "12"，来自收藏夹或媒体缓存）。' +
       "在 msg 里写 [图片#12] 或 [视频#3] 会把对应媒体嵌在文字中间发出（图文混排，QQ 等平台可能分开显示）——" +
       "注意：msg 里写了标记这张图就会真的发出去，不想发就不要写。" +
-      "duration 表示打字耗时，消息会在打字完成时真正发出（发出前可 cancel）。" +
+      "duration 表示打字耗时——按消息长度估计，几到几十 TU。消息会在打字完成时真正发出（发出前可 cancel）。" +
       "与上一条完全相同的消息会被拦截（防止无意义复读）；确实要重复发送时加 resend: true。" +
       "像真人一样聊天：单条消息尽量简短（一般十来个字），长内容拆成多条短消息；" +
       "确需发送整段长文（如资料、文章）时须加 confirm_long: true。" +
@@ -211,7 +211,7 @@ export const BOT_TOOLS: BotToolDef[] = [
     name: "send_voice",
     signature: 'send_voice(text: string, id?: string)',
     description:
-      "把一段话转成你的声音，以语音消息发出（id 缺省为当前频道）。适合简短口语化的内容。duration 表示说话耗时，发出前可 cancel。",
+      "把一段话转成你的声音，以语音消息发出（id 缺省为当前频道）。适合简短口语化的内容。duration 表示说话耗时（几到几十 TU，过大会被拦下），发出前可 cancel。",
   },
   {
     name: "recall",
@@ -433,6 +433,8 @@ export function availableTools(opts: {
   notifyManaged?: boolean;
   /** bot.blockingAct：act 专注模式（上一个动作未完成前拒绝新的 act） */
   blockingAct?: boolean;
+  /** bot.waitRateThreshold > 0：等待占比过高时新的 wait 需要 confirm: true */
+  waitConfirm?: boolean;
 }): BotToolDef[] {
   const tools = BOT_TOOLS.filter((t) => {
     switch (t.name) {
@@ -511,6 +513,15 @@ export function availableTools(opts: {
     }
   });
   return tools.map((t) => {
+    // 等待占比拦截：只有开启时才在 wait 描述里说明 confirm 参数
+    if (t.name === "wait" && opts.waitConfirm) {
+      return {
+        ...t,
+        description:
+          t.description +
+          "最近大部分时间都在干等时，新的等待会被拦下——先考虑做点别的；确实要等的话，按拦截提示操作即可。",
+      };
+    }
     // blockingAct 专注模式：上一个动作未完成前新的 act 会被拒绝（不可绕过）——只有开启时才在描述里说明
     if (t.name === "act" && opts.blockingAct) {
       return {
