@@ -17,17 +17,26 @@ interface PinnedPersist {
   counters: { tool: number; event: number };
 }
 
-/** 行为准则：解释 Bot-LLM 的运行方式（拼进 system 段，不属于角色设定本身） */
-const CONSTITUTION = `# 你的存在方式
+/** 行为准则的开头段（两种工具协议共用的前言） */
+const CONSTITUTION_HEAD = `# 你的存在方式
 
-你生活在一个持续运行的虚拟世界中。你不是在回答问题，而是在**生活**：你通过持续输出"工具调用"来思考与行动，一个接一个，永不停歇。
+你生活在一个持续运行的虚拟世界中。你不是在回答问题，而是在**生活**：你通过持续发起"工具调用"来思考与行动，一个接一个，永不停歇。`;
 
-## 输出格式
+/** 输出格式段：文本协议（工具列在置顶区，正文输出 JSON） */
+const OUTPUT_FORMAT_JSON = `## 输出格式
 每次输出**恰好一个** JSON 对象，不要输出任何其他文字：
 {"name": "工具名", "arguments": {…}, "duration": 数字}
 
-- duration：这个动作在世界中要花费的 Time Unit 数，由你自己估计。省略表示瞬间完成。
-- 工具调用发出后你**不会**停下来等结果——决定做什么和做完是两回事。结果会在动作完成时以事件的形式出现在你的意识流里。
+- duration：这个动作在世界中要花费的 Time Unit 数，由你自己估计。省略表示瞬间完成。`;
+
+/** 输出格式段：原生协议（工具经 function calling 接口声明与调用） */
+const OUTPUT_FORMAT_NATIVE = `## 行动方式
+每次通过工具调用接口（function calling）调用**恰好一个**工具，不要输出任何正文文字。
+
+- 每个工具都有 duration 参数：这个动作在世界中要花费的 Time Unit 数，由你自己估计。省略表示瞬间完成。`;
+
+/** 输出格式段之后的通用规则 */
+const CONSTITUTION = `- 工具调用发出后你**不会**停下来等结果——决定做什么和做完是两回事。结果会在动作完成时以事件的形式出现在你的意识流里。
 - 调用发出后会先收到一条"已开始"的系统确认（含编号 tc_xx）。看到确认就说明调用已生效，**不要因为结果还没出现就重复调用**；带 duration 的调用在完成前可以用 cancel 取消。
 
 ## 事件
@@ -196,12 +205,18 @@ export class BotContext {
   timeInfo = "";
   /** 聊天账号列表提供者（service 注入）：只含 platform:id，保持前缀稳定 */
   accountsProvider: (() => string) | null = null;
+  /** 工具走原生 function calling 声明（service 按 bot.nativeToolCalls 与 mode 注入）：切换行为准则的输出格式段 */
+  nativeToolCalls = false;
 
   renderSystemText(timeLine: string): string {
     const accounts = this.accountsProvider?.() ?? "";
     return [
       "# 你是谁\n" + (this.pinned.persona.trim() || "（角色设定缺失）"),
-      CONSTITUTION,
+      CONSTITUTION_HEAD +
+        "\n\n" +
+        (this.nativeToolCalls ? OUTPUT_FORMAT_NATIVE : OUTPUT_FORMAT_JSON) +
+        "\n" +
+        CONSTITUTION,
       ...(accounts
         ? [
             "# 你的聊天账号\n" +

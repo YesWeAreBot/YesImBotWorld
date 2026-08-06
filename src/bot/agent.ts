@@ -158,7 +158,8 @@ export class BotAgent {
     tools?: BotToolDef[],
   ) {
     this.toolDefs = tools ?? BOT_TOOLS;
-    this.backend = createBackend(config.bot, this.layerNames("core"));
+    // 原生声明用全量内置工具（稳定，不随界面状态变）；允许集另行按分层控制
+    this.backend = createBackend(config.bot, this.layerNames("core"), this.toolDefs);
     this.scheduler = new Scheduler(
       clock,
       (content, ref) => this.pushEvent("tool", content, { ref }),
@@ -176,7 +177,11 @@ export class BotAgent {
     return this.layerDefs(layer).map((t) => t.name);
   }
 
-  /** 手机界面状态 / App 打开状态变化后：重算允许的工具名集并同步进后端（含 GBNF 语法） */
+  /**
+   * 手机界面状态 / App 打开状态变化后：重算**允许集**并同步进后端（GBNF 语法 / 解析校验）。
+   * 原生 tools **声明**保持稳定：始终是全量内置工具（分层解锁照旧只以 Event 通知、由允许集把关），
+   * 请求前缀不随频道进出/界面切换变化；只有打开/关闭应用或电脑时，其动态工具才进出声明。
+   */
   private refreshToolGate(): void {
     const names = [...this.layerNames("core")];
     if (this.phoneUi.chatOpen) {
@@ -186,9 +191,10 @@ export class BotAgent {
         if (this.phoneUi.channelIsGroup) names.push(...this.layerNames("group"));
       }
     }
-    names.push(...(this.apps?.activeToolNames() ?? []));
-    names.push(...(this.computer?.activeToolNames() ?? []));
+    const appDefs = [...(this.apps?.activeToolDefs() ?? []), ...(this.computer?.activeToolDefs() ?? [])];
+    names.push(...appDefs.map((d) => d.name));
     this.backend.setToolNames(names);
+    this.backend.setToolDefs?.([...this.toolDefs, ...appDefs]);
   }
 
   /**
@@ -382,9 +388,12 @@ export class BotAgent {
               this.parseFailures,
               truncate(err.raw ?? err.message, 1200),
             );
+            const nativeMode = this.config.bot.mode === "chat" && this.config.bot.nativeToolCalls;
             const emphasis =
               this.parseFailures >= 3
-                ? "不要写正文或解释，先想清楚要调用哪个工具，然后只输出那一个 JSON。"
+                ? nativeMode
+                  ? "不要写正文或解释，先想清楚要调用哪个工具，然后通过工具调用接口调用它。"
+                  : "不要写正文或解释，先想清楚要调用哪个工具，然后只输出那一个 JSON。"
                 : "";
             this.pushEvent(
               "system",

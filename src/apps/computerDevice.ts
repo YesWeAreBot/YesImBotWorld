@@ -98,6 +98,11 @@ export class ComputerDevice {
     return this.active ? [...this.active.toolMap.keys()] : [];
   }
 
+  /** 当前展开的电脑工具完整定义（供原生 tools 声明） */
+  activeToolDefs(): AppToolDef[] {
+    return this.active?.defs ?? [];
+  }
+
   hasTool(name: string): boolean {
     return this.active?.toolMap.has(name) ?? false;
   }

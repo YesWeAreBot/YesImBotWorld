@@ -21,6 +21,7 @@ export interface BotModelConfig {
   temperature: number;
   maxTokens: number;
   disableThinking: boolean;
+  nativeToolCalls: boolean;
   blockingAct: boolean;
   waitRateThreshold: number;
   waitRateWindow: number;
@@ -285,6 +286,15 @@ export const Config: Schema<Config> = Schema.intersect([
             "请求会附带 enable_thinking: false，以及 chat_template_kwargs 里的 " +
             "enable_thinking: false（Qwen/GLM 系模板）与 thinking: false（DeepSeek 系模板）。" +
             "生成工具调用不需要深度思考，关闭可显著提速省钱。仅 chat 模式生效",
+        ),
+      nativeToolCalls: Schema.boolean()
+        .default(false)
+        .description(
+          "工具的原生声明（仅 chat 模式生效）：开启后，工具通过 OpenAI tools 参数正式声明，" +
+            "模型以 function calling 接口调用（利用模型训练时的工具调用特殊 token，对云端 API 与做过工具调用训练的模型更稳）。" +
+            "声明是全量且稳定的（不随进频道/开应用变化，请求前缀不受影响）；" +
+            "分层解锁照旧只以事件通知，调用尚未解锁的工具会被拦下并提示。" +
+            "关闭时沿用文本协议：工具列在置顶区，模型在正文输出 JSON",
         ),
       blockingAct: Schema.boolean()
         .default(false)
