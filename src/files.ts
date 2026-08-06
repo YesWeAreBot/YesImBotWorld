@@ -116,6 +116,14 @@ export class WorldFiles {
     await this.atomicWrite(this.botStatus, content);
   }
 
+  async writeBotDef(content: string): Promise<void> {
+    await this.atomicWrite(this.botDef, content);
+  }
+
+  async writeWorldDef(content: string): Promise<void> {
+    await this.atomicWrite(this.worldDef, content);
+  }
+
   async readWorldStatus(): Promise<string> {
     return this.readText(this.worldStatus);
   }

@@ -46,6 +46,8 @@ export class ChatBackend implements BotBackend {
       temperature: cfg.temperature,
       maxTokens: cfg.maxTokens,
       disableThinking: cfg.disableThinking,
+      stream: cfg.stream,
+      label: "Bot",
     });
   }
 
@@ -140,6 +142,8 @@ export class TextBackend implements BotBackend {
       model: cfg.model || undefined,
       temperature: cfg.temperature,
       maxTokens: cfg.maxTokens,
+      stream: cfg.stream,
+      label: "Bot",
     });
     this.grammar = buildToolCallGrammar(toolNames);
   }

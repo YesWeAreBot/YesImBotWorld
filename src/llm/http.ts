@@ -12,7 +12,9 @@
  * 真实原因（ECONNREFUSED / ECONNRESET / 超时……）展开进错误信息，便于排查。
  */
 
-import { Agent, fetch as undiciFetch } from "undici";
+import { Agent, fetch as undiciFetch, Response as UndiciResponse } from "undici";
+
+export type LlmResponse = UndiciResponse;
 
 /**
  * 宽松的超时兜底（默认 5 分钟太紧，LLM 推理经常合法地超过它；
@@ -32,6 +34,44 @@ export interface LlmFetchInit {
   headers?: Record<string, string>;
   body?: string;
   signal?: AbortSignal | null;
+}
+
+/**
+ * 逐行读取流式响应体（OpenAI SSE / llama.cpp NDJSON 都按行切分）。
+ * 同时兼容两种换行；每行 trim 后回调（空行跳过）。
+ */
+export async function forEachStreamLine(res: LlmResponse, onLine: (line: string) => void): Promise<void> {
+  if (!res.body) throw new Error("LLM 响应无 body 流（后端不支持流式？）");
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let idx: number;
+      while ((idx = buf.indexOf("\n")) >= 0) {
+        const raw = buf.slice(0, idx).trim();
+        buf = buf.slice(idx + 1);
+        if (raw) onLine(raw);
+      }
+    }
+    buf += decoder.decode();
+    buf
+      .trim()
+      .split("\n")
+      .forEach((l) => {
+        const t = l.trim();
+        if (t) onLine(t);
+      });
+  } finally {
+    try {
+      reader.releaseLock();
+    } catch {
+      /* ignore */
+    }
+  }
 }
 
 export async function llmFetch(url: string, init: LlmFetchInit = {}) {

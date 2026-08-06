@@ -16,8 +16,10 @@ import { availableTools, renderToolsText, toolLayer, type AppInfo } from "./bot/
 import { describeCalendar } from "./calendar.js";
 import { WorldClock } from "./clock.js";
 import { BotComputer } from "./computer.js";
-import { needsMsgIds, type Config, type ModalitySupport } from "./config.js";
+import { Config, needsMsgIds, type ModalitySupport } from "./config.js";
 import { WorldFiles } from "./files.js";
+import { Prompts, type PromptOverrides } from "./prompts.js";
+import { WebUIServer, type BotStatusSummary, type NoteEntry, type WebUIHost } from "./webui/server.js";
 import { FocusManager } from "./koishi/focus.js";
 import { Gateway } from "./koishi/gateway.js";
 import { MessageStore } from "./koishi/messages.js";
@@ -44,6 +46,8 @@ declare module "koishi" {
 }
 
 const DEF_PLACEHOLDER = "（尚未编写）";
+/** WebUI 展示用版本号（与 package.json 保持一致） */
+const WEBUI_VERSION = "0.1.0";
 
 export class WorldService extends Service<Config> {
   // puppeteer 可选：未安装时浏览器 App 不提供截图（其余功能照常），安装后无需改动即可用
@@ -52,13 +56,13 @@ export class WorldService extends Service<Config> {
     puppeteer: { required: false },
   };
 
-  private files!: WorldFiles;
+  files!: WorldFiles;
   private clock!: WorldClock;
   private store!: MessageStore;
   private names!: ChannelNameResolver;
-  private media!: MediaStore;
+  media!: MediaStore;
   private captioner!: CaptionService;
-  private gallery!: GalleryStore;
+  gallery!: GalleryStore;
   private renderer!: MediaRenderer;
   private world!: WorldAgent;
   private focus!: FocusManager;
@@ -80,11 +84,18 @@ export class WorldService extends Service<Config> {
   private computer: BotComputer | null = null;
   /** Bot 的个人电脑设备（与手机平级的设备）：open_computer 打开 */
   private computerDevice: ComputerDevice | null = null;
-  private worldRunning = false;
+  private worldActive = false;
+  /** 提示词容器：默认值 + WebUI 覆盖（覆盖持久化于 <basePath>/webui/prompts.json） */
+  private promptStore!: Prompts;
+  webuiDir!: string;
+  private webui: WebUIServer | null = null;
 
   constructor(ctx: Context, config: Config) {
     super(ctx, "yesimbotWorld", true);
     this.config = config;
+
+    this.webuiDir = path.resolve(ctx.baseDir, config.basePath, "webui");
+    this.promptStore = new Prompts();
 
     // 同源推理端点互斥开关：并发下会饿死请求/崩溃的后端保持开启；能真正并发的后端可关闭
     setEndpointLockEnabled(config.serializeSameEndpoint);
@@ -144,10 +155,10 @@ export class WorldService extends Service<Config> {
     // 消息网关始终活跃：所有消息入库；通知事件仅在世界运行时投递
     new Gateway(ctx, config.messaging, config.platformOps, this.store, this.media, this.renderer, this.focus, this.notifyMgr, this.phoneStatus, this.requests, this.ownSends, this.names, () => this.clock ?? null, {
       notify: (content, wake) => {
-        if (this.worldRunning && this.bot) this.bot.pushEvent("koishi", content, { wake });
+        if (this.worldActive && this.bot) this.bot.pushEvent("koishi", content, { wake });
       },
       selfMessage: (key, content, msgId) => {
-        if (!this.worldRunning || !this.bot) return;
+        if (!this.worldActive || !this.bot) return;
         const mode = config.messaging.externalSelfMessages;
         if (mode === "simulate") {
           this.bot.simulateExternalSend(key, content, msgId);
@@ -178,7 +189,9 @@ export class WorldService extends Service<Config> {
     await this.focus.load();
     await this.notifyMgr.load();
 
-    this.world = new WorldAgent(this.config.world, this.files, this.clock, this.logger);
+    // WebUI 覆盖的提示词：Bot 与 World 的默认模板即时套用（无需重启）
+    this.promptStore = await Prompts.load(this.webuiDir);
+    this.world = new WorldAgent(this.config.world, this.files, this.clock, this.logger, this.promptStore);
 
     if (this.config.autoStart && (await this.files.isInitialized())) {
       try {
@@ -187,9 +200,19 @@ export class WorldService extends Service<Config> {
         this.logger.warn("自动启动失败: %s", err);
       }
     }
+
+    if (this.config.webui.enabled) {
+      try {
+        await this.startWebUI();
+      } catch (err) {
+        this.logger.warn("WebUI 启动失败: %s", err);
+      }
+    }
   }
 
   override async stop(): Promise<void> {
+    await this.webui?.stop().catch(() => {});
+    this.webui = null;
     // 插件停止（进程退出/重载）≠ 用户暂停世界：世界时间在离线期间继续流逝
     await this.stopWorld({ suspend: true });
   }
@@ -201,7 +224,7 @@ export class WorldService extends Service<Config> {
     if ((await this.files.isInitialized()) && !force) {
       return "世界已经初始化过了。如需重新创世，使用 world.init -f（会归档并清空当前世界状态）。";
     }
-    if (this.worldRunning) await this.stopWorld();
+    if (this.worldActive) await this.stopWorld();
     if (force) {
       await this.files.reset();
       await this.focus.clear();
@@ -230,7 +253,7 @@ export class WorldService extends Service<Config> {
 
     // 建立全新的 Bot 上下文（角色设定来自刚生成的 Bot_Status.md）
     await fs.writeFile(this.files.stream, "");
-    const context = new BotContext(this.files, this.pinnedToolsText());
+    const context = new BotContext(this.files, this.pinnedToolsText(), this.promptStore);
     context.pinned.persona = await this.files.readBotStatus();
     await context.persistPinned();
 
@@ -239,7 +262,7 @@ export class WorldService extends Service<Config> {
   }
 
   async startWorld(): Promise<string> {
-    if (this.worldRunning) return "世界已在运行中。";
+    if (this.worldActive) return "世界已在运行中。";
     if (!(await this.files.isInitialized())) {
       return "世界尚未初始化。请先编写定义文件并执行 world.init。";
     }
@@ -248,7 +271,7 @@ export class WorldService extends Service<Config> {
     // 置顶列表只放 core 层常驻工具；chat/channel/group 层在打开应用/进入频道时以事件展开
     const tools = this.currentTools();
 
-    this.botContext = new BotContext(this.files, this.pinnedToolsText());
+    this.botContext = new BotContext(this.files, this.pinnedToolsText(), this.promptStore);
     // 工具原生声明（仅 chat 模式）：行为准则里的输出格式段随之切换
     this.botContext.nativeToolCalls = this.config.bot.mode === "chat" && this.config.bot.nativeToolCalls;
     // wait 被移除时，行为准则与时间说明不再提及等待
@@ -427,14 +450,14 @@ export class WorldService extends Service<Config> {
       this.logger,
     );
     this.tingle.start();
-    this.worldRunning = true;
+    this.worldActive = true;
     this.logger.info("世界开始运转：%s", this.clock.timeLine());
     return `世界开始运转。当前 ${this.clock.timeLine()}`;
   }
 
   async stopWorld(opts: { suspend?: boolean } = {}): Promise<string> {
-    if (!this.worldRunning) return "世界并未在运行。";
-    this.worldRunning = false;
+    if (!this.worldActive) return "世界并未在运行。";
+    this.worldActive = false;
     this.tingle?.stop();
     this.tingle = null;
     await this.bot?.stop();
@@ -466,7 +489,7 @@ export class WorldService extends Service<Config> {
     const initialized = await this.files.isInitialized();
     const stateText = !initialized
       ? "未初始化"
-      : this.worldRunning
+      : this.worldActive
         ? "运行中"
         : this.clock.running
           ? "未运行（世界时间仍在流逝）"
@@ -544,6 +567,166 @@ export class WorldService extends Service<Config> {
     return list;
   }
 
+  // ---------- WebUI ----------
+
+  private async startWebUI(): Promise<void> {
+    if (this.webui) return;
+    this.webui = new WebUIServer(this);
+    await this.webui.start();
+    this.logger.info("WebUI 已启动：http://%s:%d", this.config.webui.host, this.config.webui.port);
+  }
+
+  /** WebUIHost：结构性实现（server.ts 经由该接口读写一切） */
+  get baseDir(): string {
+    return path.resolve(this.ctx.baseDir, this.config.basePath);
+  }
+
+  get version(): string {
+    return WEBUI_VERSION;
+  }
+
+  get configSchema(): unknown {
+    return Config;
+  }
+
+  getClock() {
+    return this.clock ?? null;
+  }
+
+  async isInitialized(): Promise<boolean> {
+    return this.files.isInitialized();
+  }
+
+  worldRunning(): boolean {
+    return this.worldActive;
+  }
+
+  worldQueue(): number {
+    return this.world?.queueLength ?? 0;
+  }
+
+  botStatus(): BotStatusSummary | null {
+    return this.bot?.status() ?? null;
+  }
+
+  appOpen(): string | null {
+    return this.appManager?.currentName ?? null;
+  }
+
+  computerOn(): string | null {
+    return this.computerDevice?.currentName ?? null;
+  }
+
+  phoneDown(): boolean {
+    return this.phoneStatus.down;
+  }
+
+  focusChannels(): string[] {
+    return this.focus.activeKeys();
+  }
+
+  prompts(): Prompts {
+    return this.promptStore;
+  }
+
+  async savePromptsOverrides(overrides: PromptOverrides): Promise<void> {
+    await Prompts.save(this.webuiDir, overrides);
+  }
+
+  /** 重载定义：与 world.reload 指令行为一致（World-LLM 调整世界状态并告知 Bot） */
+  async reloadWorld(): Promise<string> {
+    if (this.notReady()) return this.notReady()!;
+    if (!(await this.files.isInitialized())) return "世界尚未初始化。";
+    const { botDef, worldDef } = await this.files.readDefinitions();
+    await this.world.reconcileDefinitions(botDef, worldDef, (content) => {
+      this.bot?.pushEvent("world", content);
+    });
+    return "定义已重新载入，世界状态已调整。";
+  }
+
+  async resetWorld(): Promise<string> {
+    await this.stopWorld();
+    await this.files.reset();
+    await this.clock.reset();
+    await this.focus.clear();
+    await this.notifyMgr.reset();
+    this.phoneStatus.down = false;
+    return "世界已重置。定义文件保留，可重新 world.init。";
+  }
+
+  async clearMsg(): Promise<string> {
+    await this.store.clear();
+    return "聊天消息记录已清空（媒体缓存与世界状态不受影响）。";
+  }
+
+  async injectEvent(text: string): Promise<string> {
+    if (!this.worldActive || !this.bot) return "世界未在运行。";
+    if (!text?.trim()) return "内容不能为空。";
+    this.bot.pushEvent("system", text.trim(), { wake: true });
+    return "已注入。";
+  }
+
+  /**
+   * 应用新配置：合并后整体替换插件作用域（MainScope.update 强制重启），
+   * loader 会把合并结果写回配置文件。先停掉旧 WebUI 再重启，端口即可即时切换；
+   * 旧实例在作用域重启时随 dispose 一起清理。
+   */
+  async applyConfig(next: Config): Promise<{ message: string; port: number }> {
+    const merged: Config = { ...this.config, ...next };
+    if (next.webui) merged.webui = { ...this.config.webui, ...next.webui };
+    const port = merged.webui.port;
+    // 等当前 HTTP 响应写盘/落地后再停服重载，避免截断对请求方的应答
+    setTimeout(() => {
+      void this.restartScope(merged).catch((err) => this.logger.warn("配置热重载失败: %s", err));
+    }, 300);
+    return { message: "配置已应用，插件作用域将自动重启生效。", port };
+  }
+
+  /** 停止当前 WebUI → 触发父级插件作用域整体重启（apply 以新配置重跑） */
+  private async restartScope(config: Config): Promise<void> {
+    await this.webui?.stop().catch(() => {});
+    this.webui = null;
+    const parent = (this.ctx.scope as { parent?: { scope?: { update?: (c: Config, forced: boolean) => void } } }).parent
+      ?.scope;
+    if (!parent?.update) {
+      throw new Error("找不到插件作用域，无法热重载（可手动重启插件应用新配置）");
+    }
+    parent.update(config, true);
+  }
+
+  async notes(): Promise<NoteEntry[]> {
+    let names: string[] = [];
+    try {
+      names = (await fs.readdir(this.files.notesDir)).filter((f) => f.toLowerCase().endsWith(".md"));
+    } catch {
+      return [];
+    }
+    const out: NoteEntry[] = [];
+    for (const name of names.sort()) {
+      const content = await fs.readFile(path.join(this.files.notesDir, name), "utf8").catch(() => "");
+      // 与 NotesApp 一致：剥掉 frontmatter 元数据，只留正文
+      const body = content.replace(/^---\n[\s\S]*?\n---\n?/, "").trim();
+      out.push({ title: name.replace(/\.md$/i, ""), content: body });
+    }
+    return out;
+  }
+
+  async writeNote(name: string, content: string): Promise<void> {
+    const title = (name ?? "").trim().replace(/[/\\:*?"<>|\u0000-\u001f]/g, " ").slice(0, 60).trim();
+    if (!title) throw new Error("标题不能为空");
+    const file = path.join(this.files.notesDir, `${title}.md`);
+    await fs.mkdir(this.files.notesDir, { recursive: true });
+    const stamp = this.clock?.clockString(this.clock.now());
+    const fm = `---\ncreated: ${stamp}\nupdated: ${stamp}\n---\n\n`;
+    await fs.writeFile(file, fm + String(content ?? "").trim() + "\n");
+  }
+
+  async deleteNote(name: string): Promise<void> {
+    const title = (name ?? "").trim().replace(/[/\\:*?"<>|\u0000-\u001f]/g, " ").trim();
+    if (!title) throw new Error("标题不能为空");
+    await fs.rm(path.join(this.files.notesDir, `${title}.md`), { force: true });
+  }
+
   // ---------- 命令 ----------
 
   /** start() 完成前命令不可用 */
@@ -592,6 +775,18 @@ export class WorldService extends Service<Config> {
     });
 
     cmd
+      .subcommand(".webui", "查看运维 WebUI 的访问地址（若已启用）", { authority: 1 })
+      .action(async () => {
+        if (this.notReady()) return this.notReady()!;
+        const webui = this.config.webui;
+        if (!webui.enabled || !this.webui) {
+          return "WebUI 未启用。在配置中开启 webui.enabled 并重启插件后可用。";
+        }
+        const base = webui.token ? `地址：http://${webui.host}:${webui.port}/ 访问令牌：${webui.token}` : `地址：http://${webui.host}:${webui.port}/`;
+        return `运维 WebUI 已启动。${base}`;
+      });
+
+    cmd
       .subcommand(".reload", "用户修改定义文件后：让世界调整状态并（以世界观内方式）告知 Bot", { authority: 3 })
       .action(async ({ session }) => {
         if (this.notReady()) return this.notReady()!;
@@ -615,7 +810,7 @@ export class WorldService extends Service<Config> {
     cmd
       .subcommand(".inject <text:text>", "以系统事件形式向 Bot 的意识流注入一条内容（调试用）", { authority: 3 })
       .action(async (_, text) => {
-        if (!this.worldRunning || !this.bot) return "世界未在运行。";
+        if (!this.worldActive || !this.bot) return "世界未在运行。";
         if (!text?.trim()) return "内容不能为空。";
         this.bot.pushEvent("system", text.trim(), { wake: true });
         return "已注入。";

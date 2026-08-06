@@ -145,6 +145,7 @@ export class CaptionService {
       model: cfg.model,
       temperature: 0.2,
       maxTokens: cfg.maxTokens,
+      label: "解释器",
     });
     const content: ContentPart[] = [{ type: "text", text: promptOverride ?? cfg.prompt }, part];
     const result = await client.complete(

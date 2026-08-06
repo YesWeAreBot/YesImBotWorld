@@ -8,6 +8,7 @@ import { ToolCallParseError } from "../llm/parse.js";
 import type { BotEvent, CompressionResult, EventSource, MediaRef, ParsedToolCall, PhoneStatus, RichText, ToolCallRecord } from "../types.js";
 import type { WorldAgent } from "../world/agent.js";
 import type { NotifyManager } from "../koishi/notify.js";
+import { debug } from "../webui/debug.js";
 import { createBackend, type BotBackend } from "./backend.js";
 import type { BotContext } from "./context.js";
 import { Scheduler } from "./scheduler.js";
@@ -450,6 +451,14 @@ export class BotAgent {
 
         const call = this.finalize(parsed);
         await this.context.appendToolCall(call);
+        debug.emit("bot.tool", `${call.id} ${call.name}`, {
+          id: call.id,
+          name: call.name,
+          arguments: call.arguments,
+          duration: call.duration,
+          issuedAt: call.issuedAt,
+          expectedAt: call.expectedAt,
+        });
         this.logger.info(
           "[tool] %s %s(%s)%s",
           call.id,
@@ -482,6 +491,12 @@ export class BotAgent {
           expectedAt: item.worldTime,
         };
         await this.context.appendToolCall(call);
+        debug.emit("bot.tool", `${call.id} ${call.name}`, {
+          id: call.id,
+          name: call.name,
+          arguments: call.arguments,
+          source: "external",
+        });
         if (!item.content) continue;
         item.refToolCallId = call.id;
       }
@@ -494,6 +509,14 @@ export class BotAgent {
         attachments: item.attachments,
       };
       await this.context.appendEvent(event);
+      debug.emit("bot.event", `[${event.source}] ${event.id}`, {
+        id: event.id,
+        source: event.source,
+        content: event.content,
+        worldTime: event.worldTime,
+        ref: event.refToolCallId,
+        attachments: event.attachments?.length ?? 0,
+      });
     }
   }
 

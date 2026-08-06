@@ -67,7 +67,7 @@ export interface GalleryEntry {
  */
 export class GalleryStore {
   constructor(
-    private ctx: Context,
+    readonly ctx: Context,
     readonly baseDir: string,
   ) {
     ctx.model.extend(

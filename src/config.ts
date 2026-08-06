@@ -21,6 +21,8 @@ export interface BotModelConfig {
   temperature: number;
   maxTokens: number;
   disableThinking: boolean;
+  /** 以流式方式请求 LLM（SSE 边生成边返回）。不支持的旧后端可关闭，改为一次性返回 */
+  stream: boolean;
   nativeToolCalls: boolean;
   disableWait: boolean;
   ignoreSendDuration: boolean;
@@ -80,6 +82,8 @@ export interface WorldModelConfig {
   temperature: number;
   maxTokens: number;
   disableThinking: boolean;
+  /** 以流式方式请求 LLM（SSE 边生成边返回）。不支持的旧后端可关闭，改为一次性返回 */
+  stream: boolean;
   maxToolRounds: number;
   compressMaxInputChars: number;
   waitNarrateMinRealSeconds: number;
@@ -228,6 +232,14 @@ export function needsMsgIds(ops: PlatformOpsConfig): boolean {
   return ops.recall || ops.react || ops.reply || ops.forwardMsgs || ops.emojiLikes || ops.essence;
 }
 
+/** 运维 WebUI：浏览器里的管理界面（配置/提示词/状态/调试/相册），数据存于 <basePath>/webui/ */
+export interface WebUIConfig {
+  enabled: boolean;
+  host: string;
+  port: number;
+  token: string;
+}
+
 export interface Config {
   basePath: string;
   autoStart: boolean;
@@ -241,6 +253,7 @@ export interface Config {
   captioners: CaptionersConfig;
   media: MediaConfig;
   tts: TtsConfig;
+  webui: WebUIConfig;
 }
 
 export const Config: Schema<Config> = Schema.intersect([
@@ -288,6 +301,12 @@ export const Config: Schema<Config> = Schema.intersect([
             "请求会附带 enable_thinking: false，以及 chat_template_kwargs 里的 " +
             "enable_thinking: false（Qwen/GLM 系模板）与 thinking: false（DeepSeek 系模板）。" +
             "生成工具调用不需要深度思考，关闭可显著提速省钱。仅 chat 模式生效",
+        ),
+      stream: Schema.boolean()
+        .default(true)
+        .description(
+          "以流式方式请求 LLM：SSE 边生成边返回，调试页可实时看到逐段输出。" +
+            "大多数 OpenAI 兼容后端都支持；个别后端不支持 stream 且传入会报错时，请关闭本项（改为一次性返回整段结果）",
         ),
       nativeToolCalls: Schema.boolean()
         .default(false)
@@ -379,6 +398,12 @@ export const Config: Schema<Config> = Schema.intersect([
           "关闭模型思维链（对支持开关思考模式的模型生效，如 Qwen3 / DeepSeek V3.1+ / GLM 系）。" +
             "请求会附带 enable_thinking: false，以及 chat_template_kwargs 里的 " +
             "enable_thinking: false（Qwen/GLM 系模板）与 thinking: false（DeepSeek 系模板）",
+        ),
+      stream: Schema.boolean()
+        .default(true)
+        .description(
+          "以流式方式请求 LLM：SSE 边生成边返回，调试页可实时看到逐段输出。" +
+            "大多数 OpenAI 兼容后端都支持；个别后端不支持 stream 且传入会报错时，请关闭本项（改为一次性返回整段结果）",
         ),
       maxToolRounds: Schema.natural().default(8).description("单次响应中允许的最大工具调用轮数"),
       compressMaxInputChars: Schema.natural()
@@ -802,6 +827,31 @@ export const Config: Schema<Config> = Schema.intersect([
         ),
       captionTimeoutMs: Schema.natural().default(60000).description("单次解释调用的超时（毫秒）"),
     }).description("媒体处理"),
+  }),
+
+  Schema.object({
+    webui: Schema.object({
+      enabled: Schema.boolean()
+        .default(false)
+        .description(
+          "启用运维 WebUI：在浏览器里管理这个插件——调整全部配置、改写内置提示词、" +
+            "实时查看 Bot/World 状态与世界新闻、流式阅读 Bot-LLM/World-LLM 的原始请求与响应、管理相册。",
+        ),
+      host: Schema.string()
+        .default("127.0.0.1")
+        .description("监听地址。仅本机访问用 127.0.0.1；局域网访问填 0.0.0.0（注意安全）"),
+      port: Schema.natural()
+        .min(1)
+        .max(65535)
+        .default(18111)
+        .description("监听端口。启动后可用指令 world.webui 查看访问地址"),
+      token: Schema.string()
+        .role("secret")
+        .default("")
+        .description(
+          "访问令牌。留空不鉴权（仅建议本机使用）；设置后，页面与全部 API 都要求携带该令牌（浏览器会提示输入，API 用 Authorization: Bearer <token> 或 ?token=）",
+        ),
+    }).description("运维 WebUI：浏览器里的管理界面（配置 / 提示词 / 状态 / 调试 / 相册）"),
   }),
 
   Schema.object({
