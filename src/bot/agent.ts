@@ -182,7 +182,11 @@ export class BotAgent {
     this.backend.setToolNames(names);
   }
 
-  /** 解析频道参数：显式给了 id 用 id，否则用当前所在频道 */
+  /**
+   * 解析频道参数：显式给了 id 用 id，否则用当前所在频道。
+   * 误写的目标参数形态（detail/channel_id 等）不在这里打捞——由 dispatch 入口的
+   * misusedTargetKeys 拦截并报错纠正，避免静默回退到无关频道。
+   */
   private channelArg(call: ToolCallRecord): string | null {
     const raw = call.arguments.id ?? call.arguments.channel;
     const explicit = raw != null ? String(raw).trim() : "";
@@ -512,6 +516,20 @@ export class BotAgent {
   private async dispatch(call: ToolCallRecord): Promise<void> {
     // 连续 wait 计数：做了任何别的事就清零
     if (call.name !== "wait") this.waitStreak = 0;
+    // 目标参数误写拦截（频道类工具）：Bot 幻觉出 OneBot API 风格的 detail/channel_id
+    // 等写法且没给 id 时，绝不静默回退到当前频道（那会把消息发进无关频道）——
+    // 拦下并告知正确格式，让它重试。不打捞：打捞会让错误格式被强化
+    const misused = misusedTargetKeys(call.arguments);
+    if (misused.length && toolLayer(call.name) !== "core") {
+      this.pushEvent(
+        "system",
+        `（${call.name} 的目标参数格式不对：不存在 ${misused.join(" / ")} 这种参数。` +
+          `频道一律用 id 参数指定，格式为 "平台:频道id"，直接从 check_msg 列表或消息通知里照抄完整的频道 id 即可；` +
+          `已在目标频道页内时可省略 id。什么都没有发生，请改正后重试。）`,
+        { ref: call.id },
+      );
+      return;
+    }
     switch (call.name) {
       case "wait":
         return this.dispatchWait(call);
@@ -1284,7 +1302,16 @@ export class BotAgent {
       return;
     }
     if (!msg && !media.length) {
-      this.pushEvent("system", "（send 需要 msg（或 media）参数。）", { ref: call.id });
+      // 误写的消息参数名（message/text/content）：点名纠正，不打捞
+      const alias = ["message", "text", "content"].find((k) => call.arguments[k] != null);
+      this.pushEvent(
+        "system",
+        alias
+          ? `（send 的消息参数必须叫 msg，不存在 ${alias} 这种参数。` +
+              `正确格式：send(id?: string, msg: string, …)。什么都没有发生，请改正后重试。）`
+          : "（send 需要 msg（或 media）参数。）",
+        { ref: call.id },
+      );
       return;
     }
     // 超长消息拦截：真人聊天单条消息很短；确需发长文时要求二次确认
@@ -1325,9 +1352,24 @@ export class BotAgent {
 
   private dispatchSendFile(call: ToolCallRecord): void {
     const id = this.channelArg(call) ?? "";
-    const file = String(call.arguments.file ?? call.arguments.ref ?? "");
-    if (!id || !file) {
-      this.pushEvent("system", "（send_file 需要 file 参数，且需先进入频道或给出 id。）", { ref: call.id });
+    const file = String(call.arguments.file ?? "");
+    if (!id) {
+      this.pushEvent("system", "（send_file 需要频道：先 select_channel 进入频道，或给出 id 参数。）", { ref: call.id });
+      return;
+    }
+    if (!file) {
+      // 误写的文件参数名：点名纠正，不打捞
+      const alias = ["ref", "media", "path", "filename", "file_id", "name"].find(
+        (k) => call.arguments[k] != null,
+      );
+      this.pushEvent(
+        "system",
+        alias
+          ? `（send_file 的文件参数必须叫 file，不存在 ${alias} 这种参数。` +
+              `正确格式：send_file(file: string, id?: string)。什么都没有发生，请改正后重试。）`
+          : "（send_file 需要 file 参数。）",
+        { ref: call.id },
+      );
       return;
     }
     this.ackStart(call);
@@ -1343,9 +1385,22 @@ export class BotAgent {
 
   private dispatchSendVoice(call: ToolCallRecord): void {
     const id = this.channelArg(call) ?? "";
-    const text = String(call.arguments.text ?? call.arguments.msg ?? "");
-    if (!id || !text) {
-      this.pushEvent("system", "（send_voice 需要 text 参数，且需先进入频道或给出 id。）", { ref: call.id });
+    const text = String(call.arguments.text ?? "");
+    if (!id) {
+      this.pushEvent("system", "（send_voice 需要频道：先 select_channel 进入频道，或给出 id 参数。）", { ref: call.id });
+      return;
+    }
+    if (!text) {
+      // 误写的文本参数名：点名纠正，不打捞
+      const alias = ["msg", "message", "content", "voice"].find((k) => call.arguments[k] != null);
+      this.pushEvent(
+        "system",
+        alias
+          ? `（send_voice 的文本参数必须叫 text，不存在 ${alias} 这种参数。` +
+              `正确格式：send_voice(text: string, id?: string)。什么都没有发生，请改正后重试。）`
+          : "（send_voice 需要 text 参数。）",
+        { ref: call.id },
+      );
       return;
     }
     this.ackStart(call);
@@ -1545,6 +1600,17 @@ export class BotAgent {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * 频道目标参数的常见误写（OneBot API 风格等）：没给 id/channel 却带着这些键时返回键名列表。
+ * 注意 user_id 不算——群管理工具里它合法地表示"群成员"（此时频道缺省为当前群页）。
+ */
+export function misusedTargetKeys(args: Record<string, unknown>): string[] {
+  if (args.id != null || args.channel != null) return [];
+  return ["detail", "channel_id", "channelId", "target", "to", "group_id"].filter(
+    (k) => args[k] != null,
+  );
 }
 
 function truncate(text: string, max: number): string {
