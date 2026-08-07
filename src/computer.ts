@@ -20,6 +20,22 @@ export interface ComputerExecResult {
   output: string;
 }
 
+/** WebUI 设备面板用的容器状态快照 */
+export interface ComputerInspection {
+  /** 是否配置了 docker CLI */
+  configured: boolean;
+  cli: string;
+  name: string;
+  image: string;
+  exists: boolean;
+  running: boolean;
+  /** docker 原生状态（created/running/exited/…） */
+  status: string;
+  startedAt: string;
+  /** 检测失败原因（CLI 不存在 / docker 出错） */
+  error: string;
+}
+
 interface CmdResult {
   code: number | null;
   stdout: string;
@@ -88,6 +104,79 @@ export class BotComputer {
   /** 主目录路径（在电脑内） */
   get homeDir(): string {
     return this.cfg.docker.workdir;
+  }
+
+  // ---------- WebUI 设备管理 ----------
+
+  /** 容器实时状态（docker inspect）；docker CLI 缺失/出错时给出原因，不抛错 */
+  async inspect(): Promise<ComputerInspection> {
+    const { cli, containerName: name, image } = this.cfg.docker;
+    const base: ComputerInspection = {
+      configured: !!cli,
+      cli,
+      name,
+      image,
+      exists: false,
+      running: false,
+      status: "",
+      startedAt: "",
+      error: "",
+    };
+    if (!cli) {
+      base.error = "未配置 Docker CLI（apps.computer.docker.cli）";
+      return base;
+    }
+    try {
+      const res = await execDocker(
+        cli,
+        ["inspect", "-f", "{{.State.Status}}|{{.State.Running}}|{{.State.StartedAt}}|{{.Config.Image}}", name],
+        { timeoutMs: 10000 },
+      );
+      if (res.code !== 0) {
+        // 容器不存在也算正常状态（还没创建过）
+        if (/no such/i.test(res.stderr)) return base;
+        base.error = clip(res.stderr || res.stdout, 300) || `docker inspect 退出码 ${res.code}`;
+        return base;
+      }
+      const [status, running, startedAt, img] = res.stdout.trim().split("|");
+      base.exists = true;
+      base.status = status || "";
+      base.running = running === "true";
+      base.startedAt = startedAt && startedAt.startsWith("0001") ? "" : startedAt || "";
+      base.image = img || image;
+      return base;
+    } catch (err) {
+      base.error = (err as Error).message ?? String(err);
+      return base;
+    }
+  }
+
+  /** 开机（不存在则创建），供 WebUI 设备面板使用 */
+  async start(): Promise<string> {
+    const ready = await this.ensureReady();
+    return ready.ok ? `电脑已开机（容器 ${this.cfg.docker.containerName} 运行中）。` : `开机失败：${ready.error}`;
+  }
+
+  /** 关机（不删除容器与数据），供 WebUI 设备面板使用 */
+  async stop(): Promise<string> {
+    this.ready = null;
+    if (!this.cfg.docker.cli) return "未配置 Docker CLI。";
+    const res = await execDocker(this.cfg.docker.cli, ["stop", "--time=5", this.cfg.docker.containerName], {
+      timeoutMs: 30000,
+    }).catch((err) => ({ code: 1, stdout: "", stderr: String(err), killed: false }));
+    if (res.code !== 0) return `关机失败：${clip(res.stderr, 300) || "容器可能不存在"}`;
+    return "电脑已关机（容器仍在，数据保留）。";
+  }
+
+  /** 重启容器，供 WebUI 设备面板使用 */
+  async restart(): Promise<string> {
+    this.ready = null;
+    if (!this.cfg.docker.cli) return "未配置 Docker CLI。";
+    const res = await execDocker(this.cfg.docker.cli, ["restart", "--time=5", this.cfg.docker.containerName], {
+      timeoutMs: 40000,
+    }).catch((err) => ({ code: 1, stdout: "", stderr: String(err), killed: false }));
+    if (res.code !== 0) return `重启失败：${clip(res.stderr, 300) || "容器可能不存在"}`;
+    return "电脑已重启。";
   }
 
   /** 电脑关机：本插件自建的容器会一并关闭，下次打开再自动启动 */

@@ -104,6 +104,47 @@ async function main() {
   check(overview.initialized === false, "未初始化状态正确");
   check(overview.worldRunning === false && overview.worldQueue === 0, "世界未运行、队列为 0");
   check(Array.isArray(overview.galleryCounts) && Array.isArray(overview.news), "overview 含相册/新闻字段");
+  const ovAddresses = (overview as { addresses?: { label: string; url: string }[] }).addresses;
+  check(
+    Array.isArray(ovAddresses) && ovAddresses.some((a) => a.url.includes(`:${PORT}/`)),
+    "overview 含访问地址列表（访问与安全）",
+  );
+
+  // ---- 设备（电脑 + 手机窥视） ----
+  const devices = (await (await fetch(`${base}/api/devices`, { headers: auth })).json()) as {
+    computer: { mode: string; on: string | null; docker: unknown; remote: unknown };
+    phone: { down: boolean; appOpen: string | null; chatOpen: boolean; chatAppName: string };
+  };
+  check(devices.computer.mode === "off", "设备：电脑默认 off 模式");
+  check(devices.phone.down === false && typeof devices.phone.chatAppName === "string", "设备：手机状态完整");
+  const scrRes = await fetch(`${base}/api/computer/screen`, { headers: auth });
+  check(scrRes.status === 503, "窥屏：off 模式返回 503（优雅降级）");
+  const actRes = await fetch(`${base}/api/computer/action`, {
+    method: "POST",
+    headers: { ...auth, "content-type": "application/json" },
+    body: JSON.stringify({ action: "start" }),
+  });
+  const actJson = (await actRes.json()) as { ok?: boolean; text?: string };
+  check(actRes.status === 200 && typeof actJson.text === "string", "电脑管理：非 docker 模式动作优雅返回");
+  const badAct = await fetch(`${base}/api/computer/action`, {
+    method: "POST",
+    headers: { ...auth, "content-type": "application/json" },
+    body: JSON.stringify({ action: "rm -rf /" }),
+  });
+  check(badAct.status === 400, "电脑管理：非法 action 返回 400");
+  const execRes = await fetch(`${base}/api/computer/exec`, {
+    method: "POST",
+    headers: { ...auth, "content-type": "application/json" },
+    body: JSON.stringify({ command: "echo hi" }),
+  });
+  const execJson = (await execRes.json()) as { output?: string };
+  check(execRes.status === 200 && typeof execJson.output === "string", "电脑终端：非 docker 模式优雅返回");
+  const emptyExec = await fetch(`${base}/api/computer/exec`, {
+    method: "POST",
+    headers: { ...auth, "content-type": "application/json" },
+    body: JSON.stringify({ command: "  " }),
+  });
+  check(emptyExec.status === 400, "电脑终端：空命令返回 400");
 
   // ---- SSE ----
   const sseRes = await fetch(`${base}/api/events?token=${TOKEN}`);

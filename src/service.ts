@@ -19,7 +19,7 @@ import { BotComputer } from "./computer.js";
 import { Config, needsMsgIds, type ModalitySupport } from "./config.js";
 import { WorldFiles } from "./files.js";
 import { Prompts, type PromptOverrides } from "./prompts.js";
-import { WebUIServer, type BotStatusSummary, type NoteEntry, type WebUIHost } from "./webui/server.js";
+import { WebUIServer, type BotStatusSummary, type DevicesInfo, type NoteEntry, type WebUIHost } from "./webui/server.js";
 import { FocusManager } from "./koishi/focus.js";
 import { Gateway } from "./koishi/gateway.js";
 import { MessageStore } from "./koishi/messages.js";
@@ -84,6 +84,8 @@ export class WorldService extends Service<Config> {
   private computer: BotComputer | null = null;
   /** Bot 的个人电脑设备（与手机平级的设备）：open_computer 打开 */
   private computerDevice: ComputerDevice | null = null;
+  /** 远程桌面实现（remote_desktop 模式）：WebUI 窥屏直接用它 peek */
+  private remoteDesktopApp: RemoteDesktopApp | null = null;
   private worldActive = false;
   /** 提示词容器：默认值 + WebUI 覆盖（覆盖持久化于 <basePath>/webui/prompts.json） */
   private promptStore!: Prompts;
@@ -347,6 +349,7 @@ export class WorldService extends Service<Config> {
       this.config.apps.computer.mode === "remote_desktop" && this.config.bot.modalities.image
         ? new RemoteDesktopApp(this.config.apps.computer.remoteDesktop, this.media, this.logger)
         : null;
+    this.remoteDesktopApp = remoteDesktopApp;
     this.computerDevice = new ComputerDevice(
       terminalApp,
       filesApp,
@@ -467,6 +470,7 @@ export class WorldService extends Service<Config> {
     // 关闭电脑设备（断开远程桌面等连接）并关机：本插件自建的容器一并关闭（下次打开电脑时自动再开机）
     await this.computerDevice?.close().catch(() => {});
     this.computerDevice = null;
+    this.remoteDesktopApp = null;
     await this.computer?.shutdown().catch(() => {});
     this.computer = null;
     if (opts.suspend) {
@@ -619,6 +623,56 @@ export class WorldService extends Service<Config> {
 
   phoneDown(): boolean {
     return this.phoneStatus.down;
+  }
+
+  // ---------- 设备页（电脑 + 手机窥视） ----------
+
+  async devicesInfo(): Promise<DevicesInfo> {
+    const cc = this.config.apps.computer;
+    const botSt = this.bot?.status() ?? null;
+    return {
+      computer: {
+        mode: cc.mode,
+        on: this.computerDevice?.currentName ?? null,
+        docker: cc.mode === "docker" && this.computer ? await this.computer.inspect() : null,
+        remote: cc.mode === "remote_desktop" ? { host: cc.remoteDesktop.host, port: cc.remoteDesktop.port } : null,
+      },
+      phone: {
+        down: this.phoneStatus.down,
+        appOpen: this.appManager?.currentName ?? null,
+        chatOpen: botSt?.phoneUi?.chatOpen ?? false,
+        channelKey: botSt?.phoneUi?.channelKey ?? null,
+        channelIsGroup: botSt?.phoneUi?.channelIsGroup ?? false,
+        chatAppName: this.config.apps.chatAppName || "QQ",
+      },
+    };
+  }
+
+  async computerScreen(maxWidth?: number): Promise<{ png: Buffer; width: number; height: number }> {
+    const cc = this.config.apps.computer;
+    if (cc.mode !== "remote_desktop") {
+      throw new Error(cc.mode === "docker" ? "Docker 电脑没有屏幕——它是纯终端，用下面的控制台操作。" : "电脑未启用（apps.computer.mode = off）。");
+    }
+    if (!this.remoteDesktopApp) {
+      throw new Error("远程桌面未接线（需要 bot.modalities.image 开启图片模态）。");
+    }
+    return this.remoteDesktopApp.peek(maxWidth);
+  }
+
+  async computerAction(action: "start" | "stop" | "restart"): Promise<string> {
+    if (this.config.apps.computer.mode !== "docker" || !this.computer) {
+      return "这台电脑不是 Docker 模式，没有容器可管理。";
+    }
+    if (action === "start") return this.computer.start();
+    if (action === "stop") return this.computer.stop();
+    return this.computer.restart();
+  }
+
+  async computerExec(command: string) {
+    if (this.config.apps.computer.mode !== "docker" || !this.computer) {
+      return { code: null, output: "（这台电脑不是 Docker 模式——远程桌面请用窥屏，未启用请先在配置里打开。）" };
+    }
+    return this.computer.exec(command);
   }
 
   focusChannels(): string[] {

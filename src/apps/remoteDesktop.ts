@@ -79,6 +79,31 @@ export class RemoteDesktopApp implements WorldApp {
     this.session = null;
   }
 
+  /**
+   * WebUI「设备」页的实时窥屏：截一帧当前画面（不入 Bot 的工作窗口，纯运维观察）。
+   * 优先复用 Bot 打开着的会话；没开时临时连一次截完即断，不干扰 Bot 侧状态。
+   * 连不上时抛错，由调用方转成提示。
+   */
+  async peek(maxWidth?: number): Promise<{ png: Buffer; width: number; height: number }> {
+    const width = maxWidth ?? this.cfg.maxWidth;
+    if (this.session?.connected) {
+      const shot = await this.session.snapshot(width);
+      if (shot.png.length) return shot;
+    }
+    const temp = new RfbSession(
+      { host: this.cfg.host, port: this.cfg.port, password: this.cfg.password, connectTimeoutMs: this.cfg.connectTimeoutMs },
+      this.logger,
+    );
+    try {
+      await temp.connect();
+      const shot = await temp.snapshot(width);
+      if (!shot.png.length) throw new Error("截到的画面是空的");
+      return shot;
+    } finally {
+      temp.disconnect();
+    }
+  }
+
   /** 确保已有连接；连接断开/从未连上时尝试重连。返回 null 表示就绪，否则返回给 Bot 的提示 */
   private async requireSession(): Promise<string | null> {
     if (this.session?.connected) return null;

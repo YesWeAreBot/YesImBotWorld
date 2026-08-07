@@ -267,13 +267,27 @@ export class BotAgent {
     this.loopPromise = null;
   }
 
-  status(): { running: boolean; waiting: string | null; streamLength: number; approxChars: number; pendingTasks: number } {
+  status(): {
+    running: boolean;
+    waiting: string | null;
+    streamLength: number;
+    approxChars: number;
+    pendingTasks: number;
+    /** 手机界面状态（WebUI「设备」页窥视手机用） */
+    phoneUi: { chatOpen: boolean; channelKey: string | null; channelIsGroup: boolean; forwardDepth: number };
+  } {
     return {
       running: this.running,
       waiting: this.waiting?.callId ?? null,
       streamLength: this.context.stream.length,
       approxChars: this.context.approxChars(),
       pendingTasks: this.scheduler.pendingCount,
+      phoneUi: {
+        chatOpen: this.phoneUi.chatOpen,
+        channelKey: this.phoneUi.channelKey,
+        channelIsGroup: this.phoneUi.channelIsGroup,
+        forwardDepth: this.phoneUi.forwardStack.length,
+      },
     };
   }
 

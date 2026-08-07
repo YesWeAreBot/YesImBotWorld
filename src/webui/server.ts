@@ -15,6 +15,7 @@
 import http from "node:http";
 import { promises as fs } from "node:fs";
 import { watch as watchDir, type FSWatcher } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import type { WebUIConfig, Config } from "../config.js";
 import type { WorldFiles } from "../files.js";
@@ -23,6 +24,7 @@ import { normalizeCategory, UNSORTED_CATEGORY, sanitizeFileName } from "../media
 import type { MediaStore } from "../media/store.js";
 import type { Prompts, PromptOverrides } from "../prompts.js";
 import type { WorldClock } from "../clock.js";
+import type { ComputerExecResult, ComputerInspection } from "../computer.js";
 import { introspect, validateConfig } from "./schema.js";
 import { debug, type DebugEntry } from "./debug.js";
 import { PAGE_HTML } from "./page.js";
@@ -33,11 +35,33 @@ export interface BotStatusSummary {
   streamLength: number;
   approxChars: number;
   pendingTasks: number;
+  /** 手机界面状态（设备页窥视用）；老版本 Bot 可能不提供 */
+  phoneUi?: { chatOpen: boolean; channelKey: string | null; channelIsGroup: boolean; forwardDepth: number };
 }
 
 export interface NoteEntry {
   title: string;
   content: string;
+}
+
+/** 「设备」页聚合信息：电脑（docker 管理 / 远程桌面）+ 手机 */
+export interface DevicesInfo {
+  computer: {
+    mode: "off" | "docker" | "remote_desktop";
+    /** Bot 侧打开着的电脑应用名（开着 = 电脑开机中） */
+    on: string | null;
+    docker: ComputerInspection | null;
+    remote: { host: string; port: number } | null;
+  };
+  phone: {
+    down: boolean;
+    appOpen: string | null;
+    chatOpen: boolean;
+    channelKey: string | null;
+    channelIsGroup: boolean;
+    /** 聊天应用显示名（如 QQ / 微信），用于手机窥视屏 */
+    chatAppName: string;
+  };
 }
 
 /** WorldService 提供给 WebUI 的能力（结构性实现） */
@@ -72,6 +96,14 @@ export interface WebUIHost {
   notes(): Promise<NoteEntry[]>;
   writeNote(name: string, content: string): Promise<void>;
   deleteNote(name: string): Promise<void>;
+  /** 设备页：电脑 + 手机的实时状态 */
+  devicesInfo(): Promise<DevicesInfo>;
+  /** 远程桌面实时截屏（peek，不影响 Bot 视野）；不可用/连不上时抛错 */
+  computerScreen(maxWidth?: number): Promise<{ png: Buffer; width: number; height: number }>;
+  /** Docker 电脑的开关机管理 */
+  computerAction(action: "start" | "stop" | "restart"): Promise<string>;
+  /** 在 Docker 电脑里执行一条命令（运维用途） */
+  computerExec(command: string): Promise<ComputerExecResult>;
 }
 
 const MIME_BY_EXT: Record<string, string> = {
@@ -355,7 +387,65 @@ export class WebUIServer {
         news,
         galleryCounts: counts,
         tokenSet: !!this.cfg.token,
+        addresses: accessUrls(this.cfg.host, this.cfg.port),
       });
+      return;
+    }
+
+    // ---------- 设备（电脑 + 手机窥视） ----------
+    if (pathname === "/api/devices" && method === "GET") {
+      sendJSON(res, 200, await host.devicesInfo());
+      return;
+    }
+
+    if (pathname === "/api/computer/screen" && method === "GET") {
+      try {
+        const w = Number(q.get("w")) || undefined;
+        const shot = await host.computerScreen(w);
+        res.writeHead(200, {
+          "content-type": "image/png",
+          "cache-control": "no-store",
+          "x-screen-width": String(shot.width),
+          "x-screen-height": String(shot.height),
+        });
+        res.end(shot.png);
+      } catch (err) {
+        sendJSON(res, 503, { error: (err as Error).message ?? String(err) });
+      }
+      return;
+    }
+
+    if (pathname === "/api/computer/action" && method === "POST") {
+      const { action } = await readJson(req);
+      if (action !== "start" && action !== "stop" && action !== "restart") {
+        sendJSON(res, 400, { error: "action 只能是 start / stop / restart" });
+        return;
+      }
+      try {
+        const text = await host.computerAction(action);
+        this.sendLifecycle("computer." + action, text);
+        sendJSON(res, 200, { ok: true, text });
+      } catch (err) {
+        sendJSON(res, 500, { error: (err as Error).message ?? String(err) });
+      }
+      return;
+    }
+
+    if (pathname === "/api/computer/exec" && method === "POST") {
+      const { command } = await readJson(req);
+      if (!String(command ?? "").trim()) {
+        sendJSON(res, 400, { error: "command 不能为空" });
+        return;
+      }
+      if (String(command).length > 4000) {
+        sendJSON(res, 400, { error: "command 过长（>4000 字符）" });
+        return;
+      }
+      try {
+        sendJSON(res, 200, await host.computerExec(String(command)));
+      } catch (err) {
+        sendJSON(res, 500, { error: (err as Error).message ?? String(err) });
+      }
       return;
     }
 
@@ -839,4 +929,28 @@ function sendJSON(res: http.ServerResponse, status: number, data: unknown): void
     "content-length": Buffer.byteLength(body),
   });
   res.end(body);
+}
+
+/** 概览页「访问与安全」：本机 + 局域网可访问的 WebUI 地址列表 */
+function accessUrls(host: string, port: number): { label: string; url: string }[] {
+  const out: { label: string; url: string }[] = [];
+  const seen = new Set<string>();
+  const push = (label: string, h: string) => {
+    const url = `http://${h}:${port}/`;
+    if (seen.has(url)) return;
+    seen.add(url);
+    out.push({ label, url });
+  };
+  const wild = host === "0.0.0.0" || host === "::" || host === "";
+  if (!wild) push(host === "127.0.0.1" || host === "localhost" ? "本机" : "监听地址", host);
+  push("本机", "127.0.0.1");
+  if (wild) {
+    for (const list of Object.values(os.networkInterfaces())) {
+      for (const it of list ?? []) {
+        if (it.internal || it.family !== "IPv4") continue;
+        push("局域网", it.address);
+      }
+    }
+  }
+  return out;
 }
