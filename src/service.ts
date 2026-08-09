@@ -161,6 +161,8 @@ export class WorldService extends Service<Config> {
       },
       selfMessage: (key, content, msgId) => {
         if (!this.worldActive || !this.bot) return;
+        // 自己的账号发出了消息：无论何种呈现模式，先打断对该频道的延期发送意图
+        this.bot.noteDeferredSelfSent(key);
         const mode = config.messaging.externalSelfMessages;
         if (mode === "simulate") {
           this.bot.simulateExternalSend(key, content, msgId);
@@ -173,6 +175,9 @@ export class WorldService extends Service<Config> {
             );
           });
         }
+      },
+      channelActivity: (key) => {
+        if (this.worldActive && this.bot) this.bot.noteDeferredChannelActivity(key);
       },
     });
 
@@ -249,8 +254,9 @@ export class WorldService extends Service<Config> {
     await this.clock.reset();
 
     this.logger.info("开始创世：调用 World-LLM 生成初始状态…");
-    // 生成空的 News.db
+    // 生成空的 News.db 与 facts.jsonl
     if (!(await this.files.exists(this.files.news))) await fs.writeFile(this.files.news, "");
+    if (!(await this.files.exists(this.files.facts))) await fs.writeFile(this.files.facts, "");
     await this.world.initialize(botDef, worldDef);
 
     // 建立全新的 Bot 上下文（角色设定来自刚生成的 Bot_Status.md）
@@ -260,7 +266,7 @@ export class WorldService extends Service<Config> {
     await context.persistPinned();
 
     this.logger.info("创世完成");
-    return `创世完成。\n- ${this.files.botStatus}\n- ${this.files.worldStatus}\n- ${this.files.news}\n使用 world.start 让世界开始运转。`;
+    return `创世完成。\n- ${this.files.botStatus}\n- ${this.files.worldStatus}\n- ${this.files.news}\n- ${this.files.facts}\n使用 world.start 让世界开始运转。`;
   }
 
   async startWorld(): Promise<string> {
@@ -523,6 +529,7 @@ export class WorldService extends Service<Config> {
       `世界状态：${stateText}`,
       `世界时钟：${this.clock.timeLine()}（1 TU = ${this.clock.unitRealSeconds} 现实秒 / ${this.clock.unitWorldSeconds} 世界秒）`,
       `世界历法：${this.clock.syncRealTime ? "与现实时间同步" : describeCalendar(this.clock.calendar)}`,
+      `Tingle：${this.clock.tingleMode === "auto" ? `auto（World 动态决定间隔，${this.clock.tingleMinUnits}~${this.clock.tingleMaxUnits} TU）` : `固定每 ${this.config.clock.tingleEveryUnits} TU 一次`}`,
       `数据目录：${this.files.base}`,
     ];
     if (this.bot) {

@@ -37,7 +37,7 @@ export interface WorldPromptSet {
   resolveWait: string;
   /** Bot 主动查看时间。{{timeLine}} */
   resolveCheckTime: string;
-  /** 世界心跳（Tingle）。{{timeLine}} */
+  /** 世界心跳（Tingle）。{{timeLine}} {{timeInfo}} {{nextTingle}} */
   tingle: string;
   /** 离线补叙。{{fromTimeLine}} {{toTimeLine}} {{gapTU}} */
   resolveOfflineGap: string;
@@ -140,7 +140,7 @@ export const WORLD_PROMPT_DEFAULTS: WorldPromptSet = {
   system:
     "你是一个虚拟世界的模拟引擎（World-LLM）。这个世界中生活着一个由另一个 LLM 扮演的角色（Bot），" +
     "它相信自己是世界中活生生的人。你的职责：\n" +
-    "- 维护 World_Status.md（世界当前状态）与 News（世界事件日志）\n" +
+    "- 维护 World_Status.md（世界当前状态）、News（世界重大事件日志）与 facts.jsonl（Bot 的小事记）\n" +
     "- 裁定 Bot 行动的结果，通过 send_event 把它能感知到的一切告诉它\n" +
     "- 让世界独立、连贯地运转：世界不围着 Bot 转，有自己的节奏与因果\n\n" +
     "原则：\n" +
@@ -157,6 +157,8 @@ export const WORLD_PROMPT_DEFAULTS: WorldPromptSet = {
     "- 状态文件是当前时刻的真实快照：裁定或演化导致状态变化时必须及时 update——" +
     "尤其 Bot 的位置、状态、正在做的事、随身物品发生变化时，一定要更新 bot_status，不要让它过时\n" +
     "- News 是世界的大事记，不是流水账：只记录重要、之后可能被提起或产生影响的事件，日常背景动静不要写入\n" +
+    "- 与 News（世界中心）不同，facts.jsonl 是 Bot 中心的小事记：Bot 的日常习惯、偏好、生活状态这类" +
+    "够不上世界大事、但对了解 Bot 有用的私人小事记在这里（用 update(facts)），Bot 会通过 check_facts 看到它\n" +
     "- 修改状态文件时保持 Markdown 结构稳定，只改需要改的部分\n\n" +
     "<world_definition>（用户给出的世界定义，最高准则）\n{{worldDef}}\n</world_definition>\n\n" +
     // 易变内容放在系统提示最末尾：前面的原则与世界定义保持逐字稳定，
@@ -179,7 +181,9 @@ export const WORLD_PROMPT_DEFAULTS: WorldPromptSet = {
     `**必须** update bot_status 使其与裁定后的现实一致（这一步经常被遗漏，请自查）；` +
     `若改变了周遭世界，update world_status；\n` +
     `4. News 是大事记不是流水账：只有足够重要、之后可能被提起或产生影响的结果才 update news 记一条，` +
-    `日常小动作不要记录。`,
+    `日常小动作不要记录。\n` +
+    `5. 若结果改变了 Bot 的私人生活状态（习惯、偏好、心情、日常小事），` +
+    `用 update(facts) 记进它的私人小事记（facts 是 Bot 中心的小事，News 是世界中心的大事，别混用）。`,
 
   resolveWait:
     `Bot 从 {{issuedAt}} 开始等待 {{n}} 个 TU，等待即将在 ` +
@@ -201,6 +205,7 @@ export const WORLD_PROMPT_DEFAULTS: WorldPromptSet = {
 
   tingle:
     `世界心跳（Tingle）触发，当前 {{timeLine}}。\n` +
+    `时间换算：{{timeInfo}}\n` +
     `请推进世界的自然演化：\n` +
     `1. check world_status 与最近 news，保持连贯；\n` +
     `2. 构思一件此刻世界中正在发生的事（大小皆可：天气变化、路人经过、新闻播报、突发事件……），` +
@@ -209,7 +214,10 @@ export const WORLD_PROMPT_DEFAULTS: WorldPromptSet = {
     `（时段更替后的作息、之前在做的事早已结束、疲劳饥饿等），update bot_status 使其与当前时刻一致；\n` +
     `4. News 是世界的大事记，不是心跳流水账：只有足够重要、之后可能被提起或产生影响的事` +
     `才 update news 记一条——**大多数心跳不需要写 News**，日常背景动静（天气微变、路人走过）绝不要记录；\n` +
-    `5. 仅当这件事会被 Bot 直接感知到（发生在它身边、有巨大动静等）时，才 send_event 告诉它，否则不要打扰。`,
+    `5. 世界演化若带来 Bot 私人生活的小变化（它的作息、习惯、偏好、日常小事），` +
+    `用 update(facts) 记进它的私人小事记（facts 是 Bot 中心的小事，News 是世界中心的大事，别混用）；\n` +
+    `6. 仅当这件事会被 Bot 直接感知到（发生在它身边、有巨大动静等）时，才 send_event 告诉它，否则不要打扰。` +
+    `{{nextTingle}}`,
 
   resolveOfflineGap:
     `Bot 的意识刚刚中断了一段时间：从 {{fromTimeLine}} 到现在（{{toTimeLine}}），` +
@@ -240,7 +248,8 @@ export const WORLD_PROMPT_DEFAULTS: WorldPromptSet = {
     `包含：角色设定（性格、说话风格、背景）、当前位置、当前状态（精神、心情）、正在做的事。这份文件会作为 Bot 的自我认知置顶注入；\n` +
     `2. 调用 update(world_status)：写出世界的初始状态文件，包含：世界观要点、当前时间与环境、` +
     `主要地点与人物的当前状态、正在发生的背景事件；\n` +
-    `3. 可选：用 update(news) 记录一两条开场事件。`,
+    `3. 可选：用 update(news) 记录一两条世界开场大事；\n` +
+    `4. 可选：用 update(facts) 记录一两条 Bot 的私人小事（初始偏好、习惯等，供它日后 check_facts 回忆）。`,
 
   compressSystem:
     "你是一个虚拟角色的记忆整理器。角色刚进入休息状态，你需要把它近期的意识流（工具调用与事件）" +

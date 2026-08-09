@@ -84,6 +84,12 @@ export const BOT_TOOLS: BotToolDef[] = [
       "回想或打听世界上近来发生的事（新闻与见闻），列出最近 n 条（默认 10）。check_status(world) 只给新增的，这里可以完整回看。",
   },
   {
+    name: "check_facts",
+    signature: "check_facts(n?: number)",
+    description:
+      "回忆你自己的私人小事（你的喜好、说过的话、做过的小事，与全世界的大事无关），列出最近 n 条（默认 10）。这是只属于你的记事本。",
+  },
+  {
     name: "check_msg",
     signature: "check_msg(n: number)",
     description: "刷新消息列表：列出最近活跃的 n 个频道及各自的最新一条消息。",
@@ -193,6 +199,8 @@ export const BOT_TOOLS: BotToolDef[] = [
       "在 msg 里写 [图片#12] 或 [视频#3] 会把对应媒体嵌在文字中间发出（图文混排，QQ 等平台可能分开显示）——" +
       "注意：msg 里写了标记这张图就会真的发出去，不想发就不要写。" +
       "duration 表示打字耗时——按消息长度估计，几到几十 TU。消息会在打字完成时真正发出（发出前可 cancel）。" +
+      "duration 明显超过打字时间时不会自动发出，而是视为你打算过会儿再发：到点后系统会问你到底要不要发（想发再调用一次 send）；" +
+      "期间若目标频道来了新消息、你自己的账号在那边发了消息、或你转去忙别的，这个念头就会被打断。" +
       "与上一条完全相同的消息会被拦截（防止无意义复读）；确实要重复发送时加 resend: true。" +
       "像真人一样聊天：单条消息尽量简短（一般十来个字），长内容拆成多条短消息；" +
       "确需发送整段长文（如资料、文章）时须加 confirm_long: true。" +
@@ -211,7 +219,8 @@ export const BOT_TOOLS: BotToolDef[] = [
     name: "send_voice",
     signature: 'send_voice(text: string, id?: string)',
     description:
-      "把一段话转成你的声音，以语音消息发出（id 缺省为当前频道）。适合简短口语化的内容。duration 表示说话耗时（几到几十 TU，过大会被拦下），发出前可 cancel。",
+      "把一段话转成你的声音，以语音消息发出（id 缺省为当前频道）。适合简短口语化的内容。" +
+      "duration 表示说话耗时（几到几十 TU）；明显超过时会视为你打算过会儿再发，到点后询问你是否要发（想发再调用一次 send_voice）。发出前可 cancel。",
   },
   {
     name: "recall",
@@ -528,7 +537,7 @@ export function availableTools(opts: {
         description:
           def.name === "send"
             ? def.description.replace(
-                /duration 表示打字耗时[\s\S]*?（发出前可 cancel）。/,
+                /duration 表示打字耗时[\s\S]*?这个念头就会被打断。/,
                 "duration 会被忽略，消息立即发出。",
               )
             : def.description.replace(

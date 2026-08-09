@@ -17,6 +17,8 @@ export interface GatewayCallbacks {
   notify(content: RichText, wake: boolean): void;
   /** 外部（其他插件/指令输出）以 Bot 账号发出的消息（externalSelfMessages 开启时）；msgId 为平台消息 id（可能为空） */
   selfMessage(channelKey: string, content: string, msgId: string): void;
+  /** 任意频道收到了新消息（不管是否聚焦/通知）。用于打断"过会儿再发"的延期发送意图 */
+  channelActivity(channelKey: string): void;
 }
 
 /**
@@ -379,6 +381,8 @@ export class Gateway {
     });
 
     const key = `${session.platform}:${session.channelId}`;
+    // 频道有新动静：先让系统侧（延期发送意图等）知情，再走通知策略
+    this.callbacks.channelActivity(key);
     // Bot 正在关注的频道：无视通知策略与频道列表，必定呈现完整内容并唤醒
     const focused = this.focus.isFocused(key);
     if (!focused && !this.notifyList.isNotifyChannel(key)) return;

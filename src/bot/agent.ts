@@ -12,6 +12,7 @@ import { debug } from "../webui/debug.js";
 import { createBackend, type BotBackend } from "./backend.js";
 import type { BotContext } from "./context.js";
 import { Scheduler } from "./scheduler.js";
+import { typingSlackTU } from "./typing.js";
 import { BOT_TOOLS, renderToolsText, toolLayer, type BotToolDef } from "./tools.js";
 
 /** Koishi 侧能力（消息查询与发送），由 service 层实现注入 */
@@ -94,6 +95,20 @@ interface MailboxItem {
  *
  * wait() / rest() 是仅有的两个会暂停生成的工具。
  */
+
+/** 延期发送意图：duration 明显超过打字时间的 send，不自动发出，到点询问 Bot 是否要发 */
+interface PendingDeferred {
+  callId: string;
+  kind: "text" | "file" | "voice";
+  /** 目标频道（调用时给的 id，可能为简写） */
+  rawId: string;
+  /** 规范化后的频道 key（异步解析，best-effort） */
+  channelKey: string | null;
+  content: string;
+  expectedAt: number;
+  timer?: ReturnType<typeof setTimeout>;
+}
+
 export class BotAgent {
   private backend: BotBackend;
   readonly scheduler: Scheduler;
@@ -110,6 +125,8 @@ export class BotAgent {
   private lastNewsT: number | null = null;
   /** 上一次 send 的签名（频道+内容+图片），用于拦截连续的重复发送 */
   private lastSendSig: string | null = null;
+  /** 延期发送意图（"过会儿再发"），到点询问、三类情况打断 */
+  private pendingDeferred: PendingDeferred[] = [];
   /** 上一次 act 的描述与调用编号，用于拦截“结果未出就重复做同一件事” */
   private lastAct: { sig: string; callId: string } | null = null;
   /**
@@ -220,6 +237,10 @@ export class BotAgent {
       !prev.channelKey || prev.channelIsGroup !== isGroup;
     this.phoneUi = { chatOpen: true, channelKey: key, channelIsGroup: isGroup, forwardStack: [] };
     this.refreshToolGate();
+    // 注意力转移到别的频道：打断之前挂着的"过会儿再发"念头（频道切换并不总是先离开旧频道）
+    if (prev.channelKey && prev.channelKey !== key) {
+      this.interruptAllDeferred("你把注意力转去了别处");
+    }
     if (toolsetChanged) {
       const defs = [...this.layerDefs("channel"), ...(isGroup ? this.layerDefs("group") : [])];
       const lines: string[] = [];
@@ -261,6 +282,7 @@ export class BotAgent {
     this.running = false;
     this.abort?.abort();
     this.scheduler.stopAll();
+    this.stopAllDeferred();
     this.waiting = null;
     this.wakeFn?.();
     await this.loopPromise;
@@ -358,6 +380,8 @@ export class BotAgent {
       asToolCall: { name: "send", arguments: { id: channelKey, msg } },
     });
     this.logger.info("[external-send:simulate] %s %s", channelKey, truncate(msg, 100));
+    // 账号自己发出了一条消息：打断对该频道的延期发送意图
+    this.noteDeferredSelfSent(channelKey);
   }
 
   // ---------- 主循环 ----------
@@ -609,6 +633,12 @@ export class BotAgent {
           this.lastNewsT = Math.max(...news.map((e) => e.t));
           return `你回想起近来听到的种种消息：\n` + news.map((e) => `- [${e.clock}] ${e.content}`).join("\n");
         });
+      case "check_facts":
+        return this.dispatchLocal(call, async () => {
+          const facts = await this.files.readFacts(clampInt(call.arguments.n, 1, 30, 10));
+          if (!facts.length) return "你翻了翻自己的记事本——上面还没有写过任何东西。";
+          return `你翻开自己的私人记事本，想起这些小事：\n` + facts.map((e) => `- [${e.clock}] ${e.content}`).join("\n");
+        });
       case "check_msg":
         return this.dispatchLocal(call, async () =>
           this.messenger.recentChannels(clampInt(call.arguments.n, 1, 20, 5)),
@@ -708,6 +738,7 @@ export class BotAgent {
           this.phoneUi = { chatOpen: false, channelKey: null, channelIsGroup: false, forwardStack: [] };
           this.phone.down = true;
           this.refreshToolGate();
+          this.interruptAllDeferred("你把手机放到了一边");
           const focusNote = await this.messenger.putDownPhone();
           return (
             `你把手机放到了一边${closedApp ? `（「${closedApp}」已关闭）` : ""}。` +
@@ -1403,6 +1434,129 @@ export class BotAgent {
   }
 
   /**
+   * 延期发送判定：duration 明显超过按字数估算的打字时间时，不再当作打字耗时
+   * （那只是被当成延时报错的把戏），而是把"过会儿再发"的意图存下来：
+   * 到点不自动发出，而是询问 Bot 到底要不要发；延期期间被打断则取消并告知。
+   * 返回 true 表示已按延期发送处理（调用方直接 return）。
+   */
+  private maybeDeferSend(call: ToolCallRecord, kind: "text" | "file" | "voice", id: string, content: string): boolean {
+    if (this.config.bot.ignoreSendDuration) return false;
+    const n = call.duration ?? 0;
+    const slack = typingSlackTU(
+      content.length,
+      this.config.messaging.typingCharsPerSec,
+      this.clock.unitRealSeconds,
+      this.config.messaging.sendDeferFactor,
+    );
+    if (n <= slack) return false;
+
+    this.registerDeferred(call, kind, id, content);
+    return true;
+  }
+
+  private registerDeferred(call: ToolCallRecord, kind: "text" | "file" | "voice", id: string, content: string): void {
+    const pend: PendingDeferred = {
+      callId: call.id,
+      kind,
+      rawId: id,
+      channelKey: null,
+      content,
+      expectedAt: call.expectedAt,
+    };
+    this.pendingDeferred.push(pend);
+    // best-effort 解析规范频道 key（用于按频道匹配打断条件）
+    void this.messenger
+      .resolveKey(id)
+      .then((r) => {
+        if (!("error" in r)) pend.channelKey = r.key;
+      })
+      .catch(() => undefined);
+
+    const target = kind === "text" ? `给 ${id} 发消息说「${content}」` : kind === "voice" ? `给 ${id} 发语音「${content}」` : `给 ${id} 发送文件「${content}」`;
+    this.pushEvent(
+      "system",
+      `（你打算过会儿${target}——这个 duration 明显超过打字时间，更像"过会儿再发"而不是打字，所以不会自动发出。` +
+        `到 T=${call.expectedAt.toFixed(1)} 时我会问你到底要不要发。` +
+        `期间若目标频道来了新消息、你自己的账号在那边发出了一条消息、或你把注意力转去了别处，这个念头就会被打断。` +
+        `想取消可用 cancel ${call.id}。）`,
+      { ref: call.id },
+    );
+
+    const delay = this.clock.realMsUntil(call.expectedAt);
+    pend.timer = setTimeout(() => this.flushDeferred(pend), Math.max(0, delay));
+  }
+
+  /** 到期询问：到点不自动发，改为让 Bot 决定 */
+  private flushDeferred(pend: PendingDeferred): void {
+    if (pend.timer) {
+      clearTimeout(pend.timer);
+      pend.timer = undefined;
+    }
+    this.pendingDeferred = this.pendingDeferred.filter((p) => p !== pend);
+    const toolName = pend.kind === "text" ? "send" : pend.kind === "voice" ? "send_voice" : "send_file";
+    const target = pend.kind === "text" ? `给 ${pend.rawId} 发消息说「${pend.content}」` : pend.kind === "voice" ? `给 ${pend.rawId} 发语音「${pend.content}」` : `给 ${pend.rawId} 发送文件「${pend.content}」`;
+    this.pushEvent(
+      "system",
+      `（时间到了 T=${pend.expectedAt.toFixed(1)}——你之前打算过会儿${target}。现在要发吗？` +
+        `如果还想发，就再调用一次 ${toolName}；如果改主意了，就当我没提。之前那一通还没发出的念头已被解除。）`,
+      { wake: true },
+    );
+  }
+
+  /** 按频道匹配的延期意图是否命中 */
+  private matchesDeferred(p: PendingDeferred, key: string): boolean {
+    return p.channelKey === key || p.rawId === key;
+  }
+
+  /** 同频道来了新消息：打断对那个频道的延期发送意图 */
+  noteDeferredChannelActivity(key: string): void {
+    if (!this.pendingDeferred.length) return;
+    const hit = this.pendingDeferred.filter((p) => this.matchesDeferred(p, key));
+    for (const pend of hit) {
+      if (pend.timer) clearTimeout(pend.timer);
+      this.pendingDeferred = this.pendingDeferred.filter((p) => p !== pend);
+      this.pushEvent(
+        "system",
+        `（${pend.rawId} 那边来了新的消息——你之前打算过会儿${pend.kind === "text" ? "发消息" : pend.kind === "voice" ? "发语音" : "发送文件"}「${pend.content}」的念头被打断了。）`,
+      );
+    }
+  }
+
+  /** 自己的账号（无论何种原因：其他插件、主人顶号、自己刚发的）在频道里发出了消息：打断对该频道的延期发送意图 */
+  noteDeferredSelfSent(key: string): void {
+    if (!this.pendingDeferred.length) return;
+    const hit = this.pendingDeferred.filter((p) => this.matchesDeferred(p, key));
+    for (const pend of hit) {
+      if (pend.timer) clearTimeout(pend.timer);
+      this.pendingDeferred = this.pendingDeferred.filter((p) => p !== pend);
+      this.pushEvent(
+        "system",
+        `（你的账号在 ${pend.rawId} 发出了一条消息——之前那个"过会儿${pend.kind === "text" ? "发消息" : pend.kind === "voice" ? "发语音" : "发文件"}「${pend.content}」"的念头被打断了。）`,
+      );
+    }
+  }
+
+  /** 注意力转移到别处（换频道 / 放下手机）：打断全部延期发送意图 */
+  private interruptAllDeferred(reason: string): void {
+    if (!this.pendingDeferred.length) return;
+    for (const pend of this.pendingDeferred) {
+      if (pend.timer) clearTimeout(pend.timer);
+      this.pushEvent(
+        "system",
+        `（你之前打算过会儿${pend.kind === "text" ? "给 " + pend.rawId + " 发消息" : "给 " + pend.rawId + (pend.kind === "voice" ? " 发语音" : " 发送文件")}「${pend.content}」，但${reason}——那个念头被打断了。）`,
+      );
+    }
+    this.pendingDeferred = [];
+  }
+
+  private stopAllDeferred(): void {
+    for (const pend of this.pendingDeferred) {
+      if (pend.timer) clearTimeout(pend.timer);
+    }
+    this.pendingDeferred = [];
+  }
+
+  /**
    * 发送类工具的目标解析（在执行时刻调用）：给了别的频道 id 时先切换过去
    * （等效先 select_channel，工具集随频道类型联动），返回规范化 key。
    * 聊天应用已被关闭时（打字期间 close_app / 放下手机），消息照常发出，
@@ -1418,7 +1572,6 @@ export class BotAgent {
   }
 
   private dispatchSend(call: ToolCallRecord): void {
-    if (this.gateSendDuration(call, "打字")) return;
     const id = this.channelArg(call) ?? "";
     const msg = String(call.arguments.msg ?? "");
     const mediaRaw = call.arguments.media ?? call.arguments.images;
@@ -1457,6 +1610,9 @@ export class BotAgent {
       );
       return;
     }
+    // duration 明显超过打字时间 → 视为"过会儿再发"，延期后询问而不是自动发出
+    if (this.maybeDeferSend(call, "text", id, msg)) return;
+    if (this.gateSendDuration(call, "打字")) return;
     // 拦截与上一条完全相同的发送（模型常见的复读行为），除非显式声明 resend
     const sig = JSON.stringify([id, msg, media.map(String), replyTo ?? "", atSender]);
     if (sig === this.lastSendSig && !isTruthy(call.arguments.resend)) {
@@ -1476,13 +1632,15 @@ export class BotAgent {
       run: async () => {
         const target = await this.switchToTarget(id);
         if ("error" in target) return target.error;
-        return this.messenger.send(target.key, msg, media, replyTo, atSender, insist);
+        const out = await this.messenger.send(target.key, msg, media, replyTo, atSender, insist);
+        // 自己发出了一条消息：打断对该频道的延期发送意图
+        this.noteDeferredSelfSent(target.key);
+        return out;
       },
     });
   }
 
   private dispatchSendFile(call: ToolCallRecord): void {
-    if (this.gateSendDuration(call, "挑选并发送文件的")) return;
     const id = this.channelArg(call) ?? "";
     const file = String(call.arguments.file ?? "");
     if (!id) {
@@ -1504,19 +1662,22 @@ export class BotAgent {
       );
       return;
     }
+    if (this.maybeDeferSend(call, "file", id, file)) return;
+    if (this.gateSendDuration(call, "挑选并发送文件的")) return;
     this.ackStart(call);
     this.scheduler.schedule(call, {
       executeAt: "expected",
       run: async () => {
         const target = await this.switchToTarget(id);
         if ("error" in target) return target.error;
-        return this.messenger.sendFile(target.key, file);
+        const out = await this.messenger.sendFile(target.key, file);
+        this.noteDeferredSelfSent(target.key);
+        return out;
       },
     });
   }
 
   private dispatchSendVoice(call: ToolCallRecord): void {
-    if (this.gateSendDuration(call, "说话")) return;
     const id = this.channelArg(call) ?? "";
     const text = String(call.arguments.text ?? "");
     if (!id) {
@@ -1536,13 +1697,17 @@ export class BotAgent {
       );
       return;
     }
+    if (this.maybeDeferSend(call, "voice", id, text)) return;
+    if (this.gateSendDuration(call, "说话")) return;
     this.ackStart(call);
     this.scheduler.schedule(call, {
       executeAt: "expected", // 说完的那一刻语音才发出（此前可 cancel）
       run: async () => {
         const target = await this.switchToTarget(id);
         if ("error" in target) return target.error;
-        return this.messenger.sendVoice(target.key, text);
+        const out = await this.messenger.sendVoice(target.key, text);
+        this.noteDeferredSelfSent(target.key);
+        return out;
       },
     });
   }

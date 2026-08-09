@@ -95,6 +95,10 @@ export interface ClockConfigData {
   worldSecondsPerUnit: number;
   epoch: string;
   tingleEveryUnits: number;
+  /** fixed：固定间隔；auto：由 World 在每次 Tingle 时动态决定下一次间隔 */
+  tingleMode: "fixed" | "auto";
+  tingleMinUnits: number;
+  tingleMaxUnits: number;
   offlineNarrateMinUnits: number;
 }
 
@@ -114,6 +118,10 @@ export interface MessagingConfig {
   externalSelfMessages: ExternalSelfMessageMode;
   selfCommands: boolean;
   offlineHistory: boolean;
+  /** 打字速度（字/现实秒），用于按消息字数线性估算打字耗时，判定 send 的 duration 语义 */
+  typingCharsPerSec: number;
+  /** "模拟打字"的 duration 上限 = 打字估算 × 该倍数；超过视为"过会儿再发" */
+  sendDeferFactor: number;
 }
 
 /** 聊天平台扩展操作（收发消息之外的能力），每个接口独立开关，默认全部关闭 */
@@ -453,6 +461,20 @@ export const Config: Schema<Config> = Schema.intersect([
         .min(0)
         .default(1800)
         .description("每过多少个 Time Unit 产生一次 Tingle（触发 World-LLM 推进世界、生成 News）。默认 1800（同步模式下即 30 分钟）。0 表示禁用"),
+      tingleMode: Schema.union([
+        Schema.const("fixed").description("固定间隔（使用上面的 tingleEveryUnits）"),
+        Schema.const("auto").description("由 World 在每次 Tingle 时根据世界节奏动态决定下一次间隔"),
+      ])
+        .default("fixed")
+        .description("Tingle 间隔模式。auto 模式下 World 会获知当前历法、时刻与 TU 换算关系，自行决定下一次心跳的间隔"),
+      tingleMinUnits: Schema.number()
+        .min(0)
+        .default(300)
+        .description("auto 模式下下一次 Tingle 间隔的下限（TU）。防止 World 把心跳压得太密集。默认 300（同步模式下即 5 分钟）"),
+      tingleMaxUnits: Schema.number()
+        .min(0)
+        .default(14400)
+        .description("auto 模式下下一次 Tingle 间隔的上限（TU）。防止 World 把心跳拖得太久。默认 14400（同步模式下即 4 小时）"),
       offlineNarrateMinUnits: Schema.number()
         .min(0)
         .default(600)
@@ -920,6 +942,21 @@ export const Config: Schema<Config> = Schema.intersect([
           "插件离线期间（Bot 掉线/世界未启动）错过的群消息，是否在重新上线后用 NapCat 等实现的 " +
             "get_group_msg_history 扩展接口补拉入库。只写入消息记录（Bot 翻记录时能看到），" +
             "不注入逐条事件打扰上下文；仅拉取关注中 / 通知列表 / 最近活跃的 QQ 群",
+        ),
+      typingCharsPerSec: Schema.number()
+        .min(0.1)
+        .default(5)
+        .description(
+          "打字速度（字/现实秒）。系统按 send 的 msg 字数线性估算打字耗时，" +
+            "用来区分 duration 是「模拟打字时间」还是「过会儿再发」",
+        ),
+      sendDeferFactor: Schema.number()
+        .min(1)
+        .default(4)
+        .description(
+          "send 系工具 duration 超过「打字估算 × 该倍数」时，不再当作打字时间（那只会被当成延时报错的把戏），" +
+            "而是视为「过会儿再发」的意图：到点后系统会询问 Bot 到底要不要发；" +
+            "延期期间目标频道来了新消息、自己的账号在那边发了消息、或注意力转去了别处，都会打断这个念头",
         ),
     }).description("Koishi 消息接入"),
   }),

@@ -23,8 +23,13 @@ export class TingleTimer {
   start(): void {
     if (this.running || this.cfg.tingleEveryUnits <= 0) return;
     this.running = true;
-    this.scheduleNext();
-    this.logger.info("Tingle 已启动：每 %d TU（%d 现实秒）一次", this.cfg.tingleEveryUnits, this.cfg.tingleEveryUnits * this.clock.unitRealSeconds);
+    this.scheduleNext(this.cfg.tingleEveryUnits);
+    this.logger.info(
+      "Tingle 已启动：%s（默认 %d TU，即 %d 现实秒）",
+      this.cfg.tingleMode === "auto" ? "auto 模式（间隔由 World 动态决定）" : "固定间隔",
+      this.cfg.tingleEveryUnits,
+      this.cfg.tingleEveryUnits * this.clock.unitRealSeconds,
+    );
   }
 
   stop(): void {
@@ -33,21 +38,33 @@ export class TingleTimer {
     this.timer = null;
   }
 
-  private scheduleNext(): void {
+  private scheduleNext(intervalTU: number): void {
     if (!this.running) return;
-    const delayMs = this.cfg.tingleEveryUnits * this.clock.unitRealSeconds * 1000;
+    const delayMs = Math.max(0, intervalTU) * this.clock.unitRealSeconds * 1000;
     this.timer = setTimeout(() => {
-      void this.fire().finally(() => this.scheduleNext());
+      void this.fire().finally(() => this.scheduleNext(this.lastInterval));
     }, delayMs);
   }
+
+  /** auto 模式下上一次 Tingle 之后 World 决定的下一次间隔（TU）；fixed 模式恒为配置值 */
+  private lastInterval = 0;
 
   private async fire(): Promise<void> {
     if (!this.running) return;
     this.logger.debug("Tingle 触发");
     try {
-      await this.world.tingle(this.deliver);
+      const next = await this.world.tingle(this.deliver);
+      // World 动态决定的间隔：限制在配置的上下限内；没决定则沿用默认
+      let interval = this.cfg.tingleEveryUnits;
+      if (this.cfg.tingleMode === "auto" && next !== null && next > 0) {
+        const min = this.cfg.tingleMinUnits;
+        const max = this.cfg.tingleMaxUnits;
+        interval = Math.min(max > 0 ? max : next, Math.max(min > 0 ? min : next, next));
+      }
+      this.lastInterval = interval;
     } catch (err) {
       this.logger.warn("Tingle 处理失败: %s", err);
+      this.lastInterval = this.cfg.tingleEveryUnits;
     }
   }
 }

@@ -109,6 +109,21 @@ export class WorldClock {
     return this.cfg.epoch;
   }
 
+  /** Tingle 间隔模式：fixed = 固定间隔；auto = 由 World 动态决定 */
+  get tingleMode(): "fixed" | "auto" {
+    return this.cfg.tingleMode;
+  }
+
+  /** auto 模式下 Tingle 间隔的下限（TU） */
+  get tingleMinUnits(): number {
+    return this.cfg.tingleMinUnits;
+  }
+
+  /** auto 模式下 Tingle 间隔的上限（TU） */
+  get tingleMaxUnits(): number {
+    return this.cfg.tingleMaxUnits;
+  }
+
   private async save(): Promise<void> {
     // 原子写入：避免进程在写入途中被杀导致 clock.json 损坏（那会让世界时间归零）
     const tmp = `${this.file}.tmp`;

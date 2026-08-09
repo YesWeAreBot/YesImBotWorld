@@ -14,12 +14,13 @@ const WORLD_TOOLS: ChatToolDef[] = [
     type: "function",
     function: {
       name: "check",
-      description: "读取状态文件。bot_status = Bot 状态；world_status = 世界状态；news = 最近的世界事件列表",
+      description:
+        "读取状态文件。bot_status = Bot 状态；world_status = 世界状态；news = 最近的世界重大事件（世界中心，Bot 读新闻时也会看到，别拿它记 Bot 私事）；facts = Bot 的小事记（Bot 中心，Bot 记私人小事时读这里）",
       parameters: {
         type: "object",
         properties: {
-          target: { type: "string", enum: ["bot_status", "world_status", "news"] },
-          n: { type: "integer", description: "target 为 news 时读取最近多少条，默认 10" },
+          target: { type: "string", enum: ["bot_status", "world_status", "news", "facts"] },
+          n: { type: "integer", description: "target 为 news / facts 时读取最近多少条，默认 10" },
         },
         required: ["target"],
       },
@@ -28,13 +29,30 @@ const WORLD_TOOLS: ChatToolDef[] = [
   {
     type: "function",
     function: {
-      name: "update",
+      name: "grep",
       description:
-        "更新状态。bot_status / world_status 会用 content 整体覆盖对应 md 文件；news 则把 content 作为一条新事件追加到事件列表（自动附带当前世界时刻）",
+        "在状态文件中按关键词检索，只返回命中的行/条目，避免整文件读取占用上下文。需要回顾文件里是否出现过某件事时用它，比 check 更省",
       parameters: {
         type: "object",
         properties: {
-          target: { type: "string", enum: ["bot_status", "world_status", "news"] },
+          target: { type: "string", enum: ["bot_status", "world_status", "news", "facts"] },
+          keyword: { type: "string", description: "要检索的关键词" },
+          n: { type: "integer", description: "最多返回多少条命中，默认 20" },
+        },
+        required: ["target", "keyword"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "update",
+      description:
+        "更新状态。bot_status / world_status 会用 content 整体覆盖对应 md 文件；news 把 content 作为一条世界重大事件追加（世界中心，只有影响世界走向的大事才记这里）；facts 把 content 作为一条 Bot 小事记追加（Bot 中心，Bot 的私人小事记这里）。均自动附带当前世界时刻",
+      parameters: {
+        type: "object",
+        properties: {
+          target: { type: "string", enum: ["bot_status", "world_status", "news", "facts"] },
           content: { type: "string" },
         },
         required: ["target", "content"],
@@ -47,6 +65,21 @@ const WORLD_TOOLS: ChatToolDef[] = [
       name: "check_time",
       description: "查询 World Clock 的当前时刻",
       parameters: { type: "object", properties: {} },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "set_tingle",
+      description:
+        "（仅限 Tingle 任务）决定下一次世界心跳（Tingle）的间隔，单位 Time Unit。根据世界当前的节奏自行取舍：平淡无事的日子可以拉长，事多的时段需要加密。未调用则沿用默认间隔",
+      parameters: {
+        type: "object",
+        properties: {
+          units: { type: "number", description: "下一次 Tingle 的间隔（TU），须在系统给定的范围内" },
+        },
+        required: ["units"],
+      },
     },
   },
   {
@@ -71,6 +104,8 @@ export interface WorldInvocation {
   task: string;
   /** send_event 的交付目标；未提供时 send_event 不可用 */
   deliver?: (content: string) => void;
+  /** 是否允许 set_tingle（仅 Tingle 任务） */
+  allowTingle?: boolean;
 }
 
 /**
@@ -84,6 +119,8 @@ export class WorldAgent {
   private client: ChatClient;
   private tail: Promise<unknown> = Promise.resolve();
   private pending = 0;
+  /** World 通过 set_tingle 为下一次心跳设定的间隔（TU）；读取后清空 */
+  private nextTingleUnits: number | null = null;
 
   /** 排队中（含执行中）的调用数，用于观测积压 */
   get queueLength(): number {
@@ -158,10 +195,37 @@ export class WorldAgent {
     return this.invokeWithTools({ task, deliver });
   }
 
-  /** Tingle：世界心跳，推进世界演化 */
-  async tingle(deliver: (content: string) => void): Promise<void> {
-    const task = fill(this.prompts.world.tingle, { timeLine: this.clock.timeLine() });
-    await this.invokeWithTools({ task, deliver });
+  /** Tingle：世界心跳，推进世界演化。返回 World 为下一次心跳设定的间隔（TU），未设定则返回 null */
+  async tingle(deliver: (content: string) => void): Promise<number | null> {
+    const task = fill(this.prompts.world.tingle, {
+      timeLine: this.clock.timeLine(),
+      timeInfo: this.timeInfoText(),
+      nextTingle: this.tingleNextTingleText(),
+    });
+    await this.invokeWithTools({ task, deliver, allowTingle: true });
+    const next = this.nextTingleUnits;
+    this.nextTingleUnits = null;
+    return next;
+  }
+
+  /** World 了解时间换算的信息（Tingle / 动态间隔用） */
+  private timeInfoText(): string {
+    const unitWorld = this.clock.unitWorldSeconds;
+    const unitReal = this.clock.unitRealSeconds;
+    const realNote = this.clock.syncRealTime ? "（与现实同步：1 TU = 1 现实秒）" : `（现实中 1 TU ≈ ${unitReal} 秒）`;
+    return `时间换算：1 TU = ${unitWorld} 世界秒${realNote}；当前历法下的时刻：${this.clock.timeLine()}`;
+  }
+
+  /** Tingle 模板里"决定下一次间隔"的指令段：auto 模式有，fixed 模式为空 */
+  private tingleNextTingleText(): string {
+    if (this.clock.tingleMode !== "auto") return "";
+    const min = this.clock.tingleMinUnits;
+    const max = this.clock.tingleMaxUnits;
+    return (
+      `\n本次是 auto 模式：你需要在结尾用 set_tingle 工具决定下一次心跳的间隔（TU，${min} ~ ${max}）。` +
+      `世界节奏平淡无事时拉长、事多时加密；换算成现实时长：` +
+      `${(min * this.clock.unitRealSeconds).toFixed(0)} 秒 ~ ${(max * this.clock.unitRealSeconds).toFixed(0)} 秒。`
+    );
   }
 
   /** 插件离线期间世界时间照常流逝：补叙这段时间世界发生了什么，并告知刚恢复意识的 Bot */
@@ -355,9 +419,11 @@ export class WorldAgent {
 
   /** 运行工具循环，返回模型最后一轮的文本内容 */
   private async runToolLoop(invocation: WorldInvocation): Promise<string> {
-    const tools = invocation.deliver
-      ? WORLD_TOOLS
-      : WORLD_TOOLS.filter((t) => t.function.name !== "send_event");
+    const tools = WORLD_TOOLS.filter(
+      (t) =>
+        (invocation.deliver || t.function.name !== "send_event") &&
+        (invocation.allowTingle || t.function.name !== "set_tingle"),
+    );
     const messages: ChatMessage[] = [
       { role: "system", content: await this.systemPrompt() },
       { role: "user", content: invocation.task },
@@ -441,11 +507,46 @@ export class WorldAgent {
           const target = String(args.target ?? "");
           if (target === "bot_status") return (await this.files.readBotStatus()) || "（空）";
           if (target === "world_status") return (await this.files.readWorldStatus()) || "（空）";
-          if (target === "news") {
+          if (target === "news" || target === "facts") {
             const n = Number(args.n ?? 10);
-            const news = await this.files.readNews(n);
-            if (!news.length) return "（暂无事件）";
-            return news.map((e) => `[T=${e.t.toFixed(1)} ${e.clock}] ${e.content}`).join("\n");
+            const entries = target === "news" ? await this.files.readNews(n) : await this.files.readFacts(n);
+            if (!entries.length) return "（暂无内容）";
+            return entries.map((e) => `[T=${e.t.toFixed(1)} ${e.clock}] ${e.content}`).join("\n");
+          }
+          return `未知 target: ${target}`;
+        }
+        case "grep": {
+          const target = String(args.target ?? "");
+          const keyword = String(args.keyword ?? "").toLowerCase();
+          if (!keyword) return "keyword 不能为空";
+          if (target === "news" || target === "facts") {
+            const raw = await this.files.readText(target === "news" ? this.files.news : this.files.facts);
+            const hits: string[] = [];
+            for (const line of raw.trim().split("\n").reverse()) {
+              if (!line.trim()) continue;
+              try {
+                const e = JSON.parse(line) as { t: number; clock: string; content: string };
+                if (e.content.toLowerCase().includes(keyword)) {
+                  hits.push(`[T=${e.t.toFixed(1)} ${e.clock}] ${e.content}`);
+                  if (hits.length >= Number(args.n ?? 20)) break;
+                }
+              } catch {
+                /* 跳过损坏行 */
+              }
+            }
+            return hits.length ? hits.join("\n") : "（无匹配）";
+          }
+          if (target === "bot_status" || target === "world_status") {
+            const text =
+              target === "bot_status" ? await this.files.readBotStatus() : await this.files.readWorldStatus();
+            const hits: string[] = [];
+            for (const line of text.split("\n")) {
+              if (line.toLowerCase().includes(keyword)) {
+                hits.push(line);
+                if (hits.length >= Number(args.n ?? 20)) break;
+              }
+            }
+            return hits.length ? hits.join("\n") : "（无匹配）";
           }
           return `未知 target: ${target}`;
         }
@@ -460,20 +561,33 @@ export class WorldAgent {
             await this.files.writeWorldStatus(content);
             return "World_Status.md 已更新";
           }
-          if (target === "news") {
+          if (target === "news" || target === "facts") {
             // 防止模型在工具循环中重复记录相同内容
-            const recent = await this.files.readNews(5);
+            const recent = target === "news" ? await this.files.readNews(5) : await this.files.readFacts(5);
             if (recent.some((e) => e.content === content)) {
-              return "这条事件与近期记录重复，未追加。";
+              return "这条内容与近期记录重复，未追加。";
             }
             const t = this.clock.now();
-            await this.files.appendNews({ t, clock: this.clock.clockString(t), content });
-            return "已追加至事件列表";
+            if (target === "news") {
+              await this.files.appendNews({ t, clock: this.clock.clockString(t), content });
+              return "已追加至世界重大事件列表";
+            }
+            await this.files.appendFacts({ t, clock: this.clock.clockString(t), content });
+            return "已追加至 Bot 小事记";
           }
           return `未知 target: ${target}`;
         }
         case "check_time":
           return this.clock.timeLine();
+        case "set_tingle": {
+          const units = Number(args.units);
+          if (!Number.isFinite(units) || units <= 0) return "units 必须是大于 0 的数字";
+          const min = this.clock.tingleMinUnits;
+          const max = this.clock.tingleMaxUnits;
+          const clamped = Math.max(min > 0 ? min : 0, Math.min(max > 0 ? max : units, units));
+          this.nextTingleUnits = clamped;
+          return `已设定：下一次心跳间隔 ${clamped} TU（${(clamped * this.clock.unitRealSeconds).toFixed(1)} 现实秒）。`;
+        }
         case "send_event": {
           const content = String(args.content ?? "");
           if (!invocation.deliver) return "当前任务不允许 send_event";

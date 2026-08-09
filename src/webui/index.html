@@ -672,6 +672,7 @@ function renderOverview(o){
   // 世界事件 + 访问安全
   var cols = el('div', {style:'display:grid;grid-template-columns:1fr;gap:0'});
   cols.appendChild(newsSection(o));
+  cols.appendChild(factsSection(o));
   cols.appendChild(accessSection(o));
   root.appendChild(cols);
   main.appendChild(root);
@@ -684,6 +685,8 @@ function patchOverviewDynamic(o){
   if(cards){ cards.textContent = ''; overviewCards(o).forEach(function(x){ cards.appendChild(x); }); }
   var newsBox = $('#ov-news');
   if(newsBox){ newsBox.textContent = ''; newsBox.appendChild(newsSection(o).querySelector('.body') || el('div')); }
+  var factsBox = $('#ov-facts');
+  if(factsBox){ factsBox.textContent = ''; factsBox.appendChild(factsSection(o).querySelector('.body') || el('div')); }
 }
 function heroSub(o){
   if(!o.initialized) return '世界尚未创世——先编写定义，然后点击「创世」';
@@ -729,6 +732,23 @@ function newsSection(o){
   return el('div', {cls:'section'}, [
     el('h3', {html:'最近的世界事件 <span class="hint">完整编辑在「状态」页</span>'}),
     el('div', {id:'ov-news'}, [body])
+  ]);
+}
+function factsSection(o){
+  var body = el('div', {cls:'body'});
+  if(o.facts && o.facts.length){
+    o.facts.forEach(function(n){
+      body.appendChild(el('div', {cls:'news-item'}, [
+        el('span', {cls:'clock', text:'[' + n.clock + ']'}),
+        el('span', {text: ' ' + n.content, style:'font-size:12.5px'})
+      ]));
+    });
+  } else {
+    body.appendChild(el('p', {cls:'empty', text:'（还没有任何小事）'}));
+  }
+  return el('div', {cls:'section'}, [
+    el('h3', {html:'最近的小事记 <span class="hint">Bot 的私人小事，完整编辑在「状态」页</span>'}),
+    el('div', {id:'ov-facts'}, [body])
   ]);
 }
 function accessSection(o){
@@ -1161,9 +1181,9 @@ function gotoCfg(gkey){
 var PRIMARY = {
   bot: ['mode', 'baseURL', 'apiKey', 'model', 'stream'],
   world: ['baseURL', 'apiKey', 'model', 'stream'],
-  clock: ['syncRealTime', 'epoch', 'realSecondsPerUnit'],
+  clock: ['syncRealTime', 'epoch', 'realSecondsPerUnit', 'tingleEveryUnits', 'tingleMode', 'tingleMinUnits', 'tingleMaxUnits'],
   apps: ['chatAppName', 'weatherEnabled', 'weatherDefaultCity', 'browserEnabled', 'notesEnabled', 'computer'],
-  messaging: ['notifyChannels', 'notifyPolicy', 'wakeOnNotify', 'offlineHistory']
+  messaging: ['notifyChannels', 'notifyPolicy', 'wakeOnNotify', 'offlineHistory', 'typingCharsPerSec', 'sendDeferFactor']
 };
 var CFG_ICONS = {root:'sliders', bot:'cpu', world:'gauge', clock:'activity', platformOps:'phone', apps:'monitor', captioners:'image', tts:'film', media:'folder', webui:'sliders', messaging:'edit'};
 var PLAT_CATS = [
@@ -1652,7 +1672,8 @@ function renderStateEditor(s){
   var panes = el('div');
   panes.appendChild(statePane('bot', 'Bot 状态', s.botStatus, '/api/state/bot-status'));
   panes.appendChild(statePane('world', '世界状态', s.worldStatus, '/api/state/world-status'));
-  panes.appendChild(newsPane(s.news));
+  panes.appendChild(jsonlPane('世界新闻', 'World-LLM 记录的世界大事记（JSONL）', s.news, '/api/state/news', '新增一条世界事件…'));
+  panes.appendChild(jsonlPane('Bot 小事记', 'Bot 的私人小事（facts.jsonl）', s.facts || [], '/api/state/facts', '新增一条 Bot 小事…'));
   panes.appendChild(statePane('botdef', 'Bot 角色定义', s.botDef, '/api/definitions/bot'));
   panes.appendChild(statePane('worlddef', '世界定义', s.worldDef, '/api/definitions/world'));
   frag.appendChild(panes);
@@ -1675,14 +1696,14 @@ function statePane(id, title, content, url){
   ]));
   return sec;
 }
-function newsPane(news){
-  var sec = el('div', {cls:'section', 'data-pane': 'news'});
-  sec.appendChild(el('h3', {html:'世界新闻 <span class="hint">World-LLM 记录的大事记（JSONL）</span>'}));
+function jsonlPane(title, hint, items, urlBase, placeholder){
+  var sec = el('div', {cls:'section', 'data-pane': urlBase.split('/').pop()});
+  sec.appendChild(el('h3', {html: title + ' <span class="hint">' + hint + '</span>'}));
   var body = el('div', {cls:'body'});
   var list = el('div');
   function render(){
     list.textContent = '';
-    news.forEach(function(n, i){
+    items.forEach(function(n, i){
       var it = el('div', {cls:'news-item'});
       var ta = el('textarea', {rows: 2});
       ta.value = n.content;
@@ -1690,24 +1711,24 @@ function newsPane(news){
       it.appendChild(ta);
       it.appendChild(el('div', {cls:'toolbar', style:'margin:4px 0 0'}, [
         el('button', {text:'保存修改', onclick:function(){
-          api('PUT', '/api/state/news', {index:i, content: ta.value}).then(function(){ news[i].content = ta.value; toast('已保存', 'ok'); }).catch(showErr);
+          api('PUT', urlBase, {index:i, content: ta.value}).then(function(){ items[i].content = ta.value; toast('已保存', 'ok'); }).catch(showErr);
         }}),
         el('button', {cls:'danger', text:'删除', onclick:function(){
-          if(!confirm('删除这条事件？')) return;
-          api('DELETE', '/api/state/news?index=' + i).then(function(){ news.splice(i,1); render(); }).catch(showErr);
+          if(!confirm('删除这条？')) return;
+          api('DELETE', urlBase + '?index=' + i).then(function(){ items.splice(i,1); render(); }).catch(showErr);
         }})
       ]));
       list.appendChild(it);
     });
   }
   render();
-  var addInp = el('input', {placeholder:'新增一条世界事件…', style:'flex:1'});
+  var addInp = el('input', {placeholder: placeholder, style:'flex:1'});
   body.appendChild(el('div', {cls:'toolbar'}, [
     addInp,
     el('button', {cls:'primary', text:'追加', onclick:function(){
       var v = addInp.value.trim();
       if(!v) return;
-      api('POST', '/api/state/news', {content: v}).then(function(){ addInp.value=''; loadState(); }).catch(showErr);
+      api('POST', urlBase, {content: v}).then(function(){ addInp.value=''; loadState(); }).catch(showErr);
     }})
   ]));
   body.appendChild(list);

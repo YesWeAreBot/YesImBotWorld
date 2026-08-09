@@ -5,7 +5,7 @@ YesImBot World：让 Bot 生活在一个由 LLM 独立维护的虚拟世界中�
 两个 LLM 同时运行：
 
 - **Bot-LLM**：持续推理的 Agent，一个接一个地生成工具调用（Tool Call），像文字版 VLA——它不是在"回复消息"，而是在世界中**生活**：行动、等待、休息、翻手机、聊天。
-- **World-LLM**：世界模拟引擎。无持续上下文，按需被唤起：裁定 Bot 行动的结果、响应等待到期、响应 Tingle（世界心跳）推进世界演化，并维护 `World_Status.md` 与 `News.db`。它只模拟 Bot 所处的虚拟世界——聊天平台属于外部真实系统，World-LLM 被明确禁止虚构平台内的事件（消息、好友申请等只能来自 Koishi）。
+- **World-LLM**：世界模拟引擎。无持续上下文，按需被唤起：裁定 Bot 行动的结果、响应等待到期、响应 Tingle（世界心跳）推进世界演化，并维护 `World_Status.md`、`News.db`（世界重大事件）与 `facts.jsonl`（Bot 的小事记）。它只模拟 Bot 所处的虚拟世界——聊天平台属于外部真实系统，World-LLM 被明确禁止虚构平台内的事件（消息、好友申请等只能来自 Koishi）。
 
 ## 提醒
 
@@ -38,7 +38,8 @@ YesImBot World：让 Bot 生活在一个由 LLM 独立维护的虚拟世界中�
 | `World_Definition.md` | **用户** | 世界定义（创世输入，World-LLM 的最高准则） |
 | `Bot_Status.md` | Bot-LLM（经压缩流程） | Bot 当前状态，作为角色设定置顶注入 |
 | `World_Status.md` | World-LLM | 世界当前状态 |
-| `News.db` | World-LLM | 世界事件列表（JSONL 格式，一行一个事件） |
+| `News.db` | World-LLM | **世界**重大事件列表（JSONL，一行一个事件）。世界中心——只有影响世界走向的大事记这里 |
+| `facts.jsonl` | World-LLM | **Bot** 的小事记（JSONL，一行一件）。Bot 中心——Bot 的私人小事（习惯、偏好、日常）记这里，Bot 用 `check_facts` 回忆 |
 | `gallery/` | **用户 + Bot** | 收藏夹，按分类子目录存放：`表情包/`、`meme/`、`截图/`、`照片/`、`未整理/`。用户手动投放的文件放进 `未整理/`（或直接丢根目录，会被自动清扫进去），Bot 有空时会看图、写描述、归类 |
 | `assets/` | 运行时 | 媒体资产库（收到/发出的图片、音频、视频，sha256 去重） |
 | `stream.jsonl` | 运行时 | Bot 工作窗口（Tool Call 流）持久化 |
@@ -106,6 +107,13 @@ YesImBot World：让 Bot 生活在一个由 LLM 独立维护的虚拟世界中�
 - **生成与执行解耦**：生成完一个工具调用不等待结果、立即想下一步；结果在世界到达期望完成时刻时以 Event 注入（若届时结果未就绪，则就绪后立即注入）。模型快 → 角色行动连贯；模型慢 → 角色发呆愣神——推理速度本身塑造性格；
 - `send` 在期望完成时刻（打字完成）才真正发出，此前可 `cancel`（撤回还没发出去的话）；
 - **Tingle**：每 `tingleEveryUnits` 个 TU 触发一次 World-LLM，推进世界演化并追加 News（只有 Bot 能感知的事才打扰它）。
+  配置 `clock.tingleMode = auto` 时可改为由 World 动态决定间隔：每次心跳会向 World-LLM 提供当前历法、时刻与
+  TU 换算关系，它用 `set_tingle` 工具自行决定下一次间隔（限制在 `tingleMinUnits ~ tingleMaxUnits` 内），
+  平淡无事的日子拉长、事多的时段加密；
+- `send` 的 `duration` 语义判定：系统按消息字数线性估算打字耗时（`messaging.typingCharsPerSec`），
+  duration 未超过「估算 × `sendDeferFactor`」时当作打字时间照常发送；明显超过时视为「过会儿再发」的意图——
+  不会自动发出，到点后系统会询问 Bot 到底要不要发（想发再调用一次 send）；延期期间若目标频道来了新消息、
+  自己的账号在那边发了消息（其他插件 / 主人顶号）、或 Bot 把注意力转去了别处，这个念头会被打断并以事件告知。
 
 ## 上下文规则（缓存友好 + 拟人）
 
@@ -174,6 +182,8 @@ Bot 不只能收，也能发：
 
 发送都遵循"打字/说话耗时"语义：duration 到点才真正发出，此前可 `cancel` 撤回；
 发出的媒体以占位符入库，之后 `select_channel` 回看自己发过的图和语音。
+duration 明显超过按字数估算的打字时间时，视为"过会儿再发"而非打字耗时：
+不自动发出，到点询问 Bot 是否要发（详见「时间模型」），延期期间的三种打断条件也会以事件告知。
 未配置 TTS 时 `send_voice` 不会出现在工具列表（GBNF 语法同步收窄）。
 
 另外两条拟人化约束：
@@ -200,6 +210,19 @@ Bot 不只能收，也能发：
 改写为 `[某某 撤回了一条消息]` 标记（Bot 已看过的上下文不动——它自然记得内容，只是知道"这条被收回
 去了"）；Bot 正关注该频道时会追加一条事件告知。Bot 自己撤回消息只改记录，不另行打扰。
 
+### World 内部工具（World-LLM 用）
+
+World-LLM 每次被唤起时通过工具调用读写状态：
+
+| 工具 | 说明 |
+|---|---|
+| `check(target, n?)` | 读取状态文件：`bot_status` / `world_status` / `news`（世界大事）/ `facts`（Bot 小事） |
+| `grep(target, keyword, n?)` | 按关键词检索文件中的关键部分，只返回命中的行/条目（避免整文件读取占用上下文） |
+| `update(target, content)` | 维护状态文件：`news` 追加世界大事、`facts` 追加 Bot 小事（世界中心与 Bot 中心严格区分） |
+| `send_event(content)` | 向 Bot 的意识流投递事件（它唯一能感知到你的方式） |
+| `check_time()` | 查询世界时钟当前时刻 |
+| `set_tingle(units)` | 仅 Tingle 任务：动态决定下一次心跳间隔（auto 模式） |
+
 ## Bot 可用工具
 
 工具**模仿真实手机分层展开**：只有 core 层进置顶列表（省上下文），其余层在打开应用/进入频道时
@@ -221,6 +244,7 @@ Bot 不只能收，也能发：
 | `check_status(target)` | 查看自身（`self`）或世界（`world`，含近期 News） |
 | `check_time()` | 看一眼现在几点（世界裁定能否得知） |
 | `check_news(n?)` | 回看世界近期新闻/见闻 |
+| `check_facts(n?)` | 回忆自己的私人小事记（facts.jsonl：习惯、偏好、日常，Bot 中心） |
 | `check_gallery(category?)` / `check_media(n?, type?)` | 浏览收藏夹（分类总览 / 打开某一类）/ 只读翻看媒体缓存 |
 | `view_media(media[])` | 发图前细看：原生识图附原图，否则解释器详述 |
 | `gallery_save(media_id, category, description, name?)` | 收藏进分类（表情包 / meme / 截图 / 照片），描述必填 |
@@ -432,6 +456,9 @@ plugins:
       worldSecondsPerUnit: 1
       epoch: "2026-01-01 08:00" # 自由文本，幻想纪年亦可（创世时由 World-LLM 生成匹配的历法）
       tingleEveryUnits: 1800 # 每 1800 TU（同步模式即 30 分钟）一次世界心跳
+      tingleMode: fixed # fixed = 固定间隔；auto = 由 World 动态决定下一次间隔（配合 set_tingle）
+      tingleMinUnits: 300 # auto 模式下间隔下限（同步模式即 5 分钟）
+      tingleMaxUnits: 14400 # auto 模式下间隔上限（同步模式即 4 小时）
       offlineNarrateMinUnits: 600 # 离线达此 TU 数（同步模式即 10 分钟）时由 World-LLM 补叙离线期间的世界（0 禁用补叙）
     messaging:
       notifyChannels: ["onebot:123456789"]
@@ -443,6 +470,8 @@ plugins:
       externalSelfMessages: off # 非本插件产生的 Bot 账号消息：off / simulate（伪装成 send）/ event（事件告知）/ silent（只入库，翻记录时发现）
       selfCommands: false # 允许 Bot 触发 Koishi 指令（消息以指令名开头即执行，自己玩自己；world 系列除外）
       offlineHistory: true # 重新上线时用 get_group_msg_history 补拉离线期间错过的群消息（只入库 + 汇总事件，不打扰上下文）
+      typingCharsPerSec: 5 # 打字速度（字/现实秒），按消息字数线性估算打字耗时，判定 send 的 duration 语义
+      sendDeferFactor: 4 # duration 超过「打字估算 × 该倍数」视为"过会儿再发"：到点询问、三类情况打断
     platformOps: # 平台扩展操作，每项独立开关（默认全部 false，此处为示例）
       recall: true
       react: true

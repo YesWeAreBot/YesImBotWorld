@@ -363,6 +363,7 @@ export class WebUIServer {
       const clock = host.getClock();
       const bot = host.botStatus();
       const news = await host.files.readNews(8);
+      const facts = await host.files.readFacts(8);
       const counts = await host.gallery.counts();
       sendJSON(res, 200, {
         version: host.version,
@@ -385,6 +386,7 @@ export class WebUIServer {
         phoneDown: host.phoneDown(),
         focusChannels: host.focusChannels(),
         news,
+        facts,
         galleryCounts: counts,
         tokenSet: !!this.cfg.token,
         addresses: accessUrls(this.cfg.host, this.cfg.port),
@@ -454,6 +456,7 @@ export class WebUIServer {
         botStatus: await host.files.readBotStatus(),
         worldStatus: await host.files.readWorldStatus(),
         news: await readAllNews(host.files.news),
+        facts: await readAllNews(host.files.facts),
         botDef: await host.files.readText(host.files.botDef),
         worldDef: await host.files.readText(host.files.worldDef),
         meta: await host.files.readMeta(),
@@ -513,6 +516,31 @@ export class WebUIServer {
     if (pathname === "/api/state/news" && method === "DELETE") {
       const index = Number(q.get("index"));
       await removeNews(host.files.news, index);
+      sendJSON(res, 200, { ok: true });
+      return;
+    }
+
+    // ---------- Bot 小事记 ----------
+    if (pathname === "/api/state/facts" && method === "POST") {
+      const { content } = await readJson(req);
+      const t = host.getClock()?.now() ?? Date.now();
+      await host.files.appendFacts({
+        t,
+        clock: host.getClock()?.clockString(t) ?? String(t),
+        content: String(content ?? "").trim(),
+      });
+      sendJSON(res, 200, { ok: true });
+      return;
+    }
+    if (pathname === "/api/state/facts" && method === "PUT") {
+      const { index, content } = await readJson(req);
+      await editNews(host.files.facts, Number(index), String(content ?? ""));
+      sendJSON(res, 200, { ok: true });
+      return;
+    }
+    if (pathname === "/api/state/facts" && method === "DELETE") {
+      const index = Number(q.get("index"));
+      await removeNews(host.files.facts, index);
       sendJSON(res, 200, { ok: true });
       return;
     }

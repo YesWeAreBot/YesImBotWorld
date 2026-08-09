@@ -34,7 +34,8 @@ const WORLD_DEF_TEMPLATE = `# 世界定义
  * ├── World_Definition.md  # 用户编写：世界定义
  * ├── Bot_Status.md        # Bot-LLM 维护（压缩时更新）：Bot 当前状态
  * ├── World_Status.md      # World-LLM 维护：世界当前状态
- * ├── News.db              # World-LLM 维护：世界事件列表（JSONL 格式）
+ * ├── News.db              # World-LLM 维护：世界重大事件列表（JSONL 格式，世界中心）
+ * ├── facts.jsonl          # World-LLM 维护：Bot 的小事记（JSONL 格式，Bot 中心）
  * ├── clock.json           # World Clock 状态
  * ├── meta.json            # 世界元数据（创世时判定：是否现实世界等）
  * ├── focus.json           # Bot 正在关注的频道
@@ -51,6 +52,7 @@ export class WorldFiles {
   readonly botStatus: string;
   readonly worldStatus: string;
   readonly news: string;
+  readonly facts: string;
   readonly clock: string;
   readonly meta: string;
   readonly focus: string;
@@ -67,6 +69,7 @@ export class WorldFiles {
     this.botStatus = path.join(base, "Bot_Status.md");
     this.worldStatus = path.join(base, "World_Status.md");
     this.news = path.join(base, "News.db");
+    this.facts = path.join(base, "facts.jsonl");
     this.clock = path.join(base, "clock.json");
     this.meta = path.join(base, "meta.json");
     this.focus = path.join(base, "focus.json");
@@ -152,6 +155,27 @@ export class WorldFiles {
     return entries;
   }
 
+  /** 追加一条 Bot 的小事记（facts.jsonl，Bot 中心，供 Bot 记私事） */
+  async appendFacts(entry: NewsEntry): Promise<void> {
+    await fs.appendFile(this.facts, JSON.stringify(entry) + "\n");
+  }
+
+  /** 读取最近 n 条 Bot 小事记 */
+  async readFacts(n = 10): Promise<NewsEntry[]> {
+    const raw = await this.readText(this.facts);
+    if (!raw.trim()) return [];
+    const lines = raw.trim().split("\n");
+    const entries: NewsEntry[] = [];
+    for (const line of lines.slice(-n)) {
+      try {
+        entries.push(JSON.parse(line) as NewsEntry);
+      } catch {
+        /* 跳过损坏行 */
+      }
+    }
+    return entries;
+  }
+
   /** 读取世界元数据（不存在时返回空对象） */
   async readMeta(): Promise<WorldMeta> {
     try {
@@ -186,7 +210,7 @@ export class WorldFiles {
   /** 重置全部运行时状态（保留用户定义文件），旧状态归档 */
   async reset(): Promise<void> {
     const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-    for (const file of [this.botStatus, this.worldStatus, this.news, this.pinned, this.stream, this.clock, this.meta, this.focus, this.notify]) {
+    for (const file of [this.botStatus, this.worldStatus, this.news, this.facts, this.pinned, this.stream, this.clock, this.meta, this.focus, this.notify]) {
       if (await this.exists(file)) {
         const dest = path.join(this.archiveDir, `${stamp}-${path.basename(file)}`);
         await fs.rename(file, dest).catch(() => fs.rm(file, { force: true }));
