@@ -1058,6 +1058,12 @@ export class BotAgent {
           this.pushEvent("system", "（group_ban 需要 id、user_id 和 minutes 参数（0 表示解除禁言）。）", { ref: call.id });
           return;
         }
+        // 低于 1 分钟的禁言（不足 60 秒）对用户而言近乎无意义，先拦下
+        const gateMsg = shortBanGateMessage(minutes, isTruthy(call.arguments.robot));
+        if (gateMsg) {
+          this.pushEvent("system", `（${gateMsg}）`, { ref: call.id });
+          return;
+        }
         return this.dispatchLocal(call, async () => this.messenger.groupBan(id, userId, minutes));
       }
       case "group_whole_ban": {
@@ -1768,6 +1774,22 @@ function clampInt(value: unknown, min: number, max: number, fallback: number): n
 /** 宽松解析布尔参数（模型可能输出 true / "true" / 1） */
 function isTruthy(value: unknown): boolean {
   return value === true || value === "true" || value === 1;
+}
+
+/**
+ * 秒级禁言拦截：minutes 在 (0, 1) 之间（即禁言不足 60 秒）时返回提示文本。
+ * 这类禁言几乎不会有实际效果，且容易让人以为已经处理了；
+ * 如果确实要这么短（如拿来测自己群的接口），在参数里带 robot: true 放行。
+ * 提示文本里说明了绕过参数但签名里没有它，避免模型产生惯性（与 wait 的 confirm 同理）。
+ */
+export function shortBanGateMessage(minutes: number, robot: boolean): string | null {
+  if (robot) return null;
+  if (minutes > 0 && minutes < 1) {
+    return `禁言时长 ${minutes} 分钟不到 1 分钟（低于 60 秒的禁言几乎没有实际意义）已被拦下——` +
+      `如果你确实要这么短的禁言（比如在自己群测试接口），再调用一次 group_ban 并加上 robot: true；` +
+      `否则请给出至少 1 分钟的时长。`;
+  }
+  return null;
 }
 
 /** 宽松解析 id 列表参数：数组、或逗号/空格分隔的字符串 */

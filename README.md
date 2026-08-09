@@ -99,6 +99,9 @@ YesImBot World：让 Bot 生活在一个由 LLM 独立维护的虚拟世界中�
 - 只有 `world.stop` 显式暂停才会冻结时间；**插件停用 / Koishi 关闭期间世界时间照常流逝**——
   重新启动时通过持久化的现实时间锚点补回离线时段，唤醒事件会告知 Bot 意识中断了多少 TU，
   离线达到 `offlineNarrateMinUnits` 时还会由 World-LLM 补叙这段时间世界发生了什么；
+- 插件离线期间错过的**群消息**：重新上线（`world.start`）时若 `messaging.offlineHistory` 开启，
+  会用 OneBot 的 `get_group_msg_history` 扩展接口补拉关注中 / 通知列表 / 最近活跃的 QQ 群消息写进记录
+  （翻记录时能看到，不注入逐条事件打扰上下文，完成后推一条汇总事件），与上面的世界补叙互补；
 - 每个工具调用由 Bot-LLM 自己估计 `duration`（耗时），期望完成时刻 = 生成时刻 + duration；
 - **生成与执行解耦**：生成完一个工具调用不等待结果、立即想下一步；结果在世界到达期望完成时刻时以 Event 注入（若届时结果未就绪，则就绪后立即注入）。模型快 → 角色行动连贯；模型慢 → 角色发呆愣神——推理速度本身塑造性格；
 - `send` 在期望完成时刻（打字完成）才真正发出，此前可 `cancel`（撤回还没发出去的话）；
@@ -193,6 +196,10 @@ Bot 不只能收，也能发：
   - 各模式下这类消息都会入库，`select_channel` 可回看；本插件自己发的消息通过内部标记区分，
     不会被重复上报。
 
+**撤回感知**：别人撤回一条消息时（包括群管理员撤别人、对方撤自己的消息），消息记录里对应那条会被
+改写为 `[某某 撤回了一条消息]` 标记（Bot 已看过的上下文不动——它自然记得内容，只是知道"这条被收回
+去了"）；Bot 正关注该频道时会追加一条事件告知。Bot 自己撤回消息只改记录，不另行打扰。
+
 ## Bot 可用工具
 
 工具**模仿真实手机分层展开**：只有 core 层进置顶列表（省上下文），其余层在打开应用/进入频道时
@@ -272,7 +279,7 @@ Bot 不只能收，也能发：
 | `essence` | `set_essence(msg_id, remove?)` | `set_essence_msg` / `delete_essence_msg` | 设置/移出群精华 |
 | `essenceList` | `get_essence_list(id)` | `get_essence_msg_list` | 查看群精华消息列表 |
 | `groupSign` | `group_sign(id)` | `set_group_sign` / `send_group_sign` | 群打卡 |
-| `groupBan` | `group_ban(id, user_id, minutes)` | `set_group_ban` | 禁言/解除禁言 |
+| `groupBan` | `group_ban(id, user_id, minutes)` | `set_group_ban` | 禁言/解除禁言。低于 1 分钟（不足 60 秒）的禁言会被拦下，需加 `robot: true` 二次确认才执行 |
 | `groupWholeBan` | `group_whole_ban(id, enable)` | `set_group_whole_ban` | 全员禁言 |
 | `groupKick` | `group_kick(id, user_id, block?)` | `set_group_kick` | 移出群成员（谨慎开启） |
 | `groupAdmin` | `group_admin(id, user_id, enable)` | `set_group_admin` | 设置/取消管理员（需群主） |
@@ -435,6 +442,7 @@ plugins:
       coldChannelMsgs: 3 # 连发几条无人回应后拦截 send 提醒别刷屏，需 insist: true 才发出（0 禁用）
       externalSelfMessages: off # 非本插件产生的 Bot 账号消息：off / simulate（伪装成 send）/ event（事件告知）/ silent（只入库，翻记录时发现）
       selfCommands: false # 允许 Bot 触发 Koishi 指令（消息以指令名开头即执行，自己玩自己；world 系列除外）
+      offlineHistory: true # 重新上线时用 get_group_msg_history 补拉离线期间错过的群消息（只入库 + 汇总事件，不打扰上下文）
     platformOps: # 平台扩展操作，每项独立开关（默认全部 false，此处为示例）
       recall: true
       react: true

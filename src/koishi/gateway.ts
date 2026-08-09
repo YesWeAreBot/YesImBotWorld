@@ -5,6 +5,7 @@ import { MEDIA_PLACEHOLDER, mediaPlaceholder } from "../media/render.js";
 import type { MediaStore } from "../media/store.js";
 import type { PhoneStatus, RichText } from "../types.js";
 import type { FocusManager } from "./focus.js";
+import { recallNoticeText } from "./markers.js";
 import type { MessageStore } from "./messages.js";
 import type { ChannelNameResolver } from "./names.js";
 import type { NotifyManager } from "./notify.js";
@@ -81,6 +82,70 @@ export class Gateway {
         ctx.logger("yesimbot-world").warn("禁言通知处理失败: %s", err);
       });
     }) as never);
+
+    // 撤回：message-deleted 是 satori 标准事件（OneBot 的 group_recall / friend_recall
+    // 都会映射到这里）。别人撤回消息后，消息记录里对应的那条会被改写为"撤回了一条消息"，
+    // 否则消息已经缓存在记录里，Bot 会一直"看到"一条其实已经不存在了的消息
+    ctx.on("message-deleted", (session) => {
+      void this.handleRecall(session).catch((err) => {
+        ctx.logger("yesimbot-world").warn("撤回处理失败: %s", err);
+      });
+    });
+  }
+
+  /**
+   * 撤回感知：把消息记录里被撤回的那条改写为撤回标记（上下文不动——Bot 已经看过的
+   * 消息它自然记得内容，无需篡改历史）；Bot 正在关注该频道时追加事件告知是哪条被撤回了。
+   * Bot 自己发起的撤回（recall 工具 / 其他设备上操作）只改记录、不另行告知——它知道。
+   */
+  private async handleRecall(session: Session): Promise<void> {
+    const channelId = session.channelId ?? "";
+    const messageId = session.messageId ? String(session.messageId) : "";
+    if (!channelId || !messageId) return;
+    const platform = session.platform ?? "unknown";
+    const key = `${platform}:${channelId}`;
+    const selfId = String(session.selfId ?? session.bot?.selfId ?? "");
+    // OneBot 群撤回：user_id 是消息发送者、operator_id 是执行撤回的人（可能是管理员）；私聊撤回没有 operator
+    const senderId = String(session.userId ?? "");
+    const operatorId =
+      String((session as unknown as { operatorId?: string }).operatorId ?? "") || senderId;
+
+    const row = await this.store.findByMessageId(platform, channelId, messageId);
+    const selfOp = !!selfId && operatorId === selfId;
+    const selfSender = !!selfId && senderId === selfId;
+    const samePerson = !!operatorId && operatorId === senderId;
+    const operatorName = selfOp ? "你" : await this.lookupUsername(platform, channelId, operatorId);
+    const senderName = selfSender
+      ? "你"
+      : (row?.username || (await this.lookupUsername(platform, channelId, senderId)));
+    const notice = recallNoticeText({ operatorName, selfOp, senderName, selfSender, samePerson });
+
+    if (row) {
+      await this.store.updateContent(row.id, `[${notice}]`);
+    } else {
+      // 记录里找不到原消息（发出时插件不在线 / 记录被清空过）：撤回本身也是频道里的动态，补记一条
+      await this.store.store({
+        platform,
+        channelId,
+        guildId: session.guildId ?? "",
+        userId: operatorId,
+        username: selfOp ? "（我）" : operatorName,
+        content: `[${notice}]`,
+        timestamp: new Date(),
+        self: selfOp,
+        messageId,
+      });
+    }
+
+    // Bot 自己撤的：它已经通过工具结果知道了，不再打扰
+    if (selfOp) return;
+    // 只有正在关注这个频道时才追加事件（翻记录时总能看到撤回标记，不必每条都提醒）
+    if (this.phone.down || !this.focus.isFocused(key)) return;
+    const msgTag = needsMsgIds(this.ops) ? `（msg:${messageId}）` : "";
+    this.callbacks.notify(
+      { text: `你正留意着 ${await this.names.display(key)}，看到${notice}${msgTag}。` },
+      true,
+    );
   }
 
   /** 别人戳了 Bot：转为手机通知并入库（群里别人互戳与 Bot 自己戳人不理会） */

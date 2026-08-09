@@ -20,6 +20,7 @@ import { atTag, faceTag, formatBanDuration } from "./gateway.js";
 import { needsMsgIds, type MessagingConfig, type PlatformOpsConfig } from "../config.js";
 import type { KnownChannel, MessageStore } from "./messages.js";
 import type { ChannelNameResolver } from "./names.js";
+import type { NotifyManager } from "./notify.js";
 import type { OwnSendTracker } from "./ownsends.js";
 import type { RequestStore } from "./requests.js";
 
@@ -49,6 +50,7 @@ export class KoishiMessenger implements MessengerApi {
     private galleryStore: GalleryStore,
     private tts: TtsClient | null,
     private focus: FocusManager,
+    private notify: NotifyManager,
     private ops: PlatformOpsConfig,
     private messaging: MessagingConfig,
     private requests: RequestStore,
@@ -1567,6 +1569,143 @@ export class KoishiMessenger implements MessengerApi {
       `你放下了手机，不再盯着 ${cleared.join("、")}。` +
       "之后这些频道再有消息，只会像平常一样通知你。"
     );
+  }
+
+  // ---------- 离线历史补拉 ----------
+
+  /**
+   * 插件离线期间错过的群消息补拉（OneBot 扩展接口 get_group_msg_history）。
+   * 世界启动时由 service 调用一次：把离线期间目标群的消息写进消息记录（翻记录时
+   * 能看到这段时间发生了什么），不注入逐条事件打扰当前上下文。
+   * 目标群 = 正在关注的 + 通知列表里的 + 最近活跃的，且仅限 OneBot 群（私聊无此接口）。
+   * 返回各群补到的消息条数；群还没有任何已存消息时不拉（尊重创世 / 清空记录）。
+   */
+  async syncOfflineHistory(): Promise<{ total: number; channels: { key: string; count: number }[] }> {
+    const empty = { total: 0, channels: [] as { key: string; count: number }[] };
+    if (!this.messaging.offlineHistory) return empty;
+
+    const keys = new Set<string>();
+    for (const k of this.focus.activeKeys()) keys.add(k);
+    for (const k of this.notify.keys()) {
+      if (k !== "*") keys.add(k);
+    }
+    // 通知列表里配了 "*" 时用最近活跃的频道兜底（"*" 本身不是具体频道）
+    for (const { key } of await this.store.recentChannels(10)) keys.add(key);
+
+    const channels: { key: string; count: number }[] = [];
+    let total = 0;
+    for (const key of keys) {
+      const idx = key.indexOf(":");
+      if (idx <= 0) continue;
+      const platform = key.slice(0, idx);
+      const channelId = key.slice(idx + 1);
+      if (platform !== "onebot" || channelId.startsWith("private:")) continue;
+      try {
+        const count = await this.syncGroupHistory(platform, channelId);
+        if (count > 0) {
+          channels.push({ key, count });
+          total += count;
+        }
+      } catch (err) {
+        this.ctx
+          .logger("yesimbot-world")
+          .warn("离线历史补拉失败 %s: %s", key, (err as Error).message ?? err);
+      }
+    }
+    return { total, channels };
+  }
+
+  /**
+   * 单个群的离线历史补拉：以群内已存消息的最大时间为水位线，向前翻 get_group_msg_history。
+   * 按 messageId 去重（含边界上同一秒实时入库的新消息）；早于水位线 / 未来的消息跳过。
+   * count=50/页，最多 4 页，按时间正序入库；取本页最小 message_seq（或响应的 next_seq）
+   * 继续往前翻，翻到水位线以内、页不满或 seq 不再递减时终止。
+   */
+  private async syncGroupHistory(platform: string, channelId: string): Promise<number> {
+    const bot = this.findOnebot();
+    if (!bot) return 0;
+
+    // 水位线：群内最后一条已存消息的时间（毫秒）；群还没有记录就不拉
+    const latest = await this.store.channelMessages(platform, channelId, 1);
+    if (!latest.length) return 0;
+    const watermarkMs = latest[0]!.timestamp.getTime();
+    // 去重依据：该群已存的最近消息 id（也覆盖边界上同一秒实时入库的新消息）
+    const known = new Set<string>();
+    for (const row of await this.store.channelMessages(platform, channelId, 500)) {
+      if (row.messageId) known.add(row.messageId);
+    }
+
+    const params: Record<string, unknown> = { group_id: toIdValue(channelId), count: 50 };
+    const selfId = String(bot.selfId ?? "");
+    let added = 0;
+    for (let page = 0; page < 4; page++) {
+      const data = ((await callOnebot(bot, "get_group_msg_history", params)) ?? {}) as {
+        messages?: unknown[];
+        next_seq?: number | string;
+      };
+      const messages = (Array.isArray(data.messages) ? data.messages : []) as Record<string, unknown>[];
+      if (!messages.length) break;
+
+      const rows: { timeMs: number; msgId: string; seq: number; self: boolean; userId: string; username: string; content: string }[] = [];
+      let minSeq = Infinity;
+      let anyOlderThanWatermark = false;
+      for (const raw of messages) {
+        const timeMs = Number(raw.time ?? 0) * 1000;
+        if (timeMs > 0 && timeMs < watermarkMs) anyOlderThanWatermark = true;
+        const msgId = String(raw.message_id ?? "");
+        if (!msgId || known.has(msgId)) continue;
+        known.add(msgId);
+        if (timeMs <= 0 || timeMs < watermarkMs || timeMs > Date.now()) continue;
+        const seq = Number(raw.message_seq ?? 0);
+        if (Number.isFinite(seq) && seq > 0 && seq < minSeq) minSeq = seq;
+        const sender = (raw.sender ?? {}) as Record<string, unknown>;
+        const senderId = String(sender.user_id ?? "");
+        const self = !!selfId && senderId === selfId;
+        const username = self ? "（我）" : String(sender.card ?? sender.nickname ?? sender.user_id ?? "?");
+        let content = "";
+        if (Array.isArray(raw.message)) {
+          content = await this.serializeRawSegments(raw.message as Record<string, unknown>[]);
+        } else if (typeof raw.message === "string") {
+          content = raw.message;
+        } else if (Array.isArray(raw.content)) {
+          content = await this.serializeRawSegments(raw.content as Record<string, unknown>[]);
+        } else if (typeof raw.content === "string") {
+          content = raw.content;
+        }
+        if (!content.trim()) continue;
+        rows.push({ timeMs, msgId, seq, self, userId: senderId, username, content });
+      }
+
+      rows.sort((a, b) => a.timeMs - b.timeMs);
+      for (const r of rows) {
+        await this.store.store({
+          platform,
+          channelId,
+          guildId: "",
+          userId: r.userId,
+          username: r.username,
+          content: r.content,
+          timestamp: new Date(r.timeMs),
+          self: r.self,
+          messageId: r.msgId,
+        });
+        added++;
+      }
+
+      // 本页已翻到水位线以内 → 前面的都更早，无需再翻
+      if (anyOlderThanWatermark) break;
+      // 页不满说明到底了
+      if (messages.length < 50) break;
+      const nextSeq = (() => {
+        const fromResp = Number(data.next_seq ?? 0);
+        if (Number.isFinite(fromResp) && fromResp > 0) return fromResp;
+        return Number.isFinite(minSeq) && minSeq < Infinity ? minSeq : 0;
+      })();
+      // seq 没有往前推进（与上一页相同）说明没有更早的消息了
+      if (nextSeq <= 0 || nextSeq === params.message_seq) break;
+      params.message_seq = nextSeq;
+    }
+    return added;
   }
 
   // ---------- 内部 ----------

@@ -330,6 +330,7 @@ export class WorldService extends Service<Config> {
       this.gallery,
       this.config.tts.enabled ? new TtsClient(this.config.tts) : null,
       this.focus,
+      this.notifyMgr,
       this.config.platformOps,
       this.config.messaging,
       this.requests,
@@ -454,6 +455,26 @@ export class WorldService extends Service<Config> {
     );
     this.tingle.start();
     this.worldActive = true;
+
+    // 离线历史补拉：把插件离线期间（Bot 掉线/世界未启动）错过的目标群消息写进消息记录，
+    // 不注入逐条事件打扰上下文；完成后若确实补到了，推一条汇总事件让 Bot 知道去翻记录
+    if (this.config.messaging.offlineHistory) {
+      void messenger
+        .syncOfflineHistory()
+        .then(async ({ total, channels }) => {
+          if (!total || !this.bot) return;
+          const shown = channels.slice(0, 5);
+          const labels = await Promise.all(shown.map((c) => this.names.display(c.key)));
+          const namesText =
+            labels.join("、") + (channels.length > shown.length ? ` 等 ${channels.length} 个群` : "");
+          this.bot.pushEvent(
+            "system",
+            `离线期间你在 ${namesText} 错过的 ${total} 条消息已补录到聊天记录里（用 check_msg / select_channel 翻看）。`,
+          );
+        })
+        .catch((err) => this.logger.warn("离线历史补拉失败: %s", err));
+    }
+
     this.logger.info("世界开始运转：%s", this.clock.timeLine());
     return `世界开始运转。当前 ${this.clock.timeLine()}`;
   }

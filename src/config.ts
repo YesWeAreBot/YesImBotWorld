@@ -113,6 +113,7 @@ export interface MessagingConfig {
   coldChannelMsgs: number;
   externalSelfMessages: ExternalSelfMessageMode;
   selfCommands: boolean;
+  offlineHistory: boolean;
 }
 
 /** 聊天平台扩展操作（收发消息之外的能力），每个接口独立开关，默认全部关闭 */
@@ -912,6 +913,13 @@ export const Config: Schema<Config> = Schema.intersect([
           "允许 Bot 触发 Koishi 指令（自己玩自己）：它发出的消息若以某个已注册指令名开头（不带前缀），" +
             "将以它自己的身份执行，指令输出照常发回频道（配合 externalSelfMessages 可让它看到结果）。" +
             "能执行哪些指令取决于 Bot 账号在 Koishi 的权限等级；本插件自身的 world 系列指令除外",
+        ),
+      offlineHistory: Schema.boolean()
+        .default(true)
+        .description(
+          "插件离线期间（Bot 掉线/世界未启动）错过的群消息，是否在重新上线后用 NapCat 等实现的 " +
+            "get_group_msg_history 扩展接口补拉入库。只写入消息记录（Bot 翻记录时能看到），" +
+            "不注入逐条事件打扰上下文；仅拉取关注中 / 通知列表 / 最近活跃的 QQ 群",
         ),
     }).description("Koishi 消息接入"),
   }),

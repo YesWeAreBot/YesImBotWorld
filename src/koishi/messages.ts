@@ -116,6 +116,15 @@ export class MessageStore {
     return rows[0] ?? null;
   }
 
+  /**
+   * 撤回改写：把已存消息的内容替换为撤回标记（如 "[某某 撤回了一条消息]"）。
+   * 只改消息记录（影响此后翻记录时的呈现），不触碰 Bot 的上下文——
+   * 已进入上下文的消息 Bot 自然记得内容，撤回只是让它知道"这条被对方收回了"。
+   */
+  async updateContent(id: number, content: string): Promise<void> {
+    await this.ctx.database.set("yesimbot_world_message", { id }, { content });
+  }
+
   /** 按平台消息 id 跨频道查找（view_forward 纠错：Bot 把消息编号当转发 id 时定位原消息） */
   async findAnyByMessageId(messageId: string): Promise<WorldMessageRow | null> {
     if (!messageId) return null;

@@ -30,6 +30,13 @@ export class NotifyManager {
     return this.managed;
   }
 
+  /** 当前允许通知的频道 key 列表（含 "*" 全频道通配） */
+  keys(): string[] {
+    if (!this.managed || !this.loaded) return [...this.initial];
+    if (this.allow.has("*")) return ["*"];
+    return [...this.allow];
+  }
+
   async load(): Promise<void> {
     if (!this.managed) return;
     try {

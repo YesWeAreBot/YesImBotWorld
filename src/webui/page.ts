@@ -1171,7 +1171,7 @@ var PRIMARY = {
   world: ['baseURL', 'apiKey', 'model', 'stream'],
   clock: ['syncRealTime', 'epoch', 'realSecondsPerUnit'],
   apps: ['chatAppName', 'weatherEnabled', 'weatherDefaultCity', 'browserEnabled', 'notesEnabled', 'computer'],
-  messaging: ['notifyChannels', 'notifyPolicy', 'wakeOnNotify']
+  messaging: ['notifyChannels', 'notifyPolicy', 'wakeOnNotify', 'offlineHistory']
 };
 var CFG_ICONS = {root:'sliders', bot:'cpu', world:'gauge', clock:'activity', platformOps:'phone', apps:'monitor', captioners:'image', tts:'film', media:'folder', webui:'sliders', messaging:'edit'};
 var PLAT_CATS = [
