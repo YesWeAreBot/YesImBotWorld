@@ -185,6 +185,15 @@ img.full{max-width:100%;max-height:72vh;border-radius:10px}
 .feed-row .l{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--fg-dim)}
 .tag{font-size:10px;padding:1.5px 7px;border-radius:6px;background:var(--panel2);color:var(--fg-dim);flex:none;font-family:var(--mono)}
 .tag.req{color:#8ab4ff}.tag.res{color:#7bd88f}.tag.tool{color:#e8c66a}.tag.event{color:#c792ea}.tag.err{color:#ff8a8a}
+.tag.use{color:#c792ea;border:1px solid rgba(199,146,234,.4)}
+.usage-entry{display:flex;align-items:center;gap:12px;padding:7px 4px;border-bottom:1px dashed var(--line);font-size:12.5px}
+.usage-entry:last-child{border-bottom:none}
+.usage-entry .usage-lbl{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.usage-entry .usage-time{color:var(--fg-dark);font-size:11px;flex:none}
+.usage-entry .usage-num{font-family:var(--mono);font-size:12px;flex:none}
+.usage-entry .usage-num.dim{color:var(--fg-dark);font-size:11px}
+.card-label{font-size:11.5px;color:var(--fg-dark);letter-spacing:.6px;margin-bottom:4px}
+.card-value{font-size:16px;font-weight:650;word-break:break-word}
 .addr-row{display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px dashed var(--line)}
 .addr-row:last-child{border-bottom:none}
 .addr-row .u{font-family:var(--mono);font-size:12.5px;flex:1;word-break:break-all}
@@ -354,6 +363,7 @@ var debugEntries = [], debugSubview = 'llm', debugOrder = 'desc', debugAutoScrol
 var stateCache = null, stateEditor = null;
 var lastOverview = null;
 var liveFeed = [], genMap = {}, liveSeeded = false;
+var usageCache = null, usageFilter = 'total', usageFilterLabel = '';
 var devicesCache = null, screenTimer = null, screenBusy = false, screenUrl = null, execDraft = '', execBusy = false, execHistory = [];
 var viewTimers = [];
 
@@ -396,6 +406,7 @@ var ICONS = {
   image: svgIcon('<rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="10" r="2"/><path d="M21 16l-5-5-8 8"/>'),
   film: svgIcon('<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 4v16M17 4v16M3 9h4M3 15h4M17 9h4M17 15h4"/>'),
   folder: svgIcon('<path d="M3 7a2 2 0 0 1 2-2h4l2 3h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>'),
+  chart: svgIcon('<path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/>'),
   sliders: svgIcon('<path d="M4 8h10M18 8h2M4 16h4M12 16h8"/><circle cx="16" cy="8" r="2"/><circle cx="10" cy="16" r="2"/>'),
   menu: svgIcon('<path d="M4 7h16M4 12h16M4 17h16"/>'),
   phone: svgIcon('<rect x="7" y="2.5" width="10" height="19" rx="2.5"/><path d="M11 18.5h2"/>')
@@ -561,6 +572,7 @@ var NAV = [
   ['overview','总览','gauge'],
   ['devices','设备','monitor'],
   ['debug','调试','activity'],
+  ['usage','用量','chart'],
   {group:'世界'},
   ['state','状态','file'],
   ['prompts','提示词','edit'],
@@ -598,6 +610,7 @@ function switchView(name){
   else if(name === 'prompts') loadPrompts();
   else if(name === 'state') loadState();
   else if(name === 'debug') loadDebug();
+  else if(name === 'usage') loadUsage();
   else if(name === 'gallery') loadGallery();
   else if(name === 'media') loadMedia();
   else if(name === 'data') refreshData();
@@ -1489,6 +1502,11 @@ function renderField(node, path, value){
   box2.appendChild(el('div', {cls:'lbl'}, [el('div', {cls:'name', text: path[path.length-1]}), el('div', {cls:'desc', text: node.description || ''})]));
   var ctl2 = el('div', {cls:'ctl'});
   ctl2.appendChild(renderInput(node, path, value));
+  if(isModelField(path)){
+    ctl2.appendChild(el('div', {style:'margin-top:4px'}, [el('button', {text:'获取模型列表', style:'font-size:11px;padding:2px 8px', onclick:function(){
+      fetchModelsFor(path, this);
+    }})]));
+  }
   if(node.role !== 'secret' && node.default !== undefined && t !== 'const'){
     ctl2.appendChild(el('div', {style:'margin-top:4px'}, [el('button', {text:'重置为默认', style:'font-size:11px;padding:2px 8px', onclick:function(){
       var v = JSON.parse(JSON.stringify(node.default)); setPath(cfgCache, path, v); ctl2.textContent=''; ctl2.appendChild(renderInput(node, path, v));
@@ -1580,6 +1598,53 @@ function defaultFor(node){
   if(node.type === 'boolean') return false;
   if(node.type === 'number') return 0;
   return '';
+}
+function isModelField(path){
+  var last = path[path.length - 1];
+  if(last !== 'model') return false;
+  for(var i = path.length - 1; i >= 0; i--){
+    if(path[i] === 'bot' || path[i] === 'world') return true;
+  }
+  return false;
+}
+function fetchModelsFor(path, btn){
+  if(!cfgCache) return;
+  var parent = path.slice(0, path.length - 1);
+  var baseURL = getPath(cfgCache, parent.concat('baseURL'));
+  var apiKey = getPath(cfgCache, parent.concat('apiKey')) || '';
+  if(!baseURL){ toast('请先填写该组的 baseURL', 'warn'); return; }
+  var old = btn.textContent;
+  btn.textContent = '加载中…';
+  btn.disabled = true;
+  api('POST', '/api/llm/models', {baseURL: baseURL, apiKey: apiKey}).then(function(r){
+    var models = r.models || [];
+    if(!models.length){ toast('该端点未返回模型列表', 'warn'); return; }
+    var current = getPath(cfgCache, path);
+    var select = el('select', {style:'width:100%'});
+    models.forEach(function(m){
+      select.appendChild(el('option', {text: m, value: m}));
+      if(m === current) select.selectedIndex = select.options.length - 1;
+    });
+    var body = el('div', null, [
+      el('p', {text:'选择要使用的模型：', style:'color:var(--fg-dim);font-size:13px'}),
+      select,
+      el('div', {cls:'toolbar'}, [
+        el('button', {text:'取消', onclick: function(){ hideModal(); }}),
+        el('button', {cls:'primary', text:'确定', onclick: function(){
+          setPath(cfgCache, path, select.value);
+          cfgDirty = true;
+          hideModal();
+          toast('已选择模型：' + select.value, 'ok');
+          renderCfgBody();
+        }})
+      ])
+    ]);
+    showModal('选择模型', body);
+  }).catch(function(err){ toast('获取模型列表失败：' + (err.message || err), 'err'); })
+    .finally(function(){
+      btn.textContent = old;
+      btn.disabled = false;
+    });
 }
 function saveConfig(){
   var newPort = cfgCache.webui ? cfgCache.webui.port : undefined;
@@ -1897,14 +1962,31 @@ function renderDebugList(){
 function prettyDetail(e){
   try { return JSON.stringify(JSON.parse(e.detail), null, 2); } catch(err){ return e.detail; }
 }
+function usageBadge(e){
+  var u = null;
+  try {
+    u = JSON.parse(e.detail || '').usage;
+  } catch(err){ return null; }
+  if(!u) return null;
+  var total = u.total_tokens != null ? u.total_tokens : u.total;
+  var prompt = u.prompt_tokens != null ? u.prompt_tokens : u.prompt;
+  var completion = u.completion_tokens != null ? u.completion_tokens : u.completion;
+  if(total == null && prompt == null && completion == null) return null;
+  if(total == null) total = (prompt || 0) + (completion || 0);
+  if(!total) return null;
+  return el('span', {cls:'tag use', title:'token 用量：输入 ' + (prompt||0) + '，输出 ' + (completion||0), text: String(total) + ' tok'});
+}
 function debugRow(e){
   var row = el('div', {cls:'dbg', 'data-id': e.id});
-  var head = el('div', {cls:'head'}, [
+  var headKids = [
     el('span', {cls:'t', text: fmtTime(e.ts)}),
     el('span', {cls:'tag ' + tagClass(e), text: e.kind}),
     el('span', {cls:'l', text: e.label}),
     el('span', {cls:'tag ' + (e.level==='error'?'err':''), text: e.level})
-  ]);
+  ];
+  var use = usageBadge(e);
+  if(use) headKids.push(use);
+  var head = el('div', {cls:'head'}, headKids);
   head.onclick = function(){ row.classList.toggle('open'); };
   row.appendChild(head);
   var detail = el('div', {cls:'detail'});
@@ -1956,8 +2038,121 @@ function updateDebugEntry(e){
   if(heads[0]) heads[0].textContent = fmtTime(e.ts);
   if(heads[2]) heads[2].textContent = e.label;
   if(heads[3]){ heads[3].textContent = e.level; heads[3].className = 'tag ' + (e.level==='error'?'err':''); }
+  var use = row.querySelector('.head .tag.use');
+  if(use){
+    var nb = usageBadge(e);
+    if(nb) use.replaceWith(nb);
+    else use.remove();
+  } else {
+    var nb2 = usageBadge(e);
+    if(nb2) row.querySelector('.head').appendChild(nb2);
+  }
   var pre = row.querySelector('.detail pre');
   if(pre) pre.textContent = prettyDetail(e);
+}
+
+// ---------- 用量统计 ----------
+function loadUsage(){
+  var main = $('#main');
+  main.textContent = '';
+  main.appendChild(viewHead('Token 用量', '按 LLM 请求统计的 token 消耗（保存在 webui 目录 usage.jsonl）。点击标签可按该维度查看明细。'));
+  var holder = el('div', {text:'加载中…', cls:'empty'});
+  main.appendChild(holder);
+  usageFilter = 'total';
+  usageFilterLabel = '';
+  api('GET', '/api/usage?n=500').then(function(r){
+    usageCache = r;
+    holder.textContent = '';
+    holder.appendChild(renderUsage());
+  }).catch(showErr);
+  viewTimers.push(setInterval(function(){
+    if(activeView !== 'usage') return;
+    api('GET', '/api/usage?n=500').then(function(r){
+      usageCache = r;
+      renderUsage();
+    }).catch(function(){});
+  }, 15000));
+}
+function renderUsage(){
+  var wrap = el('div');
+  if(!usageCache) return wrap;
+  var s = usageCache.summary;
+  var totals = s.totals;
+  var cards = el('div', {cls:'cards'}, [
+    usageCard('请求数', totals.requests, '次'),
+    usageCard('总 token', totals.totalTokens, 'tok'),
+    usageCard('输入 token', totals.promptTokens, 'tok'),
+    usageCard('输出 token', totals.completionTokens, 'tok')
+  ]);
+  wrap.appendChild(cards);
+  var bar = el('div', {cls:'toolbar'}, [
+    el('span', {text:'明细：', style:'color:var(--fg-dark);font-size:12px'}),
+    el('button', {cls: usageFilter==='total'?'active':'', text:'全部', onclick:function(){ usageFilter='total'; usageFilterLabel=''; renderUsageDetail(); }}),
+    el('button', {cls: usageFilter==='label'?'active':'', text:'按标签', onclick:function(){ usageFilter='label'; usageFilterLabel=''; renderUsageDetail(); }}),
+    el('button', {cls: usageFilter==='model'?'active':'', text:'按模型', onclick:function(){ usageFilter='model'; usageFilterLabel=''; renderUsageDetail(); }}),
+    el('span', {cls:'spacer'}),
+    el('button', {text:'清空全部', cls:'danger', onclick:function(){
+      if(!confirm('确定清空全部用量记录？此操作不可恢复。')) return;
+      api('DELETE', '/api/usage').then(function(){
+        api('GET', '/api/usage?n=500').then(function(r){ usageCache = r; renderUsage(); }).catch(showErr);
+      }).catch(showErr);
+    }})
+  ]);
+  wrap.appendChild(bar);
+  wrap.appendChild(el('div', {id:'usage-detail'}));
+  renderUsageDetail();
+  return wrap;
+}
+function usageCard(label, value, unit){
+  return el('div', {cls:'card'}, [
+    el('div', {cls:'card-label', text: label}),
+    el('div', {cls:'card-value', text: String(Number(value)||0) + ' ' + unit})
+  ]);
+}
+function renderUsageDetail(){
+  var holder = $('#usage-detail');
+  if(!holder || !usageCache) return;
+  holder.textContent = '';
+  var s = usageCache.summary;
+  var list = el('div', {cls:'section'});
+  list.appendChild(el('h3', {text: usageFilterLabel || '最近 500 条请求'}));
+  var body = el('div', {cls:'body'});
+  if(usageFilter === 'label'){
+    Object.keys(s.byLabel || {}).forEach(function(k){
+      var it = s.byLabel[k];
+      body.appendChild(usageRow(k, 'label', it));
+    });
+  } else if(usageFilter === 'model'){
+    Object.keys(s.byModel || {}).forEach(function(k){
+      var it = s.byModel[k];
+      body.appendChild(usageRow(k || '（空）', 'model', it));
+    });
+  } else {
+    body.appendChild(el('p', {cls:'empty', text: usageCache.entries.length ? '' : '（暂无记录，发起一次 LLM 请求后这里会出现数据）'}));
+    usageCache.entries.forEach(function(e){
+      body.appendChild(el('div', {cls:'usage-entry'}, [
+        el('span', {cls:'usage-lbl', text: e.label + ' › ' + (e.model || '?')}),
+        el('span', {cls:'usage-time', text: fmtTime(e.ts)}),
+        el('span', {cls:'usage-num', text: String(e.totalTokens) + ' tok'}),
+        el('span', {cls:'usage-num dim', text: '↑' + e.promptTokens + ' ↓' + e.completionTokens})
+      ]));
+    });
+  }
+  list.appendChild(body);
+  holder.appendChild(list);
+}
+function usageRow(name, dim, it){
+  return el('div', {cls:'usage-entry', style:'cursor:pointer', onclick:function(){
+    usageFilter = 'total';
+    usageFilterLabel = name;
+    usageCache.entries = (usageCache.entries || []).filter(function(e){ return dim === 'label' ? e.label === name : e.model === name; });
+    renderUsageDetail();
+  }}, [
+    el('span', {cls:'usage-lbl', text: name}),
+    el('span', {cls:'usage-num', text: String(it.requests || 0) + ' 次'}),
+    el('span', {cls:'usage-num', text: String(it.totalTokens || 0) + ' tok'}),
+    el('span', {cls:'usage-num dim', text: '↑' + (it.promptTokens||0) + ' ↓' + (it.completionTokens||0)})
+  ]);
 }
 
 // ---------- 相册 ----------

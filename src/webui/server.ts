@@ -27,6 +27,8 @@ import type { WorldClock } from "../clock.js";
 import type { ComputerExecResult, ComputerInspection } from "../computer.js";
 import { introspect, validateConfig } from "./schema.js";
 import { debug, type DebugEntry } from "./debug.js";
+import { usageStore } from "./usage.js";
+import { llmFetch } from "../llm/http.js";
 import { PAGE_HTML } from "./page.js";
 
 export interface BotStatusSummary {
@@ -177,6 +179,7 @@ export class WebUIServer {
     });
 
     debug.enabled = true;
+    usageStore.init(this.host.webuiDir ? path.join(this.host.webuiDir, "usage.jsonl") : "");
     this.unsubDebug = debug.subscribe((entry, isUpdate) =>
       this.sendEvent({ channel: "debug", entry, update: isUpdate === true }, entry.id),
     );
@@ -569,6 +572,21 @@ export class WebUIServer {
       return;
     }
 
+    // ---------- LLM 模型列表（配置页获取可选模型） ----------
+    if (pathname === "/api/llm/models" && method === "POST") {
+      const body = await readJson(req);
+      const baseURL = String(body.baseURL ?? "").trim();
+      const apiKey = String(body.apiKey ?? "");
+      if (!baseURL) return void sendJSON(res, 400, { error: "缺少 baseURL" });
+      try {
+        const models = await fetchLlmModels(baseURL, apiKey);
+        sendJSON(res, 200, { models });
+      } catch (err) {
+        sendJSON(res, 500, { error: (err as Error).message ?? String(err) });
+      }
+      return;
+    }
+
     // ---------- 提示词 ----------
     if (pathname === "/api/prompts" && method === "GET") {
       sendJSON(res, 200, {
@@ -810,6 +828,22 @@ export class WebUIServer {
       return;
     }
 
+    // ---------- Token 用量统计 ----------
+    if (pathname === "/api/usage" && method === "GET") {
+      const n = Math.min(Number(q.get("n")) || 300, 2000);
+      sendJSON(res, 200, {
+        summary: usageStore.summary(),
+        entries: usageStore.recent(n),
+        snapshot: usageStore.summary().totals.requests,
+      });
+      return;
+    }
+    if (pathname === "/api/usage" && method === "DELETE") {
+      usageStore.clear();
+      sendJSON(res, 200, { ok: true });
+      return;
+    }
+
     if (pathname === "/api/health" && method === "GET") {
       sendJSON(res, 200, { ok: true, version: host.version });
       return;
@@ -820,6 +854,24 @@ export class WebUIServer {
 }
 
 // ---------- 辅助 ----------
+
+/** 向 OpenAI 兼容端点拉取可选模型列表（GET {baseURL}/models） */
+async function fetchLlmModels(baseURL: string, apiKey: string): Promise<string[]> {
+  const root = baseURL.replace(/\/+$/, "");
+  const url = root + "/models";
+  const res = await llmFetch(url, {
+    headers: apiKey ? { authorization: `Bearer ${apiKey}` } : {},
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`列出模型失败 (${res.status})：${text.slice(0, 200)}`);
+  }
+  const data = (await res.json()) as { data?: { id?: string }[] };
+  const ids = (data.data ?? [])
+    .map((m) => m.id)
+    .filter((id): id is string => typeof id === "string" && !!id);
+  return ids;
+}
 
 async function galleryEntries(host: WebUIHost): Promise<unknown[]> {
   const counts = await host.gallery.counts();

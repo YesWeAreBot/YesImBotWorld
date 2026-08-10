@@ -11,6 +11,7 @@
 
 import { llmFetch, forEachStreamLine, type LlmResponse } from "./http.js";
 import { debug } from "../webui/debug.js";
+import { usageStore } from "../webui/usage.js";
 
 export interface TextClientConfig {
   baseURL: string;
@@ -77,31 +78,36 @@ export class TextClient {
 
     // 非流式：一次性 JSON 响应
     if (!stream) {
-      const data = (await res.json()) as { content?: string };
+      const data = (await res.json()) as { content?: string; timings?: LlmTimings };
       if (typeof data.content !== "string") {
         debug.emit("llm.req", `${label}·无响应`, { ...input, ms: Date.now() - startedAt }, "error");
         throw new Error("text completion 响应缺少 content 字段");
       }
       const ms = Date.now() - startedAt;
-      debug.emit("llm.res", `${label}·${ms}ms`, {
+      const usage = timingsToUsage(data.timings);
+      debug.emit("llm.res", `${label}·${ms}ms${usage ? ` · ${usage.total} tok` : ""}`, {
         url: this.endpoint(),
         model: this.cfg.model ?? "",
         ms,
+        usage,
         content: data.content.slice(0, 4000),
       });
+      this.recordUsage(usage);
       return data.content;
     }
 
     // 流式：边生成边把增量写进同一条 llm.res 记录，完成时原地收尾
     let streamId: number | null = null;
-    let content = "";
+    let result: { content: string; timings?: LlmTimings };
     try {
-      content = await readTextStream(res, (partial) => {
+      result = await readTextStream(res, (partial, u) => {
+        const usageNow = timingsToUsage(u);
         const labelNow = `${label}·流式 ${Date.now() - startedAt}ms`;
         const detail = {
           url: this.endpoint(),
           model: this.cfg.model ?? "",
           ms: Date.now() - startedAt,
+          usage: usageNow,
           content: partial.slice(-6000),
         };
         if (streamId == null) streamId = debug.emit("llm.res", labelNow, detail);
@@ -112,28 +118,65 @@ export class TextClient {
       throw err;
     }
     const ms = Date.now() - startedAt;
+    const content = result.content;
+    const usage = timingsToUsage(result.timings);
+    this.recordUsage(usage);
     const finalDetail = {
       url: this.endpoint(),
       model: this.cfg.model ?? "",
       ms,
+      usage,
       content: content.slice(0, 4000),
     };
-    if (streamId != null) debug.update(streamId, { label: `${label}·${ms}ms`, detail: finalDetail });
-    else debug.emit("llm.res", `${label}·${ms}ms`, finalDetail);
+    if (streamId != null) debug.update(streamId, { label: `${label}·${ms}ms${usage ? ` · ${usage.total} tok` : ""}`, detail: finalDetail });
+    else debug.emit("llm.res", `${label}·${ms}ms${usage ? ` · ${usage.total} tok` : ""}`, finalDetail);
     return content;
   }
+
+  private recordUsage(usage: LlmUsage | null): void {
+    if (!usage) return;
+    usageStore.record({
+      label: this.cfg.label ?? "LLM",
+      model: this.cfg.model ?? "",
+      promptTokens: usage.prompt,
+      completionTokens: usage.completion,
+      totalTokens: usage.total,
+    });
+  }
+}
+
+interface LlmTimings {
+  prompt_n?: number;
+  predicted_n?: number;
+  prompt_eval_count?: number;
+  predicted_eval_count?: number;
+}
+
+interface LlmUsage {
+  prompt: number;
+  completion: number;
+  total: number;
+}
+
+function timingsToUsage(t: LlmTimings | undefined): LlmUsage | null {
+  if (!t) return null;
+  const prompt = Number(t.prompt_n ?? t.prompt_eval_count) || 0;
+  const completion = Number(t.predicted_n ?? t.predicted_eval_count) || 0;
+  if (!prompt && !completion) return null;
+  return { prompt, completion, total: prompt + completion };
 }
 
 /**
  * 读取 llama.cpp /completion 的 NDJSON 流（stream:true），增量累加 content；
- * 每 ~500ms 有新增内容时回调一次 onProgress。兼容后端忽略 stream
- * 直接返回整段 JSON 的情况。
+ * 每 ~500ms 有新增内容时回调一次 onProgress(content, timings)。
+ * 兼容后端忽略 stream 直接返回整段 JSON 的情况。
  */
 async function readTextStream(
   res: LlmResponse,
-  onProgress: (content: string) => void,
-): Promise<string> {
+  onProgress: (content: string, timings?: LlmTimings) => void,
+): Promise<{ content: string; timings?: LlmTimings }> {
   let content = "";
+  let timings: LlmTimings | undefined;
   let dirty = false;
   let lastEmit = 0;
   let sawData = false;
@@ -144,13 +187,14 @@ async function readTextStream(
     allLines += line + "\n";
     const payload = line.startsWith("data:") ? line.slice(5).trim() : line;
     if (!payload) return;
-    let chunk: { content?: string };
+    let chunk: { content?: string; timings?: LlmTimings };
     try {
       chunk = JSON.parse(payload) as typeof chunk;
     } catch {
       return;
     }
     sawData = true;
+    if (chunk.timings) timings = chunk.timings;
     if (typeof chunk.content === "string" && chunk.content) {
       content += chunk.content;
       dirty = true;
@@ -159,15 +203,15 @@ async function readTextStream(
     if (dirty && now - lastEmit >= THROTTLE_MS) {
       lastEmit = now;
       dirty = false;
-      onProgress(content);
+      onProgress(content, timings);
     }
   });
-  if (dirty) onProgress(content);
+  if (dirty) onProgress(content, timings);
 
   if (!sawData && allLines.trim()) {
-    let data: { content?: string } | null = null;
+    let data: { content?: string; timings?: LlmTimings } | null = null;
     try {
-      data = JSON.parse(allLines) as { content?: string };
+      data = JSON.parse(allLines) as { content?: string; timings?: LlmTimings };
     } catch {
       /* 非 JSON，忽略 */
     }
@@ -176,8 +220,8 @@ async function readTextStream(
     }
     if (data && typeof data.content === "string" && data.content) {
       content = data.content;
-      onProgress(content);
+      onProgress(content, data.timings);
     }
   }
-  return content;
+  return { content, timings };
 }

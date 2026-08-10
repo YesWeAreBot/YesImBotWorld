@@ -21,6 +21,7 @@ import * as memoryMod from "@koishijs/plugin-database-memory";
 import { Config } from "../src/config.js";
 import { apply } from "../src/index.js";
 import { debug } from "../src/webui/debug.js";
+import { usageStore } from "../src/webui/usage.js";
 
 // esbuild 的 CJS 互操作会让 default 指向整个模块对象：逐层剥到类本身
 const memory = (memoryMod as unknown as { default?: { default?: unknown } }).default?.default;
@@ -218,6 +219,48 @@ async function main() {
     body: JSON.stringify({ config: { bot: { mode: "invalid-mode" } } }),
   });
   check(badRes.status === 400, "非法配置返回 400");
+
+  // ---- Token 用量统计 ----
+  const usageBefore = (await (await fetch(`${base}/api/usage`, { headers: auth })).json()) as {
+    summary: { totals: { requests: number; totalTokens: number } };
+    entries: unknown[];
+    snapshot: number;
+  };
+  check(
+    Array.isArray(usageBefore.entries) && usageBefore.snapshot === usageBefore.summary.totals.requests,
+    "/api/usage 返回条目列表与快照计数",
+  );
+  usageStore.record({ label: "Smoke", model: "test-model", promptTokens: 10, completionTokens: 20, totalTokens: 30 });
+  const usageAfter = (await (await fetch(`${base}/api/usage`, { headers: auth })).json()) as {
+    summary: {
+      totals: { requests: number; totalTokens: number };
+      byLabel: Record<string, { requests: number; totalTokens: number }>;
+      byModel: Record<string, { requests: number; totalTokens: number }>;
+    };
+  };
+  check(
+    usageAfter.summary.totals.totalTokens === usageBefore.summary.totals.totalTokens + 30 &&
+      usageAfter.summary.byLabel.Smoke?.totalTokens === 30 &&
+      usageAfter.summary.byModel["test-model"]?.totalTokens === 30,
+    "usageStore.record 后 /api/usage 汇总正确",
+  );
+  const usageDel = await fetch(`${base}/api/usage`, { method: "DELETE", headers: auth });
+  check(usageDel.status === 200, "DELETE /api/usage 返回 200");
+
+  // ---- LLM 模型列表（config 页拉取） ----
+  const noBase = await fetch(`${base}/api/llm/models`, {
+    method: "POST",
+    headers: { ...auth, "content-type": "application/json" },
+    body: JSON.stringify({ apiKey: "" }),
+  });
+  check(noBase.status === 400, "/api/llm/models 缺少 baseURL 返回 400");
+  const badModels = await fetch(`${base}/api/llm/models`, {
+    method: "POST",
+    headers: { ...auth, "content-type": "application/json" },
+    body: JSON.stringify({ baseURL: "http://127.0.0.1:1/v1", apiKey: "" }),
+  });
+  const badModelsJson = (await badModels.json()) as { error?: string };
+  check(badModels.status === 500 && typeof badModelsJson.error === "string", "/api/llm/models 连接失败返回 500 与错误信息");
 
   await app.stop();
   await fs.rm(tmpRoot, { recursive: true, force: true });

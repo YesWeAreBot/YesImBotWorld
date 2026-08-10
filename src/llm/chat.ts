@@ -2,6 +2,7 @@
 
 import { llmFetch, forEachStreamLine, type LlmResponse } from "./http.js";
 import { debug } from "../webui/debug.js";
+import { usageStore } from "../webui/usage.js";
 
 export type ContentPart =
   | { type: "text"; text: string }
@@ -50,6 +51,13 @@ export interface ChatResult {
   toolCalls: RawToolCall[];
 }
 
+/** OpenAI 兼容的 usage 结构 */
+export interface ChatUsage {
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  total_tokens?: number;
+}
+
 export interface ChatCompleteOptions {
   tools?: ChatToolDef[];
   signal?: AbortSignal;
@@ -73,6 +81,10 @@ export class ChatClient {
       max_tokens: opts.maxTokens ?? this.cfg.maxTokens ?? 2048,
       ...(stream ? { stream: true } : {}),
     };
+    if (stream) {
+      // 请求在流末附上 usage（OpenAI 兼容后端普遍支持；不支持的通常忽略该字段）
+      body.stream_options = { include_usage: true };
+    }
     if (opts.tools?.length) body.tools = opts.tools;
     if (this.cfg.disableThinking) {
       // 覆盖主流后端/模型的"关闭思考"写法：
@@ -127,13 +139,15 @@ export class ChatClient {
         throw new Error("chat completion 响应缺少 choices[0].message");
       }
       const ms = Date.now() - startedAt;
+      const usage = normalizeUsage(data.usage);
       debug.emit(
         "llm.res",
-        `${label}·${ms}ms${message.tool_calls?.length ? "·工具调用" : "·正文"}`,
+        `${label}·${ms}ms${message.tool_calls?.length ? "·工具调用" : "·正文"}${usage ? ` · ${usage.total_tokens} tok` : ""}`,
         {
           url,
           model: this.cfg.model,
           ms,
+          usage,
           content: (message.content ?? "").slice(0, 4000),
           tool_calls: message.tool_calls?.map((tc) => ({
             name: tc.function.name,
@@ -141,6 +155,7 @@ export class ChatClient {
           })),
         },
       );
+      this.recordUsage(usage);
       return { content: message.content ?? "", toolCalls: message.tool_calls ?? [] };
     }
 
@@ -148,6 +163,7 @@ export class ChatClient {
     let streamId: number | null = null;
     let content = "";
     let toolCalls: RawToolCall[] = [];
+    let usage: ChatUsage | null = null;
     try {
       const result = await readChatCompletionStream(res, (progress) => {
         const labelNow = `${label}·流式 ${Date.now() - startedAt}ms`;
@@ -155,6 +171,7 @@ export class ChatClient {
           url,
           model: this.cfg.model,
           ms: Date.now() - startedAt,
+          usage: progress.usage,
           content: progress.content.slice(-6000),
           ...(progress.toolCalls.length
             ? {
@@ -170,22 +187,36 @@ export class ChatClient {
       });
       content = result.content;
       toolCalls = result.toolCalls;
+      usage = result.usage;
     } catch (err) {
       debug.emit("llm.req", `${label}·流式中断`, { ...input, ms: Date.now() - startedAt }, "error");
       throw err;
     }
     const ms = Date.now() - startedAt;
-    const finalLabel = `${label}·${ms}ms${toolCalls.length ? "·工具调用" : "·正文"}`;
+    this.recordUsage(usage);
+    const finalLabel = `${label}·${ms}ms${toolCalls.length ? "·工具调用" : "·正文"}${usage ? ` · ${usage.total_tokens} tok` : ""}`;
     const finalDetail = {
       url,
       model: this.cfg.model,
       ms,
+      usage,
       content: content.slice(0, 4000),
       tool_calls: toolCalls.map((tc) => ({ name: tc.function.name, arguments: tc.function.arguments })),
     };
     if (streamId != null) debug.update(streamId, { label: finalLabel, detail: finalDetail });
     else debug.emit("llm.res", finalLabel, finalDetail);
     return { content, toolCalls };
+  }
+
+  private recordUsage(usage: ChatUsage | null): void {
+    if (!usage || !usage.prompt_tokens && !usage.completion_tokens && !usage.total_tokens) return;
+    usageStore.record({
+      label: this.cfg.label ?? "LLM",
+      model: this.cfg.model || "",
+      promptTokens: usage.prompt_tokens ?? 0,
+      completionTokens: usage.completion_tokens ?? 0,
+      totalTokens: usage.total_tokens ?? 0,
+    });
   }
 }
 
@@ -198,6 +229,7 @@ interface StreamedToolCall {
 interface ChatProgress {
   content: string;
   toolCalls: RawToolCall[];
+  usage: ChatUsage | null;
 }
 
 /**
@@ -211,6 +243,7 @@ async function readChatCompletionStream(
 ): Promise<ChatProgress> {
   const slots: Array<StreamedToolCall | undefined> = [];
   let content = "";
+  let usage: ChatUsage | null = null;
   let dirty = false;
   let lastEmit = 0;
   let sawData = false;
@@ -226,6 +259,7 @@ async function readChatCompletionStream(
         type: "function" as const,
         function: { name: s.name, arguments: s.args },
       })),
+    usage,
   });
 
   await forEachStreamLine(res, (line) => {
@@ -234,12 +268,14 @@ async function readChatCompletionStream(
     sawData = true;
     const payload = line.slice(5).trim();
     if (!payload || payload === "[DONE]") return;
-    let chunk: { choices?: { delta?: ChatStreamDelta }[] };
+    let chunk: { choices?: { delta?: ChatStreamDelta }[]; usage?: ChatUsage };
     try {
       chunk = JSON.parse(payload) as typeof chunk;
     } catch {
       return;
     }
+    // 流末 usage（OpenAI 兼容后端在 stream_options.include_usage 时于末块携带）
+    if (chunk.usage) usage = chunk.usage;
     const delta = chunk.choices?.[0]?.delta;
     if (!delta) return;
     if (typeof delta.content === "string" && delta.content) {
@@ -276,6 +312,7 @@ async function readChatCompletionStream(
     }
     if (data) {
       const message = data.choices?.[0]?.message;
+      if (data.usage) usage = data.usage;
       if (message) {
         if (message.content) content += message.content;
         if (Array.isArray(message.tool_calls)) {
@@ -303,6 +340,16 @@ interface ChatStreamDelta {
 
 interface ChatRawResponse {
   choices?: { message?: { content?: string | null; tool_calls?: RawToolCall[] } }[];
+  usage?: ChatUsage;
+}
+
+function normalizeUsage(u: ChatUsage | null | undefined): ChatUsage | null {
+  if (!u) return null;
+  const prompt = Number(u.prompt_tokens) || 0;
+  const completion = Number(u.completion_tokens) || 0;
+  const total = Number(u.total_tokens) || 0;
+  if (!prompt && !completion && !total) return null;
+  return { prompt_tokens: prompt, completion_tokens: completion, total_tokens: total || prompt + completion };
 }
 
 function summarizeContent(content: string | ContentPart[], max: number): unknown {
