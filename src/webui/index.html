@@ -344,7 +344,8 @@ var NL = String.fromCharCode(10);
 var VERSION = '?';
 var TOKEN = localStorage.getItem('wui_token') || '';
 var activeView = 'overview';
-var lastEventId = 0;
+// SSE 断线续传锚点：跨页面加载持久化，避免每次无缓存刷新都从 0 重放整段调试历史
+var lastEventId = Number(localStorage.getItem('wui_last_id') || 0);
 var evtSource = null;
 var cfgCache = null, schemaCache = null, cfgGroup = '', cfgSearch = '', cfgDirty = false;
 var overridesCache = null, promptsDefaults = null;
@@ -484,7 +485,10 @@ function connectSSE(){
   evtSource.onopen = function(){ $('#sse-dot').className = 'on'; };
   evtSource.onerror = function(){ $('#sse-dot').className = 'off'; };
   evtSource.onmessage = function(ev){
-    if(ev.lastEventId) lastEventId = Number(ev.lastEventId) || 0;
+    if(ev.lastEventId){
+      var n = Number(ev.lastEventId) || 0;
+      if(n > lastEventId){ lastEventId = n; localStorage.setItem('wui_last_id', String(n)); }
+    }
     var msg;
     try { msg = JSON.parse(ev.data); } catch(e){ return; }
     if(msg.channel === 'debug'){
@@ -501,13 +505,15 @@ function onDebugEntry(entry){
   if(activeView === 'debug') appendDebugEntry(entry);
 }
 function onFileSignal(file){
+  // clock/botStatus/news 是高频信号（时钟每 TU 一跳）：无论当前在哪个视图都刷新总览，
+  // 但要避免与下面的分支重复请求
+  if(file === 'clock' || file === 'botStatus' || file === 'news'){ refreshOverview(false); return; }
   if(activeView === 'state') refreshState(file);
   else if(activeView === 'overview') refreshOverview(false);
   else if(activeView === 'gallery' && file === 'gallery') loadGallery();
   else if(activeView === 'media' && file === 'media') loadMedia();
   else if(activeView === 'data' && (file === 'notes' || file === 'data')) refreshData();
   else if(activeView === 'debug' && file === 'stream') renderStreamTab();
-  if(file === 'clock' || file === 'botStatus' || file === 'news') refreshOverview(false);
 }
 function onLifecycle(event, detail){
   refreshOverview(false);
@@ -516,9 +522,16 @@ function onLifecycle(event, detail){
 }
 
 // ---------- 实时生成跟踪（首页「正在生成」面板的数据源） ----------
+// 按 id（时间序）有序插入并去重：SSE 推送与 /api/debug 种子化可能交错到达，
+// 一律归位到正确的时间位置，保证列表永远是时间序（id 单调递增 = 现实时序）。
 function pushFeed(e){
-  liveFeed.push(e);
-  if(liveFeed.length > 24) liveFeed.shift();
+  for(var i=0;i<liveFeed.length;i++){
+    if(liveFeed[i].id === e.id){ liveFeed[i] = e; return; }
+    if(liveFeed[i].id > e.id) break;
+  }
+  if(i >= liveFeed.length) liveFeed.push(e);
+  else liveFeed.splice(i, 0, e);
+  if(liveFeed.length > 24) liveFeed.splice(0, liveFeed.length - 24);
 }
 function updateFeedEntry(e){
   for(var i=0;i<liveFeed.length;i++){ if(liveFeed[i].id === e.id){ liveFeed[i] = e; return; } }
@@ -681,12 +694,34 @@ function renderOverview(o){
 function patchOverviewDynamic(o){
   var c = $('#ov-clock'); if(c) c.textContent = o.clock ? o.clock.timeLine : '——';
   var s = $('#ov-sub'); if(s) s.textContent = heroSub(o);
+  // 动态卡片/事件只在内容真正变化时才重建，否则高频刷新（时钟每 TU 一跳）会让整个面板闪跳
   var cards = $('#ov-cards');
-  if(cards){ cards.textContent = ''; overviewCards(o).forEach(function(x){ cards.appendChild(x); }); }
+  if(cards){
+    var cardSig = overviewCards(o).map(function(x){ return x.textContent; }).join('|');
+    if(cards.getAttribute('data-sig') !== cardSig){
+      cards.setAttribute('data-sig', cardSig);
+      cards.textContent = '';
+      overviewCards(o).forEach(function(x){ cards.appendChild(x); });
+    }
+  }
   var newsBox = $('#ov-news');
-  if(newsBox){ newsBox.textContent = ''; newsBox.appendChild(newsSection(o).querySelector('.body') || el('div')); }
+  if(newsBox){
+    var newsSig = JSON.stringify(o.news);
+    if(newsBox.getAttribute('data-sig') !== newsSig){
+      newsBox.setAttribute('data-sig', newsSig);
+      newsBox.textContent = '';
+      newsBox.appendChild(newsSection(o).querySelector('.body') || el('div'));
+    }
+  }
   var factsBox = $('#ov-facts');
-  if(factsBox){ factsBox.textContent = ''; factsBox.appendChild(factsSection(o).querySelector('.body') || el('div')); }
+  if(factsBox){
+    var factsSig = JSON.stringify(o.facts);
+    if(factsBox.getAttribute('data-sig') !== factsSig){
+      factsBox.setAttribute('data-sig', factsSig);
+      factsBox.textContent = '';
+      factsBox.appendChild(factsSection(o).querySelector('.body') || el('div'));
+    }
+  }
 }
 function heroSub(o){
   if(!o.initialized) return '世界尚未创世——先编写定义，然后点击「创世」';
@@ -884,25 +919,37 @@ function extractTail(e){
   if(tail.length > 900) tail = '…' + tail.slice(-900);
   return tail || '（…）';
 }
-// 各侧活动流：收进各自面板，llm 条目剥掉冗余的侧前缀
+// 各侧活动流：收进各自面板，llm 条目剥掉冗余的侧前缀。
+// 增量渲染：仅当条目集合（id 序列）变化时才整体重建；集合不变时只原地刷新
+// 流式更新的时间/标签——避免每个事件都清空重建导致整个面板闪跳。
 function renderFeedRows(who){
   var box = $('#feed-' + who);
   if(!box) return;
-  box.textContent = '';
   var rows = liveFeed.filter(function(e){ return sideOf(e) === who; }).slice(-6).reverse();
-  if(!rows.length){
-    box.appendChild(el('div', {cls:'empty', text:'（还没有动静）'}));
+  var sig = rows.map(function(e){ return e.id; }).join(',');
+  if(box.getAttribute('data-sig') !== sig){
+    box.textContent = '';
+    box.setAttribute('data-sig', sig);
+    if(!rows.length){ box.appendChild(el('div', {cls:'empty', text:'（还没有动静）'})); return; }
+    rows.forEach(function(e){ box.appendChild(feedRow(e)); });
     return;
   }
-  rows.forEach(function(e){
-    var label = e.label;
-    if(e.kind === 'llm.req' || e.kind === 'llm.res') label = label.replace(/^(Bot|World|解释器)·/, '');
-    box.appendChild(el('div', {cls:'feed-row'}, [
-      el('span', {cls:'t', text: fmtTime(e.ts)}),
-      el('span', {cls:'tag ' + tagClass(e), text: e.kind}),
-      el('span', {cls:'l', text: label})
-    ]));
+  rows.forEach(function(e, i){
+    var row = box.children[i];
+    if(!row) return;
+    var t = row.querySelector('.t'); if(t && t.textContent !== fmtTime(e.ts)) t.textContent = fmtTime(e.ts);
+    var tag = row.querySelector('.tag'); if(tag && tag.textContent !== e.kind){ tag.textContent = e.kind; tag.className = 'tag ' + tagClass(e); }
+    var l = row.querySelector('.l'); if(l && l.textContent !== e.label) l.textContent = e.label;
   });
+}
+function feedRow(e){
+  var label = e.label;
+  if(e.kind === 'llm.req' || e.kind === 'llm.res') label = label.replace(/^(Bot|World|解释器)·/, '');
+  return el('div', {cls:'feed-row'}, [
+    el('span', {cls:'t', text: fmtTime(e.ts)}),
+    el('span', {cls:'tag ' + tagClass(e), text: e.kind}),
+    el('span', {cls:'l', text: label})
+  ]);
 }
 function tagClass(e){
   if(e.kind === 'llm.req') return 'req';
@@ -1665,6 +1712,7 @@ function renderStateEditor(s){
     el('button', {cls:'active', text:'Bot_Status.md', onclick:function(){ setTab(this, 'bot'); }}),
     el('button', {text:'World_Status.md', onclick:function(){ setTab(this, 'world'); }}),
     el('button', {text:'世界新闻 News.db', onclick:function(){ setTab(this, 'news'); }}),
+    el('button', {text:'Bot 小事记 facts', onclick:function(){ setTab(this, 'facts'); }}),
     el('button', {text:'Bot_Definition.md', onclick:function(){ setTab(this, 'botdef'); }}),
     el('button', {text:'World_Definition.md', onclick:function(){ setTab(this, 'worlddef'); }})
   ]);
@@ -1867,6 +1915,8 @@ function debugRow(e){
   return row;
 }
 function appendDebugEntry(e){
+  // 去重：SSE 续传重放与 /api/debug 种子化可能同时携带同一条，按 id 幂等处理
+  for(var i=0;i<debugEntries.length;i++){ if(debugEntries[i].id === e.id){ debugEntries[i] = e; return; } }
   debugEntries.push(e);
   if(debugEntries.length > 600) debugEntries.splice(0, debugEntries.length - 600);
   if(activeView !== 'debug' || debugSubview === 'stream') return;

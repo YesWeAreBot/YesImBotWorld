@@ -300,12 +300,18 @@ export class WebUIServer {
       connection: "keep-alive",
       "x-accel-buffering": "no",
     });
-    const since = Number(sinceRaw ?? 0) || 0;
+    // 断线续传锚点：优先读标准的 Last-Event-ID 请求头（EventSource 自动重连会带），
+    // 其次取前端 URL 里的 since 参数。since=0 表示全新订阅（首次访问/无缓存），
+    // 历史由前端通过 /api/debug 自行种子化，**不**整体重放——
+    // 否则每次无缓存刷新都会把整段调试历史逐条推给浏览器，造成"从头重播一遍"的闪烁。
+    const lastEventIdHeader = req.headers["last-event-id"];
+    const since = Number(lastEventIdHeader ?? sinceRaw ?? 0) || 0;
     const client: SseClient = { res, lastId: debug.snapshot() };
-    // 断线重连：补发期间错过的调试事件
-    for (const entry of debug.since(since)) {
-      client.lastId = entry.id;
-      res.write(`id: ${entry.id}\ndata: ${JSON.stringify({ channel: "debug", entry })}\n\n`);
+    if (since > 0) {
+      for (const entry of debug.since(since)) {
+        client.lastId = entry.id;
+        res.write(`id: ${entry.id}\ndata: ${JSON.stringify({ channel: "debug", entry })}\n\n`);
+      }
     }
     this.clients.add(client);
     res.write(`id: ${client.lastId}\ndata: ${JSON.stringify({ channel: "hello", snapshot: debug.snapshot() })}\n\n`);
