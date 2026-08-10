@@ -77,7 +77,13 @@ export type StreamEntry =
  * 对应 Prompt 结构中的：角色设定 / 历史压缩 / 工具列表 / 记忆摘要。
  */
 export interface PinnedContext {
-  /** 角色设定，来自 Bot_Status.md */
+  /**
+   * 最初设定（Bot 的最初样子）：Bot_Definition.md 的原文。
+   * 永远不变——只在创世时与上下文压缩时从定义文件刷新，
+   * 其余时候用户的改动以 Event（world.reload）形式传入，保持前缀稳定。
+   */
+  botDefinition: string;
+  /** 角色设定（自我认知），来自 Bot_Status.md */
   persona: string;
   /** 历史消息（Tool Call 流）的压缩 */
   historySummary: string;

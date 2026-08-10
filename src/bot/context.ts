@@ -30,6 +30,7 @@ interface PinnedPersist {
  */
 export class BotContext {
   pinned: PinnedContext = {
+    botDefinition: "",
     persona: "",
     historySummary: "（暂无，你的经历才刚刚开始）",
     toolsText: renderToolsText(),
@@ -92,6 +93,13 @@ export class BotContext {
     } catch {
       this.pinned.persona = await this.files.readBotStatus();
     }
+    // 迁移/兜底：置顶区缺少「最初设定」（旧版 pinned.json 或没有 pinned.json 的旧世界），
+    // 首次从定义文件补入并持久化；此后这部分只在创世与压缩（applyCompression）时刷新，
+    // 其余时候用户的改动以 Event 告知，保持前缀稳定（保护 KV cache）。
+    if (!this.pinned.botDefinition?.trim()) {
+      this.pinned.botDefinition = (await this.files.readDefinitions()).botDef;
+      await this.persistPinned();
+    }
     this.stream = [];
     this.attachAnchor = { pos: 0, skip: 0 };
     const raw = await this.files.readText(this.files.stream);
@@ -149,7 +157,9 @@ export class BotContext {
   renderSystemText(timeLine: string): string {
     const accounts = this.accountsProvider?.() ?? "";
     const c = this.constitution;
+    const original = this.pinned.botDefinition?.trim();
     return [
+      ...(original ? ["# 最初的你\n" + original] : []),
       "# 你是谁\n" + (this.pinned.persona.trim() || "（角色设定缺失）"),
       c.constitutionHead +
         "\n\n" +
@@ -358,7 +368,11 @@ export class BotContext {
     await this.files.archiveStream();
     this.stream = [];
     this.attachAnchor = { pos: 0, skip: 0 };
+    // 「最初设定」在压缩时从定义文件刷新（创世与压缩是仅有的两个更新时机；
+    // 压缩后整个置顶区本就要重建，前缀重算不损失缓存）
+    const { botDef } = await this.files.readDefinitions();
     this.pinned = {
+      botDefinition: botDef,
       persona: await this.files.readBotStatus(),
       historySummary: result.historySummary,
       toolsText: this.toolsText,

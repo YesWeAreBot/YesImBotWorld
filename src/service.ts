@@ -259,9 +259,11 @@ export class WorldService extends Service<Config> {
     if (!(await this.files.exists(this.files.facts))) await fs.writeFile(this.files.facts, "");
     await this.world.initialize(botDef, worldDef);
 
-    // 建立全新的 Bot 上下文（角色设定来自刚生成的 Bot_Status.md）
+    // 建立全新的 Bot 上下文（角色设定来自刚生成的 Bot_Status.md；
+    // 「最初设定」= Bot_Definition.md 原文，此后只在压缩时随定义文件刷新）
     await fs.writeFile(this.files.stream, "");
     const context = new BotContext(this.files, this.pinnedToolsText(), this.promptStore);
+    context.pinned.botDefinition = botDef;
     context.pinned.persona = await this.files.readBotStatus();
     await context.persistPinned();
 
