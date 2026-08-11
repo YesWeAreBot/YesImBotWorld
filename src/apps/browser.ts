@@ -11,12 +11,19 @@
  * - 现实世界：无头浏览器打开当前网址实拍；
  * - 虚构世界：渲染 World-LLM 生成的 HTML 后拍摄。
  * 截图自动存进收藏夹「截图」分类（未安装 puppeteer 时该操作优雅降级）。
+ *
+ * 带壳截图：网页画面外包一层手机 UI（状态栏、地址栏与浏览器按钮、底部手势条），
+ * 像真实手机截屏。外壳来源优先级：用户自定义图片（apps.phoneShellImage）
+ * > 创世时 World-LLM 依据世界观生成的外壳 HTML（meta.json）> 内置通用外壳。
+ * 截图视口 = 手机分辨率（apps.phoneResolution，auto 时用创世判定值）。
  */
 
+import { promises as fs } from "node:fs";
+import path from "node:path";
 import type { Context, Logger } from "koishi";
 import type { WorldClock } from "../clock.js";
 import type { AppsConfig } from "../config.js";
-import type { WorldFiles } from "../files.js";
+import type { WorldFiles, WorldMeta } from "../files.js";
 import type { CaptionService } from "../media/captioner.js";
 import type { GalleryStore } from "../media/gallery.js";
 import type { MediaStore } from "../media/store.js";
@@ -24,7 +31,9 @@ import type { MediaRef, RichText } from "../types.js";
 import type { WorldAgent } from "../world/agent.js";
 import type { AppRawTool, WorldApp } from "./app.js";
 import { fetchWithProxy } from "../fetch.js";
-import { parseHtml, type ParsedPage } from "./html.js";
+import { fill } from "../prompts.js";
+import { resolvePhoneResolution, type PhoneResolution } from "../phone.js";
+import { extractHtml, parseHtml, type ParsedPage } from "./html.js";
 
 const HTTP_TIMEOUT_MS = 20_000;
 const MAX_HTML_BYTES = 3 * 1024 * 1024;
@@ -33,8 +42,49 @@ const SCREEN_CHARS = 2600;
 const HISTORY_LIMIT = 10;
 const USER_AGENT =
   "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36";
-/** 截图视口（手机屏幕比例） */
-const VIEWPORT = { width: 800, height: 1280 };
+
+/**
+ * 内置带壳截图外壳：手机状态栏 + 浏览器工具栏 + 屏幕区 + 底部手势条。
+ * 全部使用 vw/vh 相对单位，适配任意分辨率；{{time}} {{url}} {{screen}} 渲染时替换。
+ * 仅在「用户未配置外壳图片、创世也没生成外壳 HTML」时使用。
+ */
+const DEFAULT_SHELL_TEMPLATE = `<!DOCTYPE html><html><head><meta charset="utf-8"><style>
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{width:100vw;height:100vh;overflow:hidden;background:#0b0e13}
+body{display:flex;flex-direction:column;font-family:-apple-system,"PingFang SC","Microsoft YaHei","Segoe UI",sans-serif}
+.statusbar{height:3.2vh;flex:none;background:#0b0e13;color:#e8edf4;display:flex;align-items:center;justify-content:space-between;padding:0 4vw;font-size:1.55vh;font-weight:600}
+.statusbar .icons{display:flex;align-items:center;gap:1.8vw}
+.statusbar svg{height:1.7vh;width:auto;display:block}
+.toolbar{height:5.4vh;flex:none;background:#151a22;display:flex;align-items:center;gap:2.2vw;padding:0 3vw;border-bottom:1px solid #232a35}
+.tbtn{color:#aeb9c8;font-size:2.6vh;line-height:1;flex:none;width:3.2vh;text-align:center;font-weight:300}
+.tbtn.dim{color:#4a5464}
+.addr{flex:1;min-width:0;height:3.7vh;background:#0d1117;border:1px solid #232a35;border-radius:2vh;display:flex;align-items:center;padding:0 3.2vw;color:#9aa7b8;font-size:1.5vh;overflow:hidden;white-space:nowrap}
+.addr svg{height:1.5vh;width:auto;flex:none;margin-right:1.8vw;opacity:.65}
+.addr span{overflow:hidden;text-overflow:ellipsis}
+.screen{flex:1;width:100%;min-height:0;object-fit:cover;object-position:top center;display:block;background:#fff}
+.navbar{height:2.8vh;flex:none;background:#0b0e13;display:flex;align-items:center;justify-content:center}
+.navbar i{width:12vw;height:.55vh;border-radius:99px;background:#39424f;display:block}
+</style></head><body>
+<div class="statusbar"><span>{{time}}</span><span class="icons">
+<svg viewBox="0 0 18 12" fill="#e8edf4"><rect x="0" y="8" width="3" height="4" rx="0.8"/><rect x="5" y="5.5" width="3" height="6.5" rx="0.8"/><rect x="10" y="3" width="3" height="9" rx="0.8"/><rect x="15" y="0" width="3" height="12" rx="0.8"/></svg>
+<svg viewBox="0 0 16 12" fill="none" stroke="#e8edf4" stroke-width="1.6" stroke-linecap="round"><path d="M1.5 4.5a10 10 0 0 1 13 0"/><path d="M4 7.2a6.4 6.4 0 0 1 8 0"/><circle cx="8" cy="10" r="1.3" fill="#e8edf4" stroke="none"/></svg>
+<svg viewBox="0 0 24 12"><rect x="0.8" y="0.8" width="19" height="10.4" rx="2.6" fill="none" stroke="#e8edf4" stroke-width="1.4"/><rect x="3" y="3" width="12" height="6" rx="1.2" fill="#e8edf4"/><rect x="21.4" y="3.6" width="2.2" height="4.8" rx="1.1" fill="#e8edf4"/></svg>
+</span></div>
+<div class="toolbar"><span class="tbtn">&#8249;</span><span class="tbtn dim">&#8250;</span><div class="addr"><svg viewBox="0 0 10 13" fill="#9aa7b8"><rect x="0" y="5" width="10" height="8" rx="1.6"/><path d="M2.4 5V3.6a2.6 2.6 0 0 1 5.2 0V5" fill="none" stroke="#9aa7b8" stroke-width="1.5"/></svg><span>{{url}}</span></div><span class="tbtn">&#10227;</span></div>
+<img class="screen" src="{{screen}}">
+<div class="navbar"><i></i></div>
+</body></html>`;
+
+/**
+ * 用户自定义外壳图片的合成模板：网页画面垫底、外壳图片拉伸覆盖在最上层
+ * （屏幕区域透明的设备边框素材）。
+ */
+const IMAGE_SHELL_TEMPLATE = `<!DOCTYPE html><html><head><meta charset="utf-8"><style>
+html,body{margin:0;padding:0;width:100vw;height:100vh;overflow:hidden;background:#000}
+.screen,.shell{position:absolute;left:0;top:0;width:100%;height:100%;display:block}
+.screen{object-fit:cover;object-position:top center}
+.shell{object-fit:fill;pointer-events:none}
+</style></head><body><img class="screen" src="{{screen}}"><img class="shell" src="{{shellImage}}"></body></html>`;
 
 /** koishi-plugin-puppeteer 的 ctx.puppeteer 服务（可选依赖，宽松类型） */
 interface PuppeteerPageLike {
@@ -409,25 +459,34 @@ export class BrowserApp implements WorldApp {
       return "（这个页面没法截图（缺少页面内容）。重新打开它试试。）";
     }
 
+    const meta = await this.files.readMeta();
+    const viewport = resolvePhoneResolution(this.cfg.phoneResolution, meta);
+
+    // 第一步：拍网页本身（手机分辨率视口）
     let png: Buffer;
     try {
-      const tab = await pptr.page();
-      try {
-        await tab.setViewport(VIEWPORT);
-        if (tab.setUserAgent) await tab.setUserAgent(USER_AGENT).catch(() => {});
+      png = await this.capture(pptr, viewport, async (tab) => {
         if (real) {
           await tab.goto(page.url, { waitUntil: "networkidle2", timeout: HTTP_TIMEOUT_MS });
         } else {
           await tab.setContent(page.html!, { waitUntil: "load", timeout: HTTP_TIMEOUT_MS });
         }
-        const shot = await tab.screenshot({ type: "png" });
-        png = Buffer.isBuffer(shot) ? shot : Buffer.from(shot as Uint8Array);
-      } finally {
-        await tab.close().catch(() => {});
-      }
+      });
     } catch (err) {
       this.logger.warn("网页截图失败 (%s): %s", page.url, err);
       return `（截图失败：${(err as Error).message ?? err}）`;
+    }
+
+    // 第二步：带壳合成——手机状态栏 + 浏览器工具栏等 UI 包住网页画面。
+    // 外壳来源：用户自定义图片 > 创世时 World-LLM 生成的外壳 HTML > 内置外壳。
+    // 合成失败不阻塞主流程，退回裸截图。
+    try {
+      const shellHtml = await this.buildShellHtml(meta, viewport, page, png);
+      png = await this.capture(pptr, viewport, (tab) =>
+        tab.setContent(shellHtml, { waitUntil: "load", timeout: HTTP_TIMEOUT_MS }),
+      );
+    } catch (err) {
+      this.logger.warn("带壳截图合成失败，使用裸截图 (%s): %s", page.url, err);
     }
 
     // 入媒体缓存 + 存进收藏夹「截图」分类
@@ -450,9 +509,85 @@ export class BrowserApp implements WorldApp {
       `可以直接用 send 发送。`
     );
   }
+
+  /** 开一个页签完成一次加载 + 截图（视口 = 手机分辨率），保证页签关闭 */
+  private async capture(
+    pptr: PuppeteerLike,
+    viewport: PhoneResolution,
+    load: (tab: PuppeteerPageLike) => Promise<unknown>,
+  ): Promise<Buffer> {
+    const tab = await pptr.page();
+    try {
+      await tab.setViewport(viewport);
+      if (tab.setUserAgent) await tab.setUserAgent(USER_AGENT).catch(() => {});
+      await load(tab);
+      const shot = await tab.screenshot({ type: "png" });
+      return Buffer.isBuffer(shot) ? shot : Buffer.from(shot as Uint8Array);
+    } finally {
+      await tab.close().catch(() => {});
+    }
+  }
+
+  /** 组装带壳合成页：外壳来源依次为 用户图片 > 创世生成 HTML > 内置模板 */
+  private async buildShellHtml(
+    meta: WorldMeta,
+    viewport: PhoneResolution,
+    page: BrowserPage,
+    contentPng: Buffer,
+  ): Promise<string> {
+    const vars: Record<string, string | number> = {
+      screen: `data:image/png;base64,${contentPng.toString("base64")}`,
+      url: escapeHtml(page.url.slice(0, 160)),
+      title: escapeHtml((page.title || "").slice(0, 80)),
+      time: clockHm(this.clock.timeLine()),
+      width: viewport.width,
+      height: viewport.height,
+    };
+    // 1. 用户自定义外壳图片（屏幕区域透明的边框素材，拉伸覆盖在最上层）
+    const imgPath = (this.cfg.phoneShellImage || "").trim();
+    if (imgPath) {
+      const dataUrl = await this.readShellImage(imgPath);
+      if (dataUrl) return fill(IMAGE_SHELL_TEMPLATE, { ...vars, shellImage: dataUrl });
+      this.logger.warn("自定义外壳图片不可用（%s），退回生成/内置外壳", imgPath);
+    }
+    // 2. 创世时 World-LLM 生成的外壳（meta.json phoneShellHtml，可手动编辑）
+    if (meta.phoneShellHtml && meta.phoneShellHtml.includes("{{screen}}")) {
+      return fill(meta.phoneShellHtml, vars);
+    }
+    // 3. 内置通用外壳
+    return fill(DEFAULT_SHELL_TEMPLATE, vars);
+  }
+
+  private async readShellImage(p: string): Promise<string | null> {
+    try {
+      const abs = path.isAbsolute(p) ? p : path.resolve(this.ctx.baseDir, p);
+      const buf = await fs.readFile(abs);
+      const ext = path.extname(abs).toLowerCase();
+      const mime =
+        ext === ".jpg" || ext === ".jpeg"
+          ? "image/jpeg"
+          : ext === ".webp"
+            ? "image/webp"
+            : ext === ".gif"
+              ? "image/gif"
+              : "image/png";
+      return `data:${mime};base64,${buf.toString("base64")}`;
+    } catch {
+      return null;
+    }
+  }
 }
 
 // ---------- 工具函数 ----------
+
+function escapeHtml(s: string): string {
+  return s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!);
+}
+
+/** 从世界时刻串里提取 HH:mm（自定义历法无标准时分时返回空串） */
+function clockHm(timeLine: string): string {
+  return timeLine.match(/\b(\d{1,2}:\d{2})\b/)?.[1] ?? "";
+}
 
 function normalizeUrl(url: string): string {
   return /^[a-z][a-z0-9+.-]*:\/\//i.test(url) ? url : `https://${url}`;
@@ -504,24 +639,6 @@ function splitScreens(text: string): string[] {
   }
   if (buf) screens.push(buf);
   return screens;
-}
-
-/** 从 World-LLM 的输出里提取 HTML 文档（容忍代码围栏与前后闲话） */
-function extractHtml(raw: string): string | null {
-  let s = raw.trim();
-  const fence = s.match(/```(?:html)?\s*([\s\S]*?)```/i);
-  if (fence) s = fence[1]!.trim();
-  const start = s.search(/<!doctype\s+html|<html[\s>]/i);
-  if (start >= 0) {
-    const endMatch = s.match(/<\/html>/i);
-    const end = endMatch ? endMatch.index! + endMatch[0].length : s.length;
-    return s.slice(start, end);
-  }
-  // 没有完整文档结构但看起来是 HTML 片段：包一层
-  if (/<(body|div|p|h1|table|ul)\b/i.test(s)) {
-    return `<!DOCTYPE html><html><head><meta charset="utf-8"/></head><body>${s}</body></html>`;
-  }
-  return null;
 }
 
 /** 按 content-type / meta 提示解码 HTML 字节（默认 UTF-8，兼容 GBK 站点） */

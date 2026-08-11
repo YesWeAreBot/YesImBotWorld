@@ -57,6 +57,14 @@ export interface WorldPromptSet {
   generateCalendarSystem: string;
   /** 历法生成：user 消息。{{worldDef}} {{epoch}} {{unitWorldSeconds}} */
   generateCalendarUser: string;
+  /** 手机屏幕规格判定：system 消息 */
+  phoneSpecSystem: string;
+  /** 手机屏幕规格判定：user 消息。{{botDef}} {{worldDef}} */
+  phoneSpecUser: string;
+  /** 浏览器带壳截图外壳生成：system 消息 */
+  phoneShellSystem: string;
+  /** 浏览器带壳截图外壳生成：user 消息。{{botDef}} {{worldDef}} {{width}} {{height}} */
+  phoneShellUser: string;
 }
 
 export interface PromptOverrides {
@@ -301,6 +309,42 @@ export const WORLD_PROMPT_DEFAULTS: WorldPromptSet = {
     `{"name":"时","count":60,"start":0,"pad":2},{"name":"分","count":60,"start":0,"pad":2}],` +
     `"epoch":[1024,3,5,8,0],"format":"{era}{年}年{月}月{日}日 {时}:{分}"}\n\n` +
     `注意：历法必须忠实于世界定义与用户设定的初始时刻；若世界与现实无异，直接选 gregorian。只输出 JSON。`,
+
+  phoneSpecSystem:
+    "你是一个虚拟世界的模拟引擎。现在是创世阶段，你要为世界中的角色决定其随身手机" +
+    "（或这个世界里等价的便携通讯设备）的屏幕规格。只输出严格的 JSON，不要输出任何其他内容。",
+
+  phoneSpecUser:
+    `<bot_definition>（角色定义）\n{{botDef}}\n</bot_definition>\n\n` +
+    `<world_definition>（世界定义）\n{{worldDef}}\n</world_definition>\n\n` +
+    `请根据世界观与角色设定，决定这个角色手机屏幕的逻辑分辨率（竖屏，宽 < 高，单位像素）：\n` +
+    `- 现代/未来世界的智能手机：常见如 720x1560、800x1280、1080x2400；\n` +
+    `- 古典、幻想或低技术世界的魔导/蒸汽设备：可以更朴素或比例更特别，但仍须在 240~2160（宽）与 320~3840（高）范围内。\n` +
+    `输出：{"width": 整数, "height": 整数}。只输出 JSON。`,
+
+  phoneShellSystem:
+    "你是一个虚拟世界的模拟引擎。现在是创世阶段，你要为角色手机的浏览器设计「带壳截图」的外壳 UI" +
+    "（手机状态栏 + 浏览器工具栏等）。只输出一个完整的 HTML 文档，不要输出任何其他内容。",
+
+  phoneShellUser:
+    `<bot_definition>（角色定义）\n{{botDef}}\n</bot_definition>\n\n` +
+    `<world_definition>（世界定义）\n{{worldDef}}\n</world_definition>\n\n` +
+    `角色的手机屏幕分辨率为 {{width}}x{{height}}（竖屏）。当它对浏览器页面截图时，` +
+    `截图会像真实手机截屏一样"带壳"：网页画面外还能看到手机状态栏与浏览器自身的 UI。` +
+    `请设计这个外壳，输出一个完整的 HTML 文档，要求：\n` +
+    `1. 布局（从上到下）：手机状态栏（左侧时间用占位符 {{time}}，右侧信号/网络/电量等装饰图形）→ ` +
+    `浏览器工具栏（后退/前进/刷新等按钮 + 地址栏，地址栏内显示占位符 {{url}}）→ ` +
+    `屏幕内容区 → 底部导航（手势条或返回/主页键，可省略）；\n` +
+    `2. 屏幕内容区必须原样包含这一行（渲染时 {{screen}} 会被替换为网页画面）：\n` +
+    `   <img class="screen" src="{{screen}}">\n` +
+    `   并为 .screen 设置样式：flex:1 或撑满剩余空间；width:100%；object-fit:cover；object-position:top center；display:block；\n` +
+    `3. 占位符 {{time}}、{{url}}、{{screen}} 必须原样保留（渲染时替换），可另用 {{title}} 显示页面标题；\n` +
+    `4. 整体必须严格充满视口：html,body 宽 100vw 高 100vh、margin:0、overflow:hidden；` +
+    `各栏尺寸用 vw/vh 等相对单位，保证任何分辨率下比例协调；\n` +
+    `5. 内联 <style>，禁止外部资源与 <script>；装饰图形用 CSS 或内联 SVG；\n` +
+    `6. 风格必须契合世界观与角色（例如现代安卓/iOS 风、魔导水晶屏、蒸汽朋克黄铜仪表盘、星舰终端等），` +
+    `配色与质感自洽；状态栏与工具栏保持可读性。\n` +
+    `除 HTML 外不要输出任何解释。`,
 };
 
 export const DEFAULT_PROMPTS: PromptOverrides = {

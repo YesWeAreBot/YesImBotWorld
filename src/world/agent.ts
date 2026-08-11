@@ -5,6 +5,13 @@ import type { WorldModelConfig } from "../config.js";
 import type { WorldFiles } from "../files.js";
 import { ChatClient, type ChatMessage, type ChatToolDef } from "../llm/chat.js";
 import { withEndpointLock } from "../llm/lock.js";
+import { extractHtml } from "../apps/html.js";
+import {
+  clampPhoneResolution,
+  DEFAULT_PHONE_RESOLUTION,
+  parsePhoneResolution,
+  type PhoneResolution,
+} from "../phone.js";
 import { fill, type Prompts } from "../prompts.js";
 import type { CompressionResult, ToolCallRecord } from "../types.js";
 import { debug } from "../webui/debug.js";
@@ -133,6 +140,8 @@ export class WorldAgent {
     private clock: WorldClock,
     private logger: Logger,
     private prompts: Prompts,
+    /** 创世时手机相关的判定选项（来自 apps 配置） */
+    private phoneCfg: { resolution: string; generateShell: boolean } = { resolution: "auto", generateShell: false },
   ) {
     this.client = new ChatClient({
       baseURL: cfg.baseURL,
@@ -300,6 +309,90 @@ export class WorldAgent {
     this.logger.info("世界历法：%s；创世时刻 %s", describeCalendar(spec), this.clock.clockString(0));
   }
 
+  /**
+   * 创世：判定手机规格。
+   * - 分辨率配置为 auto 时，由 World-LLM 依据世界观与角色设定决定屏幕分辨率；
+   * - 浏览器启用时，由 World-LLM 生成契合世界观的带壳截图外壳 HTML。
+   * 判定结果持久化到 meta.json；任一步失败都不阻塞创世（回退默认/内置值）。
+   */
+  private async setupPhone(botDef: string, worldDef: string): Promise<void> {
+    const wantAuto = (this.phoneCfg.resolution || "auto").trim().toLowerCase() === "auto";
+    const wantShell = this.phoneCfg.generateShell;
+    if (!wantAuto && !wantShell) return;
+
+    const meta = await this.files.readMeta();
+    // 外壳生成需要知道目标分辨率：显式配置优先，auto 则先判定
+    let res = wantAuto
+      ? DEFAULT_PHONE_RESOLUTION
+      : (parsePhoneResolution(this.phoneCfg.resolution) ?? DEFAULT_PHONE_RESOLUTION);
+
+    if (wantAuto) {
+      try {
+        const spec = await this.generatePhoneSpec(botDef, worldDef);
+        if (spec) {
+          res = spec;
+          meta.phone = spec;
+          this.logger.info("手机屏幕分辨率（创世判定）：%dx%d", spec.width, spec.height);
+        } else {
+          this.logger.warn("World-LLM 未能给出有效的手机分辨率，使用默认 %dx%d", res.width, res.height);
+        }
+      } catch (err) {
+        this.logger.warn("手机分辨率判定调用失败: %s", err);
+      }
+    }
+
+    if (wantShell) {
+      try {
+        const html = await this.generatePhoneShell(botDef, worldDef, res);
+        if (html) {
+          meta.phoneShellHtml = html;
+          this.logger.info("浏览器带壳截图外壳已生成（%d 字符，存于 meta.json，可手动编辑）", html.length);
+        } else {
+          this.logger.warn("World-LLM 未能生成有效的外壳 HTML（缺少 {{screen}} 占位符），截图将使用内置外壳");
+        }
+      } catch (err) {
+        this.logger.warn("手机外壳生成调用失败: %s", err);
+      }
+    }
+
+    await this.files.writeMeta(meta);
+  }
+
+  private async generatePhoneSpec(botDef: string, worldDef: string): Promise<PhoneResolution | null> {
+    const result = await this.client.complete([
+      { role: "system", content: this.prompts.world.phoneSpecSystem },
+      { role: "user", content: fill(this.prompts.world.phoneSpecUser, { botDef, worldDef }) },
+    ]);
+    const parsed = extractJson(result.content) as Record<string, unknown> | null;
+    if (!parsed) return null;
+    const width = Number(parsed.width);
+    const height = Number(parsed.height);
+    if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return null;
+    return clampPhoneResolution({ width, height });
+  }
+
+  private async generatePhoneShell(
+    botDef: string,
+    worldDef: string,
+    res: PhoneResolution,
+  ): Promise<string | null> {
+    const result = await this.client.complete([
+      { role: "system", content: this.prompts.world.phoneShellSystem },
+      {
+        role: "user",
+        content: fill(this.prompts.world.phoneShellUser, {
+          botDef,
+          worldDef,
+          width: res.width,
+          height: res.height,
+        }),
+      },
+    ]);
+    const html = extractHtml(result.content);
+    // 必须保留 {{screen}} 占位符才能合成；不合格则弃用（退回内置外壳）
+    return html && html.includes("{{screen}}") ? html : null;
+  }
+
   private async generateCalendar(worldDef: string): Promise<CalendarSpec | null> {
     const system = this.prompts.world.generateCalendarSystem;
     const user = fill(this.prompts.world.generateCalendarUser, {
@@ -314,7 +407,7 @@ export class WorldAgent {
     return parseCalendarSpec(extractJson(result.content));
   }
 
-  /** 初始化：判定世界性质、生成历法（同步模式跳过），再根据用户定义生成状态文件 */
+  /** 初始化：判定世界性质、生成历法（同步模式跳过）、判定手机规格，再根据用户定义生成状态文件 */
   async initialize(botDef: string, worldDef: string): Promise<void> {
     await this.enqueue(() => this.setupWorldMeta(worldDef));
     if (this.clock.syncRealTime) {
@@ -322,6 +415,7 @@ export class WorldAgent {
     } else {
       await this.enqueue(() => this.setupCalendar(worldDef));
     }
+    await this.enqueue(() => this.setupPhone(botDef, worldDef));
     const task = fill(this.prompts.world.initialize, {
       timeLine: this.clock.timeLine(),
       botDef,

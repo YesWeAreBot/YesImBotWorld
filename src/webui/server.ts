@@ -63,6 +63,8 @@ export interface DevicesInfo {
     channelIsGroup: boolean;
     /** 聊天应用显示名（如 QQ / 微信），用于手机窥视屏 */
     chatAppName: string;
+    /** 屏幕分辨率（配置显式指定 > 创世判定 > 默认），WebUI 手机模型按此比例展示 */
+    resolution: { width: number; height: number };
   };
 }
 

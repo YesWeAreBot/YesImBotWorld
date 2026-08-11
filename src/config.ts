@@ -229,6 +229,8 @@ export interface AppsConfig {
   browserEnabled: boolean;
   browserSearchURL: string;
   browserProxy: string;
+  phoneResolution: string;
+  phoneShellImage: string;
   notesEnabled: boolean;
   filesEnabled: boolean;
   filesCwd: string;
@@ -648,6 +650,21 @@ export const Config: Schema<Config> = Schema.intersect([
         .description(
           "浏览器访问真实互联网时使用的代理 URL（如 http://127.0.0.1:7890）。" +
             "留空时依次读取 HTTPS_PROXY / HTTP_PROXY 环境变量；都没有则不代理。",
+        ),
+      phoneResolution: Schema.string()
+        .default("auto")
+        .description(
+          "Bot 手机的屏幕分辨率（竖屏，格式「宽x高」，如 800x1280、1080x2400）。" +
+            "影响浏览器 App 截图尺寸与 WebUI「设备」页手机模型的展示比例。" +
+            "填 auto 则在创世（world.init）时由 World-LLM 依据世界观与角色设定自动决定（存入 meta.json）",
+        ),
+      phoneShellImage: Schema.string()
+        .default("")
+        .description(
+          "浏览器带壳截图的自定义外壳图片路径（png/jpg/webp；绝对路径或相对 Koishi 根目录）。" +
+            "图片会以拉伸方式覆盖在网页截图最上层，屏幕区域需为透明（常见的设备边框素材即可）。" +
+            "留空则使用创世时 World-LLM 生成的外壳 UI（存于 meta.json 的 phoneShellHtml，可手动编辑）；" +
+            "没有生成过则使用内置的通用手机外壳",
         ),
       notesEnabled: Schema.boolean()
         .default(true)

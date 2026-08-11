@@ -125,6 +125,24 @@ const NAMED_ENTITIES: Record<string, string> = {
   copy: "©", reg: "®", trade: "™", middot: "·", laquo: "«", raquo: "»", times: "×",
 };
 
+/** 从 LLM 输出里提取 HTML 文档（容忍代码围栏与前后闲话） */
+export function extractHtml(raw: string): string | null {
+  let s = raw.trim();
+  const fence = s.match(/```(?:html)?\s*([\s\S]*?)```/i);
+  if (fence) s = fence[1]!.trim();
+  const start = s.search(/<!doctype\s+html|<html[\s>]/i);
+  if (start >= 0) {
+    const endMatch = s.match(/<\/html>/i);
+    const end = endMatch ? endMatch.index! + endMatch[0].length : s.length;
+    return s.slice(start, end);
+  }
+  // 没有完整文档结构但看起来是 HTML 片段：包一层
+  if (/<(body|div|p|h1|table|ul)\b/i.test(s)) {
+    return `<!DOCTYPE html><html><head><meta charset="utf-8"/></head><body>${s}</body></html>`;
+  }
+  return null;
+}
+
 export function decodeEntities(s: string): string {
   return s.replace(/&(#x?[0-9a-fA-F]+|[a-zA-Z][a-zA-Z0-9]*);/g, (whole, body: string) => {
     if (body.startsWith("#x") || body.startsWith("#X")) {

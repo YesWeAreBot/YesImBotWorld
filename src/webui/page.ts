@@ -1247,6 +1247,10 @@ function phonePanel(d){
   var p = d.phone;
   var clock = lastOverview && lastOverview.clock ? lastOverview.clock.timeLine.slice(11) : '--:--';
   var scr = el('div', {cls:'scr' + (p.down ? ' off' : '')});
+  // 屏幕比例跟随手机分辨率（配置显式指定 > 创世判定 > 默认 800x1280）
+  var res = p.resolution && p.resolution.width > 0 && p.resolution.height > 0 ? p.resolution : {width: 800, height: 1280};
+  scr.style.aspectRatio = res.width + ' / ' + res.height;
+  scr.style.minHeight = '0';
   scr.appendChild(el('div', {cls:'notch'}));
   scr.appendChild(el('div', {cls:'statusbar'}, [el('span', {text: clock}), el('span', {text: p.down ? '○ 免打扰' : '● 在线'})]));
   if(p.down){
@@ -1282,7 +1286,8 @@ function phonePanel(d){
     el('div', {style:'margin-top:12px'}, [
       el('div', {cls:'kv'}, [el('span', {cls:'k', text:'状态'}), el('span', {cls:'v', text: p.down ? '放在一边' : '在手边'})]),
       el('div', {cls:'kv'}, [el('span', {cls:'k', text:'打开的应用'}), el('span', {cls:'v', text: p.appOpen || '（无）'})]),
-      el('div', {cls:'kv'}, [el('span', {cls:'k', text:'聊天频道'}), el('span', {cls:'v', text: p.chatOpen && p.channelKey ? p.channelKey : '—'})])
+      el('div', {cls:'kv'}, [el('span', {cls:'k', text:'聊天频道'}), el('span', {cls:'v', text: p.chatOpen && p.channelKey ? p.channelKey : '—'})]),
+      el('div', {cls:'kv'}, [el('span', {cls:'k', text:'屏幕分辨率'}), el('span', {cls:'v', text: res.width + ' × ' + res.height})])
     ])
   ]);
   return el('div', {cls:'section', id:'phone-sec', style:'margin-bottom:0'}, [el('h3', {html:'手机 <span class="hint">界面实时状态</span>'}), body]);
@@ -1297,7 +1302,7 @@ var PRIMARY = {
   bot: ['mode', 'baseURL', 'apiKey', 'model', 'stream'],
   world: ['baseURL', 'apiKey', 'model', 'stream'],
   clock: ['syncRealTime', 'epoch', 'realSecondsPerUnit', 'tingleEveryUnits', 'tingleMode', 'tingleMinUnits', 'tingleMaxUnits'],
-  apps: ['chatAppName', 'weatherEnabled', 'weatherDefaultCity', 'browserEnabled', 'notesEnabled', 'computer'],
+  apps: ['chatAppName', 'weatherEnabled', 'weatherDefaultCity', 'browserEnabled', 'phoneResolution', 'phoneShellImage', 'notesEnabled', 'computer'],
   messaging: ['notifyChannels', 'notifyPolicy', 'wakeOnNotify', 'offlineHistory', 'typingCharsPerSec', 'sendDeferFactor']
 };
 var CFG_ICONS = {root:'sliders', bot:'cpu', world:'gauge', clock:'activity', platformOps:'phone', apps:'monitor', captioners:'image', tts:'film', media:'folder', webui:'sliders', messaging:'edit'};
@@ -1789,7 +1794,11 @@ function descOf(key, prefix){
       assessRealWorldSystem: '世界性质判定 · system',
       assessRealWorldUser: '世界性质判定 · user。{{worldDef}}',
       generateCalendarSystem: '历法生成 · system',
-      generateCalendarUser: '历法生成 · user。{{worldDef}} {{epoch}} {{unitWorldSeconds}}'
+      generateCalendarUser: '历法生成 · user。{{worldDef}} {{epoch}} {{unitWorldSeconds}}',
+      phoneSpecSystem: '手机屏幕规格判定 · system（apps.phoneResolution 为 auto 时创世调用）',
+      phoneSpecUser: '手机屏幕规格判定 · user。{{botDef}} {{worldDef}}',
+      phoneShellSystem: '浏览器带壳截图外壳生成 · system（创世调用）',
+      phoneShellUser: '带壳截图外壳生成 · user。{{botDef}} {{worldDef}} {{width}} {{height}}；生成的 HTML 里保留 {{screen}} {{url}} {{time}} 占位符'
     }
   };
   return map[prefix][key] || '';

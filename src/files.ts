@@ -6,6 +6,13 @@ import type { NewsEntry } from "./types.js";
 export interface WorldMeta {
   /** 世界是否是现实地球世界（决定天气应用查真实天气还是由 World-LLM 生成） */
   realWorld?: boolean;
+  /** 手机屏幕分辨率（配置 apps.phoneResolution 为 auto 时创世由 World-LLM 决定） */
+  phone?: { width?: number; height?: number };
+  /**
+   * 创世时 World-LLM 生成的浏览器带壳截图外壳（完整 HTML 文档，
+   * 含 {{screen}} / {{url}} / {{title}} / {{time}} 占位符）
+   */
+  phoneShellHtml?: string;
 }
 
 const BOT_DEF_TEMPLATE = `# Bot 角色定义

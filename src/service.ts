@@ -18,6 +18,7 @@ import { WorldClock } from "./clock.js";
 import { BotComputer } from "./computer.js";
 import { Config, needsMsgIds, type ModalitySupport } from "./config.js";
 import { WorldFiles } from "./files.js";
+import { resolvePhoneResolution } from "./phone.js";
 import { Prompts, type PromptOverrides } from "./prompts.js";
 import { WebUIServer, type BotStatusSummary, type DevicesInfo, type NoteEntry, type WebUIHost } from "./webui/server.js";
 import { FocusManager } from "./koishi/focus.js";
@@ -198,7 +199,10 @@ export class WorldService extends Service<Config> {
 
     // WebUI 覆盖的提示词：Bot 与 World 的默认模板即时套用（无需重启）
     this.promptStore = await Prompts.load(this.webuiDir);
-    this.world = new WorldAgent(this.config.world, this.files, this.clock, this.logger, this.promptStore);
+    this.world = new WorldAgent(this.config.world, this.files, this.clock, this.logger, this.promptStore, {
+      resolution: this.config.apps.phoneResolution,
+      generateShell: this.config.apps.browserEnabled,
+    });
 
     if (this.config.autoStart && (await this.files.isInitialized())) {
       try {
@@ -674,6 +678,7 @@ export class WorldService extends Service<Config> {
         channelKey: botSt?.phoneUi?.channelKey ?? null,
         channelIsGroup: botSt?.phoneUi?.channelIsGroup ?? false,
         chatAppName: this.config.apps.chatAppName || "QQ",
+        resolution: resolvePhoneResolution(this.config.apps.phoneResolution, await this.files.readMeta()),
       },
     };
   }
