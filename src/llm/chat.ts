@@ -56,6 +56,12 @@ export interface ChatUsage {
   prompt_tokens?: number;
   completion_tokens?: number;
   total_tokens?: number;
+  /** OpenAI 风格：输入中命中缓存的 token 数 */
+  prompt_tokens_details?: { cached_tokens?: number };
+  /** DeepSeek 风格：命中/未命中缓存的输入 token 数 */
+  prompt_cache_hit_tokens?: number;
+  /** 归一化后的缓存命中数（normalizeUsage 填充） */
+  cached_tokens?: number;
 }
 
 export interface ChatCompleteOptions {
@@ -194,12 +200,13 @@ export class ChatClient {
     }
     const ms = Date.now() - startedAt;
     this.recordUsage(usage);
-    const finalLabel = `${label}·${ms}ms${toolCalls.length ? "·工具调用" : "·正文"}${usage ? ` · ${usage.total_tokens} tok` : ""}`;
+    const finalUsage = normalizeUsage(usage);
+    const finalLabel = `${label}·${ms}ms${toolCalls.length ? "·工具调用" : "·正文"}${finalUsage ? ` · ${finalUsage.total_tokens} tok` : ""}`;
     const finalDetail = {
       url,
       model: this.cfg.model,
       ms,
-      usage,
+      usage: finalUsage,
       content: content.slice(0, 4000),
       tool_calls: toolCalls.map((tc) => ({ name: tc.function.name, arguments: tc.function.arguments })),
     };
@@ -209,13 +216,15 @@ export class ChatClient {
   }
 
   private recordUsage(usage: ChatUsage | null): void {
-    if (!usage || !usage.prompt_tokens && !usage.completion_tokens && !usage.total_tokens) return;
+    const u = normalizeUsage(usage);
+    if (!u) return;
     usageStore.record({
       label: this.cfg.label ?? "LLM",
       model: this.cfg.model || "",
-      promptTokens: usage.prompt_tokens ?? 0,
-      completionTokens: usage.completion_tokens ?? 0,
-      totalTokens: usage.total_tokens ?? 0,
+      promptTokens: u.prompt_tokens ?? 0,
+      completionTokens: u.completion_tokens ?? 0,
+      totalTokens: u.total_tokens ?? 0,
+      cachedTokens: u.cached_tokens ?? 0,
     });
   }
 }
@@ -349,7 +358,14 @@ function normalizeUsage(u: ChatUsage | null | undefined): ChatUsage | null {
   const completion = Number(u.completion_tokens) || 0;
   const total = Number(u.total_tokens) || 0;
   if (!prompt && !completion && !total) return null;
-  return { prompt_tokens: prompt, completion_tokens: completion, total_tokens: total || prompt + completion };
+  // 缓存命中：OpenAI 的 prompt_tokens_details.cached_tokens 或 DeepSeek 的 prompt_cache_hit_tokens
+  const cached = Number(u.prompt_tokens_details?.cached_tokens ?? u.prompt_cache_hit_tokens) || 0;
+  return {
+    prompt_tokens: prompt,
+    completion_tokens: completion,
+    total_tokens: total || prompt + completion,
+    ...(cached ? { cached_tokens: cached } : {}),
+  };
 }
 
 function summarizeContent(content: string | ContentPart[], max: number): unknown {

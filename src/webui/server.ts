@@ -831,10 +831,11 @@ export class WebUIServer {
     // ---------- Token 用量统计 ----------
     if (pathname === "/api/usage" && method === "GET") {
       const n = Math.min(Number(q.get("n")) || 300, 2000);
+      const summary = usageStore.summary();
       sendJSON(res, 200, {
-        summary: usageStore.summary(),
+        summary,
         entries: usageStore.recent(n),
-        snapshot: usageStore.summary().totals.requests,
+        snapshot: summary.totals.requests,
       });
       return;
     }

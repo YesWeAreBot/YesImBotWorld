@@ -37,11 +37,13 @@ body{
   background-attachment:fixed;
 }
 a{color:var(--accent);text-decoration:none}
-button{font:inherit;color:var(--fg);background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:6px 14px;cursor:pointer;transition:border-color .15s,background .15s,transform .1s}
+::selection{background:rgba(110,231,255,.28)}
+button{font:inherit;color:var(--fg);background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:6px 14px;cursor:pointer;transition:border-color .15s,background .15s,transform .1s,box-shadow .15s}
 button:hover{border-color:var(--line2);background:rgba(148,163,184,.16)}
 button:active{transform:scale(.97)}
+button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible{outline:2px solid rgba(110,231,255,.5);outline-offset:1px}
 button.primary{background:linear-gradient(135deg,rgba(110,231,255,.2),rgba(138,123,255,.22));border-color:rgba(110,231,255,.45);color:#eafcff}
-button.primary:hover{border-color:var(--accent)}
+button.primary:hover{border-color:var(--accent);box-shadow:0 0 16px rgba(110,231,255,.22)}
 button.danger{color:var(--err);border-color:rgba(248,113,113,.4)}
 button.danger:hover{border-color:var(--err);background:rgba(248,113,113,.1)}
 button.ghost{background:transparent}
@@ -79,8 +81,10 @@ details[open]>summary::before{transform:rotate(90deg)}
 #nav{flex:1;overflow-y:auto;padding:4px 10px 12px}
 .nav-group{font-size:10.5px;color:var(--fg-dark);letter-spacing:2px;padding:14px 10px 5px}
 #nav a{display:flex;align-items:center;gap:10px;padding:8px 10px;margin:1px 0;color:var(--fg-dim);cursor:pointer;font-size:13.5px;border-radius:10px;border:1px solid transparent;transition:background .15s,color .15s}
+#nav a{position:relative}
 #nav a:hover{color:var(--fg);background:var(--panel)}
-#nav a.active{color:#eafcff;background:linear-gradient(135deg,rgba(110,231,255,.14),rgba(138,123,255,.14));border-color:rgba(110,231,255,.3)}
+#nav a.active{color:#eafcff;background:linear-gradient(135deg,rgba(110,231,255,.14),rgba(138,123,255,.14));border-color:rgba(110,231,255,.3);box-shadow:0 2px 12px rgba(110,231,255,.1)}
+#nav a.active:before{content:"";position:absolute;left:-10px;top:20%;bottom:20%;width:3px;border-radius:3px;background:linear-gradient(180deg,var(--accent),var(--accent2))}
 #nav a .ico{width:17px;height:17px;flex:none;opacity:.85}
 #nav a .ico svg{width:100%;height:100%;display:block}
 .side-foot{padding:12px 18px;border-top:1px solid var(--line);font-size:11px;color:var(--fg-dark);display:flex;align-items:center;gap:7px}
@@ -108,21 +112,25 @@ details[open]>summary::before{transform:rotate(90deg)}
 #sse-dot.on{background:var(--ok);box-shadow:0 0 8px rgba(74,222,128,.7)}
 #sse-dot.off{background:var(--err)}
 main{flex:1;padding:22px 26px 60px;max-width:1240px;width:100%;margin:0 auto}
-.view-head{margin-bottom:18px}
+main.anim{animation:viewIn .25s ease}
+@keyframes viewIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+.view-head{margin-bottom:18px;position:relative;padding-left:14px}
+.view-head:before{content:"";position:absolute;left:0;top:4px;bottom:4px;width:3px;border-radius:3px;background:linear-gradient(180deg,var(--accent),var(--accent2))}
 .view-title{font-size:21px;font-weight:700;margin:0;letter-spacing:.3px}
 .view-desc{color:var(--fg-dim);font-size:12.5px;margin:5px 0 0}
 
 /* ---------- 通用组件 ---------- */
 .cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px;margin-bottom:16px}
-.card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:13px 15px;transition:border-color .2s}
-.card:hover{border-color:var(--line2)}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:13px 15px;transition:border-color .2s,transform .2s,box-shadow .2s}
+.card:hover{border-color:var(--line2);transform:translateY(-1px);box-shadow:0 6px 20px rgba(0,0,0,.25)}
 .card .k{font-size:11.5px;color:var(--fg-dark);letter-spacing:.6px;margin-bottom:4px}
 .card .v{font-size:16px;font-weight:650;word-break:break-word}
 .card .v.small{font-size:12.5px;font-weight:400;color:var(--fg-dim)}
 .toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:12px 0}
 .toolbar .spacer{flex:1}
-.section{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);margin-bottom:16px;overflow:hidden}
-.section h3{margin:0;padding:12px 16px;font-size:13.5px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:8px;letter-spacing:.3px}
+.section{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);margin-bottom:16px;overflow:hidden;transition:border-color .2s}
+.section:hover{border-color:var(--line2)}
+.section h3{margin:0;padding:12px 16px;font-size:13.5px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:8px;letter-spacing:.3px;background:rgba(148,163,184,.04)}
 .section h3 .hint{font-weight:400;color:var(--fg-dark);font-size:11.5px}
 .section .body{padding:14px 16px}
 .fld{display:flex;gap:10px;margin-bottom:10px;align-items:flex-start}
@@ -138,9 +146,9 @@ main{flex:1;padding:22px 26px 60px;max-width:1240px;width:100%;margin:0 auto}
 .kv .k{color:var(--fg-dim);font-size:12.5px}
 .kv .v{text-align:right;word-break:break-all;font-size:12.5px}
 .tabs{display:flex;gap:6px;border-bottom:1px solid var(--line);margin-bottom:14px;overflow-x:auto}
-.tabs button{border:none;background:none;color:var(--fg-dim);padding:8px 13px;border-bottom:2px solid transparent;border-radius:0;white-space:nowrap}
-.tabs button:hover{color:var(--fg)}
-.tabs button.active{color:var(--accent);border-bottom-color:var(--accent)}
+.tabs button{border:none;background:none;color:var(--fg-dim);padding:8px 13px;border-bottom:2px solid transparent;border-radius:0;white-space:nowrap;transition:color .15s,border-color .15s}
+.tabs button:hover{color:var(--fg);background:none}
+.tabs button.active{color:var(--accent);border-bottom-color:var(--accent);text-shadow:0 0 18px rgba(110,231,255,.45)}
 .hidden{display:none!important}
 .empty{color:var(--fg-dark);font-size:12.5px;padding:6px 2px}
 .table-scroll{overflow-x:auto;border:1px solid var(--line);border-radius:var(--radius)}
@@ -194,14 +202,26 @@ img.full{max-width:100%;max-height:72vh;border-radius:10px}
 .tag{font-size:10px;padding:1.5px 7px;border-radius:6px;background:var(--panel2);color:var(--fg-dim);flex:none;font-family:var(--mono)}
 .tag.req{color:#8ab4ff}.tag.res{color:#7bd88f}.tag.tool{color:#e8c66a}.tag.event{color:#c792ea}.tag.err{color:#ff8a8a}
 .tag.use{color:#c792ea;border:1px solid rgba(199,146,234,.4)}
-.usage-entry{display:flex;align-items:center;gap:12px;padding:7px 4px;border-bottom:1px dashed var(--line);font-size:12.5px}
+.usage-entry{display:flex;align-items:center;gap:12px;padding:7px 4px;border-bottom:1px dashed var(--line);font-size:12.5px;border-radius:8px}
 .usage-entry:last-child{border-bottom:none}
+.usage-entry:hover{background:var(--panel)}
 .usage-entry .usage-lbl{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .usage-entry .usage-time{color:var(--fg-dark);font-size:11px;flex:none}
 .usage-entry .usage-num{font-family:var(--mono);font-size:12px;flex:none}
 .usage-entry .usage-num.dim{color:var(--fg-dark);font-size:11px}
 .card-label{font-size:11.5px;color:var(--fg-dark);letter-spacing:.6px;margin-bottom:4px}
-.card-value{font-size:16px;font-weight:650;word-break:break-word}
+.card-value{font-size:19px;font-weight:700;word-break:break-word;font-variant-numeric:tabular-nums}
+.card-value .card-unit{font-size:11.5px;font-weight:400;color:var(--fg-dark)}
+.card.usage-cache-card{background:linear-gradient(135deg,rgba(110,231,255,.08),rgba(138,123,255,.06));border-color:rgba(110,231,255,.28)}
+.card.usage-cache-card .card-value{color:var(--accent)}
+/* 分段筛选按钮 */
+button.seg{border-radius:999px;padding:4px 14px;font-size:12.5px;background:transparent}
+button.seg.active{background:linear-gradient(135deg,rgba(110,231,255,.18),rgba(138,123,255,.18));border-color:rgba(110,231,255,.45);color:#eafcff}
+/* 用量图表 */
+.chart-scroll{overflow-x:auto}
+.chart-legend{display:flex;gap:16px;margin-top:8px;flex-wrap:wrap}
+.legend-item{display:inline-flex;align-items:center;gap:6px;font-size:11.5px;color:var(--fg-dim)}
+.legend-item i{width:10px;height:10px;border-radius:3px;flex:none}
 .addr-row{display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px dashed var(--line)}
 .addr-row:last-child{border-bottom:none}
 .addr-row .u{font-family:var(--mono);font-size:12.5px;flex:1;word-break:break-all}
@@ -263,7 +283,9 @@ details.adv>.body{padding:4px 14px 12px}
 
 /* ---------- 调试 ---------- */
 .debug-list{font-family:var(--mono);font-size:12px}
-.dbg{background:var(--panel);border:1px solid var(--line);border-radius:10px;margin-bottom:7px;overflow:hidden}
+.dbg{background:var(--panel);border:1px solid var(--line);border-radius:10px;margin-bottom:7px;overflow:hidden;border-left-width:3px;transition:border-color .15s}
+.dbg:hover{border-color:var(--line2);border-left-color:rgba(110,231,255,.5)}
+.dbg.open{border-left-color:var(--accent)}
 .dbg .head{display:flex;gap:9px;align-items:center;padding:7px 12px;cursor:pointer;user-select:none}
 .dbg .head:hover{background:var(--panel)}
 .dbg .head .t{color:var(--fg-dark);font-size:11px;flex:none}
@@ -368,10 +390,11 @@ var cfgCache = null, schemaCache = null, cfgGroup = '', cfgSearch = '', cfgDirty
 var overridesCache = null, promptsDefaults = null;
 var galleryCache = [], currentCategory = '未整理';
 var debugEntries = [], debugSubview = 'llm', debugOrder = 'desc', debugAutoScroll = true, debugKindFilter = 'all';
+var debugOpenIds = {}; // 展开状态按条目 id 记忆：重建列表（切换标签/排序/SSE 重放）后仍保持展开
 var stateCache = null, stateEditor = null;
 var lastOverview = null;
 var liveFeed = [], genMap = {}, liveSeeded = false;
-var usageCache = null, usageFilter = 'total', usageFilterLabel = '';
+var usageCache = null, usageFilter = 'total', usageFilterLabel = '', usageEntryFilter = null, usageChartMode = 'hour';
 var devicesCache = null, screenTimer = null, screenBusy = false, screenUrl = null, execDraft = '', execBusy = false, execHistory = [];
 var viewTimers = [];
 
@@ -459,12 +482,19 @@ function promptToken(){
       inp,
       el('div', {cls:'toolbar'}, [
         el('button', {text:'取消', onclick:function(){ hideModal(); resolve(null); }}),
-        el('button', {cls:'primary', text:'确定', onclick:function(){ TOKEN = inp.value.trim(); localStorage.setItem('wui_token', TOKEN); hideModal(); resolve(TOKEN); }})
+        el('button', {cls:'primary', text:'确定', onclick:function(){ confirmToken(); }})
       ])
     ]);
+    function confirmToken(){
+      TOKEN = inp.value.trim();
+      localStorage.setItem('wui_token', TOKEN);
+      hideModal();
+      connectSSE(); // 令牌更新后重建 SSE 连接（否则一直 401 重试）
+      resolve(TOKEN);
+    }
     showModal('需要访问令牌', body);
     setTimeout(function(){ inp.focus(); }, 50);
-    inp.onkeydown = function(e){ if(e.key === 'Enter'){ TOKEN = inp.value.trim(); localStorage.setItem('wui_token', TOKEN); hideModal(); resolve(TOKEN); } };
+    inp.onkeydown = function(e){ if(e.key === 'Enter') confirmToken(); };
   });
 }
 function showImage(title, url){
@@ -479,6 +509,7 @@ function api(method, path, body, retried){
   if(TOKEN) opts.headers['Authorization'] = 'Bearer ' + TOKEN;
   if(body !== undefined){
     if(body instanceof FormData){ opts.body = body; }
+    else if(typeof Blob !== 'undefined' && body instanceof Blob){ opts.headers['Content-Type'] = body.type || 'application/octet-stream'; opts.body = body; }
     else if(typeof body === 'string'){ opts.headers['Content-Type'] = 'application/octet-stream'; opts.body = body; }
     else { opts.headers['Content-Type'] = 'application/json'; opts.body = JSON.stringify(body); }
   }
@@ -494,6 +525,12 @@ function api(method, path, body, retried){
       return data;
     });
   });
+}
+
+// 给 img src 之类无法携带 Authorization 头的 URL 附上令牌参数
+function withToken(url){
+  if(!TOKEN) return url;
+  return url + (url.indexOf('?') >= 0 ? '&' : '?') + 'token=' + encodeURIComponent(TOKEN);
 }
 
 // ---------- SSE ----------
@@ -532,7 +569,9 @@ function onFileSignal(file){
   else if(activeView === 'gallery' && file === 'gallery') loadGallery();
   else if(activeView === 'media' && file === 'media') loadMedia();
   else if(activeView === 'data' && (file === 'notes' || file === 'data')) refreshData();
-  else if(activeView === 'debug' && file === 'stream') renderStreamTab();
+  // 仅当调试页当前就停在「工作窗口」子页时才刷新它——否则会把调试列表
+  // （连同用户点开的条目）整个刷掉
+  else if(activeView === 'debug' && file === 'stream' && debugSubview === 'stream') renderStreamTab();
 }
 function onLifecycle(event, detail){
   refreshOverview(false);
@@ -608,10 +647,18 @@ function clearViewTimers(){
   if(screenTimer){ clearInterval(screenTimer); screenTimer = null; }
 }
 function switchView(name){
+  var changed = activeView !== name;
   activeView = name;
   if(location.hash !== '#' + name) history.replaceState(null, '', '#' + name);
   clearViewTimers();
   buildNav();
+  // 切换视图时轻微淡入；同视图刷新不动画
+  if(changed){
+    var m = $('#main');
+    m.classList.remove('anim');
+    void m.offsetWidth;
+    m.classList.add('anim');
+  }
   if(name === 'overview') refreshOverview(true);
   else if(name === 'devices') loadDevices();
   else if(name === 'config') loadConfig();
@@ -1903,6 +1950,7 @@ function loadDebug(){
   var toolbar = el('div', {cls:'toolbar'}, [
     el('button', {text:'清空', onclick:function(){
       debugEntries = [];
+      debugOpenIds = {};
       api('DELETE', '/api/debug').catch(function(){});
       renderDebugList();
     }}),
@@ -1926,19 +1974,27 @@ function loadDebug(){
 }
 function renderStreamTab(){
   var holder = $('#dbg-holder');
-  if(!holder) return;
-  holder.textContent = '';
-  var pre = el('pre', {style:'max-height:70vh;overflow:auto'});
-  pre.textContent = '加载中…';
-  holder.appendChild(pre);
+  if(!holder || activeView !== 'debug' || debugSubview !== 'stream') return;
+  // 原地更新：容器已存在时只替换文本，保持滚动阅读位置（贴底时才自动跟滚）
+  var pre = holder.querySelector('pre[data-stream]');
+  if(!pre){
+    holder.textContent = '';
+    pre = el('pre', {'data-stream':'1', style:'max-height:70vh;overflow:auto'});
+    pre.textContent = '加载中…';
+    holder.appendChild(pre);
+  }
   api('GET', '/api/stream').then(function(r){
+    if(debugSubview !== 'stream' || !pre.isConnected) return;
     var lines = [];
     (r.entries || []).forEach(function(e){
       if(e.kind === 'tool_call') lines.push('⟦tool_call⟧ ' + JSON.stringify(e.call));
       else lines.push('⟦event⟧ ' + JSON.stringify(e.event));
     });
-    pre.textContent = lines.length ? lines.join(NL) : '（工作窗口为空）';
-    pre.scrollTop = pre.scrollHeight;
+    var text = lines.length ? lines.join(NL) : '（工作窗口为空）';
+    if(pre.textContent === text) return;
+    var atBottom = pre.scrollHeight - pre.scrollTop - pre.clientHeight < 40 || pre.textContent === '加载中…';
+    pre.textContent = text;
+    if(atBottom) pre.scrollTop = pre.scrollHeight;
   }).catch(showErr);
 }
 function debugSubKinds(sub){
@@ -1982,10 +2038,12 @@ function usageBadge(e){
   if(total == null && prompt == null && completion == null) return null;
   if(total == null) total = (prompt || 0) + (completion || 0);
   if(!total) return null;
-  return el('span', {cls:'tag use', title:'token 用量：输入 ' + (prompt||0) + '，输出 ' + (completion||0), text: String(total) + ' tok'});
+  var cached = u.cached_tokens != null ? u.cached_tokens : (u.cached || 0);
+  var title = 'token 用量：输入 ' + (prompt||0) + '，输出 ' + (completion||0) + (cached ? '，缓存命中 ' + cached : '');
+  return el('span', {cls:'tag use', title: title, text: String(total) + ' tok' + (cached ? ' ⚡' : '')});
 }
 function debugRow(e){
-  var row = el('div', {cls:'dbg', 'data-id': e.id});
+  var row = el('div', {cls:'dbg' + (debugOpenIds[e.id] ? ' open' : ''), 'data-id': e.id});
   var headKids = [
     el('span', {cls:'t', text: fmtTime(e.ts)}),
     el('span', {cls:'tag ' + tagClass(e), text: e.kind}),
@@ -1995,7 +2053,11 @@ function debugRow(e){
   var use = usageBadge(e);
   if(use) headKids.push(use);
   var head = el('div', {cls:'head'}, headKids);
-  head.onclick = function(){ row.classList.toggle('open'); };
+  head.onclick = function(){
+    var open = row.classList.toggle('open');
+    if(open) debugOpenIds[e.id] = true;
+    else delete debugOpenIds[e.id];
+  };
   row.appendChild(head);
   var detail = el('div', {cls:'detail'});
   var pre = el('pre');
@@ -2008,7 +2070,9 @@ function appendDebugEntry(e){
   // 去重：SSE 续传重放与 /api/debug 种子化可能同时携带同一条，按 id 幂等处理
   for(var i=0;i<debugEntries.length;i++){ if(debugEntries[i].id === e.id){ debugEntries[i] = e; return; } }
   debugEntries.push(e);
-  if(debugEntries.length > 600) debugEntries.splice(0, debugEntries.length - 600);
+  if(debugEntries.length > 600){
+    debugEntries.splice(0, debugEntries.length - 600).forEach(function(old){ delete debugOpenIds[old.id]; });
+  }
   if(activeView !== 'debug' || debugSubview === 'stream') return;
   var kinds = debugSubKinds(debugSubview);
   if(kinds && kinds.indexOf(e.kind) < 0) return;
@@ -2063,59 +2127,194 @@ function updateDebugEntry(e){
 function loadUsage(){
   var main = $('#main');
   main.textContent = '';
-  main.appendChild(viewHead('Token 用量', '按 LLM 请求统计的 token 消耗（保存在 webui 目录 usage.jsonl）。点击标签可按该维度查看明细。'));
-  var holder = el('div', {text:'加载中…', cls:'empty'});
+  main.appendChild(viewHead('Token 用量', '按 LLM 请求统计的 token 消耗与缓存命中（保存在 webui 目录 usage.jsonl）。点击标签/模型可筛选明细。'));
+  var holder = el('div', {id:'usage-root'}, [el('p', {cls:'empty', text:'加载中…'})]);
   main.appendChild(holder);
   usageFilter = 'total';
   usageFilterLabel = '';
-  api('GET', '/api/usage?n=500').then(function(r){
-    usageCache = r;
-    holder.textContent = '';
-    holder.appendChild(renderUsage());
-  }).catch(showErr);
+  usageEntryFilter = null;
+  refreshUsage();
   viewTimers.push(setInterval(function(){
     if(activeView !== 'usage') return;
-    api('GET', '/api/usage?n=500').then(function(r){
-      usageCache = r;
-      renderUsage();
-    }).catch(function(){});
+    refreshUsage(true);
   }, 15000));
+}
+function refreshUsage(silent){
+  api('GET', '/api/usage?n=500').then(function(r){
+    usageCache = r;
+    var holder = $('#usage-root');
+    if(!holder || activeView !== 'usage') return;
+    holder.textContent = '';
+    holder.appendChild(renderUsage());
+  }).catch(function(err){ if(!silent) showErr(err); });
+}
+function fmtNum(n){
+  n = Number(n) || 0;
+  return n.toLocaleString('en-US');
+}
+function fmtTok(n){
+  n = Number(n) || 0;
+  if(n >= 1000000) return (n/1000000).toFixed(n >= 10000000 ? 0 : 1) + 'M';
+  if(n >= 1000) return (n/1000).toFixed(n >= 100000 ? 0 : 1) + 'k';
+  return String(Math.round(n));
 }
 function renderUsage(){
   var wrap = el('div');
   if(!usageCache) return wrap;
   var s = usageCache.summary;
   var totals = s.totals;
+  var hitRate = totals.promptTokens > 0 ? (totals.cachedTokens / totals.promptTokens * 100) : 0;
   var cards = el('div', {cls:'cards'}, [
-    usageCard('请求数', totals.requests, '次'),
-    usageCard('总 token', totals.totalTokens, 'tok'),
-    usageCard('输入 token', totals.promptTokens, 'tok'),
-    usageCard('输出 token', totals.completionTokens, 'tok')
+    usageCard('请求数', fmtNum(totals.requests), '次'),
+    usageCard('总 token', fmtNum(totals.totalTokens), 'tok'),
+    usageCard('输入 token', fmtNum(totals.promptTokens), 'tok'),
+    usageCard('输出 token', fmtNum(totals.completionTokens), 'tok'),
+    usageCard('缓存命中', fmtNum(totals.cachedTokens), 'tok', 'usage-cache-card'),
+    usageCard('缓存命中率', hitRate.toFixed(1), '%', 'usage-cache-card', '命中缓存的输入 token ÷ 全部输入 token。需要后端在响应里携带缓存统计（OpenAI cached_tokens / DeepSeek cache_hit / llama.cpp timings）')
   ]);
   wrap.appendChild(cards);
-  var bar = el('div', {cls:'toolbar'}, [
+  wrap.appendChild(usageChartSection());
+  var bar = el('div', {cls:'toolbar seg-bar'}, [
     el('span', {text:'明细：', style:'color:var(--fg-dark);font-size:12px'}),
-    el('button', {cls: usageFilter==='total'?'active':'', text:'全部', onclick:function(){ usageFilter='total'; usageFilterLabel=''; renderUsageDetail(); }}),
-    el('button', {cls: usageFilter==='label'?'active':'', text:'按标签', onclick:function(){ usageFilter='label'; usageFilterLabel=''; renderUsageDetail(); }}),
-    el('button', {cls: usageFilter==='model'?'active':'', text:'按模型', onclick:function(){ usageFilter='model'; usageFilterLabel=''; renderUsageDetail(); }}),
+    segBtn('全部', usageFilter==='total', function(){ usageFilter='total'; usageFilterLabel=''; usageEntryFilter=null; syncSeg(this); renderUsageDetail(); }),
+    segBtn('按标签', usageFilter==='label', function(){ usageFilter='label'; usageFilterLabel=''; usageEntryFilter=null; syncSeg(this); renderUsageDetail(); }),
+    segBtn('按模型', usageFilter==='model', function(){ usageFilter='model'; usageFilterLabel=''; usageEntryFilter=null; syncSeg(this); renderUsageDetail(); }),
     el('span', {cls:'spacer'}),
     el('button', {text:'清空全部', cls:'danger', onclick:function(){
       if(!confirm('确定清空全部用量记录？此操作不可恢复。')) return;
-      api('DELETE', '/api/usage').then(function(){
-        api('GET', '/api/usage?n=500').then(function(r){ usageCache = r; renderUsage(); }).catch(showErr);
-      }).catch(showErr);
+      api('DELETE', '/api/usage').then(function(){ refreshUsage(); }).catch(showErr);
     }})
   ]);
   wrap.appendChild(bar);
   wrap.appendChild(el('div', {id:'usage-detail'}));
-  renderUsageDetail();
+  setTimeout(renderUsageDetail, 0);
   return wrap;
 }
-function usageCard(label, value, unit){
-  return el('div', {cls:'card'}, [
+function segBtn(text, active, onclick){
+  return el('button', {cls:'seg' + (active ? ' active' : ''), text: text, onclick: onclick});
+}
+function syncSeg(btn){
+  var bar = btn.parentNode;
+  bar.querySelectorAll('button.seg').forEach(function(b){ b.classList.remove('active'); });
+  btn.classList.add('active');
+}
+function usageCard(label, value, unit, extraCls, title){
+  return el('div', {cls:'card' + (extraCls ? ' ' + extraCls : ''), title: title || ''}, [
     el('div', {cls:'card-label', text: label}),
-    el('div', {cls:'card-value', text: String(Number(value)||0) + ' ' + unit})
+    el('div', {cls:'card-value'}, [
+      el('span', {text: String(value)}),
+      el('span', {cls:'card-unit', text: ' ' + unit})
+    ])
   ]);
+}
+// ----- 时间维度图表（纯 SVG 堆叠柱状图，无依赖） -----
+function usageChartSection(){
+  var sec = el('div', {cls:'section'});
+  var head = el('h3', {html:'用量趋势 <span class="hint">堆叠柱：输入（未命中缓存）+ 缓存命中 + 输出</span>'});
+  var seg = el('span', {style:'margin-left:auto;display:inline-flex;gap:4px'});
+  var mode = usageChartMode;
+  function tab(text, m){
+    var b = el('button', {cls:'seg' + (mode === m ? ' active' : ''), text: text, style:'font-size:11px;padding:2px 10px'});
+    b.onclick = function(){
+      usageChartMode = m;
+      var box = $('#usage-chart');
+      if(box){ box.textContent = ''; box.appendChild(usageChart(m)); }
+      seg.querySelectorAll('button').forEach(function(x){ x.classList.remove('active'); });
+      b.classList.add('active');
+    };
+    return b;
+  }
+  seg.appendChild(tab('48 小时', 'hour'));
+  seg.appendChild(tab('按日', 'day'));
+  head.appendChild(seg);
+  sec.appendChild(head);
+  var body = el('div', {cls:'body', id:'usage-chart'});
+  body.appendChild(usageChart(mode));
+  sec.appendChild(body);
+  return sec;
+}
+function usageChart(mode){
+  var s = usageCache && usageCache.summary;
+  if(!s) return el('p', {cls:'empty', text:'（暂无数据）'});
+  var buckets;
+  if(mode === 'day'){
+    buckets = (s.byDay || []).slice(0, 30).reverse().map(function(d){
+      return {label: d.day.slice(5), full: d.day, t: d.totals};
+    });
+  } else {
+    buckets = (s.byHour || []).map(function(h){
+      return {label: h.hour.slice(6), full: h.hour, t: h.totals};
+    });
+  }
+  if(!buckets.length) return el('p', {cls:'empty', text:'（暂无数据，发起一次 LLM 请求后这里会出现图表）'});
+  var maxTotal = 0;
+  buckets.forEach(function(b){ if(b.t.totalTokens > maxTotal) maxTotal = b.t.totalTokens; });
+  if(!maxTotal){
+    return el('p', {cls:'empty', text: mode === 'day' ? '（暂无数据）' : '（最近 48 小时没有用量）'});
+  }
+  var W = 920, H = 200, padL = 46, padB = 22, padT = 8;
+  var plotW = W - padL - 6, plotH = H - padT - padB;
+  var n = buckets.length;
+  var slot = plotW / n;
+  var barW = Math.max(2, Math.min(26, slot * 0.68));
+  var html = '';
+  // 水平网格线 + Y 轴刻度
+  var steps = 4;
+  for(var g=0; g<=steps; g++){
+    var val = maxTotal / steps * g;
+    var y = padT + plotH - plotH / steps * g;
+    html += '<line x1="' + padL + '" y1="' + y + '" x2="' + (W-6) + '" y2="' + y + '" stroke="rgba(148,163,184,.12)" stroke-width="1"/>';
+    html += '<text x="' + (padL - 7) + '" y="' + (y + 3.5) + '" text-anchor="end" font-size="10" fill="rgba(147,160,180,.8)">' + fmtTok(val) + '</text>';
+  }
+  buckets.forEach(function(b, i){
+    var x = padL + slot * i + (slot - barW) / 2;
+    var t = b.t;
+    var fresh = Math.max(t.promptTokens - (t.cachedTokens||0), 0);
+    var tip = b.full + NL
+      + '请求 ' + fmtNum(t.requests) + ' 次' + NL
+      + '总量 ' + fmtNum(t.totalTokens) + ' tok' + NL
+      + '输入 ' + fmtNum(t.promptTokens) + '（缓存命中 ' + fmtNum(t.cachedTokens||0) + '）' + NL
+      + '输出 ' + fmtNum(t.completionTokens);
+    var segs = [
+      [fresh, 'rgba(138,123,255,.75)'],
+      [t.cachedTokens||0, 'rgba(110,231,255,.8)'],
+      [t.completionTokens, 'rgba(74,222,128,.75)']
+    ];
+    var yCur = padT + plotH;
+    var rects = '';
+    segs.forEach(function(sg){
+      if(!sg[0]) return;
+      var h = sg[0] / maxTotal * plotH;
+      yCur -= h;
+      rects += '<rect x="' + x.toFixed(1) + '" y="' + yCur.toFixed(1) + '" width="' + barW.toFixed(1) + '" height="' + Math.max(h, 0.5).toFixed(1) + '" fill="' + sg[1] + '" rx="1"/>';
+    });
+    if(!rects) rects = '<rect x="' + x.toFixed(1) + '" y="' + (padT + plotH - 1) + '" width="' + barW.toFixed(1) + '" height="1" fill="rgba(148,163,184,.15)"/>';
+    // 命中悬停区（整列）便于查看提示
+    html += '<g>' + rects
+      + '<rect x="' + (padL + slot*i).toFixed(1) + '" y="' + padT + '" width="' + slot.toFixed(1) + '" height="' + plotH + '" fill="transparent"><title>' + esc(tip) + '</title></rect>'
+      + '</g>';
+    // X 轴标签：稀疏显示避免重叠
+    var every = Math.ceil(n / Math.floor(plotW / 52));
+    if(i % every === 0){
+      html += '<text x="' + (padL + slot*i + slot/2).toFixed(1) + '" y="' + (H - 6) + '" text-anchor="middle" font-size="10" fill="rgba(147,160,180,.75)">' + esc(b.label) + '</text>';
+    }
+  });
+  var box = el('div');
+  var svgWrap = el('div', {cls:'chart-scroll'});
+  svgWrap.innerHTML = '<svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="none" style="width:100%;height:200px;display:block">' + html + '</svg>';
+  box.appendChild(svgWrap);
+  box.appendChild(el('div', {cls:'chart-legend'}, [
+    legendDot('rgba(138,123,255,.85)', '输入（未命中）'),
+    legendDot('rgba(110,231,255,.9)', '缓存命中'),
+    legendDot('rgba(74,222,128,.85)', '输出')
+  ]));
+  return box;
+}
+function legendDot(color, text){
+  var it = el('span', {cls:'legend-item'});
+  it.appendChild(el('i', {style:'background:' + color}));
+  it.appendChild(el('span', {text: text}));
+  return it;
 }
 function renderUsageDetail(){
   var holder = $('#usage-detail');
@@ -2123,26 +2322,36 @@ function renderUsageDetail(){
   holder.textContent = '';
   var s = usageCache.summary;
   var list = el('div', {cls:'section'});
-  list.appendChild(el('h3', {text: usageFilterLabel || '最近 500 条请求'}));
+  var title = usageFilterLabel ? ('筛选：' + usageFilterLabel) : (usageFilter === 'label' ? '按标签聚合' : usageFilter === 'model' ? '按模型聚合' : '最近 500 条请求');
+  var h3 = el('h3', {text: title});
+  if(usageFilterLabel){
+    h3.appendChild(el('button', {cls:'ghost', text:'清除筛选', style:'margin-left:auto;font-size:11px;padding:2px 10px', onclick:function(){
+      usageFilterLabel = ''; usageEntryFilter = null; renderUsageDetail();
+    }}));
+  }
+  list.appendChild(h3);
   var body = el('div', {cls:'body'});
-  if(usageFilter === 'label'){
-    Object.keys(s.byLabel || {}).forEach(function(k){
-      var it = s.byLabel[k];
-      body.appendChild(usageRow(k, 'label', it));
-    });
-  } else if(usageFilter === 'model'){
-    Object.keys(s.byModel || {}).forEach(function(k){
-      var it = s.byModel[k];
-      body.appendChild(usageRow(k || '（空）', 'model', it));
+  if(usageFilter === 'label' || usageFilter === 'model'){
+    var map = usageFilter === 'label' ? (s.byLabel || {}) : (s.byModel || {});
+    var keys = Object.keys(map).sort(function(a,b){ return map[b].totalTokens - map[a].totalTokens; });
+    if(!keys.length) body.appendChild(el('p', {cls:'empty', text:'（暂无记录）'}));
+    keys.forEach(function(k){
+      body.appendChild(usageRow(k || '（空）', usageFilter, map[k]));
     });
   } else {
-    body.appendChild(el('p', {cls:'empty', text: usageCache.entries.length ? '' : '（暂无记录，发起一次 LLM 请求后这里会出现数据）'}));
-    usageCache.entries.forEach(function(e){
+    var entries = (usageCache.entries || []).slice().reverse();
+    if(usageEntryFilter){
+      entries = entries.filter(function(e){
+        return usageEntryFilter.dim === 'label' ? e.label === usageEntryFilter.name : e.model === usageEntryFilter.name;
+      });
+    }
+    if(!entries.length) body.appendChild(el('p', {cls:'empty', text:'（暂无记录，发起一次 LLM 请求后这里会出现数据）'}));
+    entries.forEach(function(e){
       body.appendChild(el('div', {cls:'usage-entry'}, [
         el('span', {cls:'usage-lbl', text: e.label + ' › ' + (e.model || '?')}),
         el('span', {cls:'usage-time', text: fmtTime(e.ts)}),
-        el('span', {cls:'usage-num', text: String(e.totalTokens) + ' tok'}),
-        el('span', {cls:'usage-num dim', text: '↑' + e.promptTokens + ' ↓' + e.completionTokens})
+        el('span', {cls:'usage-num', text: fmtNum(e.totalTokens) + ' tok'}),
+        el('span', {cls:'usage-num dim', text: '↑' + fmtTok(e.promptTokens) + ' ↓' + fmtTok(e.completionTokens) + (e.cachedTokens ? ' ⚡' + fmtTok(e.cachedTokens) : '')})
       ]));
     });
   }
@@ -2150,16 +2359,21 @@ function renderUsageDetail(){
   holder.appendChild(list);
 }
 function usageRow(name, dim, it){
-  return el('div', {cls:'usage-entry', style:'cursor:pointer', onclick:function(){
+  var hit = it.promptTokens > 0 ? (it.cachedTokens||0) / it.promptTokens * 100 : 0;
+  return el('div', {cls:'usage-entry', style:'cursor:pointer', title:'点击查看该' + (dim==='label'?'标签':'模型') + '的请求明细', onclick:function(){
     usageFilter = 'total';
     usageFilterLabel = name;
-    usageCache.entries = (usageCache.entries || []).filter(function(e){ return dim === 'label' ? e.label === name : e.model === name; });
+    usageEntryFilter = {dim: dim, name: name};
     renderUsageDetail();
+    var bar = $('#usage-root .seg-bar');
+    if(bar){
+      bar.querySelectorAll('button.seg').forEach(function(b, i){ b.classList.toggle('active', i === 0); });
+    }
   }}, [
     el('span', {cls:'usage-lbl', text: name}),
-    el('span', {cls:'usage-num', text: String(it.requests || 0) + ' 次'}),
-    el('span', {cls:'usage-num', text: String(it.totalTokens || 0) + ' tok'}),
-    el('span', {cls:'usage-num dim', text: '↑' + (it.promptTokens||0) + ' ↓' + (it.completionTokens||0)})
+    el('span', {cls:'usage-num dim', text: fmtNum(it.requests || 0) + ' 次'}),
+    el('span', {cls:'usage-num', text: fmtNum(it.totalTokens || 0) + ' tok'}),
+    el('span', {cls:'usage-num dim', text: '↑' + fmtTok(it.promptTokens||0) + ' ↓' + fmtTok(it.completionTokens||0) + ' ⚡' + fmtTok(it.cachedTokens||0) + (it.promptTokens ? '（' + hit.toFixed(0) + '%）' : '')})
   ]);
 }
 
@@ -2203,7 +2417,7 @@ function renderGalleryGrid(){
   var list = el('div', {cls:'gallery-grid'});
   var items = galleryCache.filter(function(e){ return e.category === currentCategory; });
   items.forEach(function(e){
-    var url = '/api/gallery/file?category=' + encodeURIComponent(e.category) + '&name=' + encodeURIComponent(e.name);
+    var url = withToken('/api/gallery/file?category=' + encodeURIComponent(e.category) + '&name=' + encodeURIComponent(e.name));
     var card = el('div', {cls:'g-card'});
     if(e.image){
       var img = el('img', {src: url, loading:'lazy'});
@@ -2296,7 +2510,7 @@ function loadMedia(){
       if(m.summary) sum.textContent = m.summary;
       if(m.type === 'image'){
         sum.appendChild(el('div', {style:'margin-top:4px'}, [el('button', {text:'查看原图', style:'padding:2px 9px;font-size:11.5px', onclick:function(){
-          showImage('媒体 #' + m.id, '/api/media/file?id=' + m.id);
+          showImage('媒体 #' + m.id, withToken('/api/media/file?id=' + m.id));
         }})]));
       }
       tr.appendChild(sum);
@@ -2440,6 +2654,18 @@ switchView(activeView);
 if(activeView !== 'overview') refreshOverview(false);
 connectSSE();
 setInterval(function(){ refreshOverview(false); }, 8000);
+window.addEventListener('hashchange', function(){
+  var h = (location.hash || '').slice(1);
+  if(h === activeView) return;
+  for(var i=0;i<NAV.length;i++){
+    if(NAV[i][0] === h){ switchView(h); return; }
+  }
+});
+// 页面隐藏时挂起 SSE 之外的高频轮询由各视图自查 activeView；此处兜底：
+// 回到前台立即刷新一次总览，避免长时间挂后台后数据陈旧
+document.addEventListener('visibilitychange', function(){
+  if(!document.hidden) refreshOverview(false);
+});
 </script>
 </body>
 </html>

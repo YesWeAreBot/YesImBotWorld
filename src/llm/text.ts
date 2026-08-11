@@ -78,13 +78,13 @@ export class TextClient {
 
     // 非流式：一次性 JSON 响应
     if (!stream) {
-      const data = (await res.json()) as { content?: string; timings?: LlmTimings };
+      const data = (await res.json()) as { content?: string; timings?: LlmTimings; tokens_cached?: number };
       if (typeof data.content !== "string") {
         debug.emit("llm.req", `${label}·无响应`, { ...input, ms: Date.now() - startedAt }, "error");
         throw new Error("text completion 响应缺少 content 字段");
       }
       const ms = Date.now() - startedAt;
-      const usage = timingsToUsage(data.timings);
+      const usage = timingsToUsage(data.timings, data.tokens_cached);
       debug.emit("llm.res", `${label}·${ms}ms${usage ? ` · ${usage.total} tok` : ""}`, {
         url: this.endpoint(),
         model: this.cfg.model ?? "",
@@ -98,7 +98,7 @@ export class TextClient {
 
     // 流式：边生成边把增量写进同一条 llm.res 记录，完成时原地收尾
     let streamId: number | null = null;
-    let result: { content: string; timings?: LlmTimings };
+    let result: { content: string; timings?: LlmTimings; tokensCached?: number };
     try {
       result = await readTextStream(res, (partial, u) => {
         const usageNow = timingsToUsage(u);
@@ -119,7 +119,7 @@ export class TextClient {
     }
     const ms = Date.now() - startedAt;
     const content = result.content;
-    const usage = timingsToUsage(result.timings);
+    const usage = timingsToUsage(result.timings, result.tokensCached);
     this.recordUsage(usage);
     const finalDetail = {
       url: this.endpoint(),
@@ -141,6 +141,7 @@ export class TextClient {
       promptTokens: usage.prompt,
       completionTokens: usage.completion,
       totalTokens: usage.total,
+      cachedTokens: usage.cached,
     });
   }
 }
@@ -150,20 +151,28 @@ interface LlmTimings {
   predicted_n?: number;
   prompt_eval_count?: number;
   predicted_eval_count?: number;
+  /** llama.cpp：命中 KV cache 而无需重新求值的 prompt token 数 */
+  cache_n?: number;
 }
 
 interface LlmUsage {
   prompt: number;
   completion: number;
   total: number;
+  /** 命中 KV cache 的输入 token 数 */
+  cached: number;
 }
 
-function timingsToUsage(t: LlmTimings | undefined): LlmUsage | null {
+function timingsToUsage(t: LlmTimings | undefined, tokensCached?: number): LlmUsage | null {
   if (!t) return null;
-  const prompt = Number(t.prompt_n ?? t.prompt_eval_count) || 0;
+  // llama.cpp 的 timings.prompt_n 是"本次真正求值"的 token 数，缓存命中数在
+  // timings.cache_n（新版）或顶层 tokens_cached（旧版）；完整输入 = 求值 + 缓存命中
+  const evaluated = Number(t.prompt_n ?? t.prompt_eval_count) || 0;
+  const cached = Math.max(Number(t.cache_n ?? tokensCached) || 0, 0);
   const completion = Number(t.predicted_n ?? t.predicted_eval_count) || 0;
+  const prompt = evaluated + cached;
   if (!prompt && !completion) return null;
-  return { prompt, completion, total: prompt + completion };
+  return { prompt, completion, total: prompt + completion, cached };
 }
 
 /**
@@ -174,9 +183,10 @@ function timingsToUsage(t: LlmTimings | undefined): LlmUsage | null {
 async function readTextStream(
   res: LlmResponse,
   onProgress: (content: string, timings?: LlmTimings) => void,
-): Promise<{ content: string; timings?: LlmTimings }> {
+): Promise<{ content: string; timings?: LlmTimings; tokensCached?: number }> {
   let content = "";
   let timings: LlmTimings | undefined;
+  let tokensCached: number | undefined;
   let dirty = false;
   let lastEmit = 0;
   let sawData = false;
@@ -187,7 +197,7 @@ async function readTextStream(
     allLines += line + "\n";
     const payload = line.startsWith("data:") ? line.slice(5).trim() : line;
     if (!payload) return;
-    let chunk: { content?: string; timings?: LlmTimings };
+    let chunk: { content?: string; timings?: LlmTimings; tokens_cached?: number };
     try {
       chunk = JSON.parse(payload) as typeof chunk;
     } catch {
@@ -195,6 +205,7 @@ async function readTextStream(
     }
     sawData = true;
     if (chunk.timings) timings = chunk.timings;
+    if (typeof chunk.tokens_cached === "number") tokensCached = chunk.tokens_cached;
     if (typeof chunk.content === "string" && chunk.content) {
       content += chunk.content;
       dirty = true;
@@ -209,9 +220,9 @@ async function readTextStream(
   if (dirty) onProgress(content, timings);
 
   if (!sawData && allLines.trim()) {
-    let data: { content?: string; timings?: LlmTimings } | null = null;
+    let data: { content?: string; timings?: LlmTimings; tokens_cached?: number } | null = null;
     try {
-      data = JSON.parse(allLines) as { content?: string; timings?: LlmTimings };
+      data = JSON.parse(allLines) as { content?: string; timings?: LlmTimings; tokens_cached?: number };
     } catch {
       /* 非 JSON，忽略 */
     }
@@ -220,8 +231,10 @@ async function readTextStream(
     }
     if (data && typeof data.content === "string" && data.content) {
       content = data.content;
+      timings = data.timings ?? timings;
+      if (typeof data.tokens_cached === "number") tokensCached = data.tokens_cached;
       onProgress(content, data.timings);
     }
   }
-  return { content, timings };
+  return { content, timings, tokensCached };
 }
