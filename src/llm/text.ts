@@ -51,10 +51,14 @@ export class TextClient {
 
     const startedAt = Date.now();
     const stream = this.cfg.stream !== false;
+    // prompt 摘要仅用于调试视图展示；实际请求体始终发送完整 prompt
     const input = {
       url: this.endpoint(),
       model: this.cfg.model ?? "",
-      prompt: prompt.slice(0, 3000),
+      prompt:
+        prompt.length > 3000
+          ? prompt.slice(0, 3000) + `…（后略 ${prompt.length - 3000} 字符——仅调试视图截断显示，实际请求已完整发送）`
+          : prompt,
       n_predict: body.n_predict,
       stream,
     };

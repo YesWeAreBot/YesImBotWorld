@@ -418,8 +418,10 @@ export const Config: Schema<Config> = Schema.intersect([
       compressMaxInputChars: Schema.natural()
         .default(100000)
         .description(
-          "上下文压缩时送入 World-LLM 的意识流文本上限（字符数）。" +
-            "超出部分会从最早处截断（仅保留最近内容），防止压缩请求本身超过模型上下文窗口而失败",
+          "上下文压缩时单次送入 World-LLM 的意识流文本上限（字符数）。" +
+            "意识流超出该上限时不会丢弃内容，而是按时间顺序分成多段逐次总结" +
+            "（每一轮把上一轮的摘要续喂给下一轮），防止单次压缩请求超过模型上下文窗口。" +
+            "0 表示不限制（整段一次性送入）",
         ),
       waitNarrateMinRealSeconds: Schema.natural()
         .default(300)

@@ -126,7 +126,9 @@ export class DebugBus {
 function safeStringify(value: unknown, max: number): string {
   try {
     const text = JSON.stringify(value);
-    return text && text.length > max ? text.slice(0, max) + "\n…（已截断）" : (text ?? String(value));
+    return text && text.length > max
+      ? text.slice(0, max) + "\n…（调试记录过长，仅显示截断——不影响实际请求/结果）"
+      : (text ?? String(value));
   } catch {
     return String(value).slice(0, max);
   }

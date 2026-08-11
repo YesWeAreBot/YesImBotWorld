@@ -368,13 +368,24 @@ function normalizeUsage(u: ChatUsage | null | undefined): ChatUsage | null {
   };
 }
 
+/**
+ * 调试视图用的消息内容摘要。
+ * 注意：这只影响 WebUI 调试页的展示——实际发送给 LLM 的请求体始终是完整内容。
+ */
 function summarizeContent(content: string | ContentPart[], max: number): unknown {
   if (typeof content === "string") {
-    return content.length > max ? content.slice(0, max) + "…（已截断）" : content;
+    return content.length > max ? content.slice(0, max) + displayCutNote(content.length - max) : content;
   }
   return content.map((part) =>
     part.type === "text"
-      ? { type: "text", text: part.text.length > max ? part.text.slice(0, max) + "…" : part.text }
+      ? {
+          type: "text",
+          text: part.text.length > max ? part.text.slice(0, max) + displayCutNote(part.text.length - max) : part.text,
+        }
       : { type: part.type },
   );
+}
+
+function displayCutNote(omitted: number): string {
+  return `…（后略 ${omitted} 字符——仅调试视图截断显示，实际请求已完整发送）`;
 }

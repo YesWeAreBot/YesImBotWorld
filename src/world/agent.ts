@@ -358,34 +358,96 @@ export class WorldAgent {
     timeLine: string;
   }): Promise<CompressionResult> {
     return this.enqueue(async () => {
-      // 输入长度防护：意识流过长时只保留最近部分，防止压缩请求本身超过模型上下文窗口
-      let streamText = input.streamText;
+      // 输入长度防护：意识流超过单次上限时不再丢弃最早内容，而是按时间序
+      // 切成多段、分次总结——每一轮都把上一轮产出的摘要作为"旧摘要"续喂，
+      // 一口一口把整段意识流吃完（map-reduce 式滚动压缩）。
       const cap = this.cfg.compressMaxInputChars;
-      if (cap > 0 && streamText.length > cap) {
-        const tail = streamText.slice(-cap);
-        const cut = tail.indexOf("\n");
-        streamText =
-          `（意识流过长，最早的约 ${streamText.length - cap} 字符已被省略，以下仅为最近部分）\n` +
-          (cut >= 0 ? tail.slice(cut + 1) : tail);
+      let chunks =
+        cap > 0 && input.streamText.length > cap
+          ? splitByLines(input.streamText, cap)
+          : [input.streamText];
+
+      // 极端兜底：段数过多（意识流长得离谱）时只保留最近的若干段，
+      // 防止一次 rest 触发几十次 LLM 调用
+      let omittedNote = "";
+      if (chunks.length > MAX_COMPRESS_PASSES) {
+        const dropped = chunks.slice(0, chunks.length - MAX_COMPRESS_PASSES);
+        const droppedChars = dropped.reduce((n, c) => n + c.length, 0);
+        chunks = chunks.slice(-MAX_COMPRESS_PASSES);
+        omittedNote = `（意识流过长，最早的约 ${droppedChars} 字符未纳入本次总结）\n`;
         this.logger.warn(
-          "压缩输入过长（%d 字符），已截断至最近 %d 字符",
+          "压缩输入过长（%d 字符，%d 段），超出最大分段数 %d，最早 %d 字符被省略",
           input.streamText.length,
-          cap,
+          chunks.length + dropped.length,
+          MAX_COMPRESS_PASSES,
+          droppedChars,
         );
       }
+
+      if (chunks.length > 1) {
+        this.logger.info(
+          "压缩输入过长（%d 字符），分 %d 段逐段总结（每段上限 %d 字符）",
+          input.streamText.length,
+          chunks.length,
+          cap,
+        );
+        debug.emit("world.task", `分段压缩·共 ${chunks.length} 段`, {
+          totalChars: input.streamText.length,
+          chunkChars: chunks.map((c) => c.length),
+          cap,
+        });
+      }
+
       const system = this.prompts.world.compressSystem;
-      const user = fill(this.prompts.world.compressUser, {
-        timeLine: input.timeLine,
-        persona: input.persona,
-        historySummary: input.historySummary,
-        memoryDigest: input.memoryDigest,
-        streamText,
-      });
-      const result = await this.client.complete([
-        { role: "system", content: system },
-        { role: "user", content: user },
-      ]);
-      return parseCompression(result.content);
+      // 滚动状态：每一轮的产出作为下一轮的输入
+      let persona = input.persona;
+      let historySummary = input.historySummary;
+      let memoryDigest = input.memoryDigest;
+      let botStatus: string | undefined;
+
+      for (let i = 0; i < chunks.length; i++) {
+        const isLast = i === chunks.length - 1;
+        const partHeader =
+          chunks.length > 1
+            ? `（意识流较长，正分 ${chunks.length} 段按时间顺序逐段沉淀。` +
+              `这是第 ${i + 1}/${chunks.length} 段${isLast ? "，也是最近的一段" : "，之后还有更近的经历会继续沉淀"}）\n` +
+              (i === 0 ? omittedNote : "")
+            : "";
+        const user = fill(this.prompts.world.compressUser, {
+          timeLine: input.timeLine,
+          persona,
+          historySummary,
+          memoryDigest,
+          streamText: partHeader + chunks[i],
+        });
+        try {
+          const result = await this.client.complete([
+            { role: "system", content: system },
+            { role: "user", content: user },
+          ]);
+          const parsed = parseCompression(result.content);
+          historySummary = parsed.historySummary;
+          memoryDigest = parsed.memoryDigest;
+          if (parsed.botStatus) {
+            botStatus = parsed.botStatus;
+            persona = parsed.botStatus; // 后续段以最新的自我认知为基准
+          }
+        } catch (err) {
+          // 第一段就失败：整体失败，交由调用方降级处理；
+          // 中途失败：保留已完成的滚动摘要，未消化的部分标注为记忆模糊，不让前功尽弃
+          if (i === 0) throw err;
+          this.logger.warn(
+            "分段压缩在第 %d/%d 段失败，沿用已完成部分: %s",
+            i + 1,
+            chunks.length,
+            err,
+          );
+          const note = "（注：最近一段经历未能完全沉淀，这部分记忆有些模糊。）";
+          if (!historySummary.includes(note)) historySummary = `${historySummary}\n${note}`;
+          break;
+        }
+      }
+      return { historySummary, memoryDigest, botStatus };
     });
   }
 
@@ -599,6 +661,27 @@ export class WorldAgent {
           return `未知工具: ${name}`;
       }
   }
+}
+
+/** 分段压缩的最大轮数：极端长的意识流最多分这么多次总结，防止一次 rest 触发过多 LLM 调用 */
+const MAX_COMPRESS_PASSES = 8;
+
+/**
+ * 把长文本按行边界切成若干段，每段不超过 cap 字符（时间顺序保持不变）。
+ * 找不到合适的换行（单行超长）时按 cap 硬切。
+ */
+function splitByLines(text: string, cap: number): string[] {
+  const chunks: string[] = [];
+  let rest = text;
+  while (rest.length > cap) {
+    let cut = rest.lastIndexOf("\n", cap);
+    // 换行太靠前会导致段数暴涨；此时直接硬切
+    if (cut < cap * 0.3) cut = cap;
+    chunks.push(rest.slice(0, cut));
+    rest = rest.slice(rest[cut] === "\n" ? cut + 1 : cut);
+  }
+  if (rest.trim()) chunks.push(rest);
+  return chunks.length ? chunks : [text];
 }
 
 /** 从（可能带说明文字的）LLM 输出中提取第一个 JSON 对象 */
