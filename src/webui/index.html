@@ -432,7 +432,8 @@ var ICONS = {
   chart: svgIcon('<path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/>'),
   sliders: svgIcon('<path d="M4 8h10M18 8h2M4 16h4M12 16h8"/><circle cx="16" cy="8" r="2"/><circle cx="10" cy="16" r="2"/>'),
   menu: svgIcon('<path d="M4 7h16M4 12h16M4 17h16"/>'),
-  phone: svgIcon('<rect x="7" y="2.5" width="10" height="19" rx="2.5"/><path d="M11 18.5h2"/>')
+  phone: svgIcon('<rect x="7" y="2.5" width="10" height="19" rx="2.5"/><path d="M11 18.5h2"/>'),
+  portal: svgIcon('<circle cx="12" cy="12" r="9"/><path d="M3.5 12h17"/><path d="M12 3a13.5 13.5 0 0 1 0 18"/><path d="M12 3a13.5 13.5 0 0 0 0 18"/>')
 };
 function icon(name){ return ICONS[name] || ''; }
 function copyText(text, hint){
@@ -614,6 +615,7 @@ var NAV = [
   ['usage','用量','chart'],
   {group:'世界'},
   ['state','状态','file'],
+  ['crossing','穿越','portal'],
   ['prompts','提示词','edit'],
   ['gallery','相册','image'],
   ['media','媒体','film'],
@@ -656,6 +658,7 @@ function switchView(name){
   else if(name === 'config') loadConfig();
   else if(name === 'prompts') loadPrompts();
   else if(name === 'state') loadState();
+  else if(name === 'crossing') loadCrossing();
   else if(name === 'debug') loadDebug();
   else if(name === 'usage') loadUsage();
   else if(name === 'gallery') loadGallery();
@@ -733,6 +736,9 @@ function renderOverview(o){
           var txt = prompt('注入到 Bot 意识流的事件内容（system 源，可唤醒等待）：');
           if(txt && txt.trim()) worldAction('inject', false, {text: txt.trim()});
         }}),
+        (o.crossing && o.crossing.worlds && o.crossing.worlds.length)
+          ? el('button', {text: o.crossing.location ? '穿越中…' : '穿越…', onclick: function(){ crossingModal(o); }})
+          : null,
         el('button', {cls:'ghost', text:'更多', onclick: function(){ moreWorldActions(); }})
       ])
     ])
@@ -808,6 +814,13 @@ function overviewCards(o){
     card('电脑', o.computerOn ? o.computerOn : '未开机'),
     card('关注频道', o.focusChannels.length ? o.focusChannels.join('、') : '无', 'small')
   ];
+  if(o.crossing && (o.crossing.location || (o.crossing.worlds && o.crossing.worlds.length))){
+    cards.push(card('所在世界', o.crossing.location ? '异世界「' + o.crossing.location + '」' : '自己的世界', o.crossing.location ? '' : 'small'));
+  }
+  if(o.crossing && o.crossing.serverEnabled){
+    var vs = o.crossing.visitors || [];
+    cards.push(card('异世界访客', vs.length ? vs.map(function(v){ return v.name; }).join('、') : '无', vs.length ? '' : 'small'));
+  }
   if(o.appOpen) cards.push(card('手机应用', o.appOpen));
   o.galleryCounts.forEach(function(g){ cards.push(card('相册 · ' + g.category, String(g.count))); });
   return cards;
@@ -1019,6 +1032,39 @@ function tagClass(e){
   if(e.level === 'error') return 'err';
   return '';
 }
+// 穿越面板：强制把 Bot 送往某个异世界 / 送回自己的世界
+function crossingModal(o){
+  var c = o.crossing || {};
+  var body = el('div');
+  body.appendChild(el('p', {
+    style:'color:var(--fg-dim);font-size:12.5px;margin:0 0 10px',
+    text: c.location ? ('Bot 正在异世界「' + c.location + '」作客。') : 'Bot 在自己的世界里。强制送往（无视「允许主动前往」开关）：'
+  }));
+  function doTravel(target, label){
+    api('POST', '/api/crossing/travel', {world: target}).then(function(r){
+      toast(r.text, 'ok');
+      hideModal();
+      refreshOverview(true);
+    }).catch(function(err){ toast(label + '失败：' + (err.message || err), 'err'); });
+  }
+  (c.worlds || []).forEach(function(w){
+    if(c.location === w.name) return;
+    body.appendChild(el('div', {cls:'kv'}, [
+      el('span', {cls:'k', text: w.name + (w.note ? ' · ' + w.note : '') + (w.allowVoluntary ? '' : '（Bot 不可主动前往）')}),
+      el('button', {text:'送往', onclick:function(){
+        if(!confirm('把 Bot 强制送往「' + w.name + '」？')) return;
+        doTravel(w.name, '穿越');
+      }})
+    ]));
+  });
+  if(c.location){
+    body.appendChild(el('div', {cls:'toolbar', style:'margin:12px 0 0'}, [
+      el('button', {cls:'primary', text:'送回自己的世界', onclick:function(){ doTravel('home', '送回'); }})
+    ]));
+  }
+  showModal('穿越', body);
+}
+
 function moreWorldActions(){
   var body = el('div');
   [
@@ -1790,7 +1836,11 @@ function descOf(key, prefix){
       phoneSpecSystem: '手机屏幕规格判定 · system（apps.phoneResolution 为 auto 时创世调用）',
       phoneSpecUser: '手机屏幕规格判定 · user。{{botDef}} {{worldDef}}',
       phoneShellSystem: '浏览器带壳截图外壳生成 · system（创世调用）',
-      phoneShellUser: '带壳截图外壳生成 · user。{{botDef}} {{worldDef}} {{width}} {{height}}；生成的 HTML 里保留 {{screen}} {{url}} {{time}} 占位符'
+      phoneShellUser: '带壳截图外壳生成 · user。{{botDef}} {{worldDef}} {{width}} {{height}}；生成的 HTML 里保留 {{screen}} {{url}} {{time}} 占位符',
+      visitorPreamble: '穿越 · 访客任务前言（act/wait/查时间/查询的开头段）。{{name}} {{persona}}',
+      visitorArrive: '穿越 · 访客到达叙事。{{name}} {{persona}} {{timeLine}}',
+      visitorLeave: '穿越 · 访客离开善后。{{name}} {{timeLine}}',
+      dormantCatchup: '穿越 · 世界沉睡后苏醒的补叙（Bot 外出且无访客期间暂停演化，有人出现时补上）。{{fromTimeLine}} {{toTimeLine}} {{gapTU}}'
     }
   };
   return map[prefix][key] || '';
@@ -1926,6 +1976,167 @@ function setPaneText(id, content){
   if(!pane) return;
   var ta = pane.querySelector('textarea');
   if(document.activeElement !== ta) ta.value = content;
+}
+
+// ---------- 穿越（联机） ----------
+function loadCrossing(){
+  var main = $('#main');
+  main.textContent = '';
+  main.appendChild(viewHead('穿越（联机）', 'Bot 前往其他用户的世界作客，或用邀请码接待来访的异世界 Bot。网络上只传输任务与事件文本，绝不传输 API 地址或密钥。'));
+  var holder = el('div', {id:'crossing-root'}, [el('p', {cls:'empty', text:'加载中…'})]);
+  main.appendChild(holder);
+  refreshCrossing();
+  viewTimers.push(setInterval(function(){
+    if(activeView !== 'crossing') return;
+    refreshCrossing(true);
+  }, 8000));
+}
+function refreshCrossing(silent){
+  api('GET', '/api/crossing').then(function(r){
+    var holder = $('#crossing-root');
+    if(!holder || activeView !== 'crossing') return;
+    holder.textContent = '';
+    holder.appendChild(renderCrossing(r));
+  }).catch(function(err){ if(!silent) showErr(err); });
+}
+function renderCrossing(c){
+  var wrap = el('div');
+  var worlds = c.configuredWorlds || [];
+  var visitors = c.visitors || [];
+  var invites = c.invites || [];
+  // 状态卡片
+  wrap.appendChild(el('div', {cls:'cards'}, [
+    crossingCard('Bot 所在', c.location ? '异世界「' + c.location + '」' : '自己的世界', !!c.location),
+    crossingCard('接待服务', c.server && c.server.running ? '接待中' : (c.server && c.server.enabled ? '未运行' : '未开启'), c.server && c.server.running),
+    crossingCard('在场访客', visitors.length ? String(visitors.length) + ' 位' : '无', visitors.length > 0),
+    crossingCard('可去的世界', worlds.length ? String(worlds.length) + ' 个' : '未配置', false)
+  ]));
+
+  // ---- 前往异世界 ----
+  var goSec = el('div', {cls:'section'});
+  goSec.appendChild(el('h3', {html:'前往异世界 <span class="hint">这里是强制送往（无视「允许主动前往」开关）；Bot 也可以自己用 travel 工具过去</span>'}));
+  var goBody = el('div', {cls:'body'});
+  if(c.location){
+    goBody.appendChild(el('div', {cls:'toolbar', style:'margin:0 0 10px'}, [
+      el('span', {text:'Bot 正在「' + c.location + '」作客。', style:'font-size:12.5px'}),
+      el('span', {cls:'spacer'}),
+      el('button', {cls:'primary', text:'送回自己的世界', onclick:function(){ crossingTravel('home', '送回'); }})
+    ]));
+  }
+  if(!worlds.length){
+    goBody.appendChild(el('p', {cls:'empty', text:'还没有配置任何可去的世界。拿到别人分享的邀请码后，在配置 crossing.worlds 里添加：世界名、对方服务地址（http://主机:端口）、邀请码。'}));
+    goBody.appendChild(el('button', {text:'前往配置', onclick:function(){ gotoCfg('crossing'); }}));
+  } else {
+    worlds.forEach(function(w){
+      var flags = [];
+      if(!w.allowVoluntary) flags.push('Bot 不可主动前往');
+      if(!w.hasCode) flags.push('缺少邀请码');
+      if(!String(w.url||'').trim()) flags.push('缺少地址');
+      var canGo = w.hasCode && String(w.url||'').trim() && c.location !== w.name;
+      goBody.appendChild(el('div', {cls:'kv'}, [
+        el('span', {cls:'k'}, [
+          el('span', {text: w.name || '（未命名）', style:'color:var(--fg);font-size:13px'}),
+          el('span', {text: (w.note ? ' · ' + w.note : '') + (flags.length ? ' · ' + flags.join('，') : ''), style: flags.length ? 'color:var(--warn);font-size:11.5px' : 'color:var(--fg-dark);font-size:11.5px'})
+        ]),
+        el('span', {cls:'v'}, [
+          c.location === w.name
+            ? el('span', {text:'Bot 在这里', style:'color:var(--ok);font-size:12px'})
+            : (function(){
+                var attrs = {text:'送往', onclick:function(){
+                  if(!confirm('把 Bot 强制送往「' + w.name + '」？')) return;
+                  crossingTravel(w.name, '穿越');
+                }};
+                if(!canGo) attrs.disabled = 'disabled';
+                return el('button', attrs);
+              })()
+        ])
+      ]));
+    });
+  }
+  goSec.appendChild(goBody);
+  wrap.appendChild(goSec);
+
+  // ---- 接待来访 ----
+  var hostSec = el('div', {cls:'section'});
+  hostSec.appendChild(el('h3', {html:'接待来访 <span class="hint">把邀请码分享给别的用户，对方的 Bot 便可穿越到你的世界</span>'}));
+  var hostBody = el('div', {cls:'body'});
+  if(!(c.server && c.server.enabled)){
+    hostBody.appendChild(el('p', {cls:'empty', text:'接待服务未开启。开启 crossing.serverEnabled 后，你的世界会开放给持有邀请码的访客（来访 Bot 的行动由你的 World-LLM 裁定）。'}));
+    hostBody.appendChild(el('button', {text:'前往配置开启', onclick:function(){ gotoCfg('crossing'); }}));
+  } else {
+    hostBody.appendChild(el('div', {cls:'kv'}, [
+      el('span', {cls:'k', text:'服务状态'}),
+      el('span', {cls:'v', html: c.server.running
+        ? '<span style="color:var(--ok)">接待中</span> · 监听 ' + esc(c.server.host + ':' + c.server.port)
+        : '<span style="color:var(--err)">未运行（启动失败？查看日志）</span>'})
+    ]));
+    hostBody.appendChild(el('div', {cls:'kv'}, [
+      el('span', {cls:'k', text:'对外世界名'}),
+      el('span', {cls:'v', text: c.server.worldName})
+    ]));
+    hostBody.appendChild(el('div', {cls:'kv'}, [
+      el('span', {cls:'k', text:'对方需要填写的地址'}),
+      el('span', {cls:'v', text:'http://<你的公网或局域网地址>:' + c.server.port})
+    ]));
+    // 在场访客
+    hostBody.appendChild(el('div', {cls:'crumb', text:'在场访客', style:'margin-top:12px'}));
+    if(!visitors.length){
+      hostBody.appendChild(el('p', {cls:'empty', text:'（暂无访客）'}));
+    } else {
+      visitors.forEach(function(v){
+        hostBody.appendChild(el('div', {cls:'kv'}, [
+          el('span', {cls:'k', text: v.name}),
+          el('span', {cls:'v', text: '到达于 ' + new Date(v.arrivedAt).toLocaleTimeString()})
+        ]));
+      });
+    }
+    // 邀请码
+    hostBody.appendChild(el('div', {cls:'crumb', text:'邀请码（在配置 crossing.invites 里增删）', style:'margin-top:12px'}));
+    if(!invites.length){
+      hostBody.appendChild(el('p', {cls:'empty', text:'（还没有邀请码——去配置里添加一条，code 建议用长随机串）'}));
+    } else {
+      invites.forEach(function(inv){
+        var code = String(inv.code || '');
+        var masked = code ? (code.slice(0, 4) + '••••••') : '（空）';
+        hostBody.appendChild(el('div', {cls:'kv'}, [
+          el('span', {cls:'k'}, [
+            el('span', {text: (inv.name || '未备注'), style:'font-size:12.5px'}),
+            el('span', {text: inv.enabled ? '' : ' · 已吊销', style:'color:var(--err);font-size:11.5px'})
+          ]),
+          el('span', {cls:'v'}, [
+            el('code', {text: masked, style:'margin-right:8px'}),
+            code ? el('button', {text:'复制', style:'padding:2px 9px;font-size:11.5px', onclick:function(){ copyText(code, '邀请码已复制'); }}) : null
+          ])
+        ]));
+      });
+    }
+  }
+  hostSec.appendChild(hostBody);
+  wrap.appendChild(hostSec);
+
+  // ---- 说明 ----
+  wrap.appendChild(el('div', {cls:'section'}, [
+    el('h3', {text:'工作原理'}),
+    el('div', {cls:'body guide', html:
+      '<p><b>作客</b>：Bot 在异世界期间，act 裁定、等待补叙、查看时间、天气/虚构网页等都由<b>对方的 World-LLM</b> 处理；你自己的 World-LLM 只保留记忆压缩等私人工作。</p>' +
+      '<p><b>沉睡</b>：你外出且无访客时，你的世界暂停心跳（省 token）；有人出现（Bot 回家 / 访客到达）时自动补叙期间的演化。</p>' +
+      '<p><b>接待</b>：来访 Bot 的行动由你的 World-LLM 裁定，会计入你的 token 用量；世界心跳会感知在场访客并可向他们广播事件。</p>' +
+      '<p><b>安全</b>：网络上只有任务与事件文本；邀请码可随时在配置里吊销（enabled 关闭）。指令 <code>world.travel &lt;世界名|home&gt;</code> 与本页按钮等效。</p>'
+    })
+  ]));
+  return wrap;
+}
+function crossingCard(label, value, highlight){
+  return el('div', {cls:'card' + (highlight ? ' usage-cache-card' : '')}, [
+    el('div', {cls:'card-label', text: label}),
+    el('div', {cls:'card-value', style:'font-size:15px', text: String(value)})
+  ]);
+}
+function crossingTravel(target, label){
+  api('POST', '/api/crossing/travel', {world: target}).then(function(r){
+    toast(r.text, r.text.indexOf('失败') >= 0 ? 'warn' : 'ok');
+    refreshCrossing(true);
+  }).catch(function(err){ toast(label + '失败：' + (err.message || err), 'err'); });
 }
 
 // ---------- 调试 ----------

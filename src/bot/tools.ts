@@ -110,6 +110,19 @@ export const BOT_TOOLS: BotToolDef[] = [
       "（不呈现内容也不知道来自哪里），直到你用 pick_up_phone 拿起手机。想清静时用。",
   },
   {
+    name: "travel",
+    signature: 'travel(world: string)',
+    description:
+      "穿越到另一个世界作客。world 填目标世界名。到达后你身处那个世界：你的行动由那个世界裁定、" +
+      "时间按那边的历法流动；你自己的世界在你离开期间照常存在（无人在场时会沉睡，等你回来时你会得知期间的变化）。" +
+      "手机与聊天照常可用。用 go_home 随时返回。作客要有作客的样子——尊重对方世界的规则。",
+  },
+  {
+    name: "go_home",
+    signature: "go_home()",
+    description: "从异世界返回你自己的世界（只在你身处异世界时有意义）。",
+  },
+  {
     name: "pick_up_phone",
     signature: "pick_up_phone()",
     description: "把手机拿回手里：恢复正常的消息通知（不会自动打开应用）。",
@@ -448,11 +461,19 @@ export function availableTools(opts: {
   disableWait?: boolean;
   /** bot.ignoreSendDuration：send 系工具的 duration 被忽略，消息立即发出 */
   ignoreSendDuration?: boolean;
+  /** crossing.worlds 中允许 Bot 主动前往的世界（travel 工具的目的地列表） */
+  crossingWorlds?: { name: string; note?: string }[];
+  /** crossing.worlds 配置了任何世界（go_home 保留，以便被强制送出后能自己回来） */
+  crossingConfigured?: boolean;
 }): BotToolDef[] {
   const tools = BOT_TOOLS.filter((t) => {
     switch (t.name) {
       case "wait":
         return !opts.disableWait;
+      case "travel":
+        return (opts.crossingWorlds?.length ?? 0) > 0;
+      case "go_home":
+        return !!opts.crossingConfigured;
       case "send_voice":
         return opts.tts;
       case "channel_notify":
@@ -587,6 +608,17 @@ export function availableTools(opts: {
         description:
           def.description +
           `已安装的应用：${opts.apps.map((a) => `${a.name}（${a.description}）`).join("、")}。`,
+      };
+    }
+    // travel 的描述里列出可去的世界
+    if (def.name === "travel" && opts.crossingWorlds?.length) {
+      def = {
+        ...def,
+        description:
+          def.description +
+          `你能前往的世界：${opts.crossingWorlds
+            .map((w) => `「${w.name}」${w.note?.trim() ? `（${w.note.trim()}）` : ""}`)
+            .join("、")}。`,
       };
     }
     return def;

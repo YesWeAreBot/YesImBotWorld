@@ -251,6 +251,34 @@ export interface WebUIConfig {
   token: string;
 }
 
+/** 穿越：可前往的远方世界（对方分享的邀请码 + 服务地址） */
+export interface CrossingWorldConfig {
+  name: string;
+  url: string;
+  inviteCode: string;
+  allowVoluntary: boolean;
+  note: string;
+}
+
+/** 穿越：发给别人的邀请码 */
+export interface CrossingInviteConfig {
+  code: string;
+  name: string;
+  enabled: boolean;
+}
+
+/** 穿越（联机）：Bot 前往其他用户的世界作客 / 接待来访的异世界 Bot */
+export interface CrossingConfig {
+  serverEnabled: boolean;
+  host: string;
+  port: number;
+  worldName: string;
+  botName: string;
+  maxVisitors: number;
+  invites: CrossingInviteConfig[];
+  worlds: CrossingWorldConfig[];
+}
+
 export interface Config {
   basePath: string;
   autoStart: boolean;
@@ -265,6 +293,7 @@ export interface Config {
   media: MediaConfig;
   tts: TtsConfig;
   webui: WebUIConfig;
+  crossing: CrossingConfig;
 }
 
 export const Config: Schema<Config> = Schema.intersect([
@@ -894,6 +923,56 @@ export const Config: Schema<Config> = Schema.intersect([
           "访问令牌。留空不鉴权（仅建议本机使用）；设置后，页面与全部 API 都要求携带该令牌（浏览器会提示输入，API 用 Authorization: Bearer <token> 或 ?token=）",
         ),
     }).description("运维 WebUI：浏览器里的管理界面（配置 / 提示词 / 状态 / 调试 / 相册）"),
+  }),
+
+  Schema.object({
+    crossing: Schema.object({
+      serverEnabled: Schema.boolean()
+        .default(false)
+        .description(
+          "开放本世界接待异世界访客：启动穿越服务，持有你邀请码的用户的 Bot 可以穿越到你的世界作客。" +
+            "来访 Bot 的行动由你的 World-LLM 裁定；网络上只传输任务与事件文本，不传输任何 API 地址或密钥",
+        ),
+      host: Schema.string()
+        .default("0.0.0.0")
+        .description("穿越服务监听地址（要接待来自其他机器的访客需 0.0.0.0 或公网可达地址/反代）"),
+      port: Schema.natural()
+        .min(1)
+        .max(65535)
+        .default(18112)
+        .description("穿越服务监听端口。对方在世界列表里填 http://你的地址:该端口"),
+      worldName: Schema.string()
+        .default("")
+        .description("你的世界对外的名字（访客到达时看到）。留空则显示「未命名世界」"),
+      botName: Schema.string()
+        .default("")
+        .description("你的 Bot 去别人世界作客时使用的名字。留空则显示「异界来客」"),
+      maxVisitors: Schema.natural()
+        .default(3)
+        .description("同时接待的异世界访客上限"),
+      invites: Schema.array(
+        Schema.object({
+          code: Schema.string().role("secret").description("邀请码（建议用长随机串，分享给对方）"),
+          name: Schema.string().description("备注（发给谁的，便于管理）"),
+          enabled: Schema.boolean().default(true).description("是否有效（随时可吊销）"),
+        }),
+      )
+        .default([])
+        .description("发出的邀请码列表：把 code 分享给别的用户，对方的 Bot 便可凭它穿越到你的世界"),
+      worlds: Schema.array(
+        Schema.object({
+          name: Schema.string().description("世界名（Bot 用它选择目的地，需与对方设置的世界名无关、本地唯一）"),
+          url: Schema.string().description("对方穿越服务地址（如 http://1.2.3.4:18112）"),
+          inviteCode: Schema.string().role("secret").description("对方分享给你的邀请码"),
+          allowVoluntary: Schema.boolean()
+            .default(true)
+            .description("允许 Bot 主动前往（关闭后仅能由你用 world.travel 指令强制送去）"),
+          note: Schema.string().default("").description("世界简介（会写进 travel 工具说明，帮 Bot 决定去不去）"),
+        }),
+      )
+        .default([])
+        .description("可前往的异世界列表：填入别人分享给你的邀请码与地址，Bot 便可用 travel 工具穿越过去"),
+    }).description("穿越（联机）：让 Bot 到其他用户的世界作客，或接待来访的异世界 Bot"),
   }),
 
   Schema.object({

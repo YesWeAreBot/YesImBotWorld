@@ -108,6 +108,15 @@ export interface WebUIHost {
   computerAction(action: "start" | "stop" | "restart"): Promise<string>;
   /** 在 Docker 电脑里执行一条命令（运维用途） */
   computerExec(command: string): Promise<ComputerExecResult>;
+  /** 穿越：当前位置 / 服务状态 / 在场访客 / 可去的世界 */
+  crossingInfo(): {
+    location: string | null;
+    serverEnabled: boolean;
+    visitors: { name: string; arrivedAt: number }[];
+    worlds: { name: string; allowVoluntary: boolean; note: string }[];
+  };
+  /** 穿越：强制送往某个世界（"home" = 送回自己的世界） */
+  crossingForce(target: string): Promise<string>;
 }
 
 const MIME_BY_EXT: Record<string, string> = {
@@ -399,6 +408,7 @@ export class WebUIServer {
         news,
         facts,
         galleryCounts: counts,
+        crossing: host.crossingInfo(),
         tokenSet: !!this.cfg.token,
         addresses: accessUrls(this.cfg.host, this.cfg.port),
       });
@@ -643,6 +653,46 @@ export class WebUIServer {
       }
       this.sendLifecycle(`world.${action}`, { text });
       sendJSON(res, 200, { ok: true, text });
+      return;
+    }
+
+    // ---------- 穿越 ----------
+    if (pathname === "/api/crossing" && method === "GET") {
+      const info = host.crossingInfo();
+      const cc = host.config.crossing;
+      sendJSON(res, 200, {
+        ...info,
+        server: {
+          enabled: cc.serverEnabled,
+          running: info.serverEnabled,
+          host: cc.host,
+          port: cc.port,
+          worldName: cc.worldName.trim() || "未命名世界",
+        },
+        botName: cc.botName.trim() || "异界来客",
+        invites: cc.invites.map((i) => ({ name: i.name, enabled: i.enabled, code: i.code })),
+        // 配置里的完整世界列表（含未填全的，便于用户发现配置问题）
+        configuredWorlds: cc.worlds.map((w) => ({
+          name: w.name,
+          url: w.url,
+          hasCode: !!w.inviteCode.trim(),
+          allowVoluntary: w.allowVoluntary,
+          note: w.note,
+        })),
+      });
+      return;
+    }
+    if (pathname === "/api/crossing/travel" && method === "POST") {
+      const body = (await readJson(req).catch(() => ({}))) as Record<string, unknown>;
+      const target = String(body.world ?? "").trim();
+      if (!target) return void sendJSON(res, 400, { error: "缺少 world 参数（世界名，或 home 送回）" });
+      try {
+        const text = await host.crossingForce(target);
+        this.sendLifecycle("crossing.travel", { target, text });
+        sendJSON(res, 200, { ok: true, text });
+      } catch (err) {
+        sendJSON(res, 500, { error: String((err as Error).message ?? err) });
+      }
       return;
     }
 

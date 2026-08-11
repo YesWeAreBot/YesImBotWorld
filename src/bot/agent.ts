@@ -15,6 +15,18 @@ import { Scheduler } from "./scheduler.js";
 import { typingSlackTU } from "./typing.js";
 import { BOT_TOOLS, renderToolsText, toolLayer, type BotToolDef } from "./tools.js";
 
+/** 穿越能力（前往异世界作客），由 service 层实现注入 */
+export interface BotCrossingApi {
+  /** 当前所在的异世界名；null = 在自己的世界 */
+  location(): string | null;
+  /** Bot 可主动前往的世界名列表（allowVoluntary） */
+  voluntaryWorlds(): string[];
+  /** 穿越到指定世界；返回给 Bot 的叙述文本，失败抛错 */
+  travelTo(name: string): Promise<string>;
+  /** 返回自己的世界；返回给 Bot 的叙述文本 */
+  goHome(): Promise<string>;
+}
+
 /** Koishi 侧能力（消息查询与发送），由 service 层实现注入 */
 export interface MessengerApi {
   /** 宽松解析频道 id，返回规范化 key 与是否私聊（用于进入频道页/自动切频道） */
@@ -174,6 +186,8 @@ export class BotAgent {
     private phone: PhoneStatus,
     private logger: Logger,
     tools?: BotToolDef[],
+    /** 穿越能力（service 注入；未配置任何世界时为 null） */
+    private crossing: BotCrossingApi | null = null,
   ) {
     this.toolDefs = tools ?? BOT_TOOLS;
     // 原生声明用全量内置工具（稳定，不随界面状态变）；允许集另行按分层控制
@@ -624,6 +638,33 @@ export class BotAgent {
           const parts: string[] = [];
           await this.world.resolveCheckTime((content) => parts.push(content));
           return parts.length ? parts.join("\n") : `你看了看时间——当前 ${this.clock.timeLine()}`;
+        });
+      case "travel":
+        return this.dispatchLocal(call, async () => {
+          if (!this.crossing) return "（穿越能力未开启。）";
+          const name = String(call.arguments.world ?? call.arguments.name ?? "").trim();
+          if (!name) return "（travel 需要 world 参数：想去哪个世界？）";
+          const allowed = this.crossing.voluntaryWorlds();
+          if (!allowed.includes(name)) {
+            return allowed.length
+              ? `（你去不了「${name}」。你能主动前往的世界：${allowed.map((w) => `「${w}」`).join("、")}）`
+              : "（现在没有你能主动前往的世界。）";
+          }
+          try {
+            return await this.crossing.travelTo(name);
+          } catch (err) {
+            return `（穿越失败：${(err as Error).message ?? err}。那扇门没有打开——过会儿再试，或先做点别的。）`;
+          }
+        });
+      case "go_home":
+        return this.dispatchLocal(call, async () => {
+          if (!this.crossing) return "（穿越能力未开启。）";
+          if (!this.crossing.location()) return "（你就在自己的世界里，无处可回。）";
+          try {
+            return await this.crossing.goHome();
+          } catch (err) {
+            return `（返回失败：${(err as Error).message ?? err}）`;
+          }
         });
       case "check_news":
         return this.dispatchLocal(call, async () => {

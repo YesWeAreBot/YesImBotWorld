@@ -17,6 +17,8 @@ import { describeCalendar } from "./calendar.js";
 import { WorldClock } from "./clock.js";
 import { BotComputer } from "./computer.js";
 import { Config, needsMsgIds, type ModalitySupport } from "./config.js";
+import { CrossingClient } from "./crossing/client.js";
+import { CrossingServer } from "./crossing/server.js";
 import { WorldFiles } from "./files.js";
 import { resolvePhoneResolution } from "./phone.js";
 import { Prompts, type PromptOverrides } from "./prompts.js";
@@ -92,6 +94,11 @@ export class WorldService extends Service<Config> {
   private promptStore!: Prompts;
   webuiDir!: string;
   private webui: WebUIServer | null = null;
+  /** 穿越：接待异世界访客的服务（crossing.serverEnabled） */
+  private crossingServer: CrossingServer | null = null;
+  /** 穿越：Bot 当前所在的异世界连接（null = 在自己的世界） */
+  private crossingClient: CrossingClient | null = null;
+  private crossingLocation: string | null = null;
 
   constructor(ctx: Context, config: Config) {
     super(ctx, "yesimbotWorld", true);
@@ -219,11 +226,44 @@ export class WorldService extends Service<Config> {
         this.logger.warn("WebUI 启动失败: %s", err);
       }
     }
+
+    if (this.config.crossing.serverEnabled) {
+      try {
+        this.crossingServer = new CrossingServer({
+          cfg: this.config.crossing,
+          logger: this.logger,
+          world: this.world,
+          clock: () => this.clock ?? null,
+          ready: () => this.worldActive && !!this.bot,
+          notifyHostBot: (content) => this.bot?.pushEvent("world", content),
+        });
+        await this.crossingServer.start();
+        this.logger.info(
+          "穿越服务已启动：%s:%d（邀请码 %d 个）",
+          this.config.crossing.host,
+          this.config.crossing.port,
+          this.config.crossing.invites.filter((i) => i.enabled && i.code).length,
+        );
+      } catch (err) {
+        this.crossingServer = null;
+        this.logger.warn("穿越服务启动失败: %s", err);
+      }
+    }
   }
 
   override async stop(): Promise<void> {
     await this.webui?.stop().catch(() => {});
     this.webui = null;
+    await this.crossingServer?.stop().catch(() => {});
+    this.crossingServer = null;
+    // 插件停止时若 Bot 在异世界：礼貌地离开（穿越状态不跨重启，重启后回到自己的世界）
+    if (this.crossingClient) {
+      const client = this.crossingClient;
+      this.crossingClient = null;
+      this.crossingLocation = null;
+      this.world?.setRemote(null);
+      await client.leave().catch(() => {});
+    }
     // 插件停止（进程退出/重载）≠ 用户暂停世界：世界时间在离线期间继续流逝
     await this.stopWorld({ suspend: true });
   }
@@ -420,9 +460,28 @@ export class WorldService extends Service<Config> {
       this.phoneStatus,
       this.logger,
       tools,
+      this.config.crossing.worlds.some((w) => w.name.trim() && w.url.trim())
+        ? {
+            location: () => this.crossingLocation,
+            voluntaryWorlds: () =>
+              this.config.crossing.worlds
+                .filter((w) => w.allowVoluntary && w.name.trim() && w.url.trim())
+                .map((w) => w.name.trim()),
+            travelTo: (name) => this.crossingTravelTo(name),
+            goHome: () => this.crossingGoHome(),
+          }
+        : null,
     );
 
     await this.clock.resume();
+
+    // 上次运行时 Bot 还在异世界（进程崩溃/重启）：告知它已被拉回自己的世界
+    if (await this.consumeCrossingMarker()) {
+      this.bot.pushEvent(
+        "system",
+        "（你恍惚记得自己此前身在另一个世界——离线期间与那个世界的连接已经断开，你回到了自己的世界。）",
+      );
+    }
 
     // 唤醒 Bot：区分创世第一刻 / 离线恢复（时间照常流逝了）/ 暂停恢复（时间静止）
     const offline = this.clock.consumeOfflineGap();
@@ -494,6 +553,14 @@ export class WorldService extends Service<Config> {
   async stopWorld(opts: { suspend?: boolean } = {}): Promise<string> {
     if (!this.worldActive) return "世界并未在运行。";
     this.worldActive = false;
+    // Bot 还在异世界：礼貌地离开。标记文件保留——下次启动时向 Bot 解释"你回到了自己的世界"
+    if (this.crossingClient) {
+      const client = this.crossingClient;
+      this.crossingClient = null;
+      this.crossingLocation = null;
+      this.world.setRemote(null);
+      void client.leave().catch(() => {});
+    }
     this.tingle?.stop();
     this.tingle = null;
     await this.bot?.stop();
@@ -520,6 +587,159 @@ export class WorldService extends Service<Config> {
     }
     this.logger.info("世界已暂停：%s", this.clock.timeLine());
     return `世界已暂停（时间静止于 ${this.clock.timeLine()}）。`;
+  }
+
+  // ---------- 穿越（联机） ----------
+
+  /** Bot 当前所在的异世界名（null = 在自己的世界） */
+  get crossingWhere(): string | null {
+    return this.crossingLocation;
+  }
+
+  /** 在场的异世界访客列表（穿越服务未启用时为空） */
+  crossingVisitors(): { name: string; arrivedAt: number }[] {
+    return this.crossingServer?.visitorList() ?? [];
+  }
+
+  /** 穿越到指定世界；返回给 Bot / 用户的叙述文本，失败抛错 */
+  async crossingTravelTo(name: string): Promise<string> {
+    if (!this.worldActive || !this.bot) throw new Error("世界未在运行");
+    const target = this.config.crossing.worlds.find((w) => w.name.trim() === name.trim());
+    if (!target || !target.url.trim()) throw new Error(`没有配置名为「${name}」的世界`);
+    if (!target.inviteCode.trim()) throw new Error(`世界「${name}」缺少邀请码`);
+    // 已在别的世界：先离开（允许直接跳跃）
+    if (this.crossingClient) {
+      const prev = this.crossingClient;
+      this.crossingClient = null;
+      this.crossingLocation = null;
+      this.world.setRemote(null);
+      void prev.leave().catch(() => {});
+    }
+    const profile = await this.crossingProfile();
+    const client = new CrossingClient(target, profile, {
+      onEvent: (content) => this.bot?.pushEvent("world", content),
+      onLost: (reason) => this.crossingLost(client, reason),
+      logger: this.logger,
+    });
+    const info = await client.arrive();
+    this.crossingClient = client;
+    this.crossingLocation = info.worldName || target.name.trim();
+    this.world.setRemote(client);
+    await this.writeCrossingMarker(this.crossingLocation);
+    this.logger.info("[穿越] Bot 前往异世界「%s」（%s）", this.crossingLocation, target.url);
+    return (
+      `一阵天旋地转——你穿越到了异世界「${this.crossingLocation}」` +
+      `${info.timeLine ? `（当地 ${info.timeLine}）` : ""}。` +
+      `在这里，你的行动由这个世界裁定；你自己的世界会静静等你回来。用 go_home 可随时返回。`
+    );
+  }
+
+  /** 返回自己的世界；返回给 Bot / 用户的叙述文本 */
+  async crossingGoHome(): Promise<string> {
+    const client = this.crossingClient;
+    const from = this.crossingLocation;
+    if (!client) return "（你就在自己的世界里。）";
+    this.crossingClient = null;
+    this.crossingLocation = null;
+    this.world.setRemote(null);
+    await this.clearCrossingMarker();
+    void client.leave().catch(() => {});
+    this.logger.info("[穿越] Bot 从「%s」返回自己的世界", from);
+    // 世界若沉睡（外出期间无访客）：补叙沉睡期间的演化，"归来所见"随后送达 Bot
+    const dormant = this.world.isDormant;
+    void this.world
+      .wakeDormant((content) => this.bot?.pushEvent("world", content))
+      .catch((err) => this.logger.warn("[穿越] 归来补叙失败: %s", err));
+    return (
+      `你离开了「${from}」，回到自己的世界。当前 ${this.clock.timeLine()}。` +
+      (dormant ? "离开的这段时间里，这个世界也在按自己的节奏运转着。" : "")
+    );
+  }
+
+  /** 与异世界的连接不可恢复地断开：把 Bot"弹回"自己的世界 */
+  private crossingLost(client: CrossingClient, reason: string): void {
+    if (this.crossingClient !== client) return; // 已经离开/换了世界
+    const from = this.crossingLocation;
+    this.crossingClient = null;
+    this.crossingLocation = null;
+    this.world.setRemote(null);
+    void this.clearCrossingMarker();
+    this.logger.warn("[穿越] 与异世界「%s」的连接丢失：%s", from, reason);
+    this.bot?.pushEvent(
+      "system",
+      `与异世界「${from}」的连接突然断开（${reason}）——一阵失重感袭来，你被弹回了自己的世界。当前 ${this.clock.timeLine()}。`,
+      { wake: true },
+    );
+    // 世界若沉睡（外出期间无访客）：补叙沉睡期间的演化
+    void this.world
+      .wakeDormant((content) => this.bot?.pushEvent("world", content))
+      .catch((err) => this.logger.warn("[穿越] 归来补叙失败: %s", err));
+  }
+
+  /** 强制穿越（指令 / WebUI）：由用户指定送往某个世界或送回家，Bot 会以"不可抗拒的力量"感知 */
+  async crossingForce(target: string): Promise<string> {
+    if (!this.worldActive || !this.bot) return "世界未在运行（先 world.start）。";
+    if (target === "home" || target === "回家") {
+      if (!this.crossingLocation) return "Bot 就在自己的世界里。";
+      const msg = await this.crossingGoHome();
+      this.bot.pushEvent("system", `（一股不属于所在世界的力量把你拽了回去。）${msg}`, { wake: true });
+      return "已把 Bot 送回自己的世界。";
+    }
+    try {
+      const msg = await this.crossingTravelTo(target);
+      // 强制穿越：Bot 需要知道这不是它自己的决定
+      this.bot.pushEvent("system", `（一股不可抗拒的力量将你卷起——）${msg}`, { wake: true });
+      return `已把 Bot 送往「${this.crossingLocation}」。`;
+    } catch (err) {
+      return `穿越失败：${(err as Error).message ?? err}`;
+    }
+  }
+
+  /** WebUI：穿越面板信息 */
+  crossingInfo(): {
+    location: string | null;
+    serverEnabled: boolean;
+    visitors: { name: string; arrivedAt: number }[];
+    worlds: { name: string; allowVoluntary: boolean; note: string }[];
+  } {
+    return {
+      location: this.crossingLocation,
+      serverEnabled: !!this.crossingServer,
+      visitors: this.crossingVisitors(),
+      worlds: this.config.crossing.worlds
+        .filter((w) => w.name.trim() && w.url.trim())
+        .map((w) => ({ name: w.name.trim(), allowVoluntary: w.allowVoluntary, note: w.note })),
+    };
+  }
+
+  /** 出行档案：名字 + 自我认知摘录（发给对方世界供裁定；不含任何配置或密钥） */
+  private async crossingProfile(): Promise<{ name: string; persona: string }> {
+    const name = this.config.crossing.botName.trim() || "异界来客";
+    const persona = (await this.files.readBotStatus().catch(() => "")).trim();
+    return { name, persona };
+  }
+
+  private get crossingMarkerFile(): string {
+    return path.join(this.files.base, "crossing.json");
+  }
+
+  private async writeCrossingMarker(world: string): Promise<void> {
+    await fs.writeFile(this.crossingMarkerFile, JSON.stringify({ world, at: Date.now() })).catch(() => {});
+  }
+
+  private async clearCrossingMarker(): Promise<void> {
+    await fs.rm(this.crossingMarkerFile, { force: true }).catch(() => {});
+  }
+
+  /** 读取并清除穿越标记（进程重启后向 Bot 解释"你已回到自己的世界"用） */
+  private async consumeCrossingMarker(): Promise<boolean> {
+    try {
+      await fs.access(this.crossingMarkerFile);
+    } catch {
+      return false;
+    }
+    await this.clearCrossingMarker();
+    return true;
   }
 
   async statusText(): Promise<string> {
@@ -549,10 +769,23 @@ export class WorldService extends Service<Config> {
       if (openApp) lines.push(`手机里打开的应用：「${openApp}」`);
       const computerOn = this.computerDevice?.currentName;
       if (computerOn) lines.push(`电脑已开机：「${computerOn}」`);
+      if (this.crossingLocation) {
+        lines.push(
+          `穿越：Bot 正在异世界「${this.crossingLocation}」作客` +
+            (this.world.isDormant ? "（自己的世界沉睡中，Tingle 已暂停）" : ""),
+        );
+      }
       if (this.phoneStatus.down) lines.push("手机被 Bot 放在一边（通知已降级为震动）");
       if (this.config.messaging.botManagedNotifyChannels) {
         lines.push(`通知频道（Bot 自管）：${this.notifyMgr.statusText()}`);
       }
+    }
+    if (this.crossingServer) {
+      const visitors = this.crossingServer.visitorList();
+      lines.push(
+        `穿越服务：接待中（${this.config.crossing.host}:${this.config.crossing.port}）` +
+          (visitors.length ? `，在场访客：${visitors.map((v) => `「${v.name}」`).join("、")}` : "，暂无访客"),
+      );
     }
     const focused = this.focus.activeKeys();
     if (focused.length) {
@@ -576,6 +809,10 @@ export class WorldService extends Service<Config> {
       waitConfirm: this.config.bot.waitRateThreshold > 0,
       disableWait: this.config.bot.disableWait,
       ignoreSendDuration: this.config.bot.ignoreSendDuration,
+      crossingWorlds: this.config.crossing.worlds
+        .filter((w) => w.allowVoluntary && w.name.trim() && w.url.trim())
+        .map((w) => ({ name: w.name.trim(), note: w.note })),
+      crossingConfigured: this.config.crossing.worlds.some((w) => w.name.trim() && w.url.trim()),
     });
   }
 
@@ -903,6 +1140,20 @@ export class WorldService extends Service<Config> {
         if (!text?.trim()) return "内容不能为空。";
         this.bot.pushEvent("system", text.trim(), { wake: true });
         return "已注入。";
+      });
+
+    cmd
+      .subcommand(".travel <name:text>", "穿越：把 Bot 强制送往指定的异世界（填 home 送回自己的世界）", { authority: 3 })
+      .action(async (_, name) => {
+        const target = (name ?? "").trim();
+        if (!target) {
+          const worlds = this.config.crossing.worlds.filter((w) => w.name.trim() && w.url.trim());
+          return worlds.length
+            ? `用法：world.travel <世界名|home>。已配置的世界：${worlds.map((w) => `「${w.name.trim()}」${w.allowVoluntary ? "" : "（仅强制）"}`).join("、")}` +
+                (this.crossingLocation ? `\nBot 当前在「${this.crossingLocation}」。` : "")
+            : "还没有配置任何可去的世界（crossing.worlds）。";
+        }
+        return this.crossingForce(target);
       });
 
     cmd

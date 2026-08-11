@@ -65,6 +65,14 @@ export interface WorldPromptSet {
   phoneShellSystem: string;
   /** 浏览器带壳截图外壳生成：user 消息。{{botDef}} {{worldDef}} {{width}} {{height}} */
   phoneShellUser: string;
+  /** 穿越：访客任务的前言（说明任务主角是异世界访客）。{{name}} {{persona}} */
+  visitorPreamble: string;
+  /** 穿越：访客到达。{{name}} {{persona}} {{timeLine}} */
+  visitorArrive: string;
+  /** 穿越：访客离开。{{name}} {{timeLine}} */
+  visitorLeave: string;
+  /** 穿越：世界沉睡后苏醒的补叙（无人在场期间的演化）。{{fromTimeLine}} {{toTimeLine}} {{gapTU}} */
+  dormantCatchup: string;
 }
 
 export interface PromptOverrides {
@@ -345,6 +353,35 @@ export const WORLD_PROMPT_DEFAULTS: WorldPromptSet = {
     `6. 风格必须契合世界观与角色（例如现代安卓/iOS 风、魔导水晶屏、蒸汽朋克黄铜仪表盘、星舰终端等），` +
     `配色与质感自洽；状态栏与工具栏保持可读性。\n` +
     `除 HTML 外不要输出任何解释。`,
+
+  visitorPreamble:
+    `注意：本次任务的主角**不是**这个世界的常驻 Bot，而是一位从异世界穿越来作客的访客「{{name}}」。\n` +
+    `<visitor_persona>（访客的自我描述）\n{{persona}}\n</visitor_persona>\n` +
+    `请以这位访客的视角处理任务：send_event 的内容会直接送达访客本人；` +
+    `事件走向必须符合**本世界**的世界观与当前状态（先 check world_status）。` +
+    `必要时可 update world_status 记录访客的行踪与影响，但**不要**改动 bot_status 与 facts（那些属于常驻 Bot）。`,
+
+  visitorArrive:
+    `一位异世界的访客「{{name}}」刚刚穿越降临到这个世界（{{timeLine}}）。\n` +
+    `<visitor_persona>（访客的自我描述）\n{{persona}}\n</visitor_persona>\n` +
+    `请：\n` +
+    `1. check world_status 了解世界当前状态；\n` +
+    `2. 依据世界观决定访客出现的地点与场景，用 send_event 告诉访客——描述它身在何处、看到什么、` +
+    `这个世界给它的第一印象（第三人称客观叙述，内容会直接送达访客）；\n` +
+    `3. update world_status 记录这位访客在场（在哪、什么状态），保证后续裁定一致。`,
+
+  visitorLeave:
+    `异世界访客「{{name}}」离开了这个世界，返回它自己的世界（{{timeLine}}）。\n` +
+    `请 update world_status：移除或标记这位访客已离开；若它在世界里留下了影响（做过的事、别人对它的印象），酌情保留记录。`,
+
+  dormantCatchup:
+    `这个世界从 {{fromTimeLine}} 到 {{toTimeLine}} 之间处于无人在场的状态` +
+    `（常驻 Bot 去了异世界、也没有访客，约 {{gapTU}} 个 TU 的演化没有被记录）。现在又有人出现了。\n` +
+    `请补上这段时间世界的演化：\n` +
+    `1. check world_status（必要时看 news）了解沉睡前的状态；\n` +
+    `2. 按世界自身的节奏推演这段时间发生的事——不必事无巨细，几件符合世界惯性的合理进展即可；\n` +
+    `3. update world_status 使状态与当前时刻相符；有影响世界走向的大事可 update news 记录；\n` +
+    `4. 若事件通道可用（send_event 未被禁用），可以把"归来后一眼能看到的变化"简要叙述给刚回来的 Bot；通道不可用就只更新状态。`,
 };
 
 export const DEFAULT_PROMPTS: PromptOverrides = {
