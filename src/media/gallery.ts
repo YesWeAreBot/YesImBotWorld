@@ -25,6 +25,8 @@ export interface WorldGalleryRow {
 
 /** 四大分类：Bot 保存/整理图片时必须选择其一 */
 export const MAIN_CATEGORIES = ["表情包", "meme", "截图", "照片"] as const;
+/** 表情包分类：此分类下的图片发送时应作为平台表情（而非普通图片）呈现 */
+export const STICKER_CATEGORY: string = MAIN_CATEGORIES[0];
 /** 暂未描述/分类：用户手动丢进收藏夹的东西先待在这里，等 Bot 有空整理 */
 export const UNSORTED_CATEGORY = "未整理";
 export const ALL_CATEGORIES: readonly string[] = [...MAIN_CATEGORIES, UNSORTED_CATEGORY];

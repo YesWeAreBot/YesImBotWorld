@@ -5,6 +5,7 @@ import type { MessengerApi } from "../bot/agent.js";
 import type { CaptionService } from "../media/captioner.js";
 import {
   MAIN_CATEGORIES,
+  STICKER_CATEGORY,
   UNSORTED_CATEGORY,
   ALL_CATEGORIES,
   normalizeCategory,
@@ -26,6 +27,12 @@ import type { RequestStore } from "./requests.js";
 
 /** msg 中的内联媒体标记：Bot 会照抄事件里见到的 [图片#12]、[视频#3：描述] 等形式 */
 const INLINE_MEDIA = /\[(图片|视频|音频|语音)#(\d+)[^\]]*\]/g;
+
+/**
+ * 「表情包」分类图片的表情标记：OneBot image 段的 sub_type=1 表示表情（QQ 按表情包渲染，
+ * 对方无法"保存为图片"），summary 为聊天列表/引用中的预览文案，与 QQ 客户端发表情的行为一致。
+ */
+const STICKER_ATTRS = { sub_type: 1, summary: "[动画表情]" } as const;
 
 const IMAGE_EXT = new Set([".jpg", ".jpeg", ".png", ".gif", ".webp"]);
 const AUDIO_EXT = new Set([".mp3", ".wav", ".ogg", ".flac", ".aac", ".amr", ".m4a"]);
@@ -504,7 +511,7 @@ export class KoishiMessenger implements MessengerApi {
       // 标记被替换成媒体后，紧邻它的空格会孤立地留在相邻文本段的首尾——一并吃掉（换行保留，可能是有意排版）
       await pushText(before.replace(/[ \t]+$/, ""));
       while (cursor < msg.length && (msg[cursor] === " " || msg[cursor] === "\t")) cursor++;
-      elements.push(await this.mediaElement(resolved.ref));
+      elements.push(await this.mediaElement(resolved.ref, resolved.sticker));
       sentRefs.push(resolved.ref);
       inlineIds.add(resolved.ref.id);
       stored += mediaPlaceholder(resolved.ref.id, resolved.ref.type);
@@ -519,7 +526,7 @@ export class KoishiMessenger implements MessengerApi {
         continue;
       }
       if (inlineIds.has(resolved.ref.id)) continue;
-      elements.push(await this.mediaElement(resolved.ref));
+      elements.push(await this.mediaElement(resolved.ref, resolved.sticker));
       sentRefs.push(resolved.ref);
       stored += mediaPlaceholder(resolved.ref.id, resolved.ref.type);
     }
@@ -553,11 +560,18 @@ export class KoishiMessenger implements MessengerApi {
     return result;
   }
 
-  /** 媒体引用 → 消息元素（图片 / 视频） */
-  private async mediaElement(ref: MediaRef): Promise<h> {
+  /**
+   * 媒体引用 → 消息元素（图片 / 视频）。
+   * sticker = true 的图片标记为平台表情：OneBot 适配器会把元素上的额外属性原样并入
+   * image 段的 data，NapCat 端据此以 sub_type=1（表情）发送——QQ 会按表情包尺寸渲染，
+   * 且别人无法将其"保存为图片"，与真人发的表情包行为一致（发普通大图反而容易暴露是 Bot）。
+   * 其他平台的适配器会忽略这两个未知属性，不受影响。
+   */
+  private async mediaElement(ref: MediaRef, sticker = false): Promise<h> {
     const data = await this.media.readFile(ref);
     const src = toDataUrl(data, ref.mime);
-    return ref.type === "video" ? h("video", { src }) : h("img", { src });
+    if (ref.type === "video") return h("video", { src });
+    return sticker ? h("img", { src, ...STICKER_ATTRS }) : h("img", { src });
   }
 
   /** 以文件形式发送音频/视频/任意文件 */
@@ -576,7 +590,9 @@ export class KoishiMessenger implements MessengerApi {
       const ext = path.extname(entry.name).toLowerCase();
       const mime = MIME_BY_EXT[ext] ?? "application/octet-stream";
       const type = typeByExt(entry.name);
-      element = this.fileElement(type, data, mime, entry.name);
+      element = this.fileElement(type, data, mime, entry.name, {
+        sticker: type === "image" && entry.category === STICKER_CATEGORY,
+      });
       if (type === "audio" || type === "video" || type === "image") {
         const mediaId = await this.media.ingest(toDataUrl(data, mime), type);
         stored = mediaId !== null ? mediaPlaceholder(mediaId, type) : `[文件 ${entry.name}]`;
@@ -588,7 +604,9 @@ export class KoishiMessenger implements MessengerApi {
       if ("error" in resolved) return resolved.error;
       const data = await this.media.readFile(resolved.ref);
       const name = path.basename(resolved.ref.file);
-      element = this.fileElement(resolved.ref.type, data, resolved.ref.mime, name);
+      element = this.fileElement(resolved.ref.type, data, resolved.ref.mime, name, {
+        sticker: resolved.sticker,
+      });
       stored = mediaPlaceholder(resolved.ref.id, resolved.ref.type);
     }
 
@@ -1788,11 +1806,15 @@ export class KoishiMessenger implements MessengerApi {
     return { platform, channelId };
   }
 
-  /** 解析媒体引用："12" / "media:12" / "图片#12" / "gallery:分类/name.png"，可限定允许的媒体类型 */
+  /**
+   * 解析媒体引用："12" / "media:12" / "图片#12" / "gallery:分类/name.png"，可限定允许的媒体类型。
+   * sticker：图片是否属于收藏夹「表情包」分类（发送时应作为平台表情而非普通图片呈现）——
+   * 收藏夹引用直接看分类；裸媒体编号按 sha256 反查收藏记录（同一张图无论怎么引用都一致）。
+   */
   private async resolveMediaRef(
     refText: string,
     allowTypes?: MediaType[],
-  ): Promise<{ ref: MediaRef } | { error: string }> {
+  ): Promise<{ ref: MediaRef; sticker: boolean } | { error: string }> {
     const galleryName = parseGalleryRef(refText);
     if (galleryName !== null) {
       const entry = await this.galleryStore.resolve(galleryName);
@@ -1806,7 +1828,7 @@ export class KoishiMessenger implements MessengerApi {
       if (id === null) return { error: `（读取 "${entry.name}" 失败，可先用 check_gallery 确认它存在。）` };
       const row = await this.media.get(id);
       if (!row) return { error: `（读取 "${entry.name}" 失败。）` };
-      return { ref: row.ref };
+      return { ref: row.ref, sticker: type === "image" && entry.category === STICKER_CATEGORY };
     }
     const match = refText.match(/(\d+)\s*$/);
     if (!match) return { error: `（无法理解的媒体引用："${refText}"）` };
@@ -1817,15 +1839,27 @@ export class KoishiMessenger implements MessengerApi {
         error: `（#${row.id} 是${LABEL[row.ref.type]}，不能放进普通消息；请用 send_file${row.ref.type === "audio" ? " 或 send_voice" : ""} 发送。）`,
       };
     }
-    return { ref: row.ref };
+    let sticker = false;
+    if (row.ref.type === "image") {
+      const meta = await this.galleryStore.findBySha(row.sha256).catch(() => null);
+      sticker = meta?.category === STICKER_CATEGORY;
+    }
+    return { ref: row.ref, sticker };
   }
 
-  private fileElement(type: MediaType | "file", data: Buffer, mime: string, name: string): h {
+  private fileElement(
+    type: MediaType | "file",
+    data: Buffer,
+    mime: string,
+    name: string,
+    opts: { sticker?: boolean } = {},
+  ): h {
     const src = toDataUrl(data, mime);
     // 图片/音频/视频用对应元素（audio 在 QQ 等平台即语音）；其他一律 file
     if (type === "video") return h("video", { src, title: name });
     if (type === "audio") return h("audio", { src, title: name });
-    if (type === "image") return h("img", { src, title: name });
+    // 「表情包」分类的图片作为平台表情发送（见 mediaElement 的说明）
+    if (type === "image") return h("img", { src, title: name, ...(opts.sticker ? STICKER_ATTRS : {}) });
     return h("file", { src, title: name });
   }
 
