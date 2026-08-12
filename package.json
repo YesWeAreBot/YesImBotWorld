@@ -18,9 +18,18 @@
     "dist"
   ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/YesWeAreBot/YesImBotWorld.git"
+  },
+  "homepage": "https://github.com/YesWeAreBot/YesImBotWorld",
+  "bugs": {
+    "url": "https://github.com/YesWeAreBot/YesImBotWorld/issues"
+  },
   "scripts": {
     "build": "pkgroll --sourcemap",
-    "check": "tsc --noEmit"
+    "check": "tsc --noEmit",
+    "prepublishOnly": "npm run check && npm run build"
   },
   "dependencies": {
     "rfb2": "0.2.2",
