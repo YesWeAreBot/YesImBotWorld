@@ -275,6 +275,7 @@ export interface CrossingConfig {
   worldName: string;
   botName: string;
   maxVisitors: number;
+  visitorPersonaMode: "pinned" | "check";
   invites: CrossingInviteConfig[];
   worlds: CrossingWorldConfig[];
 }
@@ -940,7 +941,10 @@ export const Config: Schema<Config> = Schema.intersect([
         .min(1)
         .max(65535)
         .default(18112)
-        .description("穿越服务监听端口。对方在世界列表里填 http://你的地址:该端口"),
+        .description(
+          "穿越服务监听端口。对方在世界列表里填 http://你的地址:该端口（支持反向代理到任意路径前缀，" +
+            "如 https://你的域名/world）。用浏览器直接打开该地址会看到引导页，可用于检验双方网络是否联通",
+        ),
       worldName: Schema.string()
         .default("")
         .description("你的世界对外的名字（访客到达时看到）。留空则显示「未命名世界」"),
@@ -950,6 +954,16 @@ export const Config: Schema<Config> = Schema.intersect([
       maxVisitors: Schema.natural()
         .default(3)
         .description("同时接待的异世界访客上限"),
+      visitorPersonaMode: Schema.union([
+        Schema.const("pinned").description("常驻系统提示（默认）——档案全程可见、无额外往返，档案不变期间前缀缓存完整复用；代价是所有 World 调用都携带档案（占上下文窗口）"),
+        Schema.const("check").description("按需查看——系统提示只放访客名单，World-LLM 用 check_visitor 工具查档案；省上下文窗口，但每次查看都要额外一轮往返且档案无法命中前缀缓存"),
+      ])
+        .default("pinned")
+        .description(
+          "接待访客时，访客状态档案在 World-LLM 提示词中的放置方式。" +
+            "档案更新不频繁（默认提示词语义）且上下文窗口充裕时选 pinned（缓存命中率最优）；" +
+            "上下文窗口紧张（≤32k）或档案更新极频繁时选 check",
+        ),
       invites: Schema.array(
         Schema.object({
           code: Schema.string().role("secret").description("邀请码（建议用长随机串，分享给对方）"),

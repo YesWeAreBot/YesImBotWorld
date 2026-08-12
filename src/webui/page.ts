@@ -386,7 +386,7 @@ var activeView = 'overview';
 // SSE 断线续传锚点：跨页面加载持久化，避免每次无缓存刷新都从 0 重放整段调试历史
 var lastEventId = Number(localStorage.getItem('wui_last_id') || 0);
 var evtSource = null;
-var cfgCache = null, schemaCache = null, cfgGroup = '', cfgSearch = '', cfgDirty = false;
+var cfgCache = null, schemaCache = null, cfgGroup = '', cfgSearch = '', cfgDirty = false, cfgPortOriginal = null;
 var overridesCache = null, promptsDefaults = null;
 var galleryCache = [], currentCategory = '未整理';
 var debugEntries = [], debugSubview = 'llm', debugOrder = 'desc', debugAutoScroll = true, debugKindFilter = 'all';
@@ -1372,6 +1372,7 @@ function loadConfig(){
   api('GET', '/api/config').then(function(r){
     schemaCache = r.schema;
     cfgCache = r.value;
+    cfgPortOriginal = r.value && r.value.webui ? Number(r.value.webui.port) : null;
     cfgDirty = false;
     if(!cfgGroup) cfgGroup = cfgGroupKey((schemaCache.children || [])[0] || {});
     holder.textContent = '';
@@ -1753,17 +1754,26 @@ function fetchModelsFor(path, btn){
     });
 }
 function saveConfig(){
-  var newPort = cfgCache.webui ? cfgCache.webui.port : undefined;
+  var newPort = cfgCache.webui ? Number(cfgCache.webui.port) : null;
   api('POST', '/api/config', {config: cfgCache}).then(function(r){
     if(r.error) throw new Error(r.error);
     cfgDirty = false;
     toast('配置已保存并应用，插件作用域正在重启…', 'ok');
-    if(newPort && Number(newPort) !== (Number(location.port) || 80)){
-      toast('端口已变更为 ' + newPort + '，即将跳转…', 'warn');
+    // 端口变更判定：与「保存前的配置端口」比较，而不是与浏览器地址栏比较——
+    // 经反向代理/域名访问时 location.port 与内部端口无关，误判会把用户跳去打不开的地址
+    var portChanged = newPort && cfgPortOriginal && newPort !== cfgPortOriginal;
+    if(portChanged && Number(location.port) === cfgPortOriginal){
+      // 直连访问（地址栏端口 = 旧配置端口）：跳转到新端口
+      toast('WebUI 端口已变更为 ' + newPort + '，即将跳转…', 'warn');
       setTimeout(function(){ location.href = location.protocol + '//' + location.hostname + ':' + newPort + '/'; }, 1200);
+    } else if(portChanged){
+      // 经代理/域名访问：不动地址，提醒用户自己更新反代目标
+      toast('WebUI 端口已变更为 ' + newPort + '。你正通过代理/域名访问，请同步更新反向代理的目标端口。', 'warn');
+      setTimeout(function(){ refreshOverview(false); }, 1500);
     } else {
       setTimeout(function(){ refreshOverview(false); }, 1500);
     }
+    if(newPort) cfgPortOriginal = newPort;
   }).catch(function(err){ toast('保存失败：' + (err.message || err), 'err'); });
 }
 
@@ -1827,7 +1837,7 @@ function descOf(key, prefix){
       lifestyleNoWait: '心态段收尾（wait 被移除时）'
     },
     world: {
-      system: 'World-LLM 系统提示。{{worldDef}} 世界定义、{{timeLine}} 当前时刻',
+      system: 'World-LLM 系统提示。{{worldDef}} 世界定义、{{timeLine}} 当前时刻（默认模板不含时间——把易变内容挡在系统提示外，前缀缓存才能跨调用复用；时间由各任务文本自带）',
       adjudicateAct: '裁定 Bot 的 act 动作。{{desc}} {{issuedAt}} {{duration}} {{expectedAt}}',
       resolveWait: 'wait 补叙。{{issuedAt}} {{n}} {{expectedAt}}',
       resolveCheckTime: 'Bot 主动查看时间。{{timeLine}}',
@@ -1845,8 +1855,8 @@ function descOf(key, prefix){
       phoneSpecUser: '手机屏幕规格判定 · user。{{botDef}} {{worldDef}}',
       phoneShellSystem: '浏览器带壳截图外壳生成 · system（创世调用）',
       phoneShellUser: '带壳截图外壳生成 · user。{{botDef}} {{worldDef}} {{width}} {{height}}；生成的 HTML 里保留 {{screen}} {{url}} {{time}} 占位符',
-      visitorPreamble: '穿越 · 访客任务前言（act/wait/查时间/查询的开头段）。{{name}} {{persona}}',
-      visitorArrive: '穿越 · 访客到达叙事。{{name}} {{persona}} {{timeLine}}',
+      visitorPreamble: '穿越 · 访客任务前言（act/wait/查时间/查询的开头段）。{{name}} {{persona}} {{personaWhere}}（档案位置提示，随 visitorPersonaMode 变化）',
+      visitorArrive: '穿越 · 访客到达叙事。{{name}} {{persona}} {{personaWhere}} {{timeLine}}',
       visitorLeave: '穿越 · 访客离开善后。{{name}} {{timeLine}}',
       dormantCatchup: '穿越 · 世界沉睡后苏醒的补叙（Bot 外出且无访客期间暂停演化，有人出现时补上）。{{fromTimeLine}} {{toTimeLine}} {{gapTU}}'
     }
@@ -2084,7 +2094,11 @@ function renderCrossing(c){
     ]));
     hostBody.appendChild(el('div', {cls:'kv'}, [
       el('span', {cls:'k', text:'对方需要填写的地址'}),
-      el('span', {cls:'v', text:'http://<你的公网或局域网地址>:' + c.server.port})
+      el('span', {cls:'v', text:'http://<你的公网或局域网地址>:' + c.server.port + '（或反代后的 https 地址，支持路径前缀）'})
+    ]));
+    hostBody.appendChild(el('div', {cls:'kv'}, [
+      el('span', {cls:'k', text:'联通检验'}),
+      el('span', {cls:'v', text:'让对方用浏览器打开上面的地址——能看到引导页即为联通'})
     ]));
     // 在场访客
     hostBody.appendChild(el('div', {cls:'crumb', text:'在场访客', style:'margin-top:12px'}));

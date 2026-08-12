@@ -39,6 +39,8 @@ interface VisitorSession extends VisitorInfo {
   pendingTasks: number;
   absenceTimer: NodeJS.Timeout | null;
   arrivedAt: number;
+  /** World-LLM 写回的访客状态（同步会话内的 persona，并经 SSE 回传访客世界） */
+  updateStatus: (content: string) => void;
 }
 
 export interface CrossingServerHost {
@@ -63,11 +65,17 @@ export class CrossingServer {
     return this.host.cfg.worldName.trim() || "未命名世界";
   }
 
-  /** 当前在场访客（World-LLM Tingle 感知 + send_event 定向投递用） */
-  visitors(): { name: string; deliver: (content: string) => void }[] {
+  /**
+   * 当前在场访客的完整通道（按到达顺序，逐字稳定）：
+   * 状态档案进 World-LLM 系统提示的 <visitors> 区、send_event to= 定向投递、
+   * update_visitor_status 状态写回。
+   */
+  visitors(): { name: string; persona: string; deliver: (content: string) => void; updateStatus: (content: string) => void }[] {
     return [...this.sessions.values()].map((s) => ({
       name: s.name,
+      persona: s.persona,
       deliver: (content: string) => this.push(s, { type: "event", content }),
+      updateStatus: s.updateStatus,
     }));
   }
 
@@ -127,17 +135,39 @@ export class CrossingServer {
 
   // ---------- HTTP ----------
 
+  /**
+   * 提取 API 端点名：按**路径后缀**匹配，容忍反向代理加的任意前缀
+   * （如 nginx `location /world/ { proxy_pass http://…:18112; }` 未加尾斜杠时，
+   * 上游收到的是 /world/crossing/arrive）。
+   */
+  private endpointOf(pathname: string): string | null {
+    const m = pathname.match(/(?:^|\/)crossing\/(arrive|events|task|leave|ping)\/?$/);
+    return m ? m[1]! : null;
+  }
+
   private async handle(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     const url = new URL(req.url ?? "/", "http://localhost");
-    const pathname = url.pathname;
     const method = (req.method ?? "GET").toUpperCase();
+    const ep = this.endpointOf(url.pathname);
 
-    if (pathname === "/crossing/arrive" && method === "POST") return this.handleArrive(req, res);
-    if (pathname === "/crossing/events" && method === "GET") return this.handleEvents(url, req, res);
-    if (pathname === "/crossing/task" && method === "POST") return this.handleTask(req, res);
-    if (pathname === "/crossing/leave" && method === "POST") return this.handleLeave(req, res);
-    if (pathname === "/crossing/ping" && method === "GET") {
-      return void sendJSON(res, 200, { ok: true, worldName: this.worldName });
+    if (ep === "arrive" && method === "POST") return this.handleArrive(req, res);
+    if (ep === "events" && method === "GET") return this.handleEvents(url, req, res);
+    if (ep === "task" && method === "POST") return this.handleTask(req, res);
+    if (ep === "leave" && method === "POST") return this.handleLeave(req, res);
+    if (ep === "ping" && method === "GET") {
+      return void sendJSON(res, 200, {
+        ok: true,
+        service: "yesimbot-world-crossing",
+        worldName: this.worldName,
+        accepting: this.host.ready(),
+      });
+    }
+    // 其余 GET 请求（浏览器直接访问任意路径）：引导页——检验网络联通 + 指引对方配置
+    if (method === "GET" || method === "HEAD") {
+      const html = this.guidePage();
+      res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+      res.end(method === "HEAD" ? undefined : html);
+      return;
     }
     sendJSON(res, 404, { error: "Not Found" });
   }
@@ -152,8 +182,14 @@ export class CrossingServer {
       return void sendJSON(res, 429, { error: "这个世界的访客已满，稍后再来" });
     }
     const name = String(body.name ?? "").trim().slice(0, CROSSING_LIMITS.maxNameChars) || "异界来客";
-    if ([...this.sessions.values()].some((s) => s.name === name)) {
-      return void sendJSON(res, 409, { error: `已有同名访客「${name}」在场` });
+    const dupe = [...this.sessions.values()].find((s) => s.name === name);
+    if (dupe) {
+      // 旧会话仍有活跃 SSE 连接：真正的同名冲突，拒绝
+      if (dupe.res) return void sendJSON(res, 409, { error: `已有同名访客「${name}」在场` });
+      // 旧会话已断线（多半是访客进程重启后重连）：静默顶替，不做离场叙事
+      this.sessions.delete(dupe.token);
+      this.closeSession(dupe);
+      this.host.logger.info("[穿越] 访客「%s」重连，顶替断线的旧会话", name);
     }
     const persona = String(body.persona ?? "").slice(0, CROSSING_LIMITS.maxPersonaChars);
     const session: VisitorSession = {
@@ -166,6 +202,11 @@ export class CrossingServer {
       pendingTasks: 0,
       absenceTimer: null,
       arrivedAt: Date.now(),
+      updateStatus: (content: string) => {
+        // 同步会话内 persona（后续任务的前言用最新状态）并回传访客世界持久化
+        session.persona = content.slice(0, CROSSING_LIMITS.maxPersonaChars);
+        this.push(session, { type: "status_update", content });
+      },
     };
     this.sessions.set(session.token, session);
     this.armAbsence(session);
@@ -322,6 +363,93 @@ export class CrossingServer {
     }
     session.res = null;
   }
+
+  /**
+   * 浏览器引导页：能看到这个页面 = 网络已联通。
+   * 指引访客的主人如何把这个世界加进自己的 crossing.worlds；
+   * 页面内不含任何敏感信息（API 仍需邀请码）。
+   */
+  private guidePage(): string {
+    const name = escapeHtml(this.worldName);
+    const accepting = this.host.ready();
+    const visitors = this.sessions.size;
+    const max = Math.max(1, this.host.cfg.maxVisitors);
+    const statusText = accepting
+      ? `开放中 · 访客 ${visitors}/${max}`
+      : "世界当前未在运行（暂不接待，联通性不受影响）";
+    const statusColor = accepting ? "#4ade80" : "#fbbf24";
+    return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>${name} · 穿越服务</title>
+<style>
+:root{color-scheme:dark}
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px;
+  font:14px/1.7 -apple-system,"PingFang SC","Microsoft YaHei","Segoe UI",sans-serif;color:#e4eaf4;
+  background:radial-gradient(900px 480px at 85% -8%, rgba(138,123,255,.14), transparent 62%),
+             radial-gradient(700px 420px at -8% 110%, rgba(110,231,255,.09), transparent 58%), #07090f}
+.card{width:640px;max-width:100%;background:rgba(148,163,184,.06);border:1px solid rgba(148,163,184,.16);
+  border-radius:18px;padding:28px 30px;box-shadow:0 24px 70px rgba(0,0,0,.45)}
+h1{font-size:20px;margin:0 0 4px;letter-spacing:.3px}
+.sub{color:#93a0b4;font-size:12.5px;margin:0 0 18px}
+.ok{display:inline-flex;align-items:center;gap:8px;font-size:13px;padding:6px 14px;border-radius:999px;
+  background:rgba(74,222,128,.1);border:1px solid rgba(74,222,128,.4);color:#4ade80;margin-bottom:14px}
+.ok:before{content:"";width:8px;height:8px;border-radius:50%;background:#4ade80;box-shadow:0 0 8px rgba(74,222,128,.7)}
+.kv{display:flex;justify-content:space-between;gap:12px;padding:8px 0;border-bottom:1px dashed rgba(148,163,184,.14);font-size:13px}
+.kv:last-of-type{border-bottom:none}
+.kv .k{color:#93a0b4}
+h2{font-size:14px;margin:22px 0 8px;color:#6ee7ff;letter-spacing:.5px}
+ol{margin:0;padding-left:20px;color:#c5cfdd;font-size:13px}
+ol li{margin-bottom:6px}
+code{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;background:rgba(148,163,184,.12);padding:1px 7px;border-radius:6px;word-break:break-all}
+.urlbox{display:flex;gap:8px;align-items:center;margin:8px 0 2px}
+.urlbox code{flex:1;padding:8px 12px;font-size:12.5px}
+button{font:inherit;color:#e4eaf4;background:rgba(110,231,255,.14);border:1px solid rgba(110,231,255,.4);
+  border-radius:9px;padding:6px 16px;cursor:pointer;font-size:12.5px}
+button:hover{background:rgba(110,231,255,.22)}
+.dim{color:#5b6678;font-size:11.5px;margin-top:18px}
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>「${name}」</h1>
+  <p class="sub">YesImBot World · 穿越服务（联机）</p>
+  <div class="ok">网络联通正常——你能看到这个页面，说明穿越服务可以从你的位置访问</div>
+  <div class="kv"><span class="k">接待状态</span><span style="color:${statusColor}">${escapeHtml(statusText)}</span></div>
+  <div class="kv"><span class="k">用途</span><span>持有邀请码的用户，其 Bot 可穿越到这个世界作客</span></div>
+  <h2>如何让你的 Bot 来这个世界</h2>
+  <ol>
+    <li>向这个世界的主人索取<b>邀请码</b>；</li>
+    <li>在你自己的 YesImBot World 插件<b>配置页面</b>里，找到 <code>crossing</code>（穿越 · 联机）配置组下的
+      <code>worlds</code> 列表，添加一项：<code>name</code> 世界名随意（如「${name}」）、
+      <code>url</code> 填下方地址、<code>inviteCode</code> 填对方给你的邀请码；</li>
+    <li>保存配置后，在 WebUI「穿越」页把 Bot 送过来，或让它自己用 <code>travel</code> 工具前来。</li>
+  </ol>
+  <h2>要填写的服务地址</h2>
+  <div class="urlbox"><code id="u">（正在读取…）</code><button onclick="copyUrl()">复制</button></div>
+  <p class="dim">本页不包含任何敏感信息；所有穿越 API 均需邀请码。程序化联通检查：<code id="ping">…/crossing/ping</code></p>
+</div>
+<script>
+var base = location.origin + location.pathname.replace(/\\/+$/, '').replace(/\\/crossing\\/(arrive|events|task|leave|ping)$/, '');
+document.getElementById('u').textContent = base || location.origin;
+document.getElementById('ping').textContent = (base || location.origin) + '/crossing/ping';
+function copyUrl(){
+  var t = document.getElementById('u').textContent;
+  if(navigator.clipboard && navigator.clipboard.writeText){ navigator.clipboard.writeText(t); }
+  else { var ta = document.createElement('textarea'); ta.value = t; document.body.appendChild(ta); ta.select(); document.execCommand('copy'); ta.remove(); }
+}
+</script>
+</body>
+</html>`;
+  }
+}
+
+function escapeHtml(s: string): string {
+  return s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!);
 }
 
 // ---------- 辅助 ----------

@@ -33,6 +33,8 @@ interface PendingTask {
 export interface CrossingClientHooks {
   /** 主世界推来的事件（进 Bot 意识流） */
   onEvent: (content: string) => void;
+  /** 主世界的 World-LLM 更新了 Bot 的状态文件（写回本地 Bot_Status.md） */
+  onStatusUpdate?: (content: string) => void;
   /** 连接不可恢复地丢失（重试耗尽 / 被送别）——上层应把 Bot 弹回自己的世界 */
   onLost: (reason: string) => void;
   logger: Logger;
@@ -58,7 +60,11 @@ export class CrossingClient implements RemoteWorldLink {
   }
 
   private base(): string {
-    return this.target.url.trim().replace(/\/+$/, "");
+    // 容忍用户把引导页/ping 地址整段粘进来：剥掉尾斜杠与 /crossing/... 后缀
+    return this.target.url
+      .trim()
+      .replace(/\/+$/, "")
+      .replace(/\/crossing(?:\/(?:arrive|events|task|leave|ping))?$/, "");
   }
 
   // ---------- 生命周期 ----------
@@ -174,6 +180,8 @@ export class CrossingClient implements RemoteWorldLink {
           }
           if (msg.type === "event") {
             if (msg.content?.trim()) this.hooks.onEvent(msg.content);
+          } else if (msg.type === "status_update") {
+            if (msg.content?.trim()) this.hooks.onStatusUpdate?.(msg.content);
           } else if (msg.type === "task_result") {
             const p = this.pending.get(msg.taskId);
             if (p) {

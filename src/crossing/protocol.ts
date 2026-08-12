@@ -30,6 +30,8 @@ export type CrossingSseMsg =
   | { type: "hello"; worldName: string; timeLine: string }
   | { type: "event"; content: string }
   | { type: "task_result"; taskId: string; ok: boolean; content: string }
+  /** 主世界的 World-LLM 更新了访客的状态文件（写回访客世界的 Bot_Status.md） */
+  | { type: "status_update"; content: string }
   | { type: "farewell"; reason: string };
 
 /** 访客档案（到达时提交；persona 建议为 Bot_Status 摘录，供主世界裁定其行动） */

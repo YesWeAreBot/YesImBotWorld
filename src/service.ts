@@ -210,6 +210,7 @@ export class WorldService extends Service<Config> {
       resolution: this.config.apps.phoneResolution,
       generateShell: this.config.apps.browserEnabled,
     });
+    this.world.visitorPersonaMode = this.config.crossing.visitorPersonaMode;
 
     if (this.config.autoStart && (await this.files.isInitialized())) {
       try {
@@ -516,6 +517,10 @@ export class WorldService extends Service<Config> {
     const toolsNotice = this.botContext.toolsChangeNotice();
     if (toolsNotice) this.bot.pushEvent("system", toolsNotice);
 
+    // 常驻 Bot 的实时事件通道：接待访客时，World-LLM 用 send_event to="bot" 把
+    // 访客与 Bot 的互动送达 Bot 本人（wake：有人当面互动应唤醒等待中的 Bot）
+    this.world.setHostBotDeliver((content) => this.bot?.pushEvent("world", content, { wake: true }));
+
     this.bot.start();
     this.tingle = new TingleTimer(
       this.config.clock,
@@ -561,6 +566,7 @@ export class WorldService extends Service<Config> {
       this.world.setRemote(null);
       void client.leave().catch(() => {});
     }
+    this.world.setHostBotDeliver(null);
     this.tingle?.stop();
     this.tingle = null;
     await this.bot?.stop();
@@ -617,7 +623,16 @@ export class WorldService extends Service<Config> {
     }
     const profile = await this.crossingProfile();
     const client = new CrossingClient(target, profile, {
-      onEvent: (content) => this.bot?.pushEvent("world", content),
+      // 主世界推来的事件都是冲着这位访客来的（到达场景 / to= 定向）：唤醒等待中的 Bot
+      onEvent: (content) => this.bot?.pushEvent("world", content, { wake: true }),
+      // 所在世界的 World-LLM 更新了 Bot 的状态：写回本地 Bot_Status.md
+      //（与本地 World-LLM update(bot_status) 的行为对齐——静默落盘，置顶区在下次 rest 时同步）
+      onStatusUpdate: (content) => {
+        void this.files
+          .writeBotStatus(content)
+          .then(() => this.logger.info("[穿越] 所在世界更新了 Bot_Status.md（%d 字符）", content.length))
+          .catch((err) => this.logger.warn("[穿越] 写回 Bot_Status 失败: %s", err));
+      },
       onLost: (reason) => this.crossingLost(client, reason),
       logger: this.logger,
     });

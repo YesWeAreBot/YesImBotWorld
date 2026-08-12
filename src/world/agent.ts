@@ -92,6 +92,40 @@ const WORLD_TOOLS: ChatToolDef[] = [
   {
     type: "function",
     function: {
+      name: "check_visitor",
+      description:
+        "（visitorPersonaMode 为 check 时可用）查看某位在场异世界访客的状态档案" +
+        "（它的自我认知与当前状态，相当于它自己世界里的 bot_status）。裁定访客的行动前应先查看",
+      parameters: {
+        type: "object",
+        properties: {
+          name: { type: "string", description: "访客名（只有一位访客在场时可省略）" },
+        },
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "update_visitor_status",
+      description:
+        "（有异世界访客在场时可用）更新某位**访客**的状态档案（相当于访客自己世界里的 bot_status，" +
+        "会回传到它的世界持久保存；当前内容见系统提示的 <visitors> 区，或用 check_visitor 查看）。用 content 整体覆盖：" +
+        "保持原有 Markdown 结构，只改需要改的部分。访客的位置、状态、随身物品、正在做的事发生持久变化时" +
+        "（受伤、获得/失去物品、移动等）应及时更新。注意：这不是本世界常驻 Bot 的 bot_status，两者互不相干",
+      parameters: {
+        type: "object",
+        properties: {
+          name: { type: "string", description: "访客名（只有一位访客在场时可省略）" },
+          content: { type: "string" },
+        },
+        required: ["content"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "send_event",
       description:
         "向 Bot 的意识流中追加一个事件。这是 Bot 唯一能感知到你的方式。用第三人称、符合世界观的口吻客观叙述发生了什么、" +
@@ -103,7 +137,9 @@ const WORLD_TOOLS: ChatToolDef[] = [
           content: { type: "string" },
           to: {
             type: "string",
-            description: "（有异世界访客在场时）把事件送达指定访客：填访客名。缺省送达默认对象",
+            description:
+              "把事件送达指定对象：填在场访客的名字，或填 \"bot\" 送达本世界的常驻 Bot。" +
+              "缺省送达本次任务的主角",
           },
         },
         required: ["content"],
@@ -119,8 +155,31 @@ export interface WorldInvocation {
   deliver?: (content: string) => void;
   /** 是否允许 set_tingle（仅 Tingle 任务） */
   allowTingle?: boolean;
-  /** 在场的异世界访客（send_event 可用 to 定向送达；穿越服务提供） */
-  visitors?: { name: string; deliver: (content: string) => void }[];
+  /** 在场的异世界访客（send_event to= 定向送达、update_visitor_status 状态写回；穿越服务提供） */
+  visitors?: PresentVisitor[];
+  /**
+   * 本世界常驻 Bot 的事件通道（send_event to="bot" 用）。
+   * 接待访客的任务里指向真实的常驻 Bot（访客与它的互动必须让它亲身经历）；
+   * 常驻 Bot 自己的任务里等同 deliver；Bot 外出时不提供。
+   */
+  botDeliver?: (content: string) => void;
+}
+
+/** 在场访客的完整通道（穿越服务提供） */
+export interface PresentVisitor {
+  name: string;
+  /** 状态档案（会注入系统提示的 <visitors> 区） */
+  persona: string;
+  /** 事件送达访客 */
+  deliver: (content: string) => void;
+  /** 状态写回访客世界（update_visitor_status 工具） */
+  updateStatus: (content: string) => void;
+}
+
+/** 接待任务里的访客引用（穿越服务传入；状态写回通道统一走 WorldInvocation.visitors） */
+export interface VisitorRef {
+  name: string;
+  persona: string;
 }
 
 /**
@@ -154,8 +213,18 @@ export class WorldAgent {
    * 只保留上下文压缩等 Bot 私有的记忆工作）；本地 Tingle 静默。
    */
   private remote: RemoteWorldLink | null = null;
-  /** 穿越：本世界在场访客的提供者（穿越服务注册；Tingle 感知 + send_event 定向） */
-  private visitorsProvider: (() => { name: string; deliver: (content: string) => void }[]) | null = null;
+  /** 穿越：本世界在场访客的提供者（穿越服务注册；系统提示 <visitors> 区 + send_event 定向 + 状态写回） */
+  private visitorsProvider: (() => PresentVisitor[]) | null = null;
+  /** 常驻 Bot 的实时事件通道（service 注册；接待访客的任务用 send_event to="bot" 送达它） */
+  private hostBotDeliver: ((content: string) => void) | null = null;
+  /**
+   * 访客状态档案的放置方式（crossing.visitorPersonaMode，service 同步）：
+   * - pinned：档案常驻系统提示 <visitors> 区（缓存命中率最优）；
+   * - check：系统提示只放名单，档案用 check_visitor 工具按需查看（省上下文窗口）。
+   */
+  visitorPersonaMode: "pinned" | "check" = "pinned";
+  /** 穿越：最近离开的访客（下一次 Tingle 时提醒世界清理其在场记述、停止续写其情节） */
+  private departedVisitors: string[] = [];
   /**
    * 世界沉睡起点（TU）：常驻 Bot 外出且无访客在场时，Tingle 跳过 LLM 调用以节省
    * token；再次有人出现（Bot 回家 / 访客到达）时由 wakeDormant 补叙期间的演化。
@@ -213,8 +282,13 @@ export class WorldAgent {
   }
 
   /** 穿越：注册在场访客提供者（穿越服务启动/停止时调用） */
-  setVisitorsProvider(fn: (() => { name: string; deliver: (content: string) => void }[]) | null): void {
+  setVisitorsProvider(fn: (() => PresentVisitor[]) | null): void {
     this.visitorsProvider = fn;
+  }
+
+  /** 注册/清除常驻 Bot 的实时事件通道（世界启动/停止时由 service 调用） */
+  setHostBotDeliver(fn: ((content: string) => void) | null): void {
+    this.hostBotDeliver = fn;
   }
 
   constructor(
@@ -268,7 +342,8 @@ export class WorldAgent {
       duration: call.duration ?? 0,
       expectedAt: this.clock.timeLine(call.expectedAt),
     });
-    return this.invokeWithTools({ task, deliver });
+    // 有访客在场时携带 visitors：Bot 的行动波及某位访客时，send_event to= 可直接送达对方
+    return this.invokeWithTools({ task, deliver, botDeliver: deliver, visitors: this.visitorsProvider?.() ?? [] });
   }
 
   /** wait 补叙：等待即将结束（由计时器准时唤醒），提前生成期间发生的事 */
@@ -280,7 +355,7 @@ export class WorldAgent {
       n,
       expectedAt: this.clock.timeLine(call.expectedAt),
     });
-    return this.invokeWithTools({ task, deliver });
+    return this.invokeWithTools({ task, deliver, botDeliver: deliver, visitors: this.visitorsProvider?.() ?? [] });
   }
 
   /** Bot 主动查看时间：由世界裁定它此刻能否得知时间（允许失败） */
@@ -310,18 +385,28 @@ export class WorldAgent {
       nextTingle: this.tingleNextTingleText(),
     });
     if (visitors.length) {
+      // 访客名单与状态档案在系统提示的 <visitors> 区；这里只放固定的操作提示（逐字稳定，利于前缀缓存）
       task +=
-        `\n（当前有异世界访客在场：${visitors.map((v) => `「${v.name}」`).join("、")}——` +
-        `世界演化时留意他们的存在；若有专门发生在某位访客身上的事，用 send_event 的 to 参数写访客名即可送达对方。）`;
+        `\n（当前有异世界访客在场，名单与状态见系统提示的 <visitors> 区——世界演化时留意他们的存在；` +
+        `若有专门发生在某位访客身上的事，用 send_event 的 to 参数写访客名即可送达对方。）`;
     }
     if (botAway) {
       task +=
         `\n（注意：这个世界的常驻 Bot 目前穿越去了异世界作客、不在场。不要给它发事件` +
         `（不带 to 的 send_event 此刻不可用）；只演化世界本身，或给在场的访客发事件。）`;
     }
+    // 最近离开的访客：提醒世界清理其在场记述、停止续写其情节（一次性提醒，随后清空）
+    if (this.departedVisitors.length) {
+      task +=
+        `\n（重要：以下异世界访客**已经离开**这个世界：${this.departedVisitors.join("、")}。` +
+        `先 check world_status——若其中仍有他们"在场/正在做某事"的记述，请 update world_status 清理干净（可保留他们留下的持久影响）；` +
+        `之后的世界演化**不要**再出现他们本人的情节。）`;
+      this.departedVisitors = [];
+    }
     await this.invokeWithTools({
       task,
       deliver: botAway ? undefined : deliver,
+      botDeliver: botAway ? undefined : deliver,
       allowTingle: true,
       visitors,
     });
@@ -385,38 +470,59 @@ export class WorldAgent {
 
   // ---------- 穿越：接待异世界访客（主世界侧，恒为本地处理） ----------
 
-  private visitorPreamble(v: { name: string; persona: string }): string {
-    return fill(this.prompts.world.visitorPreamble, {
+  /** 访客档案的所在位置提示（随 visitorPersonaMode 变化，填充 {{personaWhere}}） */
+  private personaWhere(): string {
+    return this.visitorPersonaMode === "check"
+      ? "用 check_visitor 工具可查看"
+      : "见系统提示的 <visitors> 区";
+  }
+
+  /** 接待任务里的访客前言（常驻 Bot 外出时附加提示，避免"幽灵互动"） */
+  private visitorPreamble(v: VisitorRef): string {
+    let text = fill(this.prompts.world.visitorPreamble, {
       name: v.name,
       persona: v.persona || "（访客没有留下自我描述）",
+      personaWhere: this.personaWhere(),
     });
+    if (this.remote) {
+      text +=
+        "\n（另注：本世界的常驻 Bot 眼下不在这个世界——它自己也穿越去了别处。" +
+        "场景中不要出现它本人，访客也无法与它互动。）";
+    }
+    return text;
+  }
+
+  private visitorInvocationExtras(): Pick<WorldInvocation, "visitors" | "botDeliver"> {
+    return {
+      visitors: this.visitorsProvider?.() ?? [],
+      // 常驻 Bot 在家时提供其实时事件通道（访客与它的互动必须让它亲身经历）；外出时不提供
+      botDeliver: this.remote ? undefined : (this.hostBotDeliver ?? undefined),
+    };
   }
 
   /** 访客到达：生成到达场景（deliver 送达访客）并记录进 World_Status */
-  async visitorArrive(
-    v: { name: string; persona: string },
-    deliver: (content: string) => void,
-  ): Promise<boolean> {
+  async visitorArrive(v: VisitorRef, deliver: (content: string) => void): Promise<boolean> {
     const task = fill(this.prompts.world.visitorArrive, {
       name: v.name,
       persona: v.persona || "（访客没有留下自我描述）",
+      personaWhere: this.personaWhere(),
       timeLine: this.clock.timeLine(),
     });
-    return this.invokeWithTools({ task, deliver });
+    return this.invokeWithTools({ task, deliver, ...this.visitorInvocationExtras() });
   }
 
-  /** 访客离开：World_Status 善后（无需向访客交付事件） */
+  /** 访客离开：World_Status 善后（无需向访客交付事件），并在下次心跳时提醒世界不要续写它的情节 */
   async visitorLeave(v: { name: string }): Promise<boolean> {
-    const task = fill(this.prompts.world.visitorLeave, {
-      name: v.name,
-      timeLine: this.clock.timeLine(),
-    });
+    const timeLine = this.clock.timeLine();
+    this.departedVisitors.push(`「${v.name}」（${timeLine} 离开）`);
+    if (this.departedVisitors.length > 5) this.departedVisitors.splice(0, this.departedVisitors.length - 5);
+    const task = fill(this.prompts.world.visitorLeave, { name: v.name, timeLine });
     return this.invokeWithTools({ task });
   }
 
   /** 裁定访客的 act 动作（时刻按本世界时钟换算） */
   async visitorAct(
-    v: { name: string; persona: string },
+    v: VisitorRef,
     desc: string,
     duration: number,
     deliver: (content: string) => void,
@@ -431,15 +537,11 @@ export class WorldAgent {
         duration,
         expectedAt: this.clock.timeLine(now + Math.max(duration, 0)),
       });
-    return this.invokeWithTools({ task, deliver });
+    return this.invokeWithTools({ task, deliver, ...this.visitorInvocationExtras() });
   }
 
   /** 访客 wait 补叙 */
-  async visitorWait(
-    v: { name: string; persona: string },
-    n: number,
-    deliver: (content: string) => void,
-  ): Promise<boolean> {
+  async visitorWait(v: VisitorRef, n: number, deliver: (content: string) => void): Promise<boolean> {
     const now = this.clock.now();
     const task =
       this.visitorPreamble(v) +
@@ -449,23 +551,20 @@ export class WorldAgent {
         n,
         expectedAt: this.clock.timeLine(now + Math.max(n, 0)),
       });
-    return this.invokeWithTools({ task, deliver });
+    return this.invokeWithTools({ task, deliver, ...this.visitorInvocationExtras() });
   }
 
   /** 访客查看时间（按本世界的时钟与历法） */
-  async visitorCheckTime(
-    v: { name: string; persona: string },
-    deliver: (content: string) => void,
-  ): Promise<boolean> {
+  async visitorCheckTime(v: VisitorRef, deliver: (content: string) => void): Promise<boolean> {
     const task =
       this.visitorPreamble(v) +
       "\n\n" +
       fill(this.prompts.world.resolveCheckTime, { timeLine: this.clock.timeLine() });
-    return this.invokeWithTools({ task, deliver });
+    return this.invokeWithTools({ task, deliver, ...this.visitorInvocationExtras() });
   }
 
   /** 访客的世界查询（天气 / 虚构网页等——访客的手机连的是这个世界的"互联网"） */
-  async visitorQuery(v: { name: string; persona: string }, task: string): Promise<string> {
+  async visitorQuery(v: VisitorRef, task: string): Promise<string> {
     return this.queryLocal(this.visitorPreamble(v) + "\n\n" + task);
   }
 
@@ -773,10 +872,31 @@ export class WorldAgent {
 
   private async systemPrompt(): Promise<string> {
     const { worldDef } = await this.files.readDefinitions();
-    return fill(this.prompts.world.system, {
+    let sys = fill(this.prompts.world.system, {
       worldDef,
       timeLine: this.clock.timeLine(),
     });
+    // 在场访客集中放在系统提示末尾（按到达顺序，逐字稳定）：
+    // 所有世界任务（Bot 裁定 / 各访客的裁定 / Tingle）共享同一前缀。
+    // pinned 模式连档案一起放（多访客任务交错时 persona 不逐条重算，只在变更时失效一次）；
+    // check 模式只放名单（省上下文窗口，档案用 check_visitor 按需查看）
+    const visitors = this.visitorsProvider?.() ?? [];
+    if (visitors.length) {
+      if (this.visitorPersonaMode === "check") {
+        sys +=
+          "\n\n<visitors>（当前在场的异世界访客名单——状态档案用 check_visitor 工具按需查看；" +
+          "档案变更用 update_visitor_status，事件送达用 send_event 的 to 参数）\n" +
+          visitors.map((v) => `- 「${v.name}」`).join("\n") +
+          "\n</visitors>";
+      } else {
+        sys +=
+          "\n\n<visitors>（当前在场的异世界访客——他们的状态档案，接待任务的裁定依据；" +
+          "档案变更用 update_visitor_status 工具，事件送达用 send_event 的 to 参数）\n" +
+          visitors.map((v) => `## 访客「${v.name}」\n${v.persona || "（无自我描述）"}`).join("\n\n") +
+          "\n</visitors>";
+      }
+    }
+    return sys;
   }
 
   /** 运行工具循环，返回模型最后一轮的文本内容 */
@@ -784,7 +904,10 @@ export class WorldAgent {
     const tools = WORLD_TOOLS.filter(
       (t) =>
         (invocation.deliver || invocation.visitors?.length || t.function.name !== "send_event") &&
-        (invocation.allowTingle || t.function.name !== "set_tingle"),
+        (invocation.allowTingle || t.function.name !== "set_tingle") &&
+        (invocation.visitors?.length || t.function.name !== "update_visitor_status") &&
+        ((this.visitorPersonaMode === "check" && invocation.visitors?.length) ||
+          t.function.name !== "check_visitor"),
     );
     const messages: ChatMessage[] = [
       { role: "system", content: await this.systemPrompt() },
@@ -950,23 +1073,70 @@ export class WorldAgent {
           this.nextTingleUnits = clamped;
           return `已设定：下一次心跳间隔 ${clamped} TU（${(clamped * this.clock.unitRealSeconds).toFixed(1)} 现实秒）。`;
         }
+        case "check_visitor": {
+          const visitors = invocation.visitors ?? [];
+          if (!visitors.length) return "当前没有访客在场";
+          const vname = String(args.name ?? "").trim();
+          const target = vname
+            ? visitors.find((x) => x.name === vname)
+            : visitors.length === 1
+              ? visitors[0]
+              : undefined;
+          if (!target) {
+            const names = visitors.map((x) => `「${x.name}」`).join("、");
+            return vname
+              ? `没有名为「${vname}」的访客在场（在场：${names}）`
+              : `在场访客不止一位（${names}），请用 name 参数指定要查看谁`;
+          }
+          return `访客「${target.name}」的状态档案：\n${target.persona || "（无自我描述）"}`;
+        }
+        case "update_visitor_status": {
+          const content = String(args.content ?? "");
+          const visitors = invocation.visitors ?? [];
+          if (!visitors.length) return "当前没有访客在场";
+          if (!content.trim()) return "内容为空，未更新";
+          const vname = String(args.name ?? args.to ?? "").trim();
+          const target = vname
+            ? visitors.find((x) => x.name === vname)
+            : visitors.length === 1
+              ? visitors[0]
+              : undefined;
+          if (!target) {
+            const names = visitors.map((x) => `「${x.name}」`).join("、");
+            return vname
+              ? `没有名为「${vname}」的访客在场（在场：${names}）`
+              : `在场访客不止一位（${names}），请用 name 参数指定要更新谁`;
+          }
+          target.updateStatus(content.slice(0, 20000));
+          return `访客「${target.name}」的状态已更新（将回传到它的世界）`;
+        }
         case "send_event": {
           const content = String(args.content ?? "");
           if (!content.trim()) return "事件内容为空，未发送";
-          // 定向送达在场的异世界访客（to = 访客名）
           const to = String(args.to ?? "").trim();
+          // to="bot"：送达本世界的常驻 Bot（接待访客时，访客与它的互动必须让它亲身经历）
+          if (to.toLowerCase() === "bot") {
+            if (!invocation.botDeliver) {
+              return "常驻 Bot 此刻无法接收事件（它不在这个世界，或本任务没有它的通道）";
+            }
+            invocation.botDeliver(content);
+            return "事件已送达本世界的常驻 Bot";
+          }
+          // to=访客名：定向送达在场的异世界访客
           if (to) {
             const visitor = (invocation.visitors ?? []).find((v) => v.name === to);
             if (!visitor) {
               const names = (invocation.visitors ?? []).map((v) => `「${v.name}」`).join("、");
-              return names ? `没有名为「${to}」的访客在场（在场访客：${names}）` : `没有访客在场，to 参数无效`;
+              return names
+                ? `没有名为「${to}」的访客在场（在场访客：${names}；送达常驻 Bot 请用 to="bot"）`
+                : `没有访客在场，to 参数无效（送达常驻 Bot 请用 to="bot"）`;
             }
             visitor.deliver(content);
             return `事件已送达访客「${to}」`;
           }
-          if (!invocation.deliver) return "当前任务不允许 send_event（若想送达访客，用 to 参数指定访客名）";
+          if (!invocation.deliver) return "当前任务不允许无 to 的 send_event（用 to 参数指定访客名或 \"bot\"）";
           invocation.deliver(content);
-          return "事件已送达 Bot";
+          return "事件已送达本次任务的主角";
         }
         default:
           return `未知工具: ${name}`;

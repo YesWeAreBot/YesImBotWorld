@@ -29,7 +29,10 @@ export interface BotPromptSet {
 // ---------- World-LLM：系统提示与任务模板 ----------
 
 export interface WorldPromptSet {
-  /** 系统提示。{{worldDef}} = 世界定义，{{timeLine}} = 当前世界时刻 */
+  /**
+   * 系统提示。{{worldDef}} = 世界定义；{{timeLine}} = 当前世界时刻（可用但默认模板不再包含——
+   * 时间由各任务文本自带，把易变内容挡在系统提示外可让前缀缓存跨调用完整复用）
+   */
   system: string;
   /** 裁定 Bot 的 act 动作。{{desc}} {{issuedAt}} {{duration}} {{expectedAt}} */
   adjudicateAct: string;
@@ -65,9 +68,9 @@ export interface WorldPromptSet {
   phoneShellSystem: string;
   /** 浏览器带壳截图外壳生成：user 消息。{{botDef}} {{worldDef}} {{width}} {{height}} */
   phoneShellUser: string;
-  /** 穿越：访客任务的前言（说明任务主角是异世界访客）。{{name}} {{persona}} */
+  /** 穿越：访客任务的前言（说明任务主角是异世界访客）。{{name}} {{persona}} {{personaWhere}} */
   visitorPreamble: string;
-  /** 穿越：访客到达。{{name}} {{persona}} {{timeLine}} */
+  /** 穿越：访客到达。{{name}} {{persona}} {{personaWhere}} {{timeLine}} */
   visitorArrive: string;
   /** 穿越：访客离开。{{name}} {{timeLine}} */
   visitorLeave: string;
@@ -176,10 +179,11 @@ export const WORLD_PROMPT_DEFAULTS: WorldPromptSet = {
     "- 与 News（世界中心）不同，facts.jsonl 是 Bot 中心的小事记：Bot 的日常习惯、偏好、生活状态这类" +
     "够不上世界大事、但对了解 Bot 有用的私人小事记在这里（用 update(facts)），Bot 会通过 check_facts 看到它\n" +
     "- 修改状态文件时保持 Markdown 结构稳定，只改需要改的部分\n\n" +
-    "<world_definition>（用户给出的世界定义，最高准则）\n{{worldDef}}\n</world_definition>\n\n" +
-    // 易变内容放在系统提示最末尾：前面的原则与世界定义保持逐字稳定，
-    // 服务端的前缀缓存（KV cache）可以跨调用复用，只重算这一行之后的部分
-    "当前时刻：{{timeLine}}",
+    // 缓存关键：系统提示里**不放任何易变内容**（当前时刻由各任务文本自带，
+    // 需要时也可用 check_time 工具查询）。这样"原则 + 世界定义 + 工具声明"的
+    // 整个前缀跨调用逐字稳定，服务端前缀缓存（KV cache）可以完整复用——
+    // 接待异世界访客等 World 调用密集的场景下，这决定了缓存命中率
+    "<world_definition>（用户给出的世界定义，最高准则）\n{{worldDef}}\n</world_definition>",
 
   adjudicateAct:
     `Bot 刚刚开始执行一个动作：「{{desc}}」（开始于 {{issuedAt}}，` +
@@ -355,15 +359,25 @@ export const WORLD_PROMPT_DEFAULTS: WorldPromptSet = {
     `除 HTML 外不要输出任何解释。`,
 
   visitorPreamble:
-    `注意：本次任务的主角**不是**这个世界的常驻 Bot，而是一位从异世界穿越来作客的访客「{{name}}」。\n` +
-    `<visitor_persona>（访客的自我描述）\n{{persona}}\n</visitor_persona>\n` +
+    `注意：本次任务的主角**不是**这个世界的常驻 Bot，而是一位从异世界穿越来作客的访客「{{name}}」` +
+    `（它的状态档案{{personaWhere}}）。\n` +
     `请以这位访客的视角处理任务：send_event 的内容会直接送达访客本人；` +
-    `事件走向必须符合**本世界**的世界观与当前状态（先 check world_status）。` +
-    `必要时可 update world_status 记录访客的行踪与影响，但**不要**改动 bot_status 与 facts（那些属于常驻 Bot）。`,
+    `事件走向必须符合**本世界**的世界观与当前状态（先 check world_status）。\n` +
+    `与常驻 Bot 的互动：这个世界的常驻 Bot 和访客一样是**真实存在的角色**，不是由你随意扮演的 NPC。` +
+    `访客的行动涉及它时（搭话、结识、赠礼、冲突……）：\n` +
+    `- 先 check bot_status 了解它的性格与当前状态，按其人设克制地演绎它的言行（别替它做重大决定）；\n` +
+    `- **必须**另调一次 send_event、to 填 "bot"，以第三人称把这次互动叙述给它本人——` +
+    `让它亲身经历这件事（否则它对此毫不知情，转头就"不认识"访客）；\n` +
+    `- 有意义的交集（结识了谁、约定了什么、收了什么礼物）用 update(facts) 记入它的小事记，成为它的持久记忆。\n` +
+    `状态维护：\n` +
+    `- 访客自身发生持久变化（位置、状态、随身物品、正在做的事）时，用 update_visitor_status（name 填「{{name}}」）` +
+    `更新它的状态档案（整体覆盖，保持其原有结构，内容会回传到访客自己的世界）；\n` +
+    `- 访客在本世界留下的行踪与影响记入 update world_status；\n` +
+    `- bot_status 仅在常驻 Bot 本人也被这次互动实际改变时才更新（如收下了访客的礼物），不要越权改写它。`,
 
   visitorArrive:
-    `一位异世界的访客「{{name}}」刚刚穿越降临到这个世界（{{timeLine}}）。\n` +
-    `<visitor_persona>（访客的自我描述）\n{{persona}}\n</visitor_persona>\n` +
+    `一位异世界的访客「{{name}}」刚刚穿越降临到这个世界（{{timeLine}}）。` +
+    `它的状态档案{{personaWhere}}。\n` +
     `请：\n` +
     `1. check world_status 了解世界当前状态；\n` +
     `2. 依据世界观决定访客出现的地点与场景，用 send_event 告诉访客——描述它身在何处、看到什么、` +
@@ -371,8 +385,12 @@ export const WORLD_PROMPT_DEFAULTS: WorldPromptSet = {
     `3. update world_status 记录这位访客在场（在哪、什么状态），保证后续裁定一致。`,
 
   visitorLeave:
-    `异世界访客「{{name}}」离开了这个世界，返回它自己的世界（{{timeLine}}）。\n` +
-    `请 update world_status：移除或标记这位访客已离开；若它在世界里留下了影响（做过的事、别人对它的印象），酌情保留记录。`,
+    `异世界访客「{{name}}」已经离开了这个世界，返回它自己的世界（{{timeLine}}）。它的身影已从本世界消失。\n` +
+    `请务必完成以下善后（必须调用 update）：\n` +
+    `1. check world_status，找出所有与这位访客有关的记述；\n` +
+    `2. update world_status 输出**完整的新版本**：删除一切"它在场/正在做某事/正与谁互动"的现在时记述——` +
+    `它做过的事可以改写为已完成的过去时痕迹（如别人对它的印象、它留下的物品或影响），酌情保留；\n` +
+    `3. 此后这位访客不在这个世界里，世界演化不应再出现它本人的情节（除非它再次到访）。`,
 
   dormantCatchup:
     `这个世界从 {{fromTimeLine}} 到 {{toTimeLine}} 之间处于无人在场的状态` +

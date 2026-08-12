@@ -83,7 +83,7 @@ export class TerminalApp implements WorldApp {
   /** 虚构世界：World-LLM 扮演这台电脑 */
   private async virtualRun(command: string, cwd?: string): Promise<string> {
     const task =
-      `Bot 打开了自己电脑上的终端，在${cwd ? `目录 ${cwd}` : "主目录"}敲下了命令：${command}\n` +
+      `Bot 打开了自己电脑上的终端，在${cwd ? `目录 ${cwd}` : "主目录"}敲下了命令：${command}（当前 ${this.clock.timeLine()}）\n` +
       `请扮演这台电脑的终端，直接输出它屏幕上显示的结果：\n` +
       `1. check world_status（必要时也看 bot_status）：这台电脑符合世界观（可能是魔法世界的炼金台、星际联邦的终端，` +
       `也可能这个世界根本没有电脑——那就输出对应的画面）；\n` +
