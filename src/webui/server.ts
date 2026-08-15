@@ -117,6 +117,12 @@ export interface WebUIHost {
   };
   /** 穿越：强制送往某个世界（"home" = 送回自己的世界） */
   crossingForce(target: string): Promise<string>;
+  /** 归档：手动存档（把当前全部世界状态复制成一份新快照） */
+  saveArchive(label: string): Promise<string>;
+  /** 归档：回档到某个快照（当前状态先自动存档） */
+  restoreArchive(name: string): Promise<string>;
+  /** 归档：删除某个快照 */
+  deleteArchive(name: string): Promise<void>;
 }
 
 const MIME_BY_EXT: Record<string, string> = {
@@ -239,6 +245,11 @@ export class WebUIServer {
 
   /** 关键文件的变更信号（小写字母标识，前端据此刷新对应视图） */
   private signalFile(rel: string): void {
+    // 归档目录里的变动一律发 archive 信号（避免快照文件名的基名干扰其他信号）
+    if (rel.startsWith("archive/")) {
+      this.emitSignal("archive");
+      return;
+    }
     const base = path.basename(rel);
     let signal: string | null = null;
     switch (base) {
@@ -250,6 +261,9 @@ export class WebUIServer {
         break;
       case "News.db":
         signal = "news";
+        break;
+      case "facts.jsonl":
+        signal = "facts";
         break;
       case "stream.jsonl":
         signal = "stream";
@@ -279,7 +293,11 @@ export class WebUIServer {
         else if (rel.startsWith("Notes/")) signal = "notes";
         else signal = null;
     }
-    if (!signal) return;
+    if (signal) this.emitSignal(signal);
+  }
+
+  /** 信号防抖后发送（同一信号 200ms 内的多次变动合并为一次推送） */
+  private emitSignal(signal: string): void {
     const prev = this.debounce.get(signal);
     if (prev) clearTimeout(prev);
     this.debounce.set(
@@ -565,6 +583,12 @@ export class WebUIServer {
       sendJSON(res, 200, { ok: true });
       return;
     }
+    if (pathname === "/api/state/facts/pin" && method === "POST") {
+      const { index, pinned } = await readJson(req);
+      await setFactsPinned(host.files.facts, Number(index), pinned !== false);
+      sendJSON(res, 200, { ok: true });
+      return;
+    }
 
     // ---------- 配置 ----------
     if (pathname === "/api/config" && method === "GET") {
@@ -705,15 +729,54 @@ export class WebUIServer {
 
     // ---------- 归档 ----------
     if (pathname === "/api/archive" && method === "GET") {
-      sendJSON(res, 200, { files: await listDir(host.files.archiveDir) });
+      sendJSON(res, 200, await listArchive(host.files.archiveDir));
       return;
     }
     if (pathname === "/api/archive/file" && method === "GET") {
-      const name = q.get("name") ?? "";
-      if (!safeBasename(name)) return void sendJSON(res, 400, { error: "非法文件名" });
-      const file = path.join(host.files.archiveDir, name);
-      const content = await fs.readFile(file, "utf8").catch(() => "");
-      sendJSON(res, 200, { name, content });
+      const folder = q.get("folder") ?? "";
+      const file = q.get("file") ?? "";
+      if (!safeBasename(file)) return void sendJSON(res, 400, { error: "非法文件名" });
+      if (folder && !safeBasename(folder)) return void sendJSON(res, 400, { error: "非法归档名" });
+      const target = folder
+        ? path.join(host.files.archiveDir, folder, file)
+        : path.join(host.files.archiveDir, file);
+      const ok = await fs.access(target).then(() => true, () => false);
+      if (!ok) return void sendJSON(res, 404, { error: "文件不存在" });
+      const content = await fs.readFile(target, "utf8").catch(() => "");
+      sendJSON(res, 200, { name: file, content });
+      return;
+    }
+    if (pathname === "/api/archive/save" && method === "POST") {
+      const body = (await readJson(req).catch(() => ({}))) as Record<string, unknown>;
+      const text = await host.saveArchive(String(body.label ?? ""));
+      this.sendLifecycle("archive.save", { text });
+      sendJSON(res, 200, { ok: true, text });
+      return;
+    }
+    if (pathname === "/api/archive/restore" && method === "POST") {
+      const body = (await readJson(req).catch(() => ({}))) as Record<string, unknown>;
+      const name = String(body.name ?? "");
+      if (!safeBasename(name)) return void sendJSON(res, 400, { error: "非法归档名" });
+      try {
+        const text = await host.restoreArchive(name);
+        this.sendLifecycle("archive.restore", { name, text });
+        sendJSON(res, 200, { ok: true, text });
+      } catch (err) {
+        sendJSON(res, 500, { error: (err as Error).message ?? String(err) });
+      }
+      return;
+    }
+    if (pathname === "/api/archive/delete" && method === "POST") {
+      const body = (await readJson(req).catch(() => ({}))) as Record<string, unknown>;
+      const name = String(body.name ?? "");
+      if (!safeBasename(name)) return void sendJSON(res, 400, { error: "非法归档名" });
+      try {
+        await host.deleteArchive(name);
+        this.sendLifecycle("archive.delete", { name });
+        sendJSON(res, 200, { ok: true });
+      } catch (err) {
+        sendJSON(res, 500, { error: (err as Error).message ?? String(err) });
+      }
       return;
     }
 
@@ -840,7 +903,7 @@ export class WebUIServer {
         const stat = await fs.stat(file).catch(() => null);
         files.push({ name, exists: !!stat, size: stat?.size ?? 0 });
       }
-      sendJSON(res, 200, { files, archive: await listDir(host.files.archiveDir) });
+      sendJSON(res, 200, { files, archive: await listArchive(host.files.archiveDir) });
       return;
     }
     if (pathname === "/api/data/file" && method === "GET") {
@@ -988,6 +1051,15 @@ async function removeNews(file: string, index: number): Promise<void> {
   await writeNewsLines(file, entries);
 }
 
+/** 固定/取消固定 facts.jsonl 的一条小事记（固定条目在重置世界/重新创世时保留） */
+async function setFactsPinned(file: string, index: number, pinned: boolean): Promise<void> {
+  const entries = (await readAllNews(file)) as { content: string; pinned?: boolean }[];
+  if (!Number.isInteger(index) || index < 0 || index >= entries.length) throw new Error("索引越界");
+  if (pinned) entries[index]!.pinned = true;
+  else delete entries[index]!.pinned;
+  await writeNewsLines(file, entries);
+}
+
 async function writeNewsLines(file: string, entries: unknown[]): Promise<void> {
   const tmp = `${file}.tmp`;
   await fs.writeFile(tmp, entries.map((e) => JSON.stringify(e)).join("\n") + "\n");
@@ -1009,18 +1081,57 @@ async function readJsonl(file: string, max: number): Promise<unknown[]> {
   return out;
 }
 
-async function listDir(dir: string): Promise<string[]> {
+/** 归档快照（文件夹，含 manifest 备注）与旧版扁平归档文件 */
+interface ArchiveSnapshot {
+  name: string;
+  mtime: number;
+  label: string;
+  files: { name: string; size: number }[];
+}
+
+async function listArchive(
+  dir: string,
+): Promise<{ snapshots: ArchiveSnapshot[]; legacy: string[] }> {
+  let names: string[] = [];
   try {
-    const names = await fs.readdir(dir);
-    const out: string[] = [];
-    for (const n of names) {
-      const stat = await fs.stat(path.join(dir, n)).catch(() => null);
-      if (stat?.isFile()) out.push(n);
-    }
-    return out.sort().reverse();
+    names = await fs.readdir(dir);
   } catch {
-    return [];
+    return { snapshots: [], legacy: [] };
   }
+  const snapshots: ArchiveSnapshot[] = [];
+  const legacy: string[] = [];
+  for (const n of names) {
+    const full = path.join(dir, n);
+    const stat = await fs.stat(full).catch(() => null);
+    if (!stat) continue;
+    if (stat.isDirectory()) {
+      const files: { name: string; size: number }[] = [];
+      let label = "";
+      try {
+        for (const f of await fs.readdir(full)) {
+          const fsStat = await fs.stat(path.join(full, f)).catch(() => null);
+          if (fsStat?.isFile()) files.push({ name: f, size: fsStat.size });
+        }
+        const manifest = await fs.readFile(path.join(full, "manifest.json"), "utf8").catch(() => "");
+        if (manifest) {
+          const m = JSON.parse(manifest) as { label?: string };
+          label = String(m.label ?? "");
+        }
+      } catch {
+        /* 读取失败按无备注处理 */
+      }
+      snapshots.push({
+        name: n,
+        mtime: stat.mtimeMs,
+        label,
+        files: files.sort((a, b) => a.name.localeCompare(b.name)),
+      });
+    } else {
+      legacy.push(n);
+    }
+  }
+  snapshots.sort((a, b) => b.mtime - a.mtime);
+  return { snapshots, legacy: legacy.sort().reverse() };
 }
 
 async function sendFile(res: http.ServerResponse, file: string, mime?: string): Promise<void> {

@@ -48,9 +48,10 @@ const WORLD_DEF_TEMPLATE = `# 世界定义
  * ├── focus.json           # Bot 正在关注的频道
  * ├── pinned.json          # Bot-LLM 置顶上下文 + 计数器
  * ├── stream.jsonl         # Bot-LLM 工作窗口（Tool Call 流）
+ * ├── browserCache.json    # 虚构世界浏览器页面缓存（同一网址总是呈现同一页面）
  * ├── Notes/               # Bot 的记事本：一篇笔记一个 Markdown 文件（文件名即标题）
  * ├── gallery/             # 收藏夹（分类子目录见 media/gallery.ts；描述元数据存数据库）
- * └── archive/             # 压缩时归档的历史流
+ * └── archive/             # 归档：压缩/重置/手动存档的历史快照（每份一个时间戳文件夹）
  * ```
  */
 export class WorldFiles {
@@ -66,6 +67,7 @@ export class WorldFiles {
   readonly notify: string;
   readonly pinned: string;
   readonly stream: string;
+  readonly browserCache: string;
   readonly notesDir: string;
   readonly archiveDir: string;
   readonly galleryDir: string;
@@ -83,6 +85,7 @@ export class WorldFiles {
     this.notify = path.join(base, "notify.json");
     this.pinned = path.join(base, "pinned.json");
     this.stream = path.join(base, "stream.jsonl");
+    this.browserCache = path.join(base, "browserCache.json");
     this.notesDir = path.join(base, "Notes");
     this.archiveDir = path.join(base, "archive");
     this.galleryDir = path.join(base, "gallery");
@@ -183,6 +186,31 @@ export class WorldFiles {
     return entries;
   }
 
+  /** 读取全部 Bot 小事记（按文件顺序） */
+  async readFactsAll(): Promise<NewsEntry[]> {
+    const raw = await this.readText(this.facts);
+    if (!raw.trim()) return [];
+    const entries: NewsEntry[] = [];
+    for (const line of raw.trim().split("\n")) {
+      try {
+        entries.push(JSON.parse(line) as NewsEntry);
+      } catch {
+        /* 跳过损坏行 */
+      }
+    }
+    return entries;
+  }
+
+  /** 整体覆盖 facts.jsonl */
+  async writeFacts(entries: NewsEntry[]): Promise<void> {
+    await this.atomicWrite(this.facts, entries.map((e) => JSON.stringify(e)).join("\n") + "\n");
+  }
+
+  /** 用户固定的小事记条目（重置/创世时保留） */
+  async readPinnedFacts(): Promise<NewsEntry[]> {
+    return (await this.readFactsAll()).filter((e) => e.pinned);
+  }
+
   /** 读取世界元数据（不存在时返回空对象） */
   async readMeta(): Promise<WorldMeta> {
     try {
@@ -204,31 +232,122 @@ export class WorldFiles {
     };
   }
 
-  /** 归档当前 stream 文件（压缩时调用），返回归档路径 */
+  /** 归档当前 stream 文件（压缩时调用），返回归档快照文件夹路径 */
   async archiveStream(): Promise<string | null> {
     if (!(await this.exists(this.stream))) return null;
-    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-    const dest = path.join(this.archiveDir, `stream-${stamp}.jsonl`);
-    await fs.copyFile(this.stream, dest);
+    const dir = await this.makeArchiveDir("压缩");
+    await fs.copyFile(this.stream, path.join(dir, "stream.jsonl"));
+    await this.writeManifest(dir, "压缩", ["stream.jsonl"]);
     await fs.writeFile(this.stream, "");
-    return dest;
+    return dir;
   }
 
-  /** 重置全部运行时状态（保留用户定义文件），旧状态归档 */
-  async reset(): Promise<void> {
-    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-    for (const file of [this.botStatus, this.worldStatus, this.news, this.facts, this.pinned, this.stream, this.clock, this.meta, this.focus, this.notify]) {
+  /**
+   * 把当前全部运行时状态复制成一份新归档快照（不动运行中的文件），
+   * 返回快照文件夹名。用于重置/重新创世前的自动归档与 WebUI 手动存档。
+   */
+  async snapshot(label = ""): Promise<string> {
+    const dir = await this.makeArchiveDir(label);
+    const saved: string[] = [];
+    for (const file of [
+      this.botStatus,
+      this.worldStatus,
+      this.news,
+      this.facts,
+      this.pinned,
+      this.stream,
+      this.clock,
+      this.meta,
+      this.focus,
+      this.notify,
+    ]) {
       if (await this.exists(file)) {
-        const dest = path.join(this.archiveDir, `${stamp}-${path.basename(file)}`);
-        await fs.rename(file, dest).catch(() => fs.rm(file, { force: true }));
+        await fs.copyFile(file, path.join(dir, path.basename(file)));
+        saved.push(path.basename(file));
       }
+    }
+    if (await this.exists(this.notesDir)) {
+      await fs.cp(this.notesDir, path.join(dir, "Notes"), { recursive: true });
+      saved.push("Notes/");
+    }
+    await this.writeManifest(dir, label, saved);
+    return path.basename(dir);
+  }
+
+  /** 用一份归档快照覆盖当前运行时状态（调用方负责先自动存档/停世界） */
+  async restoreFrom(snapDir: string): Promise<void> {
+    for (const file of [
+      this.botStatus,
+      this.worldStatus,
+      this.news,
+      this.facts,
+      this.pinned,
+      this.stream,
+      this.clock,
+      this.meta,
+      this.focus,
+      this.notify,
+    ]) {
+      const src = path.join(snapDir, path.basename(file));
+      if (await this.exists(src)) await fs.copyFile(src, file);
+    }
+    const notesSrc = path.join(snapDir, "Notes");
+    if (await this.exists(notesSrc)) {
+      await fs.rm(this.notesDir, { recursive: true, force: true });
+      await fs.cp(notesSrc, this.notesDir, { recursive: true });
+    }
+  }
+
+  /** 创建新的归档快照文件夹（时间戳 + 备注标签，重名时自动加序号） */
+  private async makeArchiveDir(label: string): Promise<string> {
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const safe =
+      String(label || "")
+        .trim()
+        .replace(/[^\w\u4e00-\u9fa5.-]/g, "-")
+        .slice(0, 32) || "存档";
+    const base = safe ? `${stamp}-${safe}` : stamp;
+    let dir = path.join(this.archiveDir, base);
+    for (let i = 1; await this.exists(dir); i++) {
+      dir = path.join(this.archiveDir, `${base}-${i}`);
+    }
+    await fs.mkdir(dir, { recursive: true });
+    return dir;
+  }
+
+  /** 在快照文件夹里写一份 manifest.json（WebUI 展示备注/文件清单用） */
+  private async writeManifest(dir: string, label: string, files: string[]): Promise<void> {
+    await fs.writeFile(
+      path.join(dir, "manifest.json"),
+      JSON.stringify({ created: Date.now(), label: String(label || "").trim(), files }),
+    );
+  }
+
+  /** 重置全部运行时状态（保留用户定义文件与固定的小事记），旧状态归档 */
+  async reset(): Promise<void> {
+    // 固定的小事记跨越"这辈子"保留：先归档全部旧状态，再只把固定条目留回 facts.jsonl
+    const pinnedFacts = await this.readPinnedFacts();
+    await this.snapshot("重置");
+    for (const file of [
+      this.botStatus,
+      this.worldStatus,
+      this.news,
+      this.facts,
+      this.pinned,
+      this.stream,
+      this.clock,
+      this.meta,
+      this.focus,
+      this.notify,
+      this.browserCache,
+    ]) {
+      await fs.rm(file, { force: true });
     }
     // 记事本目录整体归档（"这辈子"的笔记跟着世界走）
     if (await this.exists(this.notesDir)) {
-      await fs
-        .rename(this.notesDir, path.join(this.archiveDir, `${stamp}-Notes`))
-        .catch(() => fs.rm(this.notesDir, { recursive: true, force: true }));
+      await fs.rm(this.notesDir, { recursive: true, force: true });
     }
+    if (pinnedFacts.length) await this.writeFacts(pinnedFacts);
   }
 
   async atomicWrite(file: string, content: string): Promise<void> {

@@ -1007,6 +1007,54 @@ export class WorldService extends Service<Config> {
     return "已注入。";
   }
 
+  // ---------- 归档（快照 / 回档 / 删除） ----------
+
+  /** 手动存档：把当前全部世界状态复制成一份新快照（不影响运行中的世界） */
+  async saveArchive(label: string): Promise<string> {
+    const name = await this.files.snapshot(String(label ?? ""));
+    this.logger.info("手动存档：archive/%s", name);
+    return `已存档到 archive/${name}`;
+  }
+
+  /** 回档到某个快照：当前状态先自动存档，随后被快照覆盖并重启世界 */
+  async restoreArchive(name: string): Promise<string> {
+    if (!/^[\w\u4e00-\u9fa5.-]+$/.test(name)) throw new Error("非法归档名");
+    const snapDir = path.join(this.files.archiveDir, name);
+    const stat = await fs.stat(snapDir).catch(() => null);
+    if (!stat?.isDirectory()) throw new Error("归档不存在（仅支持文件夹形式的快照回档）");
+    const wasRunning = this.worldActive;
+    if (wasRunning) await this.stopWorld();
+    // 回档前自动存档当前状态，防误操作
+    const backup = await this.files.snapshot("回档前");
+    await this.files.restoreFrom(snapDir);
+    await this.clock.load();
+    await this.focus.load();
+    await this.notifyMgr.load();
+    this.phoneStatus.down = false;
+    this.logger.info("已回档到 archive/%s（回档前自动存档：archive/%s）", name, backup);
+    let msg = `已回档到「${name}」（回档前的状态已自动存档为 archive/${backup}）。`;
+    if (wasRunning) {
+      try {
+        await this.startWorld();
+        msg += " 世界已自动重新开始运转。";
+      } catch (err) {
+        msg += ` 世界自动重启失败：${(err as Error).message ?? err}（可用 world.start 手动启动）。`;
+      }
+    } else {
+      msg += " 用 world.start 开始运转。";
+    }
+    return msg;
+  }
+
+  /** 删除一份归档快照 */
+  async deleteArchive(name: string): Promise<void> {
+    if (!/^[\w\u4e00-\u9fa5.-]+$/.test(name)) throw new Error("非法归档名");
+    const target = path.join(this.files.archiveDir, name);
+    const stat = await fs.stat(target).catch(() => null);
+    if (!stat) throw new Error("归档不存在");
+    await fs.rm(target, { recursive: true, force: true });
+  }
+
   /**
    * 应用新配置：合并后整体替换插件作用域（MainScope.update 强制重启），
    * loader 会把合并结果写回配置文件。先停掉旧 WebUI 再重启，端口即可即时切换；

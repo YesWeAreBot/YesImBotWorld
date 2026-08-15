@@ -39,7 +39,7 @@ YesImBot World：让 Bot 生活在一个由 LLM 独立维护的虚拟世界中�
 | `Bot_Status.md` | Bot-LLM（经压缩流程） | Bot 当前状态，作为角色设定置顶注入 |
 | `World_Status.md` | World-LLM | 世界当前状态 |
 | `News.db` | World-LLM | **世界**重大事件列表（JSONL，一行一个事件）。世界中心——只有影响世界走向的大事记这里 |
-| `facts.jsonl` | World-LLM | **Bot** 的小事记（JSONL，一行一件）。Bot 中心——Bot 的私人小事（习惯、偏好、日常）记这里，Bot 用 `check_facts` 回忆 |
+| `facts.jsonl` | World-LLM | **Bot** 的小事记（JSONL，一行一件）。Bot 中心——Bot 的私人小事（习惯、偏好、日常）记这里，Bot 用 `check_facts` 回忆。可在 WebUI 固定条目（`pinned: true`），固定条目在重置世界/重新创世后保留 |
 | `gallery/` | **用户 + Bot** | 收藏夹，按分类子目录存放：`表情包/`、`meme/`、`截图/`、`照片/`、`未整理/`。用户手动投放的文件放进 `未整理/`（或直接丢根目录，会被自动清扫进去），Bot 有空时会看图、写描述、归类 |
 | `assets/` | 运行时 | 媒体资产库（收到/发出的图片、音频、视频，sha256 去重） |
 | `stream.jsonl` | 运行时 | Bot 工作窗口（Tool Call 流）持久化 |
@@ -47,7 +47,7 @@ YesImBot World：让 Bot 生活在一个由 LLM 独立维护的虚拟世界中�
 | `clock.json` | 运行时 | World Clock（世界时间 + 创世时生成的历法） |
 | `meta.json` | 运行时 | 世界元数据（创世时判定：是否现实世界设定） |
 | `focus.json` | 运行时 | Bot 正在关注的频道（关注期间消息必定完整呈现） |
-| `archive/` | 运行时 | 压缩/重置时归档的历史 |
+| `archive/` | 运行时 | 压缩/重置/手动存档的历史快照（每份一个时间戳文件夹，含 `manifest.json`；可在 WebUI「数据」页查看、回档、删除） |
 
 ## 使用步骤
 
@@ -66,7 +66,7 @@ YesImBot World：让 Bot 生活在一个由 LLM 独立维护的虚拟世界中�
 | `world.reload` | 3 | 修改定义文件后重载：World-LLM 调整状态，并以世界观内方式告知 Bot |
 | `world.inject <text>` | 3 | 注入一条系统事件（调试用，会唤醒等待中的 Bot） |
 | `world.clearmsg` | 4 | 只清空 Bot 的聊天消息记录（不影响世界状态与定义） |
-| `world.reset` | 4 | 归档并清空全部运行时状态（保留定义文件） |
+| `world.reset` | 4 | 归档并清空全部运行时状态（保留定义文件与固定的小事记） |
 
 ## Bot-LLM 两种持续生成模式
 

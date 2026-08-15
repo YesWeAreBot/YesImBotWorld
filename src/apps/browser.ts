@@ -40,6 +40,8 @@ const MAX_HTML_BYTES = 3 * 1024 * 1024;
 /** 每屏正文字符数（长页面分屏，scroll_down 翻页） */
 const SCREEN_CHARS = 2600;
 const HISTORY_LIMIT = 10;
+/** 虚构模式网页缓存的最大页数 */
+const MAX_CACHE_PAGES = 300;
 const USER_AGENT =
   "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36";
 
@@ -115,6 +117,13 @@ export class BrowserApp implements WorldApp {
 
   private current: BrowserPage | null = null;
   private history: BrowserPage[] = [];
+
+  /**
+   * 虚构模式的网页缓存（browserCache.json，随世界持久化）：
+   * 同一个网址（或同一个搜索词）总呈现同一份网页，而不是每次访问都重新生成。
+   * 上限 MAX_CACHE_PAGES 条，超出时丢弃最久未用的条目。
+   */
+  private vcache: Map<string, string> | null = null;
 
   constructor(
     private ctx: Context,
@@ -413,6 +422,25 @@ export class BrowserApp implements WorldApp {
       : nav.fromLink
         ? `在当前网页（${this.current?.url ?? "未知页面"}，标题「${this.current?.title ?? ""}」）里点开了链接「${nav.fromLink}」（指向 ${nav.url}）`
         : `在浏览器地址栏输入并打开了 ${nav.url}`;
+    const displayUrl = nav.search ? `search://${nav.search}` : nav.url!;
+
+    // 先查持久化缓存：同一个网址总是呈现同一份网页，而不是每次访问都"改头换面"
+    const key = browserCacheKey(nav);
+    if (key) {
+      const cache = await this.loadVCache();
+      const hit = cache.get(key);
+      if (hit) {
+        // 命中的条目移到末尾（最近使用），维持简单的 LRU 淘汰
+        cache.delete(key);
+        cache.set(key, hit);
+        await this.saveVCache(cache);
+        const parsed = parseHtml(hit, displayUrl);
+        this.pushHistory();
+        this.current = { ...parsed, url: displayUrl, html: hit, screen: 0 };
+        return this.renderScreen(nav.search ? `你搜索了「${nav.search}」。` : undefined);
+      }
+    }
+
     const task =
       `Bot 拿出手机，${what}（当前 ${this.clock.timeLine()}）。\n` +
       `请扮演这个世界的互联网，生成 Bot 屏幕上加载出的网页：\n` +
@@ -435,11 +463,48 @@ export class BrowserApp implements WorldApp {
     const html = extractHtml(raw);
     if (!html) return "（页面加载出来一片乱码，什么都看不清。刷新试试。）";
 
-    const displayUrl = nav.search ? `search://${nav.search}` : nav.url!;
+    if (key) {
+      const cache = await this.loadVCache();
+      cache.delete(key);
+      cache.set(key, html);
+      while (cache.size > MAX_CACHE_PAGES) {
+        const oldest = cache.keys().next().value as string | undefined;
+        if (oldest === undefined) break;
+        cache.delete(oldest);
+      }
+      await this.saveVCache(cache);
+    }
+
     const parsed = parseHtml(html, displayUrl);
     this.pushHistory();
     this.current = { ...parsed, url: displayUrl, html, screen: 0 };
     return this.renderScreen(nav.search ? `你搜索了「${nav.search}」。` : undefined);
+  }
+
+  /** 惰性加载虚构网页缓存（browserCache.json 不存在或损坏时为空） */
+  private async loadVCache(): Promise<Map<string, string>> {
+    if (this.vcache) return this.vcache;
+    this.vcache = new Map();
+    try {
+      const raw = await fs.readFile(this.files.browserCache, "utf8");
+      const obj = JSON.parse(raw) as unknown;
+      if (obj && typeof obj === "object") {
+        for (const [k, v] of Object.entries(obj as Record<string, unknown>)) {
+          if (typeof v === "string" && v) this.vcache.set(k, v);
+        }
+      }
+    } catch {
+      /* 首次使用或文件损坏：当作空缓存 */
+    }
+    return this.vcache;
+  }
+
+  private async saveVCache(cache: Map<string, string>): Promise<void> {
+    const obj: Record<string, string> = {};
+    for (const [k, v] of cache) obj[k] = v;
+    await this.files
+      .atomicWrite(this.files.browserCache, JSON.stringify(obj))
+      .catch((err) => this.logger.warn("虚构网页缓存写盘失败: %s", err));
   }
 
   // ---------- 截图（两种模式通用，依赖 ctx.puppeteer） ----------
@@ -591,6 +656,20 @@ function clockHm(timeLine: string): string {
 
 function normalizeUrl(url: string): string {
   return /^[a-z][a-z0-9+.-]*:\/\//i.test(url) ? url : `https://${url}`;
+}
+
+/**
+ * 虚构模式网页缓存的键：搜索词与网址统一归一化（小写、剥协议与尾斜杠），
+ * 让"同一个网站"（无论 http/https、带不带尾斜杠）命中同一份缓存页面。
+ */
+export function browserCacheKey(nav: { url?: string; search?: string }): string {
+  if (nav.search !== undefined && nav.search !== null) {
+    return `search://${String(nav.search).trim()}`;
+  }
+  const u = String(nav.url ?? "").trim();
+  if (!u) return "";
+  const normalized = u.replace(/^[a-z][a-z0-9+.-]*:\/\//i, "").replace(/\/+$/, "").toLowerCase();
+  return normalized ? `url://${normalized}` : "";
 }
 
 /** 还原搜索引擎的跳转链接为真实目标（360 /jump?u=、DuckDuckGo /l/?uddg=、Bing /ck/a?u=a1…） */

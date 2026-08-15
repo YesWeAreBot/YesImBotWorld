@@ -326,8 +326,9 @@ details.adv>.body{padding:4px 14px 12px}
   .cfg-wrap{grid-template-columns:1fr}
   .cfg-nav{position:static;display:flex;overflow-x:auto;max-height:none;padding:6px;gap:4px}
   .cfg-nav a{white-space:nowrap;flex:none}
-  .fld{flex-direction:column;gap:4px}
+  .fld{flex-direction:column;gap:4px;align-items:stretch}
   .fld .lbl{width:auto;padding-top:0}
+  .fld .ctl{flex:none;width:100%;min-width:0}
   .hero-clock{font-size:26px}
   button{min-height:34px}
   #tb-clock{display:none}
@@ -554,14 +555,15 @@ function onDebugEntry(entry){
   if(activeView === 'debug') appendDebugEntry(entry);
 }
 function onFileSignal(file){
-  // clock/botStatus/news 是高频信号（时钟每 TU 一跳）：无论当前在哪个视图都刷新总览，
+  // clock/botStatus 是高频信号（时钟每 TU 一跳）：无论当前在哪个视图都刷新总览，
   // 但要避免与下面的分支重复请求
-  if(file === 'clock' || file === 'botStatus' || file === 'news'){ refreshOverview(false); return; }
+  if(file === 'clock' || file === 'botStatus'){ refreshOverview(false); return; }
+  if(file === 'news' || file === 'facts'){ refreshOverview(false); if(activeView === 'state') loadState(); return; }
   if(activeView === 'state') refreshState(file);
   else if(activeView === 'overview') refreshOverview(false);
   else if(activeView === 'gallery' && file === 'gallery') loadGallery();
   else if(activeView === 'media' && file === 'media') loadMedia();
-  else if(activeView === 'data' && (file === 'notes' || file === 'data')) refreshData();
+  else if(activeView === 'data' && (file === 'notes' || file === 'data' || file === 'archive')) refreshData();
   // 仅当调试页当前就停在「工作窗口」子页时才刷新它——否则会把调试列表
   // （连同用户点开的条目）整个刷掉
   else if(activeView === 'debug' && file === 'stream' && debugSubview === 'stream') renderStreamTab();
@@ -844,8 +846,9 @@ function newsSection(o){
 }
 function factsSection(o){
   var body = el('div', {cls:'body'});
-  if(o.facts && o.facts.length){
-    o.facts.forEach(function(n){
+  var facts = (o.facts || []).slice().reverse(); // 时间倒序：最新在前
+  if(facts.length){
+    facts.forEach(function(n){
       body.appendChild(el('div', {cls:'news-item'}, [
         el('span', {cls:'clock', text:'[' + n.clock + ']'}),
         el('span', {text: ' ' + n.content, style:'font-size:12.5px'})
@@ -1068,7 +1071,7 @@ function crossingModal(o){
 function moreWorldActions(){
   var body = el('div');
   [
-    ['reset', '重置世界', '确认重置世界？所有运行时状态将被归档清空（定义文件保留）。', 'danger'],
+    ['reset', '重置世界', '确认重置世界？所有运行时状态将被归档清空（定义文件与固定的小事记保留）。', 'danger'],
     ['clearmsg', '清空消息记录', '确认清空聊天消息记录？（媒体缓存与世界状态不受影响）', ''],
     ['init -f', '重新创世 -f', '强制重新创世：将归档清空当前世界并重新生成初始状态，不可撤销。确认？', 'danger'],
   ].forEach(function(it){
@@ -1902,7 +1905,7 @@ function renderStateEditor(s){
   panes.appendChild(statePane('bot', 'Bot 状态', s.botStatus, '/api/state/bot-status'));
   panes.appendChild(statePane('world', '世界状态', s.worldStatus, '/api/state/world-status'));
   panes.appendChild(jsonlPane('世界新闻', 'World-LLM 记录的世界大事记（JSONL）', s.news, '/api/state/news', '新增一条世界事件…'));
-  panes.appendChild(jsonlPane('Bot 小事记', 'Bot 的私人小事（facts.jsonl）', s.facts || [], '/api/state/facts', '新增一条 Bot 小事…'));
+  panes.appendChild(jsonlPane('Bot 小事记', 'Bot 的私人小事（facts.jsonl），可固定条目——固定后重置世界/重新创世也会保留', s.facts || [], '/api/state/facts', '新增一条 Bot 小事…', {sortable: true, pinnable: true}));
   panes.appendChild(statePane('botdef', 'Bot 角色定义', s.botDef, '/api/definitions/bot'));
   panes.appendChild(statePane('worlddef', '世界定义', s.worldDef, '/api/definitions/world'));
   frag.appendChild(panes);
@@ -1925,18 +1928,36 @@ function statePane(id, title, content, url){
   ]));
   return sec;
 }
-function jsonlPane(title, hint, items, urlBase, placeholder){
+function jsonlPane(title, hint, items, urlBase, placeholder, opts){
+  opts = opts || {};
   var sec = el('div', {cls:'section', 'data-pane': urlBase.split('/').pop()});
   sec.appendChild(el('h3', {html: title + ' <span class="hint">' + hint + '</span>'}));
   var body = el('div', {cls:'body'});
   var list = el('div');
+  // 显示顺序：可排序时默认时间倒序（最新在前），可切换为正序
+  var order = opts.sortable ? 'desc' : 'asc';
+  // 当前展示序列：{i: 原始下标, n: 条目}
+  function ordered(){
+    var arr = [];
+    items.forEach(function(n, i){ arr.push({i: i, n: n}); });
+    if(order === 'desc') arr.reverse();
+    return arr;
+  }
   function render(){
     list.textContent = '';
-    items.forEach(function(n, i){
+    if(!items.length){
+      list.appendChild(el('p', {cls:'empty', text:'（暂无内容）'}));
+      return;
+    }
+    ordered().forEach(function(e){
+      var n = e.n, i = e.i;
       var it = el('div', {cls:'news-item'});
       var ta = el('textarea', {rows: 2});
       ta.value = n.content;
       it.appendChild(el('span', {cls:'clock', text:'[' + n.clock + ']  T=' + Number(n.t).toFixed(1)}));
+      if(n.pinned){
+        it.appendChild(el('span', {cls:'tag', style:'margin-left:6px;color:var(--warn);border-color:rgba(251,191,36,.45)', text:'已固定'}));
+      }
       it.appendChild(ta);
       it.appendChild(el('div', {cls:'toolbar', style:'margin:4px 0 0'}, [
         el('button', {text:'保存修改', onclick:function(){
@@ -1945,21 +1966,32 @@ function jsonlPane(title, hint, items, urlBase, placeholder){
         el('button', {cls:'danger', text:'删除', onclick:function(){
           if(!confirm('删除这条？')) return;
           api('DELETE', urlBase + '?index=' + i).then(function(){ items.splice(i,1); render(); }).catch(showErr);
-        }})
+        }}),
+        opts.pinnable ? el('button', {cls: n.pinned ? 'primary' : '', title: n.pinned ? '取消固定：重置世界/重新创世后这条仍会保留' : '固定这条：重置世界/重新创世也不会删除', text: n.pinned ? '取消固定' : '固定', onclick:function(){
+          api('POST', urlBase + '/pin', {index: i, pinned: !n.pinned}).then(function(){ n.pinned = !n.pinned; toast(n.pinned ? '已固定（重置/创世后保留）' : '已取消固定', 'ok'); render(); }).catch(showErr);
+        }}) : null
       ]));
       list.appendChild(it);
     });
   }
   render();
   var addInp = el('input', {placeholder: placeholder, style:'flex:1'});
-  body.appendChild(el('div', {cls:'toolbar'}, [
-    addInp,
-    el('button', {cls:'primary', text:'追加', onclick:function(){
-      var v = addInp.value.trim();
-      if(!v) return;
-      api('POST', urlBase, {content: v}).then(function(){ addInp.value=''; loadState(); }).catch(showErr);
-    }})
-  ]));
+  var addBar = el('div', {cls:'toolbar'});
+  if(opts.sortable){
+    var orderBtn = el('button', {text: order === 'desc' ? '时间倒序' : '时间正序', title:'切换显示顺序（倒序 = 最新在前）', onclick:function(){
+      order = order === 'desc' ? 'asc' : 'desc';
+      orderBtn.textContent = order === 'desc' ? '时间倒序' : '时间正序';
+      render();
+    }});
+    addBar.appendChild(orderBtn);
+  }
+  addBar.appendChild(addInp);
+  addBar.appendChild(el('button', {cls:'primary', text:'追加', onclick:function(){
+    var v = addInp.value.trim();
+    if(!v) return;
+    api('POST', urlBase, {content: v}).then(function(){ addInp.value=''; loadState(); }).catch(showErr);
+  }}));
+  body.appendChild(addBar);
   body.appendChild(list);
   sec.appendChild(body);
   return sec;
@@ -1976,7 +2008,7 @@ function refreshState(signal){
     if(!stateEditor) return;
     if(signal === 'botStatus') setPaneText('bot', r.botStatus);
     else if(signal === 'worldStatus') setPaneText('world', r.worldStatus);
-    else if(signal === 'news') loadState();
+    else if(signal === 'news' || signal === 'facts') loadState();
     else if(signal === 'botDef') setPaneText('botdef', r.botDef);
     else if(signal === 'worldDef') setPaneText('worlddef', r.worldDef);
   }).catch(function(){});
@@ -2797,27 +2829,90 @@ function refreshData(){
     notesSec.appendChild(nbody);
     holder.appendChild(notesSec);
 
-    if(r.archive && r.archive.length){
-      var aSec = el('div', {cls:'section'});
-      aSec.appendChild(el('h3', {html:'归档 archive/ <span class="hint">压缩与重置时的历史文件</span>'}));
-      var ab = el('div', {cls:'body'});
-      var alist = el('div');
-      r.archive.forEach(function(a){
-        alist.appendChild(el('div', {cls:'kv'}, [
-          el('span', {cls:'k', text: a}),
-          el('button', {text:'查看', style:'padding:2px 9px;font-size:11.5px', onclick:function(){
-            api('GET', '/api/archive/file?name=' + encodeURIComponent(a)).then(function(r2){
-              var pre = el('pre', {style:'max-height:60vh;overflow:auto'});
-              pre.textContent = r2.content;
-              showModal(a, pre);
-            }).catch(showErr);
-          }})
-        ]));
-      });
-      ab.appendChild(alist);
-      aSec.appendChild(ab);
-      holder.appendChild(aSec);
-    }
+    renderArchiveSection(holder, r.archive || {snapshots: [], legacy: []});
+  }).catch(showErr);
+}
+function renderArchiveSection(holder, archive){
+  var aSec = el('div', {cls:'section'});
+  var head = el('h3', {html:'归档 archive/ <span class="hint">压缩、重置与手动存档的历史快照</span>'});
+  head.appendChild(el('span', {style:'flex:1'}));
+  head.appendChild(el('button', {text:'手动存档…', title:'把当前全部世界状态复制成一份新快照', style:'padding:2px 10px;font-size:12px', onclick: manualArchive}));
+  aSec.appendChild(head);
+  var ab = el('div', {cls:'body'});
+  var snaps = archive.snapshots || [];
+  var legacy = archive.legacy || [];
+  if(!snaps.length && !legacy.length){
+    ab.appendChild(el('p', {cls:'empty', text:'（还没有任何归档——压缩、重置世界或手动存档后会出现）'}));
+  }
+  snaps.forEach(function(s){
+    var item = el('div', {cls:'list-item'});
+    item.appendChild(el('div', {cls:'row'}, [
+      el('span', {text: (s.label ? '「' + s.label + '」 · ' : '') + s.name, style:'flex:1;min-width:0;font-family:var(--mono);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap', title: s.name}),
+      el('span', {text: new Date(s.mtime).toLocaleString(), style:'color:var(--fg-dark);font-size:11px'}),
+      el('button', {cls:'primary', text:'回档', title:'用这份快照覆盖当前状态（回档前会自动存档当前状态）', style:'padding:2px 10px;font-size:11.5px', onclick:function(){ restoreArchive(s.name); }}),
+      el('button', {cls:'danger', text:'删除', style:'padding:2px 10px;font-size:11.5px', onclick:function(){
+        if(!confirm('删除归档「' + s.name + '」？不可恢复。')) return;
+        api('POST', '/api/archive/delete', {name: s.name}).then(function(){ toast('已删除', 'ok'); refreshData(); }).catch(showErr);
+      }})
+    ]));
+    var frow = el('div', {style:'margin-top:6px;display:flex;gap:6px;flex-wrap:wrap'});
+    s.files.forEach(function(f){
+      frow.appendChild(el('button', {text: f.name + (f.size ? ' · ' + fmtBytes(f.size) : ''), title:'查看内容', style:'padding:2px 9px;font-size:11px', onclick:function(){
+        api('GET', '/api/archive/file?folder=' + encodeURIComponent(s.name) + '&file=' + encodeURIComponent(f.name)).then(function(r2){
+          var pre = el('pre', {style:'max-height:60vh;overflow:auto'});
+          pre.textContent = r2.content;
+          showModal(s.name + ' / ' + f.name, pre);
+        }).catch(showErr);
+      }}));
+    });
+    item.appendChild(frow);
+    ab.appendChild(item);
+  });
+  if(legacy.length){
+    var lg = el('details', {style:'margin-top:6px'});
+    lg.appendChild(el('summary', {text:'旧版扁平归档（' + legacy.length + ' 个文件，升级前的历史存档）', style:'font-size:12px;color:var(--fg-dim)'}));
+    var lbody = el('div', {style:'margin-top:8px'});
+    legacy.forEach(function(a){
+      lbody.appendChild(el('div', {cls:'kv'}, [
+        el('span', {cls:'k', text: a}),
+        el('button', {text:'查看', style:'padding:2px 9px;font-size:11.5px', onclick:function(){
+          api('GET', '/api/archive/file?file=' + encodeURIComponent(a)).then(function(r2){
+            var pre = el('pre', {style:'max-height:60vh;overflow:auto'});
+            pre.textContent = r2.content;
+            showModal(a, pre);
+          }).catch(showErr);
+        }})
+      ]));
+    });
+    lg.appendChild(lbody);
+    ab.appendChild(lg);
+  }
+  aSec.appendChild(ab);
+  holder.appendChild(aSec);
+}
+function manualArchive(){
+  var inp = el('input', {placeholder:'存档备注（可选）', style:'width:100%'});
+  showModal('手动存档', el('div', null, [
+    el('p', {text:'把当前全部世界状态（Bot/World 状态、新闻、小事记、时钟、记事本、工作窗口等）复制成一份新归档快照，不影响正在运行的世界。', style:'color:var(--fg-dim);font-size:13px'}),
+    inp,
+    el('div', {cls:'toolbar', style:'margin:8px 0 0'}, [
+      el('button', {text:'取消', onclick:hideModal}),
+      el('button', {cls:'primary', text:'存档', onclick:function(){
+        api('POST', '/api/archive/save', {label: inp.value.trim()}).then(function(r){
+          hideModal();
+          toast(r.text || '已存档', 'ok');
+          refreshData();
+        }).catch(showErr);
+      }})
+    ])
+  ]));
+}
+function restoreArchive(name){
+  if(!confirm('回档到「' + name + '」？\n当前状态会先自动存档，然后被这份快照覆盖。')) return;
+  api('POST', '/api/archive/restore', {name: name}).then(function(r){
+    toast(r.text || '已回档', 'ok');
+    refreshData();
+    refreshOverview(false);
   }).catch(showErr);
 }
 function openDataFile(name){
