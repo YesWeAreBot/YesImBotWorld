@@ -1691,9 +1691,19 @@ function renderInput(node, path, value){
   }
   var inp = el('input', {type: node.role === 'secret' ? 'password' : 'text', value: value == null ? '' : value});
   if(node.role === 'secret'){
-    var wrap = el('div', {style:'display:flex;gap:6px'});
+    var isMasked = value === '******';
+    var wrap = el('div', {style:'display:flex;gap:6px;align-items:center'});
+    if(isMasked){
+      // 已设置的密钥不落地到输入框：留空 = 保持不变，输入新值 = 替换
+      inp.type = 'password';
+      inp.value = '';
+      inp.placeholder = '已设置（留空保持不变，输入新值替换）';
+      inp.style.flex = '1';
+    }
     wrap.appendChild(inp);
-    wrap.appendChild(el('button', {text:'显示', onclick:function(){ inp.type = inp.type === 'password' ? 'text' : 'password'; }}));
+    if(!isMasked){
+      wrap.appendChild(el('button', {text:'显示', onclick:function(){ inp.type = inp.type === 'password' ? 'text' : 'password'; }}));
+    }
     inp.oninput = function(){ setPath(cfgCache, path, inp.value); };
     return wrap;
   }
@@ -1726,7 +1736,8 @@ function fetchModelsFor(path, btn){
   var old = btn.textContent;
   btn.textContent = '加载中…';
   btn.disabled = true;
-  api('POST', '/api/llm/models', {baseURL: baseURL, apiKey: apiKey}).then(function(r){
+  // apiKey 可能已被脱敏（******）：把 group 路径一并传给后端，由后端按未改动时回填真实密钥
+  api('POST', '/api/llm/models', {baseURL: baseURL, apiKey: apiKey, group: parent.join('.')}).then(function(r){
     var models = r.models || [];
     if(!models.length){ toast('该端点未返回模型列表', 'warn'); return; }
     var current = getPath(cfgCache, path);

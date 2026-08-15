@@ -25,7 +25,7 @@ import type { MediaStore } from "../media/store.js";
 import type { Prompts, PromptOverrides } from "../prompts.js";
 import type { WorldClock } from "../clock.js";
 import type { ComputerExecResult, ComputerInspection } from "../computer.js";
-import { introspect, validateConfig } from "./schema.js";
+import { collectSecretPaths, introspect, validateConfig } from "./schema.js";
 import { debug, type DebugEntry } from "./debug.js";
 import { usageStore } from "./usage.js";
 import { llmFetch } from "../llm/http.js";
@@ -592,7 +592,13 @@ export class WebUIServer {
 
     // ---------- 配置 ----------
     if (pathname === "/api/config" && method === "GET") {
-      sendJSON(res, 200, { schema: introspect(host.configSchema), value: host.config });
+      const schemaNode = introspect(host.configSchema);
+      const secretPaths = collectSecretPaths(schemaNode);
+      sendJSON(res, 200, {
+        schema: schemaNode,
+        // 深度复制后把 secret 字段脱敏，避免 API key / 令牌 / 密码明文回传到浏览器
+        value: maskSecrets(host.config, secretPaths),
+      });
       return;
     }
     if (pathname === "/api/config" && method === "POST") {
@@ -601,9 +607,12 @@ export class WebUIServer {
       if (!next || typeof next !== "object") {
         return void sendJSON(res, 400, { error: "缺少 config 字段" });
       }
-      const errors = validateConfig(host.configSchema, next);
+      // 把未改动的（仍是掩码的）secret 还原为当前真实值，避免脱敏值覆盖原密钥
+      const secretPaths = collectSecretPaths(introspect(host.configSchema));
+      const restored = restoreSecrets(next as Config, host.config, secretPaths);
+      const errors = validateConfig(host.configSchema, restored);
       if (errors.length) return void sendJSON(res, 400, { error: "配置校验失败", errors });
-      const result = await host.applyConfig(next as Config);
+      const result = await host.applyConfig(restored as Config);
       sendJSON(res, 200, result);
       return;
     }
@@ -612,7 +621,11 @@ export class WebUIServer {
     if (pathname === "/api/llm/models" && method === "POST") {
       const body = await readJson(req);
       const baseURL = String(body.baseURL ?? "").trim();
-      const apiKey = String(body.apiKey ?? "");
+      let apiKey = String(body.apiKey ?? "");
+      // apiKey 被脱敏回传时（仍是掩码），按 group 路径从当前配置回填真实密钥
+      if (apiKey === SECRET_MASK) {
+        apiKey = getSecretByPath(host.config, String(body.group ?? ""));
+      }
       if (!baseURL) return void sendJSON(res, 400, { error: "缺少 baseURL" });
       try {
         const models = await fetchLlmModels(baseURL, apiKey);
@@ -970,6 +983,88 @@ export class WebUIServer {
 }
 
 // ---------- 辅助 ----------
+
+/**
+ * secret 字段回传浏览器时的占位值：前端显示为「已设置/未设置」，而非真实密钥。
+ * 与 restoreSecrets 配对：用户未修改的掩码值在保存时还原为原值。
+ */
+export const SECRET_MASK = "******";
+
+/** 判断某个路径段是否为通配（array[任意索引] / dict[任意键]） */
+function segMatches(seg: string, key: string | number): boolean {
+  return seg === "*" || seg === String(key);
+}
+
+/** 判断 config 路径是否命中 schema 里的一条 secret 路径（支持 "*" 通配段） */
+function pathIsSecret(pathSegs: string[], secretPaths: string[]): boolean {
+  return secretPaths.some((p) => {
+    const parts = p.split(".");
+    if (parts.length !== pathSegs.length) return false;
+    for (let i = 0; i < parts.length; i++) {
+      if (!segMatches(parts[i]!, pathSegs[i]!)) return false;
+    }
+    return true;
+  });
+}
+
+/** 深度复制 config，并把 secret 字段替换为掩码 */
+function maskSecrets(config: unknown, secretPaths: string[]): unknown {
+  const walk = (v: unknown, segs: string[]): unknown => {
+    if (Array.isArray(v)) return v.map((item, i) => walk(item, [...segs, String(i)]));
+    if (v && typeof v === "object") {
+      const out: Record<string, unknown> = {};
+      for (const [k, val] of Object.entries(v)) {
+        const nextSegs = [...segs, k];
+        out[k] = pathIsSecret(nextSegs, secretPaths) ? maskOf(val) : walk(val, nextSegs);
+      }
+      return out;
+    }
+    return v;
+  };
+  return walk(config, []);
+}
+
+/** 掩码占位：字符串用固定掩码；数组的 secret 元素同理（每个元素用掩码） */
+function maskOf(val: unknown): unknown {
+  if (val == null || val === "") return val;
+  return SECRET_MASK;
+}
+
+/** 按点分隔路径从配置对象取值（无 "*" 通配；用于回填 group + apiKey） */
+function getSecretByPath(config: unknown, pathStr: string): string {
+  const parts = pathStr.split(".").filter(Boolean);
+  let cur: unknown = config;
+  for (const p of parts) {
+    if (cur && typeof cur === "object") cur = (cur as Record<string, unknown>)[p];
+    else return "";
+  }
+  return typeof cur === "string" ? cur : "";
+}
+
+/** 把「仍是掩码（未改动）」的 secret 字段还原为当前真实值；非掩码值（用户新填）原样保留 */
+function restoreSecrets(next: unknown, current: unknown, secretPaths: string[]): unknown {
+  const walk = (n: unknown, c: unknown, segs: string[]): unknown => {
+    if (Array.isArray(n)) {
+      const curArr = Array.isArray(c) ? c : [];
+      return n.map((item, i) => walk(item, curArr[i], [...segs, String(i)]));
+    }
+    if (n && typeof n === "object") {
+      const curObj = c && typeof c === "object" ? (c as Record<string, unknown>) : {};
+      const out: Record<string, unknown> = {};
+      for (const [k, val] of Object.entries(n)) {
+        const nextSegs = [...segs, k];
+        if (pathIsSecret(nextSegs, secretPaths) && val === SECRET_MASK) {
+          out[k] = curObj[k];
+        } else {
+          out[k] = walk(val, curObj[k], nextSegs);
+        }
+      }
+      return out;
+    }
+    return n;
+  };
+  return walk(next, current, []);
+}
 
 /** 向 OpenAI 兼容端点拉取可选模型列表（GET {baseURL}/models） */
 async function fetchLlmModels(baseURL: string, apiKey: string): Promise<string[]> {

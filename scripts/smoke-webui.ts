@@ -65,6 +65,8 @@ async function main() {
   const config = Config({
     basePath: "world",
     autoStart: false,
+    bot: { apiKey: "sk-secret-bot-key" },
+    world: { apiKey: "sk-secret-world-key" },
     webui: { enabled: true, host: "127.0.0.1", port: PORT, token: TOKEN },
   });
   app.plugin(apply, config);
@@ -188,7 +190,19 @@ async function main() {
   check(saved.bot?.constitution === "你是冒烟测试的 Bot。", "覆盖已持久化到 prompts.json");
 
   // ---- 配置热重载（插件作用域重启，同端口恢复） ----
-  const current = (await (await fetch(`${base}/api/config`, { headers: auth })).json()) as { value: Record<string, unknown> };
+  const current = (await (await fetch(`${base}/api/config`, { headers: auth })).json()) as {
+    value: Record<string, unknown> & {
+      bot?: { apiKey?: string };
+      world?: { apiKey?: string };
+      webui?: { token?: string };
+    };
+  };
+
+  // ---- secret 脱敏：apiKey / token 不得明文回传 ----
+  check(current.value.bot?.apiKey === "******", "/api/config GET 对 bot.apiKey 脱敏");
+  check(current.value.world?.apiKey === "******", "/api/config GET 对 world.apiKey 脱敏");
+  check(current.value.webui?.token === "******", "/api/config GET 对 webui.token 脱敏");
+
   const next = { ...current.value, serializeSameEndpoint: true };
   const applyRes = await fetch(`${base}/api/config`, {
     method: "POST",
@@ -211,6 +225,14 @@ async function main() {
     }, 15000),
     "热重载后同端口恢复且新配置生效",
   );
+
+  // 掩码回传后，真实密钥应被 restore 保留（GET 应仍是掩码而非被清空）
+  const afterReload = (await (await fetch(`${base}/api/config`, { headers: auth })).json()) as {
+    value: { bot?: { apiKey?: string }; world?: { apiKey?: string }; webui?: { token?: string } };
+  };
+  check(afterReload.value.bot?.apiKey === "******", "热重载后 bot.apiKey 仍为掩码（未被清空）");
+  check(afterReload.value.world?.apiKey === "******", "热重载后 world.apiKey 仍为掩码（未被清空）");
+  check(afterReload.value.webui?.token === "******", "热重载后 webui.token 仍为掩码（未被清空）");
 
   // ---- 非法配置拒绝（枚举外取值） ----
   const badRes = await fetch(`${base}/api/config`, {
