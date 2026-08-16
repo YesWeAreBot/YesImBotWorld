@@ -212,19 +212,22 @@ export class WorldService extends Service<Config> {
     });
     this.world.visitorPersonaMode = this.config.crossing.visitorPersonaMode;
 
-    if (this.config.autoStart && (await this.files.isInitialized())) {
-      try {
-        await this.startWorld();
-      } catch (err) {
-        this.logger.warn("自动启动失败: %s", err);
-      }
-    }
-
+    // 先启动 WebUI（初始化 usageStore 并确保 webui 目录存在），再自动恢复世界运行。
+    // 否则 autoStart 时 Bot 会先发出 LLM 请求，而 usageStore 尚未 init / 目录未建，
+    // 这些用量既写不进文件、也加载不到历史，导致重启后数据不连贯。
     if (this.config.webui.enabled) {
       try {
         await this.startWebUI();
       } catch (err) {
         this.logger.warn("WebUI 启动失败: %s", err);
+      }
+    }
+
+    if (this.config.autoStart && (await this.files.isInitialized())) {
+      try {
+        await this.startWorld();
+      } catch (err) {
+        this.logger.warn("自动启动失败: %s", err);
       }
     }
 

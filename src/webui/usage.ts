@@ -7,6 +7,7 @@
  */
 
 import { promises as fs } from "node:fs";
+import path from "node:path";
 
 export interface UsageRecord {
   id: number;
@@ -45,12 +46,22 @@ export class UsageStore {
   private records: UsageRecord[] = [];
   private nextId = 1;
   private readonly maxKeep = 5000;
+  /** 目录就绪（mkdir 完成）的承诺，用于让 record 的追加写等待目录存在后再落盘 */
+  private ensured: Promise<void> | null = null;
 
   /** 初始化持久化文件；WebUI 启动时调用。重复调用只生效一次 */
   init(filePath: string): void {
     if (this.file) return;
     this.file = filePath;
-    void this.load();
+    if (!filePath) return;
+    // 先确保父目录存在再读写：目录缺失会让 appendFile 静默失败（ENOENT 被吞掉），
+    // 用量只留在内存、重启即归零。mkdir 完成后再读历史，恢复累加。
+    const dir = path.dirname(filePath);
+    this.ensured = fs
+      .mkdir(dir, { recursive: true })
+      .then(() => undefined)
+      .catch(() => undefined);
+    void this.ensured.then(() => this.load());
   }
 
   private async load(): Promise<void> {
@@ -79,7 +90,12 @@ export class UsageStore {
     const rec: UsageRecord = { id: this.nextId++, ts: Date.now(), cachedTokens: 0, ...r };
     this.records.push(rec);
     if (this.records.length > this.maxKeep) this.records.splice(0, this.records.length - this.maxKeep);
-    if (this.file) void fs.appendFile(this.file, JSON.stringify(rec) + "\n").catch(() => {});
+    if (this.file) {
+      // 等目录就绪后再追加，避免 init 与 record 之间的瞬时窗口里目录尚不存在、
+      // 追加被静默吞掉；单行 JSONL 追加是单次 write，行间不会交错。
+      const line = JSON.stringify(rec) + "\n";
+      void (this.ensured ?? Promise.resolve()).then(() => fs.appendFile(this.file, line)).catch(() => {});
+    }
   }
 
   recent(n: number): UsageRecord[] {
