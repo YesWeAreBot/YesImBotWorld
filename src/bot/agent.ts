@@ -680,7 +680,7 @@ export class BotAgent {
           const resolved = await this.messenger.resolveKey(id.trim());
           if ("error" in resolved) return resolved.error;
           await this.enterChannel(resolved.key, resolved.isPrivate);
-          return this.messenger.channelMessages(resolved.key, clampInt(call.arguments.n, 1, 50, 10));
+          return this.messenger.channelMessages(resolved.key, clampInt(call.arguments.n, 10, 200, 10));
         });
       }
       case "check_gallery": {
