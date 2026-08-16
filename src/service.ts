@@ -302,7 +302,7 @@ export class WorldService extends Service<Config> {
     await this.clock.reset();
 
     this.logger.info("开始创世：调用 World-LLM 生成初始状态…");
-    // 生成空的 News.db 与 facts.jsonl
+    // 生成空的 News.jsonl 与 facts.jsonl
     if (!(await this.files.exists(this.files.news))) await fs.writeFile(this.files.news, "");
     if (!(await this.files.exists(this.files.facts))) await fs.writeFile(this.files.facts, "");
     await this.world.initialize(botDef, worldDef);

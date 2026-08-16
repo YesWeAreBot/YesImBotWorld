@@ -199,7 +199,7 @@ export interface RemoteWorldLink {
  *
  * 每次被调用（响应 Bot 的工具调用 / Tingle / 初始化 / 定义变更）时，
  * 通过工具调用读取相关信息，生成合理的 Event，并维护
- * World_Status.md 与 News.db。所有调用串行化以避免文件写冲突。
+ * World_Status.md 与 News.jsonl。所有调用串行化以避免文件写冲突。
  */
 export class WorldAgent {
   private client: ChatClient;

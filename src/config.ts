@@ -301,7 +301,7 @@ export const Config: Schema<Config> = Schema.intersect([
   Schema.object({
     basePath: Schema.string()
       .default("data/yesimbot-world")
-      .description("数据目录（存放 Bot_Status.md / World_Status.md / News.db 等）"),
+      .description("数据目录（存放 Bot_Status.md / World_Status.md / News.jsonl 等）"),
     autoStart: Schema.boolean()
       .default(false)
       .description("Koishi 启动后自动恢复世界运行（需先执行 world.init 初始化）"),

@@ -41,7 +41,7 @@ const WORLD_DEF_TEMPLATE = `# 世界定义
  * ├── World_Definition.md  # 用户编写：世界定义
  * ├── Bot_Status.md        # Bot-LLM 维护（压缩时更新）：Bot 当前状态
  * ├── World_Status.md      # World-LLM 维护：世界当前状态
- * ├── News.db              # World-LLM 维护：世界重大事件列表（JSONL 格式，世界中心）
+ * ├── News.jsonl           # World-LLM 维护：世界重大事件列表（JSONL 格式，世界中心）
  * ├── facts.jsonl          # World-LLM 维护：Bot 的小事记（JSONL 格式，Bot 中心）
  * ├── clock.json           # World Clock 状态
  * ├── meta.json            # 世界元数据（创世时判定：是否现实世界等）
@@ -77,7 +77,7 @@ export class WorldFiles {
     this.worldDef = path.join(base, "World_Definition.md");
     this.botStatus = path.join(base, "Bot_Status.md");
     this.worldStatus = path.join(base, "World_Status.md");
-    this.news = path.join(base, "News.db");
+    this.news = path.join(base, "News.jsonl");
     this.facts = path.join(base, "facts.jsonl");
     this.clock = path.join(base, "clock.json");
     this.meta = path.join(base, "meta.json");
@@ -98,6 +98,19 @@ export class WorldFiles {
     await fs.mkdir(this.notesDir, { recursive: true });
     if (!(await this.exists(this.botDef))) await fs.writeFile(this.botDef, BOT_DEF_TEMPLATE);
     if (!(await this.exists(this.worldDef))) await fs.writeFile(this.worldDef, WORLD_DEF_TEMPLATE);
+    await this.migrateNewsDb();
+  }
+
+  /** 历史兼容：早期版本世界大事记叫 News.db（实为 JSONL），迁移为 News.jsonl */
+  private async migrateNewsDb(): Promise<void> {
+    const legacy = path.join(this.base, "News.db");
+    try {
+      if ((await this.exists(legacy)) && !(await this.exists(this.news))) {
+        await fs.rename(legacy, this.news);
+      }
+    } catch {
+      /* 迁移失败不致命：后续 readText/appendFile 会按新文件名重建，旧文件仅不再被读取 */
+    }
   }
 
   async exists(file: string): Promise<boolean> {

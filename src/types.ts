@@ -95,7 +95,7 @@ export interface PinnedContext {
   updatedAt: number;
 }
 
-/** News.db（JSONL）中的一条世界事件 */
+/** News.jsonl（JSONL）中的一条世界事件 */
 export interface NewsEntry {
   /** 世界时刻（Time Unit） */
   t: number;

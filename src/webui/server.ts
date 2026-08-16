@@ -259,7 +259,7 @@ export class WebUIServer {
       case "World_Status.md":
         signal = "worldStatus";
         break;
-      case "News.db":
+      case "News.jsonl":
         signal = "news";
         break;
       case "facts.jsonl":

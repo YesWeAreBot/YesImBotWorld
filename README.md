@@ -5,7 +5,7 @@ YesImBot World：让 Bot 生活在一个由 LLM 独立维护的虚拟世界中�
 两个 LLM 同时运行：
 
 - **Bot-LLM**：持续推理的 Agent，一个接一个地生成工具调用（Tool Call），像文字版 VLA——它不是在"回复消息"，而是在世界中**生活**：行动、等待、休息、翻手机、聊天。
-- **World-LLM**：世界模拟引擎。无持续上下文，按需被唤起：裁定 Bot 行动的结果、响应等待到期、响应 Tingle（世界心跳）推进世界演化，并维护 `World_Status.md`、`News.db`（世界重大事件）与 `facts.jsonl`（Bot 的小事记）。它只模拟 Bot 所处的虚拟世界——聊天平台属于外部真实系统，World-LLM 被明确禁止虚构平台内的事件（消息、好友申请等只能来自 Koishi）。
+- **World-LLM**：世界模拟引擎。无持续上下文，按需被唤起：裁定 Bot 行动的结果、响应等待到期、响应 Tingle（世界心跳）推进世界演化，并维护 `World_Status.md`、`News.jsonl`（世界重大事件）与 `facts.jsonl`（Bot 的小事记）。它只模拟 Bot 所处的虚拟世界——聊天平台属于外部真实系统，World-LLM 被明确禁止虚构平台内的事件（消息、好友申请等只能来自 Koishi）。
 
 ## 提醒
 
@@ -25,7 +25,7 @@ YesImBot World：让 Bot 生活在一个由 LLM 独立维护的虚拟世界中�
 │ 上下文: 置顶区(角色/历史/工具/记忆)      │◄──┤       check_time /          │
 │         + Tool Call 流(只追加)          │事件│       send_event            │
 │ 调度器: duration → 期望完成时刻 → Event │──►│ 维护: World_Status.md       │
-└──────────────────┬──────────────────────┘act│       News.db               │
+└──────────────────┬──────────────────────┘act│       News.jsonl               │
                    │                          └──────────▲─────────────────┘
               WorldClock (TU) ── Tingle 心跳 ────────────┘
 ```
@@ -38,7 +38,7 @@ YesImBot World：让 Bot 生活在一个由 LLM 独立维护的虚拟世界中�
 | `World_Definition.md` | **用户** | 世界定义（创世输入，World-LLM 的最高准则） |
 | `Bot_Status.md` | Bot-LLM（经压缩流程） | Bot 当前状态，作为角色设定置顶注入 |
 | `World_Status.md` | World-LLM | 世界当前状态 |
-| `News.db` | World-LLM | **世界**重大事件列表（JSONL，一行一个事件）。世界中心——只有影响世界走向的大事记这里 |
+| `News.jsonl` | World-LLM | **世界**重大事件列表（JSONL，一行一个事件）。世界中心——只有影响世界走向的大事记这里 |
 | `facts.jsonl` | World-LLM | **Bot** 的小事记（JSONL，一行一件）。Bot 中心——Bot 的私人小事（习惯、偏好、日常）记这里，Bot 用 `check_facts` 回忆。可在 WebUI 固定条目（`pinned: true`），固定条目在重置世界/重新创世后保留 |
 | `gallery/` | **用户 + Bot** | 收藏夹，按分类子目录存放：`表情包/`、`meme/`、`截图/`、`照片/`、`未整理/`。用户手动投放的文件放进 `未整理/`（或直接丢根目录，会被自动清扫进去），Bot 有空时会看图、写描述、归类 |
 | `assets/` | 运行时 | 媒体资产库（收到/发出的图片、音频、视频，sha256 去重） |
@@ -53,7 +53,7 @@ YesImBot World：让 Bot 生活在一个由 LLM 独立维护的虚拟世界中�
 
 1. 配置插件（两个模型的 API 地址）并启用；
 2. 编辑 `Bot_Definition.md` 与 `World_Definition.md`（首次启用后自动生成模板）；
-3. 执行指令 `world.init` —— World-LLM 创世，生成 `Bot_Status.md` / `World_Status.md` / `News.db`；
+3. 执行指令 `world.init` —— World-LLM 创世，生成 `Bot_Status.md` / `World_Status.md` / `News.jsonl`；
 4. 执行 `world.start` —— 世界时钟开始流动，Bot-LLM 进入持续推理。
 
 ### 指令
