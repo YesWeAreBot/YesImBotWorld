@@ -229,6 +229,8 @@ export interface AppsConfig {
   browserEnabled: boolean;
   browserSearchURL: string;
   browserProxy: string;
+  newsEnabled: boolean;
+  newsFeeds: string[];
   phoneResolution: string;
   phoneShellImage: string;
   notesEnabled: boolean;
@@ -680,6 +682,19 @@ export const Config: Schema<Config> = Schema.intersect([
         .description(
           "浏览器访问真实互联网时使用的代理 URL（如 http://127.0.0.1:7890）。" +
             "留空时依次读取 HTTPS_PROXY / HTTP_PROXY 环境变量；都没有则不代理。",
+        ),
+      newsEnabled: Schema.boolean()
+        .default(true)
+        .description(
+          "内置新闻应用：Bot 的手机里多一个「新闻」App，能翻阅世界的最近大事（News.jsonl），" +
+            "也可按关键词搜索或按时间范围回看，像读新闻 App 一样了解世界近况。",
+        ),
+      newsFeeds: Schema.array(Schema.string())
+        .default([])
+        .description(
+          "现实世界设定的新闻 RSS 源列表（可自行配置，需为你服务器环境可直连的地址）。留空时使用内置默认源；" +
+            "每个源都会抓取，失败/不可达会自动跳过。搜索新闻时按关键词直接在 RSS 原文里匹配" +
+            "（不支持 ?q= 的源会拉取全文后在本地过滤）。",
         ),
       phoneResolution: Schema.string()
         .default("auto")

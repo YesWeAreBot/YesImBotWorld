@@ -666,14 +666,6 @@ export class BotAgent {
             return `（返回失败：${(err as Error).message ?? err}）`;
           }
         });
-      case "check_news":
-        return this.dispatchLocal(call, async () => {
-          const news = await this.files.readNews(clampInt(call.arguments.n, 1, 30, 10));
-          if (!news.length) return "你回想近来听到的种种消息——似乎没什么值得一提的大事。";
-          // 与 check_status(world) 的增量视图保持同步：这里看过的不再作为"新发生的事"重复出现
-          this.lastNewsT = Math.max(...news.map((e) => e.t));
-          return `你回想起近来听到的种种消息：\n` + news.map((e) => `- [${e.clock}] ${e.content}`).join("\n");
-        });
       case "check_facts":
         return this.dispatchLocal(call, async () => {
           const facts = await this.files.readFacts(clampInt(call.arguments.n, 1, 30, 10));

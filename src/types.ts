@@ -102,6 +102,8 @@ export interface NewsEntry {
   /** 世界时钟的可读时间 */
   clock: string;
   content: string;
+  /** 详情正文（World-LLM 摘编时的展开内容；Bot 点进新闻条目后看到的全文） */
+  detail?: string;
   /** 是否被用户固定（仅 facts.jsonl）：固定条目在重置世界/重新创世时保留 */
   pinned?: boolean;
 }

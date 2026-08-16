@@ -231,6 +231,7 @@ button.seg.active{background:linear-gradient(135deg,rgba(110,231,255,.18),rgba(1
 .news-item{border-left:2px solid rgba(110,231,255,.35);padding:7px 12px;margin-bottom:8px;background:var(--panel);border-radius:0 10px 10px 0}
 .news-item .clock{color:var(--info);font-size:11.5px;font-family:var(--mono)}
 .news-item textarea{width:100%;margin-top:6px;font-family:var(--mono);font-size:12px}
+.news-detail{font-size:12.5px;line-height:1.6;color:var(--fg);white-space:pre-wrap;word-break:break-word}
 
 /* ---------- 设备 ---------- */
 .dev-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;align-items:start}
@@ -1323,7 +1324,7 @@ function phonePanel(d){
     scr.appendChild(el('div', {cls:'appview'}, kids));
   } else {
     var home = el('div', {cls:'home'});
-    [[p.chatAppName || 'QQ', '💬'], ['天气', '🌤'], ['浏览器', '🌐'], ['记事本', '📝']].forEach(function(a){
+    [[p.chatAppName || 'QQ', '💬'], ['天气', '🌤'], ['浏览器', '🌐'], ['新闻', '📰'], ['记事本', '📝']].forEach(function(a){
       home.appendChild(el('div', {cls:'appdot'}, [el('i', {text: a[1]}), el('span', {text: a[0]})]));
     });
     scr.appendChild(home);
@@ -1978,6 +1979,25 @@ function jsonlPane(title, hint, items, urlBase, placeholder, opts){
         it.appendChild(el('span', {cls:'tag', style:'margin-left:6px;color:var(--warn);border-color:rgba(251,191,36,.45)', text:'已固定'}));
       }
       it.appendChild(ta);
+      // 详情正文 / 来源链接（World 摘编的 detail，或现实新闻的原始 link）
+      var hasDetail = (n.detail && String(n.detail).trim()) || n.link;
+      if(hasDetail){
+        var detBtn = el('button', {text:'查看详情', style:'font-size:11.5px;padding:2px 9px;margin:4px 0 0;display:inline-flex'});
+        var detBox = el('div', {style:'display:none;margin-top:6px;padding:8px 10px;background:var(--panel);border-radius:8px;border:1px solid var(--line)'});
+        detBtn.onclick = function(){
+          var open = detBox.style.display !== 'none';
+          detBox.style.display = open ? 'none' : 'block';
+          detBtn.textContent = open ? '查看详情' : '收起详情';
+        };
+        var detLines = [];
+        if(n.detail && String(n.detail).trim()) detLines.push(el('div', {text: String(n.detail).trim(), cls:'news-detail'}));
+        if(n.link) detLines.push(el('div', {style:'margin-top:6px'}, [
+          el('a', {href: n.link, target:'_blank', rel:'noopener', text: n.link, style:'font-size:11.5px;word-break:break-all;color:var(--info)'})
+        ]));
+        detBox.append.apply(detBox, detLines);
+        it.appendChild(detBtn);
+        it.appendChild(detBox);
+      }
       it.appendChild(el('div', {cls:'toolbar', style:'margin:4px 0 0'}, [
         el('button', {text:'保存修改', onclick:function(){
           api('PUT', urlBase, {index:i, content: ta.value}).then(function(){ items[i].content = ta.value; toast('已保存', 'ok'); }).catch(showErr);

@@ -55,12 +55,13 @@ const WORLD_TOOLS: ChatToolDef[] = [
     function: {
       name: "update",
       description:
-        "更新状态。bot_status / world_status 会用 content 整体覆盖对应 md 文件；news 把 content 作为一条世界重大事件追加（世界中心，只有影响世界走向的大事才记这里）；facts 把 content 作为一条 Bot 小事记追加（Bot 中心，Bot 的私人小事记这里）。均自动附带当前世界时刻",
+        "更新状态。bot_status / world_status 会用 content 整体覆盖对应 md 文件；news 把 content 作为一条世界重大事件追加（世界中心，只有影响世界走向的大事才记这里），可另给 detail 作为这条新闻的详情正文（Bot 点进该新闻时看到的全文，一段即可，别把列表标题写太长）；facts 把 content 作为一条 Bot 小事记追加（Bot 中心，Bot 的私人小事记这里）。均自动附带当前世界时刻",
       parameters: {
         type: "object",
         properties: {
           target: { type: "string", enum: ["bot_status", "world_status", "news", "facts"] },
-          content: { type: "string" },
+          content: { type: "string", description: "要写的内容（news/facts 为一条记录的标题/简述，bot_status/world_status 为整体覆盖）" },
+          detail: { type: "string", description: "仅 target 为 news 时可选：这条新闻的详情正文（Bot 点进去看到的全文）" },
         },
         required: ["target", "content"],
       },
@@ -217,6 +218,8 @@ export class WorldAgent {
   private visitorsProvider: (() => PresentVisitor[]) | null = null;
   /** 常驻 Bot 的实时事件通道（service 注册；接待访客的任务用 send_event to="bot" 送达它） */
   private hostBotDeliver: ((content: string) => void) | null = null;
+  /** 现实世界新闻素材提供者（service 注册）：现实世界设定下 Tingle 抓取真实新闻用以摘编 */
+  private realNewsProvider: (() => Promise<string[]>) | null = null;
   /**
    * 访客状态档案的放置方式（crossing.visitorPersonaMode，service 同步）：
    * - pinned：档案常驻系统提示 <visitors> 区（缓存命中率最优）；
@@ -289,6 +292,17 @@ export class WorldAgent {
   /** 注册/清除常驻 Bot 的实时事件通道（世界启动/停止时由 service 调用） */
   setHostBotDeliver(fn: ((content: string) => void) | null): void {
     this.hostBotDeliver = fn;
+  }
+
+  /** 注册/清除现实世界新闻素材提供者（service 调用；现实世界设定下 Tingle 用它抓真实新闻摘编） */
+  setRealNewsProvider(fn: (() => Promise<string[]>) | null): void {
+    this.realNewsProvider = fn;
+  }
+
+  /** 世界是否是现实地球世界（创世判定持久化在 meta.json；旧世界回退到时钟同步模式） */
+  private async isRealWorld(): Promise<boolean> {
+    const meta = await this.files.readMeta();
+    return meta.realWorld ?? this.clock.syncRealTime;
   }
 
   constructor(
@@ -402,6 +416,23 @@ export class WorldAgent {
         `先 check world_status——若其中仍有他们"在场/正在做某事"的记述，请 update world_status 清理干净（可保留他们留下的持久影响）；` +
         `之后的世界演化**不要**再出现他们本人的情节。）`;
       this.departedVisitors = [];
+    }
+    // 现实世界设定：抓取真实新闻作为素材，由 World-LLM 摘编进 News.jsonl
+    if (this.realNewsProvider && (await this.isRealWorld())) {
+      try {
+        const headlines = await this.realNewsProvider();
+        if (headlines.length) {
+          task +=
+            `\n\n（以下是现实世界当下正在发生的真实新闻头条，供你参考：\n` +
+            headlines.map((h) => `- ${h}`).join("\n") +
+            `\n请不要逐条照抄，而是挑选其中重要、会影响世界走向或人们生活的事件，用它自己的口吻摘编成本世界的新闻` +
+            `（用 update(news) 记录，一般一两条即可，无关紧要的琐事不要记）。` +
+            `content 写一句简明的标题式简述，detail 写一段详情正文（几句话说清来龙去脉，Bot 点进这条新闻时会看到这段）。` +
+            `这些新闻对你模拟的世界而言就是真实发生的，Bot 会像读真新闻一样读到它们。）`;
+        }
+      } catch (err) {
+        this.logger.warn("抓取现实新闻素材失败（跳过一次）: %s", err);
+      }
     }
     await this.invokeWithTools({
       task,
@@ -1054,7 +1085,12 @@ export class WorldAgent {
             }
             const t = this.clock.now();
             if (target === "news") {
-              await this.files.appendNews({ t, clock: this.clock.clockString(t), content });
+              await this.files.appendNews({
+                t,
+                clock: this.clock.clockString(t),
+                content,
+                ...(typeof args.detail === "string" && args.detail.trim() ? { detail: args.detail.trim() } : {}),
+              });
               return "已追加至世界重大事件列表";
             }
             await this.files.appendFacts({ t, clock: this.clock.clockString(t), content });

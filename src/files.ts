@@ -178,6 +178,21 @@ export class WorldFiles {
     return entries;
   }
 
+  /** 读取全部世界事件（按文件顺序，供新闻 App 检索/按时间回看） */
+  async readNewsAll(): Promise<NewsEntry[]> {
+    const raw = await this.readText(this.news);
+    if (!raw.trim()) return [];
+    const entries: NewsEntry[] = [];
+    for (const line of raw.trim().split("\n")) {
+      try {
+        entries.push(JSON.parse(line) as NewsEntry);
+      } catch {
+        /* 跳过损坏行 */
+      }
+    }
+    return entries;
+  }
+
   /** 追加一条 Bot 的小事记（facts.jsonl，Bot 中心，供 Bot 记私事） */
   async appendFacts(entry: NewsEntry): Promise<void> {
     await fs.appendFile(this.facts, JSON.stringify(entry) + "\n");

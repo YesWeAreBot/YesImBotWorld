@@ -6,6 +6,8 @@ import { BrowserApp } from "./apps/browser.js";
 import { ComputerDevice } from "./apps/computerDevice.js";
 import { FileManagerApp } from "./apps/files.js";
 import { McpApp } from "./apps/mcp.js";
+import { NewsApp } from "./apps/news.js";
+import { fetchAllHeadlines } from "./apps/newsFeed.js";
 import { NotesApp } from "./apps/notes.js";
 import { RemoteDesktopApp } from "./apps/remoteDesktop.js";
 import { TerminalApp } from "./apps/terminal.js";
@@ -211,6 +213,14 @@ export class WorldService extends Service<Config> {
       generateShell: this.config.apps.browserEnabled,
     });
     this.world.visitorPersonaMode = this.config.crossing.visitorPersonaMode;
+    // 现实世界设定：给 World-LLM 注册真实新闻素材源，Tingle 时抓取摘编进 News.jsonl
+    if (this.config.apps.newsEnabled) {
+      const newsCfg = this.config.apps;
+      this.world.setRealNewsProvider(async () => {
+        const items = await fetchAllHeadlines({ feeds: newsCfg.newsFeeds, proxy: newsCfg.browserProxy }, 15);
+        return items.map((it) => it.title);
+      });
+    }
 
     // 先启动 WebUI（初始化 usageStore 并确保 webui 目录存在），再自动恢复世界运行。
     // 否则 autoStart 时 Bot 会先发出 LLM 请求，而 usageStore 尚未 init / 目录未建，
@@ -424,6 +434,7 @@ export class WorldService extends Service<Config> {
         ? [new WeatherApp(this.world, this.files, this.clock, this.config.apps, this.logger)]
         : []),
       ...(this.config.apps.notesEnabled ? [new NotesApp(this.files, this.clock, this.logger)] : []),
+      ...(this.config.apps.newsEnabled ? [new NewsApp(this.files, this.clock, this.config.apps, this.logger)] : []),
       ...(this.config.apps.browserEnabled
         ? [
             new BrowserApp(
@@ -852,6 +863,9 @@ export class WorldService extends Service<Config> {
     }
     if (this.config.apps.browserEnabled) {
       list.push({ name: "浏览器", description: "上网：搜索、打开网页，可以截图保存" });
+    }
+    if (this.config.apps.newsEnabled) {
+      list.push({ name: "新闻", description: "翻阅世界的最近大事：看头条、按关键词搜索、按时间回看" });
     }
     // 电脑不在这里：它是与手机平级的另一台设备（open_computer / close_computer 开关）
     for (const s of this.config.apps.mcpServers) {

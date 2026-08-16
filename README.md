@@ -247,7 +247,6 @@ World-LLM 每次被唤起时通过工具调用读写状态：
 | `rest(duration?)` | 休息：压缩上下文 + 预热 KV cache，醒来获知流逝的 TU（打开的应用自动关闭） |
 | `check_status(target)` | 查看自身（`self`）或世界（`world`，含近期 News） |
 | `check_time()` | 看一眼现在几点（世界裁定能否得知） |
-| `check_news(n?)` | 回看世界近期新闻/见闻 |
 | `check_facts(n?)` | 回忆自己的私人小事记（facts.jsonl：习惯、偏好、日常，Bot 中心） |
 | `check_gallery(category?)` / `check_media(n?, type?)` | 浏览收藏夹（分类总览 / 打开某一类）/ 只读翻看媒体缓存 |
 | `view_media(media[])` | 发图前细看：原生识图附原图，否则解释器详述 |
@@ -352,6 +351,15 @@ World-LLM 每次被唤起时通过工具调用读写状态：
   - **网页截图**（两种模式都支持）：依赖 `koishi-plugin-puppeteer` 提供的 `ctx.puppeteer`
     服务（本插件保持零直接依赖，未安装时仅截图不可用、浏览照常）。现实模式无头浏览器实拍网址，
     虚构模式渲染生成的 HTML；截图自动存入收藏夹「截图」分类并记下描述。
+- **内置新闻应用**（`apps.newsEnabled`，默认开启）：Bot 手机里的「新闻」App，翻阅世界的最近大事
+  （`News.jsonl`，World-LLM 维护的世界中心事件）。`headlines(n?)` 看最近头条、`search_news(keyword, n?)`
+  按关键词搜索、`search_news_time(since?, until?, n?)` 按 T（时间单位）范围回看、`open_news(n)` 点进某条看详情；
+  列表每条带编号，Bot 能像读新闻 App 一样「点进去」读全文。
+  **现实世界设定**下（`meta.json` 的 `realWorld`）：Tingle 心跳会自动抓取 `apps.newsFeeds` 配置的 RSS 源
+  （免费无需 key），经 World-LLM 摘编后写入 `News.jsonl`（每条含一句标题简述 + 一段详情正文，点进去即展开）——
+  对 Bot 而言这些就是它世界真实发生的新闻，与虚构世界保持一致、无需区分来源；而 `search_news(keyword)` 会**同时**
+  命中世界内已记录（World-LLM 摘编）的新闻与 RSS 原文（当下真实新闻标题），合并呈现；RSS 原文点进去会实时抓取该链接的网页正文。
+  RSS 源可自行配置（`apps.newsFeeds`，数组），留空用内置默认源；默认源按中国大陆服务器环境可直连优先，被墙/不可达时可替换。
 - **内置文件应用**（`apps.filesEnabled`，默认关闭）：`open_computer()` 打开电脑后在
   **这台电脑**（Docker 容器）里浏览/编辑文件，提供 `list` / `show` / `write` / `patch` /
   `mkdir` / `delete`，对应真人电脑上的"文件资源管理器"。`patch` 接受 apply_patch 块
@@ -540,6 +548,8 @@ plugins:
       browserEnabled: true # 内置浏览器（现实设定上真互联网；虚构设定由 World-LLM 生成网页；截图需 koishi-plugin-puppeteer）
       browserSearchURL: https://www.so.com/s?q=%s # 搜索引擎（%s 为搜索词占位；默认 360，大陆可直连）
       browserProxy: "" # 代理 URL，如 http://127.0.0.1:7890；留空读取 HTTPS_PROXY / HTTP_PROXY
+      newsEnabled: true # 内置新闻应用：翻阅世界最近大事（News.jsonl），看头条/关键词搜索/按时间回看；现实世界设定下 Tingle 抓取 RSS 经 World-LLM 摘编写入
+      newsFeeds: [] # 现实世界新闻 RSS 源列表（留空用内置默认源；可自行配置为服务器可直连的地址）
       filesEnabled: false # 内置资源管理器：Bot 打开电脑后可查看/修改这台电脑里的文件（docker 实现或虚构世界）；默认关闭
       filesCwd: . # 资源管理器打开的工作目录，相对电脑主目录；例如 work
       mcpServers: # 外接 MCP Server：每个都是手机里的一个 App
