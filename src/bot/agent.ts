@@ -561,7 +561,10 @@ export class BotAgent {
         attachments: item.attachments,
       };
       await this.context.appendEvent(event);
-      debug.emit("bot.event", `[${event.source}] ${event.id}`, {
+      const resultLabel = event.refToolCallId
+        ? `[${event.source} ← ${event.refToolCallId}] ${event.id}`
+        : `[${event.source}] ${event.id}`;
+      debug.emit("bot.event", resultLabel, {
         id: event.id,
         source: event.source,
         content: event.content,
@@ -1793,7 +1796,8 @@ export class BotAgent {
     const keywordLabel = keyword ? `与「${keyword}」相关` : "";
     return (
       `你静下心来，回想起了这些往事${keywordLabel}：\n` +
-      facts.map((e) => `- [${e.clock}] ${e.content}`).join("\n")
+      facts.map((e) => `- [T=${e.t.toFixed(1)} ${e.clock}] ${e.content}`).join("\n") +
+      `\n（每条开头是它的 T 时刻：想按时间往前或往后继续回忆，就把 recall 的 since / until 填成对应的 T 数值。）`
     );
   }
 

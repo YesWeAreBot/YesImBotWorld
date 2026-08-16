@@ -85,7 +85,7 @@ export class NewsApp implements WorldApp {
         {
           name: "search_news_time",
           description:
-            "按时间范围回看新闻：只返回 T（时间单位）落在 since 与 until 之间的世界内新闻。可只给一端；不填则默认最近 n 条。结果带编号，可 open_news 点进。",
+            "按时间范围回看新闻：只返回 T（时间单位）落在 since 与 until 之间的世界内新闻。since / until 填 T 的数值（可在结果里的「T=12.5」或 check_time 里看到），可只给一端；不填则默认最近 n 条。结果带编号，可 open_news 点进。",
           inputSchema: {
             type: "object",
             properties: {
@@ -134,7 +134,7 @@ export class NewsApp implements WorldApp {
   private async headlines(args: Record<string, unknown>): Promise<string> {
     const n = clampInt(args.n, 1, 50, 10);
     const news = await this.files.readNews(n);
-    this.current = news.map((e) => ({ kind: "world", headline: `[${e.clock}] ${e.content}`, entry: e }));
+    this.current = news.map((e) => ({ kind: "world", headline: worldHeadline(e), entry: e }));
     return this.renderList(this.current, "最近的新闻头条");
   }
 
@@ -147,7 +147,7 @@ export class NewsApp implements WorldApp {
     // 世界内已记录的新闻（含 detail）
     const kw = keyword.toLowerCase();
     for (const e of (await this.files.readNewsAll()).filter((e) => e.content.toLowerCase().includes(kw)).slice(-n)) {
-      items.push({ kind: "world", headline: `[${e.clock}] ${e.content}`, entry: e });
+      items.push({ kind: "world", headline: worldHeadline(e), entry: e });
     }
     // 现实世界设定：额外搜 RSS 原文
     if (await this.isRealWorld()) {
@@ -171,7 +171,7 @@ export class NewsApp implements WorldApp {
     if (since != null) news = news.filter((e) => e.t >= since);
     if (until != null) news = news.filter((e) => e.t <= until);
     news = news.slice(-n);
-    this.current = news.map((e) => ({ kind: "world", headline: `[${e.clock}] ${e.content}`, entry: e }));
+    this.current = news.map((e) => ({ kind: "world", headline: worldHeadline(e), entry: e }));
     if (since == null && until == null) {
       return this.renderList(this.current, "最近的新闻头条");
     }
@@ -193,8 +193,8 @@ export class NewsApp implements WorldApp {
       const e = item.entry!;
       const detail = e.detail?.trim();
       return detail
-        ? `你点开了这条新闻——\n【${e.clock}】${e.content}\n\n${detail}`
-        : `你点开了这条新闻——\n【${e.clock}】${e.content}\n\n（这条只有一句简讯，没有更多详情。）`;
+        ? `你点开了这条新闻——\n【T=${e.t.toFixed(1)} ${e.clock}】${e.content}\n\n${detail}`
+        : `你点开了这条新闻——\n【T=${e.t.toFixed(1)} ${e.clock}】${e.content}\n\n（这条只有一句简讯，没有更多详情。）`;
     }
     // RSS 原文：抓取网页正文
     if (!item.link) return `你点开了「${item.title ?? ""}」——但它没有附带原文链接。`;
@@ -221,6 +221,11 @@ function clampInt(value: unknown, min: number, max: number, fallback: number): n
   const n = Math.floor(Number(value));
   if (!Number.isFinite(n)) return fallback;
   return Math.max(min, Math.min(max, n));
+}
+
+/** 世界内新闻的列表行：同时带 T 数值与可读时间，便于按 T 继续回看 */
+function worldHeadline(e: NewsEntry): string {
+  return `[T=${e.t.toFixed(1)} ${e.clock}] ${e.content}`;
 }
 
 function asFiniteNumber(value: unknown): number | null {
