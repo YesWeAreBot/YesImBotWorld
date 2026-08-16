@@ -499,6 +499,7 @@ export class WebUIServer {
         botDef: await host.files.readText(host.files.botDef),
         worldDef: await host.files.readText(host.files.worldDef),
         meta: await host.files.readMeta(),
+        phoneShell: await host.files.readPhoneShell(),
         initialized: await host.isInitialized(),
       });
       return;
@@ -530,6 +531,19 @@ export class WebUIServer {
     if (pathname === "/api/state/world-status" && method === "PUT") {
       const { content } = await readJson(req);
       await host.files.writeWorldStatus(String(content ?? ""));
+      sendJSON(res, 200, { ok: true });
+      return;
+    }
+
+    // ---------- 手机外壳 HTML ----------
+    if (pathname === "/api/state/phone-shell" && method === "GET") {
+      sendJSON(res, 200, { content: await host.files.readPhoneShell() });
+      return;
+    }
+    if (pathname === "/api/state/phone-shell" && method === "PUT") {
+      const { content } = await readJson(req, 4 * 1024 * 1024);
+      await host.files.writePhoneShell(String(content ?? ""));
+      this.sendLifecycle("phoneShell");
       sendJSON(res, 200, { ok: true });
       return;
     }

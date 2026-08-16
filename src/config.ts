@@ -708,7 +708,7 @@ export const Config: Schema<Config> = Schema.intersect([
         .description(
           "浏览器带壳截图的自定义外壳图片路径（png/jpg/webp；绝对路径或相对 Koishi 根目录）。" +
             "图片会以拉伸方式覆盖在网页截图最上层，屏幕区域需为透明（常见的设备边框素材即可）。" +
-            "留空则使用创世时 World-LLM 生成的外壳 UI（存于 meta.json 的 phoneShellHtml，可手动编辑）；" +
+            "留空则使用创世时 World-LLM 生成的外壳 UI（存于数据目录的 phoneShell.html，可在 WebUI 编辑）；" +
             "没有生成过则使用内置的通用手机外壳",
         ),
       notesEnabled: Schema.boolean()

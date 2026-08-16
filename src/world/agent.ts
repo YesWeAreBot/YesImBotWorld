@@ -649,7 +649,7 @@ export class WorldAgent {
    * 创世：判定手机规格。
    * - 分辨率配置为 auto 时，由 World-LLM 依据世界观与角色设定决定屏幕分辨率；
    * - 浏览器启用时，由 World-LLM 生成契合世界观的带壳截图外壳 HTML。
-   * 判定结果持久化到 meta.json；任一步失败都不阻塞创世（回退默认/内置值）。
+   * 分辨率持久化到 meta.json；外壳 HTML 存到独立的 phoneShell.html。任一步失败都不阻塞创世（回退默认/内置值）。
    */
   private async setupPhone(botDef: string, worldDef: string): Promise<void> {
     const wantAuto = (this.phoneCfg.resolution || "auto").trim().toLowerCase() === "auto";
@@ -681,8 +681,8 @@ export class WorldAgent {
       try {
         const html = await this.generatePhoneShell(botDef, worldDef, res);
         if (html) {
-          meta.phoneShellHtml = html;
-          this.logger.info("浏览器带壳截图外壳已生成（%d 字符，存于 meta.json，可手动编辑）", html.length);
+          await this.files.writePhoneShell(html);
+          this.logger.info("浏览器带壳截图外壳已生成（%d 字符，存于 phoneShell.html，可手动编辑）", html.length);
         } else {
           this.logger.warn("World-LLM 未能生成有效的外壳 HTML（缺少 {{screen}} 占位符），截图将使用内置外壳");
         }

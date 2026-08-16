@@ -46,6 +46,7 @@ YesImBot World：让 Bot 生活在一个由 LLM 独立维护的虚拟世界中�
 | `pinned.json` | 运行时 | 置顶上下文 + id 计数器 |
 | `clock.json` | 运行时 | World Clock（世界时间 + 创世时生成的历法） |
 | `meta.json` | 运行时 | 世界元数据（创世时判定：是否现实世界设定） |
+| `phoneShell.html` | World-LLM（创世生成）/ 用户 | 浏览器带壳截图的外壳 HTML（含 `{{screen}}` 等占位符，可在 WebUI「状态 → 手机外壳」页预览与编辑） |
 | `focus.json` | 运行时 | Bot 正在关注的频道（关注期间消息必定完整呈现） |
 | `archive/` | 运行时 | 压缩/重置/手动存档的历史快照（每份一个时间戳文件夹，含 `manifest.json`；可在 WebUI「数据」页查看、回档、删除） |
 

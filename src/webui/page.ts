@@ -394,6 +394,8 @@ var galleryCache = [], currentCategory = '未整理';
 var debugEntries = [], debugSubview = 'llm', debugOrder = 'desc', debugAutoScroll = true, debugKindFilter = 'all';
 var debugOpenIds = {}; // 展开状态按条目 id 记忆：重建列表（切换标签/排序/SSE 重放）后仍保持展开
 var stateCache = null, stateEditor = null;
+// 手机外壳预览：{{screen}} 占位符用一张浅灰 SVG 占位图，展示屏幕区域
+var SCREEN_PLACEHOLDER = 'data:image/svg+xml;utf8,' + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="800" height="1280"><rect width="100%" height="100%" fill="#eef1f5"/><text x="50%" y="50%" font-family="sans-serif" font-size="28" fill="#9aa4b0" text-anchor="middle">屏幕预览</text></svg>');
 var lastOverview = null;
 var liveFeed = [], genMap = {}, liveSeeded = false;
 var usageCache = null, usageFilter = 'total', usageFilterLabel = '', usageEntryFilter = null, usageChartMode = 'hour';
@@ -1918,7 +1920,8 @@ function renderStateEditor(s){
     el('button', {text:'世界新闻 News.jsonl', onclick:function(){ setTab(this, 'news'); }}),
     el('button', {text:'Bot 小事记 facts', onclick:function(){ setTab(this, 'facts'); }}),
     el('button', {text:'Bot_Definition.md', onclick:function(){ setTab(this, 'botdef'); }}),
-    el('button', {text:'World_Definition.md', onclick:function(){ setTab(this, 'worlddef'); }})
+    el('button', {text:'World_Definition.md', onclick:function(){ setTab(this, 'worlddef'); }}),
+    el('button', {text:'手机外壳', onclick:function(){ setTab(this, 'shell'); }})
   ]);
   frag.appendChild(tabs);
   var panes = el('div');
@@ -1928,6 +1931,7 @@ function renderStateEditor(s){
   panes.appendChild(jsonlPane('Bot 小事记', 'Bot 的私人小事（facts.jsonl）——Bot 用 recall 回忆的私人记忆。可固定条目：固定后既不会被重置/创世删除，也会成为 Bot 心中「刻骨铭心的重要回忆」，是它角色扮演时的关键人设与历史依据（避免 OOC）', s.facts || [], '/api/state/facts', '新增一条 Bot 小事…', {sortable: true, pinnable: true}));
   panes.appendChild(statePane('botdef', 'Bot 角色定义', s.botDef, '/api/definitions/bot'));
   panes.appendChild(statePane('worlddef', '世界定义', s.worldDef, '/api/definitions/world'));
+  panes.appendChild(phoneShellPane(s.phoneShell || '', s.meta || {}));
   frag.appendChild(panes);
   if(s.meta && Object.keys(s.meta).length){
     frag.appendChild(el('div', {cls:'section'}, [el('h3', {text:'元数据 meta.json'}), el('div', {cls:'body'}, [el('pre', {text: JSON.stringify(s.meta, null, 2)})])]));
@@ -1946,6 +1950,48 @@ function statePane(id, title, content, url){
       api('PUT', url, {content: ta.value}).then(function(){ toast(title + ' 已保存', 'ok'); }).catch(showErr);
     }})])
   ]));
+  return sec;
+}
+function phoneShellPane(shellHtml, meta){
+  var sec = el('div', {cls:'section', 'data-pane':'shell'});
+  sec.appendChild(el('h3', {html:'手机外壳 <span class="hint">浏览器带壳截图的外壳 HTML（含 {{screen}} 等占位符），下方为预览；源码标签页可编辑</span>'}));
+  var body = el('div', {cls:'body'});
+  // 预览 iframe：用样本值替换占位符，展示外壳布局效果
+  var preview = el('iframe', {style:'width:100%;height:560px;border:1px solid var(--line);border-radius:10px;background:#fff'});
+  function renderPreview(){
+    var html = shellHtml || '';
+    if(!html.trim()){
+      preview.srcdoc = '<div style="font-family:sans-serif;color:#888;display:flex;align-items:center;justify-content:center;height:100%">（还没有外壳 HTML——创世或手动编辑后在此预览）</div>';
+      return;
+    }
+    var w = meta.phone && meta.phone.width ? meta.phone.width : 800;
+    var h = meta.phone && meta.phone.height ? meta.phone.height : 1280;
+    var sample = html
+      .replace(/\{\{\s*screen\s*\}\}/g, SCREEN_PLACEHOLDER)
+      .replace(/\{\{\s*url\s*\}\}/g, 'https://example.com/')
+      .replace(/\{\{\s*title\s*\}\}/g, '示例网页标题')
+      .replace(/\{\{\s*time\s*\}\}/g, '12:34')
+      .replace(/\{\{\s*width\s*\}\}/g, String(w))
+      .replace(/\{\{\s*height\s*\}\}/g, String(h));
+    preview.srcdoc = sample;
+  }
+  // 源码编辑（textarea）+ 保存
+  var ta = el('textarea', {rows:16, style:'width:100%;font-family:var(--mono);font-size:12px;margin-top:8px'});
+  ta.value = shellHtml || '';
+  body.appendChild(el('div', {cls:'toolbar', style:'margin-bottom:8px'}, [
+    el('button', {text:'刷新预览', onclick:function(){ shellHtml = ta.value; renderPreview(); }}),
+    el('span', {cls:'spacer'}),
+    el('button', {cls:'primary', text:'保存外壳', onclick:function(){
+      api('PUT', '/api/state/phone-shell', {content: ta.value}).then(function(){ shellHtml = ta.value; renderPreview(); toast('手机外壳已保存', 'ok'); }).catch(showErr);
+    }})
+  ]));
+  body.appendChild(preview);
+  body.appendChild(el('div', {style:'margin-top:10px'}, [
+    el('div', {text:'源码（编辑后点“刷新预览”查看效果、点“保存外壳”落盘）：', style:'color:var(--fg-dim);font-size:12px;margin-bottom:6px'}),
+    ta
+  ]));
+  renderPreview();
+  sec.appendChild(body);
   return sec;
 }
 function jsonlPane(title, hint, items, urlBase, placeholder, opts){

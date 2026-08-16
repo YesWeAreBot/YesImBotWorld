@@ -9,8 +9,8 @@ export interface WorldMeta {
   /** 手机屏幕分辨率（配置 apps.phoneResolution 为 auto 时创世由 World-LLM 决定） */
   phone?: { width?: number; height?: number };
   /**
-   * 创世时 World-LLM 生成的浏览器带壳截图外壳（完整 HTML 文档，
-   * 含 {{screen}} / {{url}} / {{title}} / {{time}} 占位符）
+   * @deprecated 创世时生成的浏览器带壳截图外壳原存于 meta.json，现已迁移到独立的
+   *   phoneShell.html 文件（见 WorldFiles.phoneShell）。保留此字段仅作迁移用。
    */
   phoneShellHtml?: string;
 }
@@ -71,6 +71,8 @@ export class WorldFiles {
   readonly notesDir: string;
   readonly archiveDir: string;
   readonly galleryDir: string;
+  /** 创世时 World-LLM 生成的浏览器带壳截图外壳（完整 HTML，含 {{screen}} 等占位符） */
+  readonly phoneShell: string;
 
   constructor(readonly base: string) {
     this.botDef = path.join(base, "Bot_Definition.md");
@@ -89,6 +91,7 @@ export class WorldFiles {
     this.notesDir = path.join(base, "Notes");
     this.archiveDir = path.join(base, "archive");
     this.galleryDir = path.join(base, "gallery");
+    this.phoneShell = path.join(base, "phoneShell.html");
   }
 
   async ensure(): Promise<void> {
@@ -99,6 +102,7 @@ export class WorldFiles {
     if (!(await this.exists(this.botDef))) await fs.writeFile(this.botDef, BOT_DEF_TEMPLATE);
     if (!(await this.exists(this.worldDef))) await fs.writeFile(this.worldDef, WORLD_DEF_TEMPLATE);
     await this.migrateNewsDb();
+    await this.migratePhoneShell();
   }
 
   /** 历史兼容：早期版本世界大事记叫 News.db（实为 JSONL），迁移为 News.jsonl */
@@ -110,6 +114,22 @@ export class WorldFiles {
       }
     } catch {
       /* 迁移失败不致命：后续 readText/appendFile 会按新文件名重建，旧文件仅不再被读取 */
+    }
+  }
+
+  /** 历史兼容：早期手机外壳 HTML 存于 meta.json 的 phoneShellHtml，迁移到独立 phoneShell.html */
+  private async migratePhoneShell(): Promise<void> {
+    try {
+      if (await this.exists(this.phoneShell)) return;
+      const meta = await this.readMeta();
+      const html = meta.phoneShellHtml?.trim();
+      if (!html) return;
+      await this.writePhoneShell(html);
+      // 迁走后在 meta.json 里清除该字段，避免双份存储
+      delete meta.phoneShellHtml;
+      await this.writeMeta(meta);
+    } catch {
+      /* 迁移失败不致命 */
     }
   }
 
@@ -251,6 +271,16 @@ export class WorldFiles {
 
   async writeMeta(meta: WorldMeta): Promise<void> {
     await this.atomicWrite(this.meta, JSON.stringify(meta));
+  }
+
+  /** 读取浏览器带壳截图外壳 HTML（不存在或读取失败返回空串） */
+  async readPhoneShell(): Promise<string> {
+    return this.readText(this.phoneShell);
+  }
+
+  /** 写入浏览器带壳截图外壳 HTML（独立文件） */
+  async writePhoneShell(html: string): Promise<void> {
+    await this.atomicWrite(this.phoneShell, html);
   }
 
   async readDefinitions(): Promise<{ botDef: string; worldDef: string }> {

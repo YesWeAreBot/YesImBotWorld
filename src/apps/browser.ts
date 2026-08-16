@@ -23,7 +23,7 @@ import path from "node:path";
 import type { Context, Logger } from "koishi";
 import type { WorldClock } from "../clock.js";
 import type { AppsConfig } from "../config.js";
-import type { WorldFiles, WorldMeta } from "../files.js";
+import type { WorldFiles } from "../files.js";
 import type { CaptionService } from "../media/captioner.js";
 import type { GalleryStore } from "../media/gallery.js";
 import type { MediaStore } from "../media/store.js";
@@ -546,7 +546,7 @@ export class BrowserApp implements WorldApp {
     // 外壳来源：用户自定义图片 > 创世时 World-LLM 生成的外壳 HTML > 内置外壳。
     // 合成失败不阻塞主流程，退回裸截图。
     try {
-      const shellHtml = await this.buildShellHtml(meta, viewport, page, png);
+      const shellHtml = await this.buildShellHtml(viewport, page, png);
       png = await this.capture(pptr, viewport, (tab) =>
         tab.setContent(shellHtml, { waitUntil: "load", timeout: HTTP_TIMEOUT_MS }),
       );
@@ -595,7 +595,6 @@ export class BrowserApp implements WorldApp {
 
   /** 组装带壳合成页：外壳来源依次为 用户图片 > 创世生成 HTML > 内置模板 */
   private async buildShellHtml(
-    meta: WorldMeta,
     viewport: PhoneResolution,
     page: BrowserPage,
     contentPng: Buffer,
@@ -615,9 +614,10 @@ export class BrowserApp implements WorldApp {
       if (dataUrl) return fill(IMAGE_SHELL_TEMPLATE, { ...vars, shellImage: dataUrl });
       this.logger.warn("自定义外壳图片不可用（%s），退回生成/内置外壳", imgPath);
     }
-    // 2. 创世时 World-LLM 生成的外壳（meta.json phoneShellHtml，可手动编辑）
-    if (meta.phoneShellHtml && meta.phoneShellHtml.includes("{{screen}}")) {
-      return fill(meta.phoneShellHtml, vars);
+    // 2. 创世时 World-LLM 生成的外壳（独立 phoneShell.html，可手动编辑）
+    const shellHtml = await this.files.readPhoneShell();
+    if (shellHtml.includes("{{screen}}")) {
+      return fill(shellHtml, vars);
     }
     // 3. 内置通用外壳
     return fill(DEFAULT_SHELL_TEMPLATE, vars);
