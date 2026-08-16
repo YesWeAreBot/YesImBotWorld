@@ -78,12 +78,6 @@ export const BOT_TOOLS: BotToolDef[] = [
       "看一眼现在几点了（看手表、掏手机、找附近的时钟）。能否看到、通过什么看到由世界决定——身边没有计时工具时可能失败。",
   },
   {
-    name: "check_facts",
-    signature: "check_facts(n?: number)",
-    description:
-      "回忆你自己的私人小事（你的喜好、说过的话、做过的小事，与全世界的大事无关），列出最近 n 条（默认 10）。这是只属于你的记事本。",
-  },
-  {
     name: "check_msg",
     signature: "check_msg(n: number)",
     description: "刷新消息列表：列出最近活跃的 n 个频道及各自的最新一条消息。",

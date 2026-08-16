@@ -666,12 +666,6 @@ export class BotAgent {
             return `（返回失败：${(err as Error).message ?? err}）`;
           }
         });
-      case "check_facts":
-        return this.dispatchLocal(call, async () => {
-          const facts = await this.files.readFacts(clampInt(call.arguments.n, 1, 30, 10));
-          if (!facts.length) return "你翻了翻自己的记事本——上面还没有写过任何东西。";
-          return `你翻开自己的私人记事本，想起这些小事：\n` + facts.map((e) => `- [${e.clock}] ${e.content}`).join("\n");
-        });
       case "check_msg":
         return this.dispatchLocal(call, async () =>
           this.messenger.recentChannels(clampInt(call.arguments.n, 1, 20, 5)),

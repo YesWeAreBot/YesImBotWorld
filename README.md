@@ -39,7 +39,7 @@ YesImBot World：让 Bot 生活在一个由 LLM 独立维护的虚拟世界中�
 | `Bot_Status.md` | Bot-LLM（经压缩流程） | Bot 当前状态，作为角色设定置顶注入 |
 | `World_Status.md` | World-LLM | 世界当前状态 |
 | `News.jsonl` | World-LLM | **世界**重大事件列表（JSONL，一行一个事件）。世界中心——只有影响世界走向的大事记这里 |
-| `facts.jsonl` | World-LLM | **Bot** 的小事记（JSONL，一行一件）。Bot 中心——Bot 的私人小事（习惯、偏好、日常）记这里，Bot 用 `check_facts` 回忆。可在 WebUI 固定条目（`pinned: true`），固定条目在重置世界/重新创世后保留 |
+| `facts.jsonl` | World-LLM | **Bot** 的小事记（JSONL，一行一件）。Bot 中心——Bot 的私人小事（习惯、偏好、日常）记这里，Bot 用 `recall` 回忆。可在 WebUI 固定条目（`pinned: true`），固定条目在重置世界/重新创世后保留 |
 | `gallery/` | **用户 + Bot** | 收藏夹，按分类子目录存放：`表情包/`、`meme/`、`截图/`、`照片/`、`未整理/`。用户手动投放的文件放进 `未整理/`（或直接丢根目录，会被自动清扫进去），Bot 有空时会看图、写描述、归类 |
 | `assets/` | 运行时 | 媒体资产库（收到/发出的图片、音频、视频，sha256 去重） |
 | `stream.jsonl` | 运行时 | Bot 工作窗口（Tool Call 流）持久化 |
@@ -247,7 +247,6 @@ World-LLM 每次被唤起时通过工具调用读写状态：
 | `rest(duration?)` | 休息：压缩上下文 + 预热 KV cache，醒来获知流逝的 TU（打开的应用自动关闭） |
 | `check_status(target)` | 查看自身（`self`）或世界（`world`，含近期 News） |
 | `check_time()` | 看一眼现在几点（世界裁定能否得知） |
-| `check_facts(n?)` | 回忆自己的私人小事记（facts.jsonl：习惯、偏好、日常，Bot 中心） |
 | `check_gallery(category?)` / `check_media(n?, type?)` | 浏览收藏夹（分类总览 / 打开某一类）/ 只读翻看媒体缓存 |
 | `view_media(media[])` | 发图前细看：原生识图附原图，否则解释器详述 |
 | `gallery_save(media_id, category, description, name?)` | 收藏进分类（表情包 / meme / 截图 / 照片），描述必填 |
