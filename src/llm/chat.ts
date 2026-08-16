@@ -60,6 +60,8 @@ export interface ChatUsage {
   prompt_tokens_details?: { cached_tokens?: number };
   /** DeepSeek 风格：命中/未命中缓存的输入 token 数 */
   prompt_cache_hit_tokens?: number;
+  /** Anthropic 风格（经 OpenAI 兼容网关透传）：读缓存命中的输入 token 数 */
+  cache_read_input_tokens?: number;
   /** 归一化后的缓存命中数（normalizeUsage 填充） */
   cached_tokens?: number;
 }
@@ -358,8 +360,14 @@ function normalizeUsage(u: ChatUsage | null | undefined): ChatUsage | null {
   const completion = Number(u.completion_tokens) || 0;
   const total = Number(u.total_tokens) || 0;
   if (!prompt && !completion && !total) return null;
-  // 缓存命中：OpenAI 的 prompt_tokens_details.cached_tokens 或 DeepSeek 的 prompt_cache_hit_tokens
-  const cached = Number(u.prompt_tokens_details?.cached_tokens ?? u.prompt_cache_hit_tokens) || 0;
+  // 缓存命中：OpenAI 的 prompt_tokens_details.cached_tokens / DeepSeek 的 prompt_cache_hit_tokens /
+  // Anthropic 经 OpenAI 网关透传的 cache_read_input_tokens（opencode 等聚合网关常用）
+  const cached =
+    Number(
+      u.prompt_tokens_details?.cached_tokens ??
+        u.prompt_cache_hit_tokens ??
+        u.cache_read_input_tokens,
+    ) || 0;
   return {
     prompt_tokens: prompt,
     completion_tokens: completion,
