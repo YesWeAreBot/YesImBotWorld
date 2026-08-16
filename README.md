@@ -258,7 +258,7 @@ World-LLM 每次被唤起时通过工具调用读写状态：
 | `put_down_phone()` | 把手机放到一边：关闭应用、清除关注，之后通知一律降级为"手机震了一下" |
 | `pick_up_phone()` | 拿起手机：恢复正常通知 |
 | `cancel(id)` | 取消倒计时中的工具调用 |
-| `identity_recall()` | 反思身份：角色设定以 Event 再次注入 |
+| `recall(keyword?, since?, until?, n?, important?)` | 回忆过往小事记：按关键词 / 按 T（时间单位）范围 / 只回忆重要回忆（固定条目，对 Bot 透明、不暴露「被固定」），是角色扮演不 OOC 的记忆依据 |
 
 ### chat / channel / group 层（节选）
 
@@ -279,7 +279,7 @@ World-LLM 每次被唤起时通过工具调用读写状态：
 
 | 开关 | 工具 | 底层接口 | 说明 |
 |---|---|---|---|
-| `recall` | `recall(id, msg_id)` | `delete_msg`（通用 deleteMessage） | 撤回已发出的消息 |
+| `recall` | `unsend(id, msg_id)` | `delete_msg`（通用 deleteMessage） | 撤回已发出的消息 |
 | `react` | `react(id, msg_id, emoji, remove?)` | `set_msg_emoji_like` / 通用 createReaction、deleteReaction | 贴/移除表情回应（emoji 字符或表情编号） |
 | `emojiLikes` | `get_emoji_likes(id, msg_id, emoji)` | `fetch_emoji_like`（NapCat 特有） | 查看某条消息上某个表情回应的用户列表 |
 | `reply` | `send(…, reply_to, at_sender?)` 或 msg 内 `<quote id="…"/>` 标签 | quote + at 元素（OneBot 回复） | 引用回复：是否引用、引用哪条由 Bot 自己决定（照抄入站看到的 `<quote …/>` 标签即可）；群聊里默认模拟 QQ 客户端在开头自动 @ 原发送人，Bot 可传 `at_sender: false` 去掉（如同真人删掉自动加的 @） |

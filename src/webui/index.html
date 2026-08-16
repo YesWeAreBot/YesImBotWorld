@@ -1916,7 +1916,7 @@ function renderStateEditor(s){
   panes.appendChild(statePane('bot', 'Bot 状态', s.botStatus, '/api/state/bot-status'));
   panes.appendChild(statePane('world', '世界状态', s.worldStatus, '/api/state/world-status'));
   panes.appendChild(jsonlPane('世界新闻', 'World-LLM 记录的世界大事记（JSONL）', s.news, '/api/state/news', '新增一条世界事件…'));
-  panes.appendChild(jsonlPane('Bot 小事记', 'Bot 的私人小事（facts.jsonl），可固定条目——固定后重置世界/重新创世也会保留', s.facts || [], '/api/state/facts', '新增一条 Bot 小事…', {sortable: true, pinnable: true}));
+  panes.appendChild(jsonlPane('Bot 小事记', 'Bot 的私人小事（facts.jsonl）——Bot 用 recall 回忆的私人记忆。可固定条目：固定后既不会被重置/创世删除，也会成为 Bot 心中「刻骨铭心的重要回忆」，是它角色扮演时的关键人设与历史依据（避免 OOC）', s.facts || [], '/api/state/facts', '新增一条 Bot 小事…', {sortable: true, pinnable: true}));
   panes.appendChild(statePane('botdef', 'Bot 角色定义', s.botDef, '/api/definitions/bot'));
   panes.appendChild(statePane('worlddef', '世界定义', s.worldDef, '/api/definitions/world'));
   frag.appendChild(panes);
@@ -1978,9 +1978,12 @@ function jsonlPane(title, hint, items, urlBase, placeholder, opts){
           if(!confirm('删除这条？')) return;
           api('DELETE', urlBase + '?index=' + i).then(function(){ items.splice(i,1); render(); }).catch(showErr);
         }}),
-        opts.pinnable ? el('button', {cls: n.pinned ? 'primary' : '', title: n.pinned ? '取消固定：重置世界/重新创世后这条仍会保留' : '固定这条：重置世界/重新创世也不会删除', text: n.pinned ? '取消固定' : '固定', onclick:function(){
-          api('POST', urlBase + '/pin', {index: i, pinned: !n.pinned}).then(function(){ n.pinned = !n.pinned; toast(n.pinned ? '已固定（重置/创世后保留）' : '已取消固定', 'ok'); render(); }).catch(showErr);
-        }}) : null
+        opts.pinnable ? el('div', {style:'display:flex;align-items:center;gap:6px;flex-wrap:wrap'}, [
+          el('button', {cls: n.pinned ? 'primary' : '', title: n.pinned ? '取消固定：这条将不再作为「重要回忆」特别保留，重置/创世时可能被清除' : '固定这条：它将成为 Bot 心中的重要回忆（用 recall 时更该记得、角色扮演不 OOC 的依据），且重置/创世后仍然保留', text: n.pinned ? '取消固定' : '固定', onclick:function(){
+            api('POST', urlBase + '/pin', {index: i, pinned: !n.pinned}).then(function(){ n.pinned = !n.pinned; toast(n.pinned ? '已固定（成为重要回忆，重置/创世后保留）' : '已取消固定', 'ok'); render(); }).catch(showErr);
+          }}),
+          el('span', {style:'font-size:11.5px;color:var(--fg-dim)', text: n.pinned ? '重要回忆 · 重置保留' : '固定=Bot 的重要回忆，重置/创世也保留'})
+        ]) : null
       ]));
       list.appendChild(it);
     });

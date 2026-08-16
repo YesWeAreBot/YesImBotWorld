@@ -857,11 +857,11 @@ export class BotAgent {
           this.refreshToolGate();
           return "你关掉了电脑，它提供的操作已失效。";
         });
-      case "recall": {
+      case "unsend": {
         const id = this.channelArg(call) ?? "";
         const msgId = String(call.arguments.msg_id ?? call.arguments.msgId ?? "");
         if (!id || !msgId) {
-          this.pushEvent("system", "（recall 需要 id 和 msg_id 参数，msg_id 来自消息记录里的 (msg:xxx) 标注。）", { ref: call.id });
+          this.pushEvent("system", "（unsend 需要 id 和 msg_id 参数，msg_id 来自消息记录里的 (msg:xxx) 标注。）", { ref: call.id });
           return;
         }
         return this.dispatchLocal(call, async () => this.messenger.recall(id, msgId));
@@ -1188,8 +1188,8 @@ export class BotAgent {
       }
       case "cancel":
         return this.dispatchCancel(call);
-      case "identity_recall":
-        return this.dispatchIdentityRecall(call);
+      case "recall":
+        return this.dispatchLocal(call, async () => this.recallFacts(call));
       default:
         // 当前打开的 App 展开的工具
         if (this.apps?.hasTool(call.name)) {
@@ -1767,13 +1767,43 @@ export class BotAgent {
     this.pushEvent("system", text, { ref: call.id });
   }
 
-  private async dispatchIdentityRecall(call: ToolCallRecord): Promise<void> {
-    // await 读取，保证事件在下一次生成前就进入邮箱（否则 Bot 可能因看不到结果而重复调用）
-    const persona = await this.files.readBotStatus();
-    this.pushEvent(
-      "system",
-      `你静下心来，回想起自己是谁——\n${persona.trim() || "（角色设定文件为空）"}`,
-      { ref: call.id },
+  /**
+   * recall：回忆过往小事记（facts.jsonl）。
+   * 支持关键词检索（grep）、按 T（时间单位）范围、只回忆重要回忆（important，映射到 pinned 标记，对 Bot 透明）与条数上限。
+   * 结果按时间正序返回（旧的在前），便于按时间线连贯回忆。固定条目对 Bot 不显式标注，避免破坏沉浸感。
+   */
+  private async recallFacts(call: ToolCallRecord): Promise<string> {
+    const args = call.arguments;
+    const keyword = typeof args.keyword === "string" ? args.keyword.trim() : "";
+    const importantOnly = isTruthy(args.important);
+    const n = clampInt(args.n, 1, 50, 10);
+    const since = asFiniteNumber(args.since);
+    const until = asFiniteNumber(args.until);
+
+    let facts = await this.files.readFactsAll();
+    if (importantOnly) facts = facts.filter((e) => e.pinned === true);
+    if (since != null) facts = facts.filter((e) => e.t >= since);
+    if (until != null) facts = facts.filter((e) => e.t <= until);
+    if (keyword) {
+      const kw = keyword.toLowerCase();
+      facts = facts.filter((e) => e.content.toLowerCase().includes(kw));
+    }
+    // 默认取最近 n 条；范围检索时也取范围内最靠后的 n 条（更相关）
+    facts = facts.slice(-n);
+
+    if (!facts.length) {
+      const hint = keyword
+        ? `你努力回想「${keyword}」——但记事本里没有相关的内容。`
+        : importantOnly
+          ? "你努力回想那些刻骨铭心的往事——脑海里一时只有一片空白。"
+          : "你努力回想自己的过往——记事本里还是一片空白。";
+      return hint;
+    }
+
+    const keywordLabel = keyword ? `与「${keyword}」相关` : "";
+    return (
+      `你静下心来，回想起了这些往事${keywordLabel}：\n` +
+      facts.map((e) => `- [${e.clock}] ${e.content}`).join("\n")
     );
   }
 
@@ -1980,6 +2010,13 @@ function clampInt(value: unknown, min: number, max: number, fallback: number): n
 /** 宽松解析布尔参数（模型可能输出 true / "true" / 1） */
 function isTruthy(value: unknown): boolean {
   return value === true || value === "true" || value === 1;
+}
+
+/** 解析可选数字参数；非有限数值（含 undefined / null / 空串）返回 null（表示"没给"） */
+function asFiniteNumber(value: unknown): number | null {
+  if (value == null || value === "") return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
 }
 
 /**

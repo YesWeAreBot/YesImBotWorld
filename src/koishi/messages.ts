@@ -23,7 +23,7 @@ export interface WorldMessageRow {
   content: string;
   timestamp: Date;
   self: boolean;
-  /** 平台侧消息 id（用于 recall / react），可能为空 */
+  /** 平台侧消息 id（用于 unsend / react），可能为空 */
   messageId: string;
 }
 

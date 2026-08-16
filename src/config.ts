@@ -524,7 +524,7 @@ export const Config: Schema<Config> = Schema.intersect([
     platformOps: Schema.object({
       recall: Schema.boolean()
         .default(false)
-        .description("recall：撤回自己已发出的消息。开启后消息记录与发送结果会附带 (msg:xxx) 消息编号"),
+        .description("unsend（撤回）：撤回自己已发出的消息。开启后消息记录与发送结果会附带 (msg:xxx) 消息编号"),
       react: Schema.boolean()
         .default(false)
         .description(

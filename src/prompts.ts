@@ -177,7 +177,7 @@ export const WORLD_PROMPT_DEFAULTS: WorldPromptSet = {
     "尤其 Bot 的位置、状态、正在做的事、随身物品发生变化时，一定要更新 bot_status，不要让它过时\n" +
     "- News 是世界的大事记，不是流水账：只记录重要、之后可能被提起或产生影响的事件，日常背景动静不要写入\n" +
     "- 与 News（世界中心）不同，facts.jsonl 是 Bot 中心的小事记：Bot 的日常习惯、偏好、生活状态这类" +
-    "够不上世界大事、但对了解 Bot 有用的私人小事记在这里（用 update(facts)），Bot 会通过 check_facts 看到它\n" +
+    "够不上世界大事、但对了解 Bot 有用的私人小事记在这里（用 update(facts)），Bot 会通过 recall / check_facts 看到它\n" +
     "- 修改状态文件时保持 Markdown 结构稳定，只改需要改的部分\n\n" +
     // 缓存关键：系统提示里**不放任何易变内容**（当前时刻由各任务文本自带，
     // 需要时也可用 check_time 工具查询）。这样"原则 + 世界定义 + 工具声明"的
@@ -269,7 +269,7 @@ export const WORLD_PROMPT_DEFAULTS: WorldPromptSet = {
     `2. 调用 update(world_status)：写出世界的初始状态文件，包含：世界观要点、当前时间与环境、` +
     `主要地点与人物的当前状态、正在发生的背景事件；\n` +
     `3. 可选：用 update(news) 记录一两条世界开场大事；\n` +
-    `4. 可选：用 update(facts) 记录一两条 Bot 的私人小事（初始偏好、习惯等，供它日后 check_facts 回忆）。`,
+    `4. 可选：用 update(facts) 记录一两条 Bot 的私人小事（初始偏好、习惯等，供它日后 recall / check_facts 回忆）。`,
 
   compressSystem:
     "你是一个虚拟角色的记忆整理器。角色刚进入休息状态，你需要把它近期的意识流（工具调用与事件）" +

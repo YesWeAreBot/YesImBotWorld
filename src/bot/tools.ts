@@ -26,7 +26,7 @@ const CHAT_LAYER = new Set([
   "user_info", "send_like", "delete_friend", "set_profile", "set_model_show", "ocr_image",
 ]);
 const CHANNEL_LAYER = new Set([
-  "send", "send_file", "send_voice", "recall", "react", "get_emoji_likes",
+  "send", "send_file", "send_voice", "unsend", "react", "get_emoji_likes",
   "forward_msgs", "view_forward", "exit_forward", "poke", "channel_notify",
 ]);
 const GROUP_LAYER = new Set([
@@ -236,8 +236,8 @@ export const BOT_TOOLS: BotToolDef[] = [
       "duration 表示说话耗时（几到几十 TU）；明显超过时会视为你打算过会儿再发，到点后询问你是否要发（想发再调用一次 send_voice）。发出前可 cancel。",
   },
   {
-    name: "recall",
-    signature: 'recall(id: string, msg_id: string)',
+    name: "unsend",
+    signature: 'unsend(id: string, msg_id: string)',
     description:
       '撤回一条你已经发出的消息。msg_id 是消息记录里 (msg:xxx) 标注的编号。' +
       "只能撤回自己发出不久的消息（平台通常限制两分钟内）。还没发出去的消息请用 cancel。",
@@ -431,9 +431,16 @@ export const BOT_TOOLS: BotToolDef[] = [
     description: '取消一个尚未到期望完成时刻的工具调用（如撤回还没发出去的消息）。id 是工具调用编号（形如 "tc_12"）。',
   },
   {
-    name: "identity_recall",
-    signature: "identity_recall()",
-    description: "静下心反思自己是谁：你的角色设定会被重新注入你的意识。感到迷失或行为偏离人设时使用。",
+    name: "recall",
+    signature: "recall(keyword?: string, since?: number, until?: number, n?: number, important?: boolean)",
+    description:
+      "回忆自己的过往：翻看私人记事本（facts.jsonl）里属于你的历史与记忆——你的人生经历、性格、习惯、重要的人和事都在这里，是你说起过去时最可靠的依据。\n" +
+      "- keyword：按关键词回想（模糊匹配内容），如 recall(keyword: \"童年\")；\n" +
+      "- since / until：只回想 T（时间单位）落在该范围内的事（可只给一端）；\n" +
+      "- important: true：只回想那些刻骨铭心、对你影响深远的重要回忆；\n" +
+      "- n：最多回想多少条（默认 10）。\n" +
+      "不确定从哪想起时可先不带参数，看看近来的过往；被问起经历、要说自己的过去、或感到自己可能" +
+      "忘了什么时，用它确认记忆，别乱编。",
   },
 ];
 
@@ -478,7 +485,7 @@ export function availableTools(opts: {
         return opts.tts;
       case "channel_notify":
         return !!opts.notifyManaged;
-      case "recall":
+      case "unsend":
         return opts.ops.recall;
       case "react":
         return opts.ops.react;

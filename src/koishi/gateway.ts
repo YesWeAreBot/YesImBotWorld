@@ -98,7 +98,7 @@ export class Gateway {
   /**
    * 撤回感知：把消息记录里被撤回的那条改写为撤回标记（上下文不动——Bot 已经看过的
    * 消息它自然记得内容，无需篡改历史）；Bot 正在关注该频道时追加事件告知是哪条被撤回了。
-   * Bot 自己发起的撤回（recall 工具 / 其他设备上操作）只改记录、不另行告知——它知道。
+   * Bot 自己发起的撤回（unsend 工具 / 其他设备上操作）只改记录、不另行告知——它知道。
    */
   private async handleRecall(session: Session): Promise<void> {
     const channelId = session.channelId ?? "";
