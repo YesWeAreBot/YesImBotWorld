@@ -684,10 +684,13 @@ export class BotAgent {
           if ("error" in resolved) return resolved.error;
           await this.enterChannel(resolved.key, resolved.isPrivate);
           const messages = await this.messenger.channelMessages(resolved.key, clampInt(call.arguments.n, 10, 200, 10));
-          return (
-            messages +
-            "\n（若你觉得还没读全、没搞懂大家在聊什么，就把 n 调大一些再调用一次 select_channel 看更早的消息。）"
-          );
+          // channelMessages 可能返回 RichText（含附件），不能直接字符串拼接
+          const text =
+            (typeof messages === "string" ? messages : messages.text) +
+            "\n（若你觉得还没读全、没搞懂大家在聊什么，就把 n 调大一些再调用一次 select_channel 看更早的消息。）";
+          return typeof messages === "string"
+            ? text
+            : { ...messages, text };
         });
       }
       case "check_gallery": {
