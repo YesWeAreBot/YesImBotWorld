@@ -431,10 +431,13 @@ export class KoishiMessenger implements MessengerApi {
     }
 
     const elements: h[] = [];
+    /** 表情包（「表情包」分类的图片）：单独作为平台表情发送，不与文字/普通图片/视频混在一条里 */
+    const stickerElements: h[] = [];
     const sentRefs: MediaRef[] = [];
     const problems: string[] = [];
     const inlineIds = new Set<number>();
     let stored = "";
+    let stickerStored = "";
     let atNote = "";
 
     // 出站富文本解析：<at …/>、<face …/> 标签（入站渲染的照抄形式）与
@@ -511,10 +514,13 @@ export class KoishiMessenger implements MessengerApi {
       // 标记被替换成媒体后，紧邻它的空格会孤立地留在相邻文本段的首尾——一并吃掉（换行保留，可能是有意排版）
       await pushText(before.replace(/[ \t]+$/, ""));
       while (cursor < msg.length && (msg[cursor] === " " || msg[cursor] === "\t")) cursor++;
-      elements.push(await this.mediaElement(resolved.ref, resolved.sticker));
+      const mediaEl = await this.mediaElement(resolved.ref, resolved.sticker);
+      if (resolved.sticker) stickerElements.push(mediaEl);
+      else elements.push(mediaEl);
       sentRefs.push(resolved.ref);
       inlineIds.add(resolved.ref.id);
-      stored += mediaPlaceholder(resolved.ref.id, resolved.ref.type);
+      if (resolved.sticker) stickerStored += mediaPlaceholder(resolved.ref.id, resolved.ref.type);
+      else stored += mediaPlaceholder(resolved.ref.id, resolved.ref.type);
     }
     await pushText(msg.slice(cursor));
 
@@ -526,26 +532,43 @@ export class KoishiMessenger implements MessengerApi {
         continue;
       }
       if (inlineIds.has(resolved.ref.id)) continue;
-      elements.push(await this.mediaElement(resolved.ref, resolved.sticker));
+      const mediaEl = await this.mediaElement(resolved.ref, resolved.sticker);
+      if (resolved.sticker) stickerElements.push(mediaEl);
+      else elements.push(mediaEl);
       sentRefs.push(resolved.ref);
-      stored += mediaPlaceholder(resolved.ref.id, resolved.ref.type);
+      if (resolved.sticker) stickerStored += mediaPlaceholder(resolved.ref.id, resolved.ref.type);
+      else stored += mediaPlaceholder(resolved.ref.id, resolved.ref.type);
     }
-    if (!elements.some((el) => el.type !== "quote")) {
+    const normalHasContent = elements.some((el) => el.type !== "quote");
+    if (!normalHasContent && !stickerElements.length) {
       return `（消息没发出去：没有可发送的内容。${problems.join("；")}）`;
     }
 
-    let msgIds: string[] = [];
-    this.ownSends.expect(`${target.platform}:${target.channelId}`);
-    try {
-      msgIds = await target.bot.sendMessage(target.channelId, elements);
-    } catch (err) {
-      this.ownSends.unexpect(`${target.platform}:${target.channelId}`);
-      const mute = await this.muteHint(target);
-      if (mute) return `（消息没发出去：${mute}，禁言解除前没法在这个群里说话。）`;
-      return `（消息发送失败：${sendFailText(err)}）`;
+    // 普通内容（文字/普通图片/视频，含引用）与表情包分别发送：
+    // 表情包单独作为平台表情发一条，不与图文混排（适配器对表情段的处理与普通图片不同）。
+    const batches: h[][] = [];
+    if (normalHasContent) batches.push(elements);
+    if (stickerElements.length) batches.push(stickerElements);
+
+    const sentMsgIds: string[] = [];
+    const channelKey = `${target.platform}:${target.channelId}`;
+    for (let bi = 0; bi < batches.length; bi++) {
+      const batch = batches[bi]!;
+      const isStickerBatch = batch === stickerElements;
+      this.ownSends.expect(channelKey);
+      try {
+        const ids = await target.bot.sendMessage(target.channelId, batch);
+        if (ids[0]) sentMsgIds.push(ids[0]);
+        // 留痕：表情包批次记表情占位，普通批次记录组装好的 stored
+        await this.storeSelf(target, isStickerBatch ? (stickerStored || "[动画表情]") : stored, ids[0]);
+      } catch (err) {
+        this.ownSends.unexpect(channelKey);
+        const mute = await this.muteHint(target);
+        if (mute) return `（消息没发出去：${mute}，禁言解除前没法在这个群里说话。）`;
+        return `（消息发送失败：${sendFailText(err)}）`;
+      }
     }
-    await this.storeSelf(target, stored, msgIds[0]);
-    await this.focus.focus(`${target.platform}:${target.channelId}`);
+    await this.focus.focus(channelKey);
     // Bot 自己玩 Koishi 指令（可选）：消息以已注册指令名开头时，以它自己的身份执行
     if (this.messaging.selfCommands) {
       void this.tryExecuteSelfCommand(target, msg).catch((err) => {
@@ -553,9 +576,10 @@ export class KoishiMessenger implements MessengerApi {
       });
     }
     let result = `消息已发送到 ${id}。`;
-    if (this.showMsgId && msgIds[0]) result = `消息已发送到 ${id}（msg:${msgIds[0]}）。`;
+    if (this.showMsgId && sentMsgIds[0]) result = `消息已发送到 ${id}（msg:${sentMsgIds.join("、")}）。`;
     if (replyTo) result += `（引用回复了 msg:${replyTo}${atNote}）`;
     if (sentRefs.length) result += `（附 ${sentRefs.length} 个媒体）`;
+    if (stickerElements.length) result += `（其中 ${stickerElements.length} 个表情包单独发送）`;
     if (problems.length) result += `注意：${problems.join("；")}`;
     return result;
   }
@@ -1841,8 +1865,9 @@ export class KoishiMessenger implements MessengerApi {
     }
     let sticker = false;
     if (row.ref.type === "image") {
+      // 优先级：收藏夹显式分类「表情包」> 媒体库的 sticker 标记（入站时识别为图片表情）
       const meta = await this.galleryStore.findBySha(row.sha256).catch(() => null);
-      sticker = meta?.category === STICKER_CATEGORY;
+      sticker = meta?.category === STICKER_CATEGORY || row.sticker === true;
     }
     return { ref: row.ref, sticker };
   }

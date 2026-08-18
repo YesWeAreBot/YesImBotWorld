@@ -21,6 +21,8 @@ export interface WorldMediaRow {
   size: number;
   /** 解释器产出的文本描述缓存；空串 = 尚未解释 */
   summary: string;
+  /** 是否作为「表情包」被摄取过（QQ 图片表情 sub_type=1）；发送时应按平台表情而非普通图片 */
+  sticker: boolean;
   createdAt: Date;
 }
 
@@ -64,6 +66,7 @@ export class MediaStore {
         file: "string(255)",
         size: "unsigned",
         summary: "text",
+        sticker: "boolean",
         createdAt: "timestamp",
       },
       { autoInc: true, primary: "id" },
@@ -77,8 +80,15 @@ export class MediaStore {
   /**
    * 摄取一个媒体资源（http(s):// 或 data: URL），返回媒体 id。
    * 下载失败 / 超限时返回 null。
+   * sticker：作为「表情包」（QQ 图片表情）摄取——与普通图片区分，发送时按平台表情呈现。
    */
-  async ingest(src: string, type: MediaType, mimeHint?: string, proxy?: string): Promise<number | null> {
+  async ingest(
+    src: string,
+    type: MediaType,
+    mimeHint?: string,
+    proxy?: string,
+    sticker = false,
+  ): Promise<number | null> {
     try {
       const fetched = await this.fetchSource(src, mimeHint, proxy);
       if (!fetched) return null;
@@ -99,7 +109,13 @@ export class MediaStore {
       const sha256 = createHash("sha256").update(data).digest("hex");
 
       const existing = await this.ctx.database.get("yesimbot_world_media", { sha256 }, { limit: 1 });
-      if (existing.length) return existing[0]!.id;
+      if (existing.length) {
+        // 去重命中：若本次是表情包而旧记录未标，则补标（曾作为表情包出现 → 保留表情身份）
+        if (sticker && !existing[0]!.sticker) {
+          await this.ctx.database.set("yesimbot_world_media", { sha256 }, { sticker: true });
+        }
+        return existing[0]!.id;
+      }
 
       await this.ensureDir();
       const ext = EXT_BY_MIME[mime] ?? defaultExt(type);
@@ -112,6 +128,7 @@ export class MediaStore {
         file,
         size: data.byteLength,
         summary: "",
+        sticker,
         createdAt: new Date(),
       });
       return row.id;

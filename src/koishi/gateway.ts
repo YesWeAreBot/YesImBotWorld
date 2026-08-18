@@ -412,7 +412,7 @@ export class Gateway {
           break;
         case "img":
         case "image": {
-          out += await this.ingest(el, "image", "[图片（获取失败）]");
+          out += await this.ingest(el, "image", "[图片（获取失败）]", isStickerElement(el));
           break;
         }
         case "audio": {
@@ -458,11 +458,16 @@ export class Gateway {
     return out;
   }
 
-  private async ingest(el: h, type: "image" | "audio" | "video", fallback: string): Promise<string> {
+  private async ingest(
+    el: h,
+    type: "image" | "audio" | "video",
+    fallback: string,
+    sticker = false,
+  ): Promise<string> {
     const src = String(el.attrs.src ?? el.attrs.url ?? "");
     if (!src) return fallback;
     const mimeHint = typeof el.attrs.type === "string" && el.attrs.type.includes("/") ? el.attrs.type : undefined;
-    const id = await this.media.ingest(src, type, mimeHint);
+    const id = await this.media.ingest(src, type, mimeHint, undefined, sticker);
     return id !== null ? mediaPlaceholder(id, type) : fallback;
   }
 
@@ -497,6 +502,16 @@ export class Gateway {
 /** 标签属性转义（与 Koishi 元素语法一致） */
 function escAttr(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
+}
+
+/**
+ * 判断一个 img 元素是否为「图片表情」（表情包）而非普通图片。
+ * QQ OneBot v11：表情包消息的 image 段带 sub_type=1（数字或 "1" 字符串）；
+ * 与我们出站时附加的 STICKER_ATTRS（sub_type: 1）一致，据此识别。
+ */
+function isStickerElement(el: h): boolean {
+  const st = el.attrs?.sub_type ?? el.attrs?.subType;
+  return st === 1 || st === "1" || st === true;
 }
 
 /** at 元素的标签文本形式（Bot 可照抄发出） */

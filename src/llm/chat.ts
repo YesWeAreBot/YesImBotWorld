@@ -382,18 +382,56 @@ function normalizeUsage(u: ChatUsage | null | undefined): ChatUsage | null {
  */
 function summarizeContent(content: string | ContentPart[], max: number): unknown {
   if (typeof content === "string") {
-    return content.length > max ? content.slice(0, max) + displayCutNote(content.length - max) : content;
+    return clipMiddle(content, max, max);
   }
-  return content.map((part) =>
-    part.type === "text"
-      ? {
+  // 保持内容结构与顺序，只省略超长字符串的中间部分（文字 / base64），不丢弃字段、不调序
+  return content.map((part) => {
+    switch (part.type) {
+      case "text":
+        return {
           type: "text",
-          text: part.text.length > max ? part.text.slice(0, max) + displayCutNote(part.text.length - max) : part.text,
-        }
-      : { type: part.type },
-  );
+          text: clipMiddle(part.text, max, max),
+        };
+      case "image_url":
+        return {
+          type: "image_url",
+          image_url: {
+            ...part.image_url,
+            url: clipField(part.image_url?.url),
+          },
+        };
+      case "video_url":
+        return {
+          type: "video_url",
+          video_url: {
+            ...part.video_url,
+            url: clipField(part.video_url?.url),
+          },
+        };
+      case "input_audio":
+        return {
+          type: "input_audio",
+          input_audio: {
+            ...part.input_audio,
+            data: clipField(part.input_audio?.data),
+          },
+        };
+      default:
+        // 未知类型：原样保留，避免丢失字段
+        return part;
+    }
+  });
 }
 
-function displayCutNote(omitted: number): string {
-  return `…（后略 ${omitted} 字符——仅调试视图截断显示，实际请求已完整发送）`;
+/** data URL / base64：只保留开头的数据类型前缀与结尾几个字符，中间大段 base64 省略（十几个可见字符即可） */
+function clipField(value: string | undefined): string {
+  if (value == null) return "";
+  return clipMiddle(value, 30, 16);
+}
+
+/** 省略中间、保留首尾：value 若不超过 head+tail 则原样；否则 head 头 + 省略标记 + tail 尾 */
+function clipMiddle(value: string, head: number, tail: number): string {
+  if (value.length <= head + tail) return value;
+  const omitted = value.length - head - tail;
+  return value.slice(0, head) + `…（中间省略 ${omitted} 字符——仅调试视图省略，实际请求已完整发送）` + value.slice(-tail);
 }
