@@ -1,4 +1,4 @@
-import type { MediaRef, MediaType, RichText } from "../types.js";
+import type { MediaRef, MediaType, RichText, RichTextPart } from "../types.js";
 import type { CaptionService } from "./captioner.js";
 import type { MediaStore } from "./store.js";
 
@@ -55,31 +55,59 @@ export class MediaRenderer {
     if (!matches.length) return { text };
 
     const attachments: MediaRef[] = [];
+    const parts: RichTextPart[] = [];
     let result = "";
     let cursor = 0;
     for (const match of matches) {
-      result += text.slice(cursor, match.index);
+      const textBefore = text.slice(cursor, match.index);
+      if (textBefore) {
+        result += textBefore;
+        parts.push({ kind: "text", text: textBefore });
+      }
       cursor = match.index! + match[0].length;
       const id = Number(match[1]);
       const type = match[2] as MediaType;
-      result += await this.renderOne(id, type, attachments);
+      const seg = await this.renderOneParts(id, type, attachments);
+      if (seg.kind === "media") {
+        const marker = `[${TYPE_LABEL[type]}#${id}${seg.note}]`;
+        result += marker;
+        parts.push({ ...seg, marker });
+      } else {
+        // 走解释器/无法查看：退化成纯文本
+        result += seg.text;
+        parts.push(seg);
+      }
     }
-    result += text.slice(cursor);
-    return attachments.length ? { text: result, attachments } : { text: result };
+    const tail = text.slice(cursor);
+    if (tail) {
+      result += tail;
+      parts.push({ kind: "text", text: tail });
+    }
+    return attachments.length
+      ? { text: result, attachments, parts }
+      : { text: result, parts };
   }
 
-  private async renderOne(id: number, type: MediaType, attachments: MediaRef[]): Promise<string> {
-    const label = `${TYPE_LABEL[type]}#${id}`;
+  /**
+   * 渲染单个媒体：原生支持 → 作为 media 段（附 ref）；否则 → 解释器文本 / 无法查看。
+   * 返回 media 段时 note 为该段的括注（如"（见附件）"）。
+   */
+  private async renderOneParts(
+    id: number,
+    type: MediaType,
+    attachments: MediaRef[],
+  ): Promise<RichTextPart> {
     const row = await this.store.get(id);
-    if (!row) return `[${label}（已丢失）]`;
+    if (!row) return { kind: "text", text: `[${TYPE_LABEL[type]}#${id}（已丢失）]` };
 
     if (this.nativeSupport(row.ref) && attachments.length < this.maxAttachments) {
       attachments.push(row.ref);
-      return `[${label}${this.attachmentNote?.(row.ref) ?? "（见附件）"}]`;
+      const note = this.attachmentNote?.(row.ref) ?? "（见附件）";
+      return { kind: "media", ref: row.ref, note, marker: "" };
     }
 
     const caption = await this.captioner.describe(row.ref);
-    if (caption) return `[${label}：${caption}]`;
-    return `[${label}（无法查看内容）]`;
+    if (caption) return { kind: "text", text: `[${TYPE_LABEL[type]}#${id}：${caption}]` };
+    return { kind: "text", text: `[${TYPE_LABEL[type]}#${id}（无法查看内容）]` };
   }
 }

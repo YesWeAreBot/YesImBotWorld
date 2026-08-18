@@ -7,6 +7,7 @@ import { BOT_PROMPT_DEFAULTS, type Prompts } from "../prompts.js";
 import type {
   BotEvent,
   CompressionResult,
+  MediaRef,
   PinnedContext,
   StreamEntry,
   ToolCallRecord,
@@ -200,6 +201,65 @@ export class BotContext {
     return `<event t="${event.worldTime.toFixed(1)}" src="${event.source}"${ref}>${event.content}</event>`;
   }
 
+  /**
+   * 把一个事件渲染成 chat 模式的 content parts。
+   * - 有原生附件且支持注入时，按 event.parts 的图文顺序交错（文字段 + image_url 段），
+   *   使聊天记录里的图片出现在对应位置，而不是全部堆在文字之后；
+   * - 无 parts / 无 loader / 附件越预算时，回退到"整段文字 + 平铺附件"的旧行为。
+   */
+  private async renderEventChatParts(
+    event: BotEvent,
+    loader: AttachmentLoadFn | null,
+    allowed: Set<number>,
+  ): Promise<ContentPart[]> {
+    const refAttr = event.refToolCallId ? ` ref="${event.refToolCallId}"` : "";
+    const open = `<event t="${event.worldTime.toFixed(1)}" src="${event.source}"${refAttr}>`;
+    const close = `</event>`;
+
+    if (!event.parts || !loader) {
+      const parts: ContentPart[] = [{ type: "text", text: open + event.content + close }];
+      if (loader && event.attachments) {
+        for (const ref of event.attachments) {
+          if (!allowed.has(ref.id)) continue;
+          const part = await loader(ref);
+          if (part) {
+            parts.push(part);
+            this.lastAttachmentPartTypes.add(part.type);
+          }
+        }
+      }
+      return parts;
+    }
+
+    // 有 parts：按顺序把文字与图片交错成 content parts
+    const out: ContentPart[] = [];
+    let buf = open;
+    const flush = () => {
+      if (buf) {
+        out.push({ type: "text", text: buf });
+        buf = "";
+      }
+    };
+    for (const seg of event.parts) {
+      if (seg.kind === "text") {
+        buf += seg.text;
+        continue;
+      }
+      // media 段：预算内且可附 → image_url；否则退化为 marker 文本（[图片#x（见附件）]）
+      const part = allowed.has(seg.ref.id) ? await loader(seg.ref) : null;
+      if (part) {
+        flush();
+        out.push(part);
+        this.lastAttachmentPartTypes.add(part.type);
+      } else {
+        buf += seg.marker;
+      }
+    }
+    buf += close;
+    flush();
+    return out;
+  }
+
   renderStreamText(): string {
     return this.stream
       .map((e) =>
@@ -220,11 +280,11 @@ export class BotContext {
    */
   async toChatMessages(timeLine: string): Promise<ChatMessage[]> {
     const loader = this.attachmentLoader && !this.attachmentsDisabled ? this.attachmentLoader : null;
-    const allowed = new Set<unknown>();
+    const allowed = new Set<number>();
     this.lastAttachmentPartTypes = new Set();
     if (loader) {
       // 1. 收集锚点之后的候选附件（单个超预算的永久跳过——决策稳定，不影响前缀）
-      const cands: { pos: number; skip: number; ref: unknown; size: number }[] = [];
+      const cands: { pos: number; skip: number; ref: MediaRef; size: number }[] = [];
       for (let i = this.attachAnchor.pos; i < this.stream.length; i++) {
         const entry = this.stream[i]!;
         if (entry.kind !== "event" || !entry.event.attachments?.length) continue;
@@ -256,9 +316,9 @@ export class BotContext {
         this.attachAnchor = first
           ? { pos: first.pos, skip: first.skip }
           : { pos: this.stream.length, skip: 0 };
-        for (const c of kept) allowed.add(c.ref);
+        for (const c of kept) allowed.add(c.ref.id);
       } else {
-        for (const c of cands) allowed.add(c.ref);
+        for (const c of cands) allowed.add(c.ref.id);
       }
     }
 
@@ -267,20 +327,11 @@ export class BotContext {
     ];
     for (const entry of this.stream) {
       const role = entry.kind === "tool_call" ? "assistant" : "user";
-      const line =
-        entry.kind === "tool_call"
-          ? BotContext.renderToolCallLine(entry.call)
-          : BotContext.renderEventLine(entry.event);
-      const parts: ContentPart[] = [{ type: "text", text: line }];
-      if (entry.kind === "event" && entry.event.attachments?.length && loader) {
-        for (const ref of entry.event.attachments) {
-          if (!allowed.has(ref)) continue;
-          const part = await loader(ref);
-          if (part) {
-            parts.push(part);
-            this.lastAttachmentPartTypes.add(part.type);
-          }
-        }
+      let parts: ContentPart[];
+      if (entry.kind === "tool_call") {
+        parts = [{ type: "text", text: BotContext.renderToolCallLine(entry.call) }];
+      } else {
+        parts = await this.renderEventChatParts(entry.event, loader, allowed);
       }
       const last = built[built.length - 1]!;
       if (last.role === role) {

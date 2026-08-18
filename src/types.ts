@@ -41,10 +41,21 @@ export interface MediaRef {
   file: string;
 }
 
+/** RichText 的一个有序分段：文本段 或 原生媒体段（图文混排按此顺序铺开） */
+export type RichTextPart =
+  | { kind: "text"; text: string }
+  | { kind: "media"; ref: MediaRef; note: string; marker: string };
+
 /** 带附件的富文本（附件 = Bot-LLM 原生支持的模态，以 content part 注入） */
 export interface RichText {
   text: string;
   attachments?: MediaRef[];
+  /**
+   * 图文有序分段（含原生附件时提供）：按此顺序把文字与媒体交错呈现，
+   * 使聊天记录等场景能"图文按位置混排"而非"文字在前、图片堆在后"。
+   * 缺省时回退到旧的 text + attachments 拼接行为。
+   */
+  parts?: RichTextPart[];
 }
 
 /**
@@ -66,6 +77,11 @@ export interface BotEvent {
   refToolCallId?: string;
   /** 原生多模态附件（仅 chat 模式 + 声明了对应模态时存在） */
   attachments?: MediaRef[];
+  /**
+   * 图文有序分段（含原生附件时提供）：按此顺序把文字与媒体交错呈现，
+   * 使聊天记录等场景在生成 content parts 时能"图文按位置混排"。
+   */
+  parts?: RichTextPart[];
 }
 
 export type StreamEntry =

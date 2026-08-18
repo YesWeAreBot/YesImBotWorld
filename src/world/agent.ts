@@ -16,6 +16,9 @@ import { fill, type Prompts } from "../prompts.js";
 import type { CompressionResult, ToolCallRecord } from "../types.js";
 import { debug } from "../webui/debug.js";
 
+/** 只读查询（query）的排队超时：避免被同源端点锁 + 持续生成的 Bot 饿死时无限悬挂 */
+const QUERY_TIMEOUT_MS = 60_000;
+
 const WORLD_TOOLS: ChatToolDef[] = [
   {
     type: "function",
@@ -205,6 +208,8 @@ export interface RemoteWorldLink {
 export class WorldAgent {
   private client: ChatClient;
   private tail: Promise<unknown> = Promise.resolve();
+  /** 只读查询（终端虚拟输出、天气等）的独立队列：不与写状态的主队列（tail）串行，避免被 act 裁定积压饿死 */
+  private queryTail: Promise<unknown> = Promise.resolve();
   private pending = 0;
   /** World 通过 set_tingle 为下一次心跳设定的间隔（TU）；读取后清空 */
   private nextTingleUnits: number | null = null;
@@ -338,6 +343,24 @@ export class WorldAgent {
       withEndpointLock(this.cfg.baseURL, fn).finally(() => this.pending--);
     const next = this.tail.then(wrapped, wrapped);
     this.tail = next.then(
+      () => undefined,
+      () => undefined,
+    );
+    return next;
+  }
+
+  /**
+   * 只读查询（query：终端虚拟输出、天气等）走独立队列：不与写状态的主队列（tail）串行，
+   * 避免被 act 裁定 / Tingle 等积压任务饿死——这类查询只 check 状态、不 update，
+   * 并发读安全；同源互斥仍由 withEndpointLock 保证。
+   * signal 用于排队等待阶段的超时（轮到自己仍会执行 fn，除非 fn 内部也响应 abort）。
+   */
+  private enqueueQuery<T>(fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+    this.pending++;
+    const wrapped = () =>
+      withEndpointLock(this.cfg.baseURL, fn, signal).finally(() => this.pending--);
+    const next = this.queryTail.then(wrapped, wrapped);
+    this.queryTail = next.then(
       () => undefined,
       () => undefined,
     );
@@ -489,14 +512,16 @@ export class WorldAgent {
 
   /** 本地世界查询（穿越服务处理访客 query 时用，绕过远程路由防止转发链） */
   private async queryLocal(task: string): Promise<string> {
-    return this.enqueue(async () => {
+    // 只读查询走独立队列 + 排队超时，避免被 act 裁定的串行队列（tail）饿死
+    const signal = AbortSignal.timeout(QUERY_TIMEOUT_MS);
+    return this.enqueueQuery(async () => {
       const content = (await this.runToolLoop({ task }))
         .replace(/<think>[\s\S]*?<\/think>/g, "")
         .replace(/<thinking>[\s\S]*?<\/thinking>/g, "")
         .trim();
       if (!content) throw new Error("World-LLM 没有给出文本回答");
       return content;
-    });
+    }, signal);
   }
 
   // ---------- 穿越：接待异世界访客（主世界侧，恒为本地处理） ----------

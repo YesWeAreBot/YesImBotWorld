@@ -5,7 +5,7 @@ import type { WorldClock } from "../clock.js";
 import { needsMsgIds, type Config } from "../config.js";
 import type { WorldFiles } from "../files.js";
 import { ToolCallParseError } from "../llm/parse.js";
-import type { BotEvent, CompressionResult, EventSource, MediaRef, ParsedToolCall, PhoneStatus, RichText, ToolCallRecord } from "../types.js";
+import type { BotEvent, CompressionResult, EventSource, MediaRef, ParsedToolCall, PhoneStatus, RichText, RichTextPart, ToolCallRecord } from "../types.js";
 import type { WorldAgent } from "../world/agent.js";
 import type { NotifyManager } from "../koishi/notify.js";
 import { debug } from "../webui/debug.js";
@@ -90,6 +90,7 @@ interface MailboxItem {
   source: EventSource;
   content: string;
   attachments?: MediaRef[];
+  parts?: RichTextPart[];
   refToolCallId?: string;
   worldTime: number;
   /** 存在时：先把此项作为 Bot 的工具调用追加进流（伪装成 Bot 主动输出），content 作为其结果事件 */
@@ -362,6 +363,7 @@ export class BotAgent {
       source,
       content: rich.text,
       attachments: rich.attachments?.length ? rich.attachments : undefined,
+      parts: rich.parts,
       refToolCallId: opts.ref,
       worldTime: this.clock.now(),
     });
@@ -559,6 +561,7 @@ export class BotAgent {
         worldTime: item.worldTime,
         refToolCallId: item.refToolCallId,
         attachments: item.attachments,
+        parts: item.parts,
       };
       await this.context.appendEvent(event);
       const resultLabel = event.refToolCallId
