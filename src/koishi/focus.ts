@@ -47,10 +47,12 @@ export class FocusManager {
     await fs.rename(tmp, this.file);
   }
 
-  /** 标记（或续期）对某频道的关注 */
+  /** 标记（或续期）对某频道的关注；Bot 同一时间只能全屏关注一个频道，切换频道即替换旧的 */
   async focus(key: string): Promise<void> {
     if (!this.enabled || !key) return;
     this.prune();
+    // 手机聊天页是全屏的：进新频道/给新频道发消息，注意力转移到它，旧频道不再关注
+    this.channels.clear();
     this.channels.set(key, this.now() + this.durationTU);
     await this.save().catch(() => {});
   }
