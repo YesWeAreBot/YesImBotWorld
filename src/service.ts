@@ -540,7 +540,9 @@ export class WorldService extends Service<Config> {
       this.config.clock,
       this.clock,
       this.world,
-      (content) => this.bot?.pushEvent("world", content),
+      // Tingle 是世界主动演化的唯一入口：若世界演化出「必须 Bot 立即行动」的事件，
+      // 应能打断 Bot 的 wait / 小憩（wake: true）。真正的 rest（压缩）不设 waiting，保持不可打断。
+      (content) => this.bot?.pushEvent("world", content, { wake: true }),
       this.logger,
     );
     this.tingle.start();
