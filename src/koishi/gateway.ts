@@ -506,12 +506,24 @@ function escAttr(s: string): string {
 
 /**
  * 判断一个 img 元素是否为「图片表情」（表情包）而非普通图片。
- * QQ OneBot v11：表情包消息的 image 段带 sub_type=1（数字或 "1" 字符串）；
- * 与我们出站时附加的 STICKER_ATTRS（sub_type: 1）一致，据此识别。
+ * QQ OneBot v11 image 段的 subType 语义：
+ * - 1 = 用户收藏的表情包 / 超级 QQ 秀表情；
+ * - 2 = QQ 自带的 gif 表情（文件名可能是 .jpg 但实际是动图）；
+ * - 0 或缺省 = 普通图片。
+ * 无 subType 的兜底：QQ 表情商城成套表情（summary 有文案 + gif 文件）。
+ * 与我们出站时附加的 STICKER_ATTRS（sub_type: 1）对应，据此识别。
  */
 function isStickerElement(el: h): boolean {
   const st = el.attrs?.sub_type ?? el.attrs?.subType;
-  return st === 1 || st === "1" || st === true;
+  if (st === 1 || st === "1" || st === 2 || st === "2" || st === true) return true;
+  const summary = el.attrs?.summary;
+  const file = el.attrs?.file;
+  return (
+    typeof summary === "string" &&
+    summary.trim() !== "" &&
+    typeof file === "string" &&
+    file.toLowerCase().endsWith(".gif")
+  );
 }
 
 /** at 元素的标签文本形式（Bot 可照抄发出） */
