@@ -56,6 +56,11 @@ export interface RichText {
    * 缺省时回退到旧的 text + attachments 拼接行为。
    */
   parts?: RichTextPart[];
+  /**
+   * act 结果后的当前状态回显（Bot_Status.md 全文），随该事件一起注入。
+   * 语义与 BotEvent.statusEcho 一致（见其注释）；经 pushEvent 透传。
+   */
+  statusEcho?: string;
 }
 
 /**
@@ -82,6 +87,14 @@ export interface BotEvent {
    * 使聊天记录等场景在生成 content parts 时能"图文按位置混排"。
    */
   parts?: RichTextPart[];
+  /**
+   * act 结果后的当前状态回显（Bot_Status.md 全文）。
+   * 仅最新一处 act 结果事件携带完整回显；新 act 结果追加前，上一处的完整回显会
+   * 退化为一句轻提示（见 BotContext.downgradeLastStatusEcho）。这样历史里永远只有
+   * 最新一处是完整状态，既给模型"现状感"（消除结果丢失焦虑、抑制复读），又避免
+   * 过时状态误导 + 每次 act 的 token 无限累积。
+   */
+  statusEcho?: string;
 }
 
 export type StreamEntry =

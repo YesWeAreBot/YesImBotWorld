@@ -93,6 +93,8 @@ interface MailboxItem {
   parts?: RichTextPart[];
   refToolCallId?: string;
   worldTime: number;
+  /** act 结果后的当前状态回显，随事件注入（见 BotEvent.statusEcho） */
+  statusEcho?: string;
   /** 存在时：先把此项作为 Bot 的工具调用追加进流（伪装成 Bot 主动输出），content 作为其结果事件 */
   asToolCall?: { name: string; arguments: Record<string, unknown> };
 }
@@ -366,6 +368,7 @@ export class BotAgent {
       parts: rich.parts,
       refToolCallId: opts.ref,
       worldTime: this.clock.now(),
+      statusEcho: rich.statusEcho,
     });
     this.logger.info(
       "[event:%s]%s %s%s",
@@ -562,6 +565,7 @@ export class BotAgent {
         refToolCallId: item.refToolCallId,
         attachments: item.attachments,
         parts: item.parts,
+        statusEcho: item.statusEcho,
       };
       await this.context.appendEvent(event);
       const resultLabel = event.refToolCallId
@@ -1231,7 +1235,7 @@ export class BotAgent {
     } else {
       this.pushEvent(
         "system",
-        `${call.id} ${call.name} 已开始执行，完成时你会收到结果——不必重复调用。`,
+        `${call.id} ${call.name} 已开始执行，完成后结果会自动以事件形式送到你这里。`,
         { ref: call.id },
       );
     }
@@ -1343,8 +1347,8 @@ export class BotAgent {
     ) {
       this.pushEvent(
         "system",
-        `（你已经在做这件事了（${this.lastAct.callId}），它还没有完成，这次没有重复开始——` +
-          `耐心等它的结果，或者先做点别的。如果你确定要同时再做一遍同样的事，请在参数里加上 repeat: true。）`,
+        `（你已经在做这件事了（${this.lastAct.callId}），它还在进行中，这次没有重复开始——` +
+          `它的结果会自动以事件的形式送到你这里。如果确实要同时再做一遍同样的事，请在参数里加上 repeat: true。）`,
         { ref: call.id },
       );
       return;
@@ -1357,9 +1361,17 @@ export class BotAgent {
         const parts: string[] = [];
         await this.world.adjudicateAct(call, (content) => parts.push(content));
         if (task.cancelled()) return null;
-        return parts.length
+        const text = parts.length
           ? parts.join("\n")
           : `（${desc || "刚才的动作"}完成了。）`;
+        // 状态回显：读 World 裁定后已更新的 Bot_Status.md 全文，随本次 act 结果一起注入。
+        // 先把上一处的完整回显退化为轻提示（历史里永远只有最新一处是完整状态），再附上本次的。
+        const status = (await this.files.readBotStatus()).trim();
+        if (status) {
+          await this.context.downgradeLastStatusEcho();
+          return { text, statusEcho: status };
+        }
+        return text;
       },
     });
   }
@@ -1611,6 +1623,17 @@ export class BotAgent {
     return { key: resolved.key };
   }
 
+  /**
+   * 发送类工具的成功结果后，回显该频道最近 n 条消息（文本），让模型看到自己的
+   * 话"上墙"了、以及对方的最新回应——消除"没发出去/发错了"的错觉，抑制重复发送。
+   * 只取文本（不转发附件），保持轻量。
+   */
+  private async echoChannelRecent(id: string, out: string, n = 10): Promise<string | RichText> {
+    const recent = await this.messenger.channelMessages(id, n);
+    const recentText = recent.text.trim();
+    return recentText ? { text: `${out}\n\n${recentText}` } : out;
+  }
+
   private dispatchSend(call: ToolCallRecord): void {
     const id = this.channelArg(call) ?? "";
     const msg = String(call.arguments.msg ?? "");
@@ -1675,7 +1698,7 @@ export class BotAgent {
         const out = await this.messenger.send(target.key, msg, media, replyTo, atSender, insist);
         // 自己发出了一条消息：打断对该频道的延期发送意图
         this.noteDeferredSelfSent(target.key);
-        return out;
+        return this.echoChannelRecent(id, out);
       },
     });
   }
@@ -1712,7 +1735,7 @@ export class BotAgent {
         if ("error" in target) return target.error;
         const out = await this.messenger.sendFile(target.key, file);
         this.noteDeferredSelfSent(target.key);
-        return out;
+        return this.echoChannelRecent(id, out);
       },
     });
   }
@@ -1747,7 +1770,7 @@ export class BotAgent {
         if ("error" in target) return target.error;
         const out = await this.messenger.sendVoice(target.key, text);
         this.noteDeferredSelfSent(target.key);
-        return out;
+        return this.echoChannelRecent(id, out);
       },
     });
   }
@@ -1991,13 +2014,16 @@ function truncate(text: string, max: number): string {
 /**
  * blockingAct 专注模式的拦截提示：存在未完成的 act 时返回提示文本（Bot 不可绕过），否则返回 null。
  * 供 dispatchAct 使用，也便于冒烟测试覆盖。
+ * 措辞纯正面、不点名任何工具：负面指令（"不要 act"）反而会强化模型对 act 的倾向，
+ * 也不指定 "等" 等具体动作，避免把复读通成另一种路径依赖。
  */
 export function actBusyMessage(pendingActs: ToolCallRecord[]): string | null {
   if (!pendingActs.length) return null;
   const pdesc = String(pendingActs[0]?.arguments.description ?? "").trim();
   return (
-    `（你正在做${pdesc ? `「${truncate(pdesc, 60)}」` : "上一件事"}，它还没有完成——` +
-    `先专心等它的结果，或者先做点别的。同时只能专注做一件事，别急着开新的动作。）`
+    `（你正在做${pdesc ? `「${truncate(pdesc, 60)}」` : "上一件事"}，它还在进行中，` +
+    `结果会自动以事件的形式送到你这里。你手头的事照常推进，` +
+    `也可以顺着它想想接下来准备做什么。）`
   );
 }
 

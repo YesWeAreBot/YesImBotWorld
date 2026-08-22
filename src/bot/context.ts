@@ -144,6 +144,40 @@ export class BotContext {
     await this.persistPinned();
   }
 
+  /**
+   * 把「最近一处带完整状态回显的 act 结果事件」退化为轻提示：删除该事件的
+   * statusEcho（完整 Bot_Status.md 原文），改在正文末尾追加一句「你的状态已随之更新」。
+   *
+   * 用途：act 结果后回显的完整 bot_status 只在「最新一处」保留（给模型现状感、抑制复读），
+   * 更早的会退化为轻提示——既避免过时的状态误导模型，也避免每次 act 的 token 无限累积。
+   * 新 act 结果追加完整回显之前调用本方法（见 dispatchAct）。
+   *
+   * 注意：stream.jsonl 是 append-only，这里需要整体重写该文件以落地退化结果；
+   * 内存中的 stream 同步修改，保证本次与后续渲染一致。
+   */
+  async downgradeLastStatusEcho(): Promise<void> {
+    let idx = -1;
+    for (let i = this.stream.length - 1; i >= 0; i--) {
+      const entry = this.stream[i]!;
+      if (entry.kind === "event" && entry.event.statusEcho) {
+        idx = i;
+        break;
+      }
+    }
+    if (idx < 0) return;
+    const entry = this.stream[idx]!;
+    if (entry.kind !== "event") return;
+    entry.event.statusEcho = undefined;
+    entry.event.content += "\n\n（你的状态已随之更新。）";
+    await this.rewriteStream();
+  }
+
+  /** 把内存中的 stream 整体重写回 stream.jsonl（原子写），用于"改写历史条目"类操作 */
+  private async rewriteStream(): Promise<void> {
+    const lines = this.stream.map((e) => JSON.stringify(e)).join("\n");
+    await this.files.atomicWrite(this.files.stream, lines ? lines + "\n" : "");
+  }
+
   // ---------- 渲染 ----------
 
   /** TU 换算说明（由 service 按时钟配置注入，如 "1 TU = 1 秒"）。Bot 估算 duration/wait 的锚点 */
@@ -198,7 +232,8 @@ export class BotContext {
 
   static renderEventLine(event: BotEvent): string {
     const ref = event.refToolCallId ? ` ref="${event.refToolCallId}"` : "";
-    return `<event t="${event.worldTime.toFixed(1)}" src="${event.source}"${ref}>${event.content}</event>`;
+    const echo = event.statusEcho ? `\n\n（你此刻的状态：\n${event.statusEcho}\n）` : "";
+    return `<event t="${event.worldTime.toFixed(1)}" src="${event.source}"${ref}>${event.content}${echo}</event>`;
   }
 
   /**
@@ -214,10 +249,11 @@ export class BotContext {
   ): Promise<ContentPart[]> {
     const refAttr = event.refToolCallId ? ` ref="${event.refToolCallId}"` : "";
     const open = `<event t="${event.worldTime.toFixed(1)}" src="${event.source}"${refAttr}>`;
+    const echo = event.statusEcho ? `\n\n（你此刻的状态：\n${event.statusEcho}\n）` : "";
     const close = `</event>`;
 
     if (!event.parts || !loader) {
-      const parts: ContentPart[] = [{ type: "text", text: open + event.content + close }];
+      const parts: ContentPart[] = [{ type: "text", text: open + event.content + echo + close }];
       if (loader && event.attachments) {
         for (const ref of event.attachments) {
           if (!allowed.has(ref.id)) continue;
@@ -255,7 +291,7 @@ export class BotContext {
         buf += seg.marker;
       }
     }
-    buf += close;
+    buf += echo + close;
     flush();
     return out;
   }

@@ -55,7 +55,7 @@ export const BOT_TOOLS: BotToolDef[] = [
     signature: 'act(description: string, repeat?: boolean)',
     description:
       "在世界中做一件事，用自然语言描述（如「去厨房泡一杯咖啡」）。结果由世界裁定，会在动作完成时以事件返回。记得给出合理的 duration。" +
-      "上一个相同的动作还没出结果时，重复的 act 会被拦截（不要因为没马上看到结果就再做一遍）；确实要同时再做一遍时加 repeat: true。",
+      "上一个相同的动作还在进行中时，重复的 act 会被拦截（结果会自动送达，无需再发起一次）；确实要同时再做一遍时加 repeat: true。",
   },
   {
     name: "rest",
@@ -578,7 +578,7 @@ export function availableTools(opts: {
         description:
           def.description +
           "开启 blockingAct（同时只能专注做一件事）时：上一个动作还没完成前，新的 act 会被直接拒绝，" +
-          "也不能用 repeat 绕过——先专心等它做完，或者先做点别的。",
+          "也不能用 repeat 绕过——手头的事照常推进，等它的结果自动送达即可。",
       };
     }
     // 开启引用回复时，send 增加 reply_to / at_sender 参数说明

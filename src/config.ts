@@ -373,11 +373,11 @@ export const Config: Schema<Config> = Schema.intersect([
             "而是立即发送（也不再有超大 duration 的拦截与发出前的 cancel 窗口）。工具描述会同步说明",
         ),
       blockingAct: Schema.boolean()
-        .default(false)
+        .default(true)
         .description(
-          "act() 的专注模式：开启后，上一个动作还没完成（结果交付）前，新的 act 会被直接拒绝并提示等待——" +
+          "act() 的专注模式（默认开启）：上一个动作还没完成（结果交付）前，新的 act 会被直接拒绝并提示——" +
             "不能被 repeat 等参数绕过；但其他工具调用（发消息、等待、看状态等）不受影响、照常进行。" +
-            "一个人同时只能专注做一件事，做别的不受影响",
+            "一个人同时只能专注做一件事，做别的不受影响。关闭后允许一个 act 进行中再开下一个 act",
         ),
       waitRateThreshold: Schema.natural()
         .max(100)
