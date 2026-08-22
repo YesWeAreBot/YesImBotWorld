@@ -64,6 +64,8 @@ export interface ChatUsage {
   cache_read_input_tokens?: number;
   /** 归一化后的缓存命中数（normalizeUsage 填充） */
   cached_tokens?: number;
+  /** 归一化标记：上游 usage 是否上报了缓存命中信息（normalizeUsage 填充） */
+  cache_reported?: boolean;
 }
 
 export interface ChatCompleteOptions {
@@ -227,6 +229,7 @@ export class ChatClient {
       completionTokens: u.completion_tokens ?? 0,
       totalTokens: u.total_tokens ?? 0,
       cachedTokens: u.cached_tokens ?? 0,
+      cacheReported: u.cache_reported === true,
     });
   }
 }
@@ -362,16 +365,19 @@ function normalizeUsage(u: ChatUsage | null | undefined): ChatUsage | null {
   if (!prompt && !completion && !total) return null;
   // 缓存命中：OpenAI 的 prompt_tokens_details.cached_tokens / DeepSeek 的 prompt_cache_hit_tokens /
   // Anthropic 经 OpenAI 网关透传的 cache_read_input_tokens（opencode 等聚合网关常用）
-  const cached =
-    Number(
-      u.prompt_tokens_details?.cached_tokens ??
-        u.prompt_cache_hit_tokens ??
-        u.cache_read_input_tokens,
-    ) || 0;
+  const cacheField =
+    u.prompt_tokens_details?.cached_tokens ?? u.prompt_cache_hit_tokens ?? u.cache_read_input_tokens;
+  // 是否上报了缓存命中信息：字段存在（即使为 0）才算「上报」；undefined = 未上报（如 vLLM 默认不带）
+  const cacheReported =
+    u.prompt_tokens_details?.cached_tokens !== undefined ||
+    u.prompt_cache_hit_tokens !== undefined ||
+    u.cache_read_input_tokens !== undefined;
+  const cached = Number(cacheField) || 0;
   return {
     prompt_tokens: prompt,
     completion_tokens: completion,
     total_tokens: total || prompt + completion,
+    cache_reported: cacheReported,
     ...(cached ? { cached_tokens: cached } : {}),
   };
 }

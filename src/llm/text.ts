@@ -146,6 +146,7 @@ export class TextClient {
       completionTokens: usage.completion,
       totalTokens: usage.total,
       cachedTokens: usage.cached,
+      cacheReported: usage.cacheReported,
     });
   }
 }
@@ -165,6 +166,8 @@ interface LlmUsage {
   total: number;
   /** 命中 KV cache 的输入 token 数 */
   cached: number;
+  /** 是否上报了缓存命中信息（cache_n / tokens_cached 存在才算上报） */
+  cacheReported: boolean;
 }
 
 function timingsToUsage(t: LlmTimings | undefined, tokensCached?: number): LlmUsage | null {
@@ -176,7 +179,8 @@ function timingsToUsage(t: LlmTimings | undefined, tokensCached?: number): LlmUs
   const completion = Number(t.predicted_n ?? t.predicted_eval_count) || 0;
   const prompt = evaluated + cached;
   if (!prompt && !completion) return null;
-  return { prompt, completion, total: prompt + completion, cached };
+  const cacheReported = t.cache_n !== undefined || tokensCached !== undefined;
+  return { prompt, completion, total: prompt + completion, cached, cacheReported };
 }
 
 /**

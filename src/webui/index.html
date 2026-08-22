@@ -2501,16 +2501,26 @@ function renderUsage(){
   if(!usageCache) return wrap;
   var s = usageCache.summary;
   var totals = s.totals;
-  var hitRate = totals.promptTokens > 0 ? (totals.cachedTokens / totals.promptTokens * 100) : 0;
+  // 缓存命中率的分母：只统计「上游上报了缓存命中信息」的请求的输入 token；
+  // 未上报的请求（如 vLLM 默认不带 cached 字段）不应稀释命中率。
+  var reportMiss = (totals.cacheMissRecords||0);
+  var hitDenom = totals.cacheReportedPromptTokens || 0;
+  var hitRate = hitDenom > 0 ? (totals.cachedTokens / hitDenom * 100) : 0;
+  var cacheHint = reportMiss > 0
+    ? '统计样本中有 ' + reportMiss + ' 条请求未上报缓存命中信息，本数值可能不准确（分母仅包含已上报缓存的请求）。'
+    : '';
   var cards = el('div', {cls:'cards'}, [
     usageCard('请求数', fmtNum(totals.requests), '次'),
     usageCard('总 token', fmtNum(totals.totalTokens), 'tok'),
     usageCard('输入 token', fmtNum(totals.promptTokens), 'tok'),
     usageCard('输出 token', fmtNum(totals.completionTokens), 'tok'),
-    usageCard('缓存命中', fmtNum(totals.cachedTokens), 'tok', 'usage-cache-card'),
-    usageCard('缓存命中率', hitRate.toFixed(1), '%', 'usage-cache-card', '命中缓存的输入 token ÷ 全部输入 token。需要后端在响应里携带缓存统计（OpenAI cached_tokens / DeepSeek cache_hit / llama.cpp timings）')
+    usageCard('缓存命中', fmtNum(totals.cachedTokens), 'tok', 'usage-cache-card', cacheHint),
+    usageCard('缓存命中率', hitRate.toFixed(1), '%', 'usage-cache-card', cacheHint || '命中缓存的输入 token ÷ 有缓存上报的输入 token。')
   ]);
   wrap.appendChild(cards);
+  if(cacheHint){
+    wrap.appendChild(el('p', {style:'color:var(--warn);font-size:12.5px;margin:8px 0 0', text:'⚠ ' + cacheHint}));
+  }
   wrap.appendChild(usageChartSection());
   var bar = el('div', {cls:'toolbar seg-bar'}, [
     el('span', {text:'明细：', style:'color:var(--fg-dark);font-size:12px'}),
@@ -2697,7 +2707,8 @@ function renderUsageDetail(){
   holder.appendChild(list);
 }
 function usageRow(name, dim, it){
-  var hit = it.promptTokens > 0 ? (it.cachedTokens||0) / it.promptTokens * 100 : 0;
+  var hitDenom = it.cacheReportedPromptTokens || 0;
+  var hit = hitDenom > 0 ? (it.cachedTokens||0) / hitDenom * 100 : 0;
   return el('div', {cls:'usage-entry', style:'cursor:pointer', title:'点击查看该' + (dim==='label'?'标签':'模型') + '的请求明细', onclick:function(){
     usageFilter = 'total';
     usageFilterLabel = name;

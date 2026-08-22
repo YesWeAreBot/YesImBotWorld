@@ -22,6 +22,8 @@ export interface UsageRecord {
   totalTokens: number;
   /** 输入中命中提示词缓存的 token 数（后端不支持时为 0） */
   cachedTokens: number;
+  /** 后端响应是否上报了缓存命中信息（false = 未上报，如 vLLM 默认不放 cached 字段） */
+  cacheReported?: boolean;
 }
 
 export interface UsageTotals {
@@ -30,6 +32,10 @@ export interface UsageTotals {
   completionTokens: number;
   totalTokens: number;
   cachedTokens: number;
+  /** 有缓存命中上报的请求的输入 token 合计（缓存命中率的分母） */
+  cacheReportedPromptTokens: number;
+  /** 未上报缓存命中的请求条数（>0 表示命中率统计可能失真） */
+  cacheMissRecords: number;
 }
 
 export interface UsageSummary {
@@ -95,7 +101,7 @@ export class UsageStore {
         try {
           const r = JSON.parse(line) as UsageRecord;
           if (typeof r.id !== "number" || typeof r.ts !== "number") continue;
-          if (typeof r.cachedTokens !== "number") r.cachedTokens = 0;
+          normalizeRecordForLoad(r);
           accumulateRecord(agg, r);
         } catch {
           /* skip */
@@ -118,7 +124,7 @@ export class UsageStore {
         try {
           const r = JSON.parse(line) as UsageRecord;
           if (typeof r.id !== "number" || typeof r.ts !== "number") continue;
-          if (typeof r.cachedTokens !== "number") r.cachedTokens = 0; // 兼容旧记录
+          normalizeRecordForLoad(r);
           this.records.push(r);
           if (r.id >= this.nextId) this.nextId = r.id + 1;
         } catch {
@@ -238,17 +244,35 @@ function normalizeTotalsMap(map: Record<string, unknown>): Record<string, UsageT
 function normalizeTotals(t: unknown): UsageTotals {
   if (!t || typeof t !== "object") return emptyTotals();
   const o = t as Partial<UsageTotals>;
+  const promptTokens = num(o.promptTokens);
+  const cachedTokens = num(o.cachedTokens);
+  // 旧格式迁移：早期 agg 没有 cacheReportedPromptTokens / cacheMissRecords 两个字段。
+  // 此时无法区分「上报/未上报」，按「全部已上报」保守回退，命中率 = cachedTokens / promptTokens，
+  // 避免旧数据被误判成全 0（漏字段）而显示 0.0% 命中率、缺失提示。
+  const legacy = o.cacheReportedPromptTokens === undefined && o.cacheMissRecords === undefined;
+  const cacheReportedPromptTokens = legacy ? promptTokens : num(o.cacheReportedPromptTokens);
+  const cacheMissRecords = legacy ? 0 : num(o.cacheMissRecords);
   return {
     requests: num(o.requests),
-    promptTokens: num(o.promptTokens),
+    promptTokens,
     completionTokens: num(o.completionTokens),
     totalTokens: num(o.totalTokens),
-    cachedTokens: num(o.cachedTokens),
+    cachedTokens,
+    cacheReportedPromptTokens,
+    cacheMissRecords,
   };
 }
 
 function num(v: unknown): number {
   return Number(v) || 0;
+}
+
+/** 规范化从磁盘读回的单条明细记录：补齐旧版本缺失的字段（cachedTokens / cacheReported） */
+function normalizeRecordForLoad(r: UsageRecord): void {
+  if (typeof r.cachedTokens !== "number") r.cachedTokens = 0;
+  // 旧记录没有 cacheReported 字段：无法区分“真未命中”与“未上报”，
+  // 按“全部已上报”保守回退，避免误触发“统计可能不准确”提示、也避免命中率分母塌成 0。
+  if (typeof r.cacheReported !== "boolean") r.cacheReported = true;
 }
 
 /** 把一条记录累加进聚合（totals / byLabel / byModel / byDay） */
@@ -262,7 +286,15 @@ function accumulateRecord(agg: UsageAggregate, r: UsageRecord): void {
 }
 
 function emptyTotals(): UsageTotals {
-  return { requests: 0, promptTokens: 0, completionTokens: 0, totalTokens: 0, cachedTokens: 0 };
+  return {
+    requests: 0,
+    promptTokens: 0,
+    completionTokens: 0,
+    totalTokens: 0,
+    cachedTokens: 0,
+    cacheReportedPromptTokens: 0,
+    cacheMissRecords: 0,
+  };
 }
 
 function accumulate(t: UsageTotals, r: UsageRecord): void {
@@ -271,6 +303,9 @@ function accumulate(t: UsageTotals, r: UsageRecord): void {
   t.completionTokens += r.completionTokens;
   t.totalTokens += r.totalTokens;
   t.cachedTokens += r.cachedTokens || 0;
+  // 缓存命中率分母：只统计「上游确实上报了缓存命中信息」的请求
+  if (r.cacheReported === true) t.cacheReportedPromptTokens += r.promptTokens;
+  else t.cacheMissRecords++;
 }
 
 function add(map: Record<string, UsageTotals>, key: string, r: UsageRecord): void {
