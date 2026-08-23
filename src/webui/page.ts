@@ -581,6 +581,10 @@ function showImage(title, url){
 function api(method, path, body, retried){
   var opts = {method:method, headers:{}};
   if(MODE === 'visitor'){
+    // 访客只读：写请求直接拒绝，不发请求（安全兜底，即便某个写按钮漏隐藏也不会真正落盘）
+    if(method !== 'GET'){
+      return Promise.reject(new Error('访客模式为只读，无法执行此操作'));
+    }
     if(VISITOR_TOKEN) opts.headers['x-visitor-token'] = VISITOR_TOKEN;
   } else if(TOKEN){
     opts.headers['Authorization'] = 'Bearer ' + TOKEN;
@@ -725,6 +729,7 @@ function visitorCanSee(grants){
   if(!grants || !grants.length) return false;
   return grants.some(function(g){ return VISITOR_GRANTS.indexOf(g) >= 0; });
 }
+function isVisitor(){ return MODE === 'visitor'; }
 function buildNav(){
   var nav = $('#nav');
   nav.textContent = '';
@@ -831,7 +836,7 @@ function renderOverview(o){
       el('div', null, [worldStatePill(o)]),
       el('div', {cls:'hero-clock', id:'ov-clock', text: clockText}),
       el('div', {cls:'hero-sub', id:'ov-sub', text: heroSub(o)}),
-      el('div', {cls:'hero-actions'}, [
+      isVisitor() ? null : el('div', {cls:'hero-actions'}, [
         el('button', {cls:'primary', text:'创世', title:'world.init：由 World-LLM 依据定义生成初始状态', onclick: function(){ worldAction('init', true); }}),
         el('button', {text:'开始', onclick: function(){ worldAction('start'); }}),
         el('button', {text:'暂停', onclick: function(){ worldAction('stop'); }}),
@@ -1254,16 +1259,18 @@ function computerPanel(d){
   if(c.on) head.appendChild(el('span', {cls:'mode-badge on', text: c.on + ' 打开中', style:'margin-left:auto'}));
   if(c.mode === 'off'){
     body.appendChild(el('p', {cls:'empty', text:'电脑未启用。开启后 Bot 会拥有一台自己的电脑：Docker 容器（终端/文件）或远程桌面（看屏幕、动鼠标键盘）。'}));
-    body.appendChild(el('button', {text:'前往配置开启', onclick:function(){ gotoCfg('apps'); }}));
+    if(!isVisitor()) body.appendChild(el('button', {text:'前往配置开启', onclick:function(){ gotoCfg('apps'); }}));
   } else if(c.mode === 'docker'){
     body.appendChild(dockerStatus(c.docker));
-    body.appendChild(el('div', {cls:'toolbar'}, [
-      el('button', {cls:'primary', text:'开机', onclick:function(){ computerAction('start'); }}),
-      el('button', {text:'关机', onclick:function(){ if(confirm('关闭 Bot 的电脑？容器数据保留，Bot 的终端会暂时不可用。')) computerAction('stop'); }}),
-      el('button', {text:'重启', onclick:function(){ if(confirm('重启 Bot 的电脑容器？')) computerAction('restart'); }}),
-    ]));
-    body.appendChild(el('div', {cls:'crumb', text:'终端控制台（运维用途，命令在容器内执行）'}));
-    body.appendChild(termBox());
+    if(!isVisitor()){
+      body.appendChild(el('div', {cls:'toolbar'}, [
+        el('button', {cls:'primary', text:'开机', onclick:function(){ computerAction('start'); }}),
+        el('button', {text:'关机', onclick:function(){ if(confirm('关闭 Bot 的电脑？容器数据保留，Bot 的终端会暂时不可用。')) computerAction('stop'); }}),
+        el('button', {text:'重启', onclick:function(){ if(confirm('重启 Bot 的电脑容器？')) computerAction('restart'); }}),
+      ]));
+      body.appendChild(el('div', {cls:'crumb', text:'终端控制台（运维用途，命令在容器内执行）'}));
+      body.appendChild(termBox());
+    }
   } else {
     body.appendChild(remotePanel(c));
   }
@@ -1368,9 +1375,7 @@ function pollScreen(){
   if(activeView !== 'devices' || !devicesCache || devicesCache.computer.mode !== 'remote_desktop') return;
   if(screenBusy) return;
   screenBusy = true;
-  var headers = {};
-  if(TOKEN) headers['Authorization'] = 'Bearer ' + TOKEN;
-  fetch('/api/computer/screen?w=1280&t=' + Date.now(), {headers: headers}).then(function(res){
+  fetch(withToken('/api/computer/screen?w=1280&t=' + Date.now())).then(function(res){
     if(!res.ok) return res.json().then(function(d){ throw new Error((d && d.error) || ('HTTP ' + res.status)); });
     return res.blob();
   }).then(function(blob){
@@ -1561,7 +1566,7 @@ function openVisitorEditor(acct, all, done){
 function loadConfig(){
   var main = $('#main');
   main.textContent = '';
-  main.appendChild(viewHead('配置', '按重要程度分层：常用项直接展开，高级项收起。保存后写入配置文件并重启插件作用域（世界自动恢复运行）。'));
+  main.appendChild(viewHead('配置', isVisitor() ? '只读模式：可浏览配置，无法修改。' : '按重要程度分层：常用项直接展开，高级项收起。保存后写入配置文件并重启插件作用域（世界自动恢复运行）。'));
   var holder = el('div', {text:'加载中…', cls:'empty'});
   main.appendChild(holder);
   api('GET', '/api/config').then(function(r){
@@ -1573,6 +1578,11 @@ function loadConfig(){
     holder.textContent = '';
     holder.appendChild(renderConfigShell());
     renderCfgBody(); // 外壳已挂载，此时 #cfg-body 可被全局查询到
+    // 访客只读：整个配置容器禁止交互（不逐个禁用字段/按钮，用 pointer-events 兜底）
+    if(isVisitor()){
+      var cfgBody = $('#cfg-body');
+      if(cfgBody){ cfgBody.style.pointerEvents = 'none'; cfgBody.style.opacity = '0.85'; }
+    }
   }).catch(showErr);
 }
 function renderConfigShell(){
@@ -1731,6 +1741,10 @@ function updateSaveBar(bar){
   bar = bar || $('#cfg-savebar');
   if(!bar) return;
   bar.textContent = '';
+  if(isVisitor()){
+    bar.appendChild(el('span', {style:'font-size:12.5px;color:var(--fg-dark)', text:'只读模式 · 配置不可修改'}));
+    return;
+  }
   bar.appendChild(el('span', {id:'cfg-dirty-dot', cls:'dirty-dot', style: cfgDirty ? '' : 'visibility:hidden'}));
   bar.appendChild(el('span', {style:'font-size:12.5px;color:var(--fg-dim)', text: cfgDirty ? '有未保存的修改' : '已保存的状态'}));
   bar.appendChild(el('span', {cls:'spacer'}));
@@ -1987,7 +2001,7 @@ function saveConfig(){
 function loadPrompts(){
   var main = $('#main');
   main.textContent = '';
-  main.appendChild(viewHead('提示词', '改写内置提示词（Bot 行为准则 / World 任务模板），保存后立即生效。带 {{变量}} 的是占位符，会被实际内容替换。'));
+  main.appendChild(viewHead('提示词', isVisitor() ? '只读模式：可浏览提示词，无法修改。' : '改写内置提示词（Bot 行为准则 / World 任务模板），保存后立即生效。带 {{变量}} 的是占位符，会被实际内容替换。'));
   var holder = el('div', {text:'加载中…', cls:'empty'});
   main.appendChild(holder);
   api('GET', '/api/prompts').then(function(r){
@@ -1996,10 +2010,12 @@ function loadPrompts(){
     holder.textContent = '';
     holder.appendChild(promptGroup('Bot-LLM · 行为准则', r.defaults.bot, r.overrides.bot, 'bot'));
     holder.appendChild(promptGroup('World-LLM · 系统提示与任务模板', r.defaults.world, r.overrides.world, 'world'));
-    holder.appendChild(el('div', {cls:'toolbar'}, [
-      el('button', {cls:'primary', text:'保存', onclick: savePrompts}),
-      el('span', {style:'color:var(--fg-dark);font-size:12px', text:'仅保存与默认不同的项'})
-    ]));
+    if(!isVisitor()){
+      holder.appendChild(el('div', {cls:'toolbar'}, [
+        el('button', {cls:'primary', text:'保存', onclick: savePrompts}),
+        el('span', {style:'color:var(--fg-dark);font-size:12px', text:'仅保存与默认不同的项'})
+      ]));
+    }
   }).catch(showErr);
 }
 function promptGroup(title, defaults, current, prefix){
@@ -2012,6 +2028,7 @@ function promptGroup(title, defaults, current, prefix){
     var ctl = el('div', {cls:'ctl'});
     var ta = el('textarea', {rows: Math.min(24, String(defaults[key]).split(NL).length + 2)});
     ta.value = current[key] !== undefined ? current[key] : defaults[key];
+    if(isVisitor()) ta.readOnly = true;
     var overBadge = el('span', {style:'font-size:11px'});
     function paint(){
       var overridden = ta.value !== defaults[key];
@@ -2021,7 +2038,7 @@ function promptGroup(title, defaults, current, prefix){
     ta.oninput = paint;
     paint();
     ctl.appendChild(ta);
-    ctl.appendChild(el('div', {cls:'toolbar', style:'margin:4px 0 0'}, [
+    ctl.appendChild(el('div', {cls:'toolbar', style:'margin:4px 0 0'}, isVisitor() ? [overBadge, el('span', {cls:'spacer'})] : [
       overBadge,
       el('span', {cls:'spacer'}),
       el('button', {text:'恢复默认', style:'font-size:11px;padding:2px 8px', onclick:function(){ ta.value = defaults[key]; paint(); }})
@@ -2132,13 +2149,15 @@ function statePane(id, title, content, url){
   var sec = el('div', {cls:'section', 'data-pane': id});
   var ta = el('textarea', {rows: 16});
   ta.value = content;
-  sec.appendChild(el('h3', {html: esc(title) + ' <span class="hint">整体覆盖，保存后实时生效</span>'}));
-  sec.appendChild(el('div', {cls:'body'}, [
-    ta,
-    el('div', {cls:'toolbar'}, [el('button', {cls:'primary', text:'保存', onclick:function(){
+  if(isVisitor()) ta.readOnly = true;
+  sec.appendChild(el('h3', {html: esc(title) + ' <span class="hint">' + (isVisitor() ? '只读' : '整体覆盖，保存后实时生效') + '</span>'}));
+  var body = el('div', {cls:'body'}, [ta]);
+  if(!isVisitor()){
+    body.appendChild(el('div', {cls:'toolbar'}, [el('button', {cls:'primary', text:'保存', onclick:function(){
       api('PUT', url, {content: ta.value}).then(function(){ toast(title + ' 已保存', 'ok'); }).catch(showErr);
-    }})])
-  ]));
+    }})]));
+  }
+  sec.appendChild(body);
   return sec;
 }
 function phoneShellPane(shellHtml, meta){
@@ -2167,7 +2186,8 @@ function phoneShellPane(shellHtml, meta){
   // 源码编辑（textarea）+ 保存
   var ta = el('textarea', {rows:16, style:'width:100%;font-family:var(--mono);font-size:12px;margin-top:8px'});
   ta.value = shellHtml || '';
-  body.appendChild(el('div', {cls:'toolbar', style:'margin-bottom:8px'}, [
+  if(isVisitor()) ta.readOnly = true;
+  body.appendChild(el('div', {cls:'toolbar', style:'margin-bottom:8px'}, isVisitor() ? [] : [
     el('button', {text:'刷新预览', onclick:function(){ shellHtml = ta.value; renderPreview(); }}),
     el('span', {cls:'spacer'}),
     el('button', {cls:'primary', text:'保存外壳', onclick:function(){
@@ -2209,6 +2229,7 @@ function jsonlPane(title, hint, items, urlBase, placeholder, opts){
       var it = el('div', {cls:'news-item'});
       var ta = el('textarea', {rows: 2});
       ta.value = n.content;
+      if(isVisitor()) ta.readOnly = true;
       it.appendChild(el('span', {cls:'clock', text:'[' + n.clock + ']  T=' + Number(n.t).toFixed(1)}));
       if(n.pinned){
         it.appendChild(el('span', {cls:'tag', style:'margin-left:6px;color:var(--warn);border-color:rgba(251,191,36,.45)', text:'已固定'}));
@@ -2233,21 +2254,23 @@ function jsonlPane(title, hint, items, urlBase, placeholder, opts){
         it.appendChild(detBtn);
         it.appendChild(detBox);
       }
-      it.appendChild(el('div', {cls:'toolbar', style:'margin:4px 0 0'}, [
-        el('button', {text:'保存修改', onclick:function(){
-          api('PUT', urlBase, {index:i, content: ta.value}).then(function(){ items[i].content = ta.value; toast('已保存', 'ok'); }).catch(showErr);
-        }}),
-        el('button', {cls:'danger', text:'删除', onclick:function(){
-          if(!confirm('删除这条？')) return;
-          api('DELETE', urlBase + '?index=' + i).then(function(){ items.splice(i,1); render(); }).catch(showErr);
-        }}),
-        opts.pinnable ? el('div', {style:'display:flex;align-items:center;gap:6px;flex-wrap:wrap'}, [
-          el('button', {cls: n.pinned ? 'primary' : '', title: n.pinned ? '取消固定：这条将不再作为「重要回忆」特别保留，重置/创世时可能被清除' : '固定这条：它将成为 Bot 心中的重要回忆（用 recall 时更该记得、角色扮演不 OOC 的依据），且重置/创世后仍然保留', text: n.pinned ? '取消固定' : '固定', onclick:function(){
-            api('POST', urlBase + '/pin', {index: i, pinned: !n.pinned}).then(function(){ n.pinned = !n.pinned; toast(n.pinned ? '已固定（成为重要回忆，重置/创世后保留）' : '已取消固定', 'ok'); render(); }).catch(showErr);
+      if(!isVisitor()){
+        it.appendChild(el('div', {cls:'toolbar', style:'margin:4px 0 0'}, [
+          el('button', {text:'保存修改', onclick:function(){
+            api('PUT', urlBase, {index:i, content: ta.value}).then(function(){ items[i].content = ta.value; toast('已保存', 'ok'); }).catch(showErr);
           }}),
-          el('span', {style:'font-size:11.5px;color:var(--fg-dim)', text: n.pinned ? '重要回忆 · 重置保留' : '固定=Bot 的重要回忆，重置/创世也保留'})
-        ]) : null
-      ]));
+          el('button', {cls:'danger', text:'删除', onclick:function(){
+            if(!confirm('删除这条？')) return;
+            api('DELETE', urlBase + '?index=' + i).then(function(){ items.splice(i,1); render(); }).catch(showErr);
+          }}),
+          opts.pinnable ? el('div', {style:'display:flex;align-items:center;gap:6px;flex-wrap:wrap'}, [
+            el('button', {cls: n.pinned ? 'primary' : '', title: n.pinned ? '取消固定：这条将不再作为「重要回忆」特别保留，重置/创世时可能被清除' : '固定这条：它将成为 Bot 心中的重要回忆（用 recall 时更该记得、角色扮演不 OOC 的依据），且重置/创世后仍然保留', text: n.pinned ? '取消固定' : '固定', onclick:function(){
+              api('POST', urlBase + '/pin', {index: i, pinned: !n.pinned}).then(function(){ n.pinned = !n.pinned; toast(n.pinned ? '已固定（成为重要回忆，重置/创世后保留）' : '已取消固定', 'ok'); render(); }).catch(showErr);
+            }}),
+            el('span', {style:'font-size:11.5px;color:var(--fg-dim)', text: n.pinned ? '重要回忆 · 重置保留' : '固定=Bot 的重要回忆，重置/创世也保留'})
+          ]) : null
+        ]));
+      }
       list.appendChild(it);
     });
   }
@@ -2262,13 +2285,16 @@ function jsonlPane(title, hint, items, urlBase, placeholder, opts){
     }});
     addBar.appendChild(orderBtn);
   }
-  addBar.appendChild(addInp);
-  addBar.appendChild(el('button', {cls:'primary', text:'追加', onclick:function(){
-    var v = addInp.value.trim();
-    if(!v) return;
-    api('POST', urlBase, {content: v}).then(function(){ addInp.value=''; loadState(); }).catch(showErr);
-  }}));
-  body.appendChild(addBar);
+  // 访客只读：不渲染「追加」输入与按钮（排序切换仍保留）
+  if(!isVisitor()){
+    addBar.appendChild(addInp);
+    addBar.appendChild(el('button', {cls:'primary', text:'追加', onclick:function(){
+      var v = addInp.value.trim();
+      if(!v) return;
+      api('POST', urlBase, {content: v}).then(function(){ addInp.value=''; loadState(); }).catch(showErr);
+    }}));
+  }
+  if(addBar.children.length) body.appendChild(addBar);
   body.appendChild(list);
   sec.appendChild(body);
   return sec;
@@ -2344,7 +2370,7 @@ function renderCrossing(c){
   }
   if(!worlds.length){
     goBody.appendChild(el('p', {cls:'empty', text:'还没有配置任何可去的世界。拿到别人分享的邀请码后，在配置 crossing.worlds 里添加：世界名、对方服务地址（http://主机:端口）、邀请码。'}));
-    goBody.appendChild(el('button', {text:'前往配置', onclick:function(){ gotoCfg('crossing'); }}));
+    if(!isVisitor()) goBody.appendChild(el('button', {text:'前往配置', onclick:function(){ gotoCfg('crossing'); }}));
   } else {
     worlds.forEach(function(w){
       var flags = [];
@@ -2360,14 +2386,14 @@ function renderCrossing(c){
         el('span', {cls:'v'}, [
           c.location === w.name
             ? el('span', {text:'Bot 在这里', style:'color:var(--ok);font-size:12px'})
-            : (function(){
+            : (isVisitor() ? el('span', {text: canGo ? '可前往' : flags.join('，') || '不可前往', style:'color:var(--fg-dark);font-size:12px'}) : (function(){
                 var attrs = {text:'送往', onclick:function(){
                   if(!confirm('把 Bot 强制送往「' + w.name + '」？')) return;
                   crossingTravel(w.name, '穿越');
                 }};
                 if(!canGo) attrs.disabled = 'disabled';
                 return el('button', attrs);
-              })()
+              })())
         ])
       ]));
     });
@@ -2381,7 +2407,7 @@ function renderCrossing(c){
   var hostBody = el('div', {cls:'body'});
   if(!(c.server && c.server.enabled)){
     hostBody.appendChild(el('p', {cls:'empty', text:'接待服务未开启。开启 crossing.serverEnabled 后，你的世界会开放给持有邀请码的访客（来访 Bot 的行动由你的 World-LLM 裁定）。'}));
-    hostBody.appendChild(el('button', {text:'前往配置开启', onclick:function(){ gotoCfg('crossing'); }}));
+    if(!isVisitor()) hostBody.appendChild(el('button', {text:'前往配置开启', onclick:function(){ gotoCfg('crossing'); }}));
   } else {
     hostBody.appendChild(el('div', {cls:'kv'}, [
       el('span', {cls:'k', text:'服务状态'}),
@@ -2482,7 +2508,16 @@ function loadDebug(){
     if(sub === 'stream') renderStreamTab();
     else renderDebugList();
   }
-  var toolbar = el('div', {cls:'toolbar'}, [
+  var toolbar = el('div', {cls:'toolbar'}, isVisitor() ? [
+    el('label', {html:'<input type="checkbox" id="dbg-auto"' + (debugAutoScroll?' checked':'') + '> 自动滚动', style:'font-size:12px;color:var(--fg-dim)'}),
+    el('button', {id:'dbg-order', text: debugOrder === 'desc' ? '倒序' : '正序', title:'切换列表排序（倒序=最新在前）', onclick:function(){
+      debugOrder = debugOrder === 'desc' ? 'asc' : 'desc';
+      $('#dbg-order').textContent = debugOrder === 'desc' ? '倒序' : '正序';
+      renderDebugList();
+    }}),
+    el('span', {cls:'spacer'}),
+    el('span', {id:'dbg-count', text:'', style:'color:var(--fg-dark);font-size:12px'})
+  ] : [
     el('button', {text:'清空', onclick:function(){
       debugEntries = [];
       debugOpenIds = {};
@@ -2724,12 +2759,13 @@ function renderUsage(){
     segBtn('全部', usageFilter==='total', function(){ usageFilter='total'; usageFilterLabel=''; usageEntryFilter=null; syncSeg(this); renderUsageDetail(); }),
     segBtn('按标签', usageFilter==='label', function(){ usageFilter='label'; usageFilterLabel=''; usageEntryFilter=null; syncSeg(this); renderUsageDetail(); }),
     segBtn('按模型', usageFilter==='model', function(){ usageFilter='model'; usageFilterLabel=''; usageEntryFilter=null; syncSeg(this); renderUsageDetail(); }),
-    el('span', {cls:'spacer'}),
+    el('span', {cls:'spacer'})
+  ].concat(isVisitor() ? [] : [
     el('button', {text:'清空全部', cls:'danger', onclick:function(){
       if(!confirm('确定清空全部用量记录？此操作不可恢复。')) return;
       api('DELETE', '/api/usage').then(function(){ refreshUsage(); }).catch(showErr);
     }})
-  ]);
+  ]));
   wrap.appendChild(bar);
   wrap.appendChild(el('div', {id:'usage-detail'}));
   setTimeout(renderUsageDetail, 0);
@@ -2955,7 +2991,7 @@ function renderGallery(){
   frag.appendChild(tabs);
   frag2.appendChild(renderGalleryGrid());
   frag.appendChild(frag2);
-  frag.appendChild(uploadBar());
+  if(!isVisitor()) frag.appendChild(uploadBar());
   return frag;
 }
 function renderGalleryGrid(){
@@ -2975,32 +3011,34 @@ function renderGalleryGrid(){
     }
     card.appendChild(el('div', {cls:'m', text: e.name + ' · ' + fmtBytes(e.size)}));
     card.appendChild(el('div', {cls:'d', text: e.description || '（无描述）'}));
-    var actions = el('div', {cls:'a'});
-    var sel = el('select');
-    ['表情包','meme','截图','照片','未整理'].forEach(function(c){
-      if(c === e.category) return;
-      sel.appendChild(el('option', {value:c, text:'移到 ' + c}));
-    });
-    if(sel.options.length){
-      sel.onchange = function(){
-        var target = sel.value;
-        if(!target) return;
-        api('POST', '/api/gallery/move', {category:e.category, name:e.name, targetCategory:target}).then(function(){
-          toast('已移动到 ' + target, 'ok'); loadGallery();
-        }).catch(showErr);
-      };
-      actions.appendChild(sel);
+    if(!isVisitor()){
+      var actions = el('div', {cls:'a'});
+      var sel = el('select');
+      ['表情包','meme','截图','照片','未整理'].forEach(function(c){
+        if(c === e.category) return;
+        sel.appendChild(el('option', {value:c, text:'移到 ' + c}));
+      });
+      if(sel.options.length){
+        sel.onchange = function(){
+          var target = sel.value;
+          if(!target) return;
+          api('POST', '/api/gallery/move', {category:e.category, name:e.name, targetCategory:target}).then(function(){
+            toast('已移动到 ' + target, 'ok'); loadGallery();
+          }).catch(showErr);
+        };
+        actions.appendChild(sel);
+      }
+      actions.appendChild(el('button', {text:'描述', onclick:function(){
+        var d = prompt('写入描述（Bot 挑图依据：内容、梗/情绪、适合场合）：', e.description || '');
+        if(d == null) return;
+        api('POST', '/api/gallery/description', {category:e.category, name:e.name, description:d}).then(function(){ toast('已保存', 'ok'); loadGallery(); }).catch(showErr);
+      }}));
+      actions.appendChild(el('button', {cls:'danger', text:'删除', onclick:function(){
+        if(!confirm('删除 ' + e.name + ' ？')) return;
+        api('POST', '/api/gallery/remove', {category:e.category, name:e.name}).then(function(){ toast('已删除', 'ok'); loadGallery(); }).catch(showErr);
+      }}));
+      card.appendChild(actions);
     }
-    actions.appendChild(el('button', {text:'描述', onclick:function(){
-      var d = prompt('写入描述（Bot 挑图依据：内容、梗/情绪、适合场合）：', e.description || '');
-      if(d == null) return;
-      api('POST', '/api/gallery/description', {category:e.category, name:e.name, description:d}).then(function(){ toast('已保存', 'ok'); loadGallery(); }).catch(showErr);
-    }}));
-    actions.appendChild(el('button', {cls:'danger', text:'删除', onclick:function(){
-      if(!confirm('删除 ' + e.name + ' ？')) return;
-      api('POST', '/api/gallery/remove', {category:e.category, name:e.name}).then(function(){ toast('已删除', 'ok'); loadGallery(); }).catch(showErr);
-    }}));
-    card.appendChild(actions);
     list.appendChild(card);
   });
   if(!items.length) list.appendChild(el('p', {cls:'empty', text:'（这个分类还是空的）'}));
@@ -3095,25 +3133,27 @@ function refreshData(){
     var nlist = el('div');
     api('GET', '/api/notes').then(function(nr){
       (nr.notes || []).forEach(function(n){
-        nlist.appendChild(el('div', {cls:'kv'}, [
-          el('span', {cls:'k', text: n.title}),
-          el('span', {cls:'v'}, [
-            el('button', {text:'打开', style:'padding:2px 9px;font-size:11.5px', onclick:function(){ openNote(n.title); }}),
-            el('button', {cls:'danger', text:'删除', style:'margin-left:6px;padding:2px 9px;font-size:11.5px', onclick:function(){
-              if(!confirm('删除笔记「' + n.title + '」？')) return;
-              api('DELETE', '/api/notes?name=' + encodeURIComponent(n.title)).then(function(){ toast('已删除', 'ok'); refreshData(); }).catch(showErr);
-            }})
-          ])
-        ]));
+        var vnode = el('span', {cls:'v'}, [
+          el('button', {text:'打开', style:'padding:2px 9px;font-size:11.5px', onclick:function(){ openNote(n.title); }})
+        ]);
+        if(!isVisitor()){
+          vnode.appendChild(el('button', {cls:'danger', text:'删除', style:'margin-left:6px;padding:2px 9px;font-size:11.5px', onclick:function(){
+            if(!confirm('删除笔记「' + n.title + '」？')) return;
+            api('DELETE', '/api/notes?name=' + encodeURIComponent(n.title)).then(function(){ toast('已删除', 'ok'); refreshData(); }).catch(showErr);
+          }}));
+        }
+        nlist.appendChild(el('div', {cls:'kv'}, [el('span', {cls:'k', text: n.title}), vnode]));
       });
       if(!nr.notes || !nr.notes.length) nlist.appendChild(el('p', {cls:'empty', text:'（记事本是空的）'}));
     }).catch(function(){});
     nbody.appendChild(nlist);
-    nbody.appendChild(el('div', {cls:'toolbar'}, [el('button', {text:'新建笔记…', onclick:function(){
-      var name = prompt('笔记标题（将创建为 Notes/<标题>.md）：');
-      if(!name) return;
-      openNote(name);
-    }})]));
+    if(!isVisitor()){
+      nbody.appendChild(el('div', {cls:'toolbar'}, [el('button', {text:'新建笔记…', onclick:function(){
+        var name = prompt('笔记标题（将创建为 Notes/<标题>.md）：');
+        if(!name) return;
+        openNote(name);
+      }})]));
+    }
     notesSec.appendChild(nbody);
     holder.appendChild(notesSec);
 
@@ -3123,8 +3163,10 @@ function refreshData(){
 function renderArchiveSection(holder, archive){
   var aSec = el('div', {cls:'section'});
   var head = el('h3', {html:'归档 archive/ <span class="hint">压缩、重置与手动存档的历史快照</span>'});
-  head.appendChild(el('span', {style:'flex:1'}));
-  head.appendChild(el('button', {text:'手动存档…', title:'把当前全部世界状态复制成一份新快照', style:'padding:2px 10px;font-size:12px', onclick: manualArchive}));
+  if(!isVisitor()){
+    head.appendChild(el('span', {style:'flex:1'}));
+    head.appendChild(el('button', {text:'手动存档…', title:'把当前全部世界状态复制成一份新快照', style:'padding:2px 10px;font-size:12px', onclick: manualArchive}));
+  }
   aSec.appendChild(head);
   var ab = el('div', {cls:'body'});
   var snaps = archive.snapshots || [];
@@ -3134,15 +3176,18 @@ function renderArchiveSection(holder, archive){
   }
   snaps.forEach(function(s){
     var item = el('div', {cls:'list-item'});
-    item.appendChild(el('div', {cls:'row'}, [
+    var rowBtns = [
       el('span', {text: (s.label ? '「' + s.label + '」 · ' : '') + s.name, style:'flex:1;min-width:0;font-family:var(--mono);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap', title: s.name}),
-      el('span', {text: new Date(s.mtime).toLocaleString(), style:'color:var(--fg-dark);font-size:11px'}),
-      el('button', {cls:'primary', text:'回档', title:'用这份快照覆盖当前状态（回档前会自动存档当前状态）', style:'padding:2px 10px;font-size:11.5px', onclick:function(){ restoreArchive(s.name); }}),
-      el('button', {cls:'danger', text:'删除', style:'padding:2px 10px;font-size:11.5px', onclick:function(){
+      el('span', {text: new Date(s.mtime).toLocaleString(), style:'color:var(--fg-dark);font-size:11px'})
+    ];
+    if(!isVisitor()){
+      rowBtns.push(el('button', {cls:'primary', text:'回档', title:'用这份快照覆盖当前状态（回档前会自动存档当前状态）', style:'padding:2px 10px;font-size:11.5px', onclick:function(){ restoreArchive(s.name); }}));
+      rowBtns.push(el('button', {cls:'danger', text:'删除', style:'padding:2px 10px;font-size:11.5px', onclick:function(){
         if(!confirm('删除归档「' + s.name + '」？不可恢复。')) return;
         api('POST', '/api/archive/delete', {name: s.name}).then(function(){ toast('已删除', 'ok'); refreshData(); }).catch(showErr);
-      }})
-    ]));
+      }}));
+    }
+    item.appendChild(el('div', {cls:'row'}, rowBtns));
     var frow = el('div', {style:'margin-top:6px;display:flex;gap:6px;flex-wrap:wrap'});
     s.files.forEach(function(f){
       frow.appendChild(el('button', {text: f.name + (f.size ? ' · ' + fmtBytes(f.size) : ''), title:'查看内容', style:'padding:2px 9px;font-size:11px', onclick:function(){
@@ -3207,7 +3252,8 @@ function openDataFile(name){
   api('GET', '/api/data/file?name=' + encodeURIComponent(name)).then(function(r){
     var ta = el('textarea', {rows: 20});
     ta.value = r.content;
-    showModal(name, el('div', null, [
+    if(isVisitor()) ta.readOnly = true;
+    showModal(name, el('div', null, isVisitor() ? [ta] : [
       ta,
       el('div', {cls:'toolbar', style:'margin:8px 0 0'}, [
         el('button', {cls:'primary', text:'保存', onclick:function(){
@@ -3223,7 +3269,8 @@ function openNote(title){
     var note = (r.notes || []).filter(function(n){ return n.title === title; })[0];
     var ta = el('textarea', {rows: 22});
     ta.value = note ? note.content : '';
-    showModal('笔记：' + title, el('div', null, [
+    if(isVisitor()) ta.readOnly = true;
+    showModal('笔记：' + title, el('div', null, isVisitor() ? [ta] : [
       ta,
       el('div', {cls:'toolbar', style:'margin:8px 0 0'}, [
         el('button', {cls:'primary', text:'保存', onclick:function(){
@@ -3253,6 +3300,8 @@ function setPath(obj, arr, val){
 
 // ---------- 启动 ----------
 (function(){
+  // 访客只读：给 body 打标记，用于 CSS 隐藏写相关元素
+  if(MODE === 'visitor') document.body.classList.add('visitor-readonly');
   var h = (location.hash || '').slice(1);
   for(var i=0;i<NAV.length;i++){
     if(NAV[i][0] === h && (NAV[i][3] === undefined || visitorCanSee(NAV[i][3]))){ activeView = h; break; }
