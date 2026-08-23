@@ -1579,11 +1579,11 @@ function openVisitorEditor(acct, all, done){
   function applyPreset(preset){
     GRANT_LABELS.forEach(function(x){ grantChecks[x[0]] = (PRESET_GRANTS[preset] || []).indexOf(x[0]) >= 0; });
   }
-  // 初始状态：账号已有 grants（不管档位，勾选以 grants 为准，避免预设覆盖用户微调）；否则按档位预设播种
+  // 初始状态：仅当账号是「自定义」档且存有 grants 时，按 grants 播种；否则按档位预设播种
   var seedPreset;
-  if(acct && acct.grants && Object.keys(acct.grants).length){
+  if(acct && acct.preset === 'custom' && acct.grants && Object.keys(acct.grants).length){
     GRANT_LABELS.forEach(function(x){ grantChecks[x[0]] = !!acct.grants[x[0]]; });
-    seedPreset = acct.preset || 'custom';
+    seedPreset = 'custom';
   } else {
     seedPreset = (isNew ? 'viewer' : (acct ? acct.preset : 'viewer')) || 'viewer';
     if(seedPreset === 'custom') seedPreset = 'viewer'; // custom 无 grants 时以 viewer 为起点

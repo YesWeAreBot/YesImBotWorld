@@ -179,7 +179,11 @@ export class VisitorStore {
       acct.username = uname;
     }
     if (patch.password) acct.passwordHash = VisitorStore.hashPassword(patch.password);
-    if (patch.preset !== undefined) acct.preset = patch.preset;
+    if (patch.preset !== undefined) {
+      acct.preset = patch.preset;
+      // 档位切出「自定义」时清空 grants：预设档用内置范围，残留的旧 grants 会造成下次编辑时误用旧勾选
+      if (patch.preset !== "custom") delete acct.grants;
+    }
     if (patch.grants !== undefined) acct.grants = patch.grants;
     await this.persist();
     return { ok: true };
