@@ -738,15 +738,28 @@ function isVisitor(){ return MODE === 'visitor'; }
 function buildNav(){
   var nav = $('#nav');
   nav.textContent = '';
-  NAV.forEach(function(it){
-    if(it.group){ nav.appendChild(el('div', {cls:'nav-group', text: it.group})); return; }
-    if(!visitorCanSee(it[3])) return;
+  var i = 0;
+  while(i < NAV.length){
+    var it = NAV[i];
+    if(it.group){
+      // 该分组下若没有任何访客可见项，则连分组标签一起隐藏
+      var groupName = it.group;
+      var hasVisible = false;
+      for(var j = i + 1; j < NAV.length && !NAV[j].group; j++){
+        if(visitorCanSee(NAV[j][3])){ hasVisible = true; break; }
+      }
+      if(hasVisible) nav.appendChild(el('div', {cls:'nav-group', text: groupName}));
+      i++;
+      continue;
+    }
+    if(!visitorCanSee(it[3])){ i++; continue; }
     var a = el('a', {cls: it[0]===activeView?'active':''});
     a.appendChild(el('span', {cls:'ico', html: icon(it[2])}));
     a.appendChild(el('span', {text: it[1]}));
     a.onclick = function(){ switchView(it[0]); closeDrawer(); };
     nav.appendChild(a);
-  });
+    i++;
+  }
 }
 function clearViewTimers(){
   viewTimers.forEach(function(t){ clearInterval(t); });
@@ -2139,7 +2152,7 @@ function collectOverrides(section, defaults, prefix, out){
 function loadState(){
   var main = $('#main');
   main.textContent = '';
-  main.appendChild(viewHead('状态', '直接读写世界状态：Bot_Status 由 Bot 维护、World_Status 与 News 由 World-LLM 维护——你改的内容会进入它们的视野。'));
+  main.appendChild(viewHead('状态', isVisitor() ? '只读浏览世界状态：Bot_Status 由 Bot 维护、World_Status 与 News 由 World-LLM 维护。' : '直接读写世界状态：Bot_Status 由 Bot 维护、World_Status 与 News 由 World-LLM 维护——你改的内容会进入它们的视野。'));
   var holder = el('div', {text:'加载中…', cls:'empty'});
   main.appendChild(holder);
   api('GET', '/api/state').then(function(r){
@@ -2150,29 +2163,35 @@ function loadState(){
 }
 function renderStateEditor(s){
   var frag = document.createDocumentFragment();
-  var tabs = el('div', {cls:'tabs'}, [
-    el('button', {cls:'active', text:'Bot_Status.md', onclick:function(){ setTab(this, 'bot'); }}),
-    el('button', {text:'World_Status.md', onclick:function(){ setTab(this, 'world'); }}),
-    el('button', {text:'世界新闻 News.jsonl', onclick:function(){ setTab(this, 'news'); }}),
-    el('button', {text:'Bot 小事记 facts', onclick:function(){ setTab(this, 'facts'); }}),
-    el('button', {text:'Bot_Definition.md', onclick:function(){ setTab(this, 'botdef'); }}),
-    el('button', {text:'World_Definition.md', onclick:function(){ setTab(this, 'worlddef'); }}),
-    el('button', {text:'手机外壳', onclick:function(){ setTab(this, 'shell'); }})
-  ]);
-  frag.appendChild(tabs);
+  // 每个标签页：id / 标题 / 对应数据块（访客无该块 grant 则整页隐藏）/ 渲染器
   var panes = el('div');
-  panes.appendChild(statePane('bot', 'Bot 状态', s.botStatus, '/api/state/bot-status'));
-  panes.appendChild(statePane('world', '世界状态', s.worldStatus, '/api/state/world-status'));
-  panes.appendChild(jsonlPane('世界新闻', 'World-LLM 记录的世界大事记（JSONL）', s.news, '/api/state/news', '新增一条世界事件…'));
-  panes.appendChild(jsonlPane('Bot 小事记', 'Bot 的私人小事（facts.jsonl）——Bot 用 recall 回忆的私人记忆。可固定条目：固定后既不会被重置/创世删除，也会成为 Bot 心中「刻骨铭心的重要回忆」，是它角色扮演时的关键人设与历史依据（避免 OOC）', s.facts || [], '/api/state/facts', '新增一条 Bot 小事…', {sortable: true, pinnable: true}));
-  panes.appendChild(statePane('botdef', 'Bot 角色定义', s.botDef, '/api/definitions/bot'));
-  panes.appendChild(statePane('worlddef', '世界定义', s.worldDef, '/api/definitions/world'));
-  panes.appendChild(phoneShellPane(s.phoneShell || '', s.meta || {}));
+  var tabDefs = [
+    { id:'bot', label:'Bot_Status.md', grant:'bot_status', build:function(){ return statePane('bot', 'Bot 状态', s.botStatus, '/api/state/bot-status'); } },
+    { id:'world', label:'World_Status.md', grant:'world_status', build:function(){ return statePane('world', '世界状态', s.worldStatus, '/api/state/world-status'); } },
+    { id:'news', label:'世界新闻 News.jsonl', grant:'news', build:function(){ return jsonlPane('世界新闻', 'World-LLM 记录的世界大事记（JSONL）', s.news, '/api/state/news', '新增一条世界事件…'); } },
+    { id:'facts', label:'Bot 小事记 facts', grant:'facts', build:function(){ return jsonlPane('Bot 小事记', 'Bot 的私人小事（facts.jsonl）——Bot 用 recall 回忆的私人记忆。可固定条目：固定后既不会被重置/创世删除，也会成为 Bot 心中「刻骨铭心的重要回忆」，是它角色扮演时的关键人设与历史依据（避免 OOC）', s.facts || [], '/api/state/facts', '新增一条 Bot 小事…', {sortable: true, pinnable: true}); } },
+    { id:'botdef', label:'Bot_Definition.md', grant:'definitions', build:function(){ return statePane('botdef', 'Bot 角色定义', s.botDef, '/api/definitions/bot'); } },
+    { id:'worlddef', label:'World_Definition.md', grant:'definitions', build:function(){ return statePane('worlddef', '世界定义', s.worldDef, '/api/definitions/world'); } },
+    { id:'shell', label:'手机外壳', grant:'world_status', build:function(){ return phoneShellPane(s.phoneShell || '', s.meta || {}); } }
+  ];
+  // 过滤：访客只保留有 grant 的标签页
+  var visible = tabDefs.filter(function(t){
+    if(MODE !== 'visitor') return true;
+    return VISITOR_GRANTS.indexOf(t.grant) >= 0;
+  });
+  var tabs = el('div', {cls:'tabs'});
+  visible.forEach(function(t, i){
+    tabs.appendChild(el('button', {cls: i===0?'active':'', text: t.label, onclick:function(){ setTab(this, t.id); }}));
+    panes.appendChild(t.build());
+  });
+  frag.appendChild(tabs);
   frag.appendChild(panes);
-  if(s.meta && Object.keys(s.meta).length){
+  if(s.meta && Object.keys(s.meta).length && (MODE !== 'visitor' || VISITOR_GRANTS.indexOf('world_status') >= 0)){
     frag.appendChild(el('div', {cls:'section'}, [el('h3', {text:'元数据 meta.json'}), el('div', {cls:'body'}, [el('pre', {text: JSON.stringify(s.meta, null, 2)})])]));
   }
-  panes.querySelectorAll('[data-pane]').forEach(function(p){ p.classList.toggle('hidden', p.getAttribute('data-pane') !== 'bot'); });
+  // 默认显示第一个可见标签页
+  var firstId = visible.length ? visible[0].id : null;
+  panes.querySelectorAll('[data-pane]').forEach(function(p){ p.classList.toggle('hidden', p.getAttribute('data-pane') !== firstId); });
   return frag;
 }
 function statePane(id, title, content, url){
