@@ -491,8 +491,12 @@ function promptToken(){
   return promptAuth();
 }
 // 登录：管理员令牌（webui.token）或访客账号（用户名+密码）
+// 采用单例：登录弹窗已显示期间，后续 401 复用同一个 Promise，不重复弹窗、不清空已填表单
+var authPromise = null;
 function promptAuth(){
-  return new Promise(function(resolve){
+  if(authPromise) return authPromise;
+  authPromise = new Promise(function(resolve){
+    var finish = function(v){ authPromise = null; hideModal(); resolve(v); };
     var mode = 'admin'; // 'admin' | 'visitor'
     var usernameInput = el('input', {placeholder:'用户名', style:'width:100%'});
     var pwdInput = el('input', {type:'password', placeholder:'密码', style:'width:100%'});
@@ -510,9 +514,9 @@ function promptAuth(){
       el('button', {cls: mode==='admin'?'primary':'', text:'管理员', onclick:function(){ setMode('admin'); }}),
       el('button', {cls: mode==='visitor'?'primary':'', text:'访客', onclick:function(){ setMode('visitor'); }})
     ]);
-    var body = el('div', null, [tabs, adminSec, errLine,
+    var body = el('div', null, [tabs, adminSec, visitorSec, errLine,
       el('div', {cls:'toolbar'}, [
-        el('button', {text:'取消', onclick:function(){ hideModal(); resolve(null); }}),
+        el('button', {text:'取消', onclick:function(){ finish(null); }}),
         el('button', {cls:'primary', text:'登录', onclick:function(){ doLogin(); }})
       ])
     ]);
@@ -548,9 +552,8 @@ function promptAuth(){
       localStorage.setItem('wui_mode', 'admin');
       localStorage.removeItem('wui_visitor_token');
       localStorage.removeItem('wui_visitor_grants');
-      hideModal();
       connectSSE();
-      resolve(t);
+      finish(t);
     }
     function setVisitor(tok, grants){
       VISITOR_TOKEN = tok;
@@ -561,10 +564,9 @@ function promptAuth(){
       localStorage.setItem('wui_visitor_token', tok);
       localStorage.setItem('wui_visitor_grants', JSON.stringify(grants));
       localStorage.removeItem('wui_token');
-      hideModal();
       buildNav();
       connectSSE();
-      resolve(tok);
+      finish(tok);
     }
     showModal('需要登录', body);
     setMode('admin');
