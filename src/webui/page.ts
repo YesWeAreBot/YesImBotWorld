@@ -740,7 +740,8 @@ function buildNav(){
   nav.textContent = '';
   var i = 0;
   while(i < NAV.length){
-    var it = NAV[i];
+    // 注意：必须用 let（块级作用域），否则 onclick 闭包都捕获同一个循环变量，全部跳到最后一个导航项
+    let it = NAV[i];
     if(it.group){
       // 该分组下若没有任何访客可见项，则连分组标签一起隐藏
       var groupName = it.group;
