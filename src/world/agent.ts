@@ -58,15 +58,27 @@ const WORLD_TOOLS: ChatToolDef[] = [
     function: {
       name: "update",
       description:
-        "更新状态。bot_status / world_status 会用 content 整体覆盖对应 md 文件；news 把 content 作为一条世界重大事件追加（世界中心，只有影响世界走向的大事才记这里），可另给 detail 作为这条新闻的详情正文（Bot 点进该新闻时看到的全文，一段即可，别把列表标题写太长）；facts 把 content 作为一条 Bot 小事记追加（Bot 中心，Bot 的私人小事记这里）。均自动附带当前世界时刻",
+        "更新状态。bot_status / world_status 整体覆盖用 content；局部修改（推荐，只改变化的部分、省得重写全文）用 patch 数组给出一组 find→replace（find 是目标文件里要替换的精确原文字符串，必须与文件内容逐字一致且唯一，replace 是替换成的新文字，可为空串表示删除）。news / facts 用 content 追加一条记录（不支持 patch）。均自动附带当前世界时刻。content 与 patch 不能同时给：给了 patch 就忽略 content",
       parameters: {
         type: "object",
         properties: {
           target: { type: "string", enum: ["bot_status", "world_status", "news", "facts"] },
           content: { type: "string", description: "要写的内容（news/facts 为一条记录的标题/简述，bot_status/world_status 为整体覆盖）" },
           detail: { type: "string", description: "仅 target 为 news 时可选：这条新闻的详情正文（Bot 点进去看到的全文）" },
+          patch: {
+            type: "array",
+            description: "仅 target 为 bot_status / world_status 时可选：局部替换列表，按顺序应用。每个元素是一处 find→replace",
+            items: {
+              type: "object",
+              properties: {
+                find: { type: "string", description: "目标文件里要替换的精确原文（逐字一致，且必须恰好出现一次）" },
+                replace: { type: "string", description: "替换成的新文字（空串表示删除这一段）" },
+              },
+              required: ["find", "replace"],
+            },
+          },
         },
-        required: ["target", "content"],
+        required: ["target"],
       },
     },
   },
@@ -1094,11 +1106,20 @@ export class WorldAgent {
         case "update": {
           const target = String(args.target ?? "");
           const content = String(args.content ?? "");
-          if (target === "bot_status") {
-            await this.files.writeBotStatus(content);
-            return "Bot_Status.md 已更新";
-          }
-          if (target === "world_status") {
+          const patch = Array.isArray(args.patch) ? args.patch : [];
+          if (target === "bot_status" || target === "world_status") {
+            // 局部替换：给了 patch 就忽略 content，做 find→replace（精确匹配、唯一匹配、原子应用）
+            if (patch.length) {
+              return this.applyStatusPatch(target, patch);
+            }
+            // 没有 patch：整体覆盖（兜底）；content 为空时视为漏传参数，报错而非清空文件
+            if (!content.trim()) {
+              return `update(${target}) 需要 patch（局部替换）或 content（整体覆盖），两者都没给有效内容，未做任何修改。`;
+            }
+            if (target === "bot_status") {
+              await this.files.writeBotStatus(content);
+              return "Bot_Status.md 已更新";
+            }
             await this.files.writeWorldStatus(content);
             return "World_Status.md 已更新";
           }
@@ -1202,6 +1223,71 @@ export class WorldAgent {
         default:
           return `未知工具: ${name}`;
       }
+  }
+
+  /**
+   * 对 bot_status / world_status 做局部替换（find→replace）。
+   *
+   * 语义（严格版）：
+   * - 每个 patch 的 find 必须在目标文件里**逐字精确匹配、且恰好出现一次**；
+   *   find 为空串、出现 0 次、或出现 ≥2 次（不唯一）都算失败；
+   * - 全部 patch 先**预检**通过后才**一次性原子应用**：任何一个失败就整体不落盘，
+   *   并返回明确报错（第几个 patch、find 片段、失败原因），让 World-LLM 改指令重试；
+   * - replace 可以为空串（删除该片段）。
+   *
+   * 这样 World-LLM 只需输出变化片段，不必重写整份状态文档，省 token 也更快。
+   */
+  private async applyStatusPatch(target: "bot_status" | "world_status", patch: unknown[]): Promise<string> {
+    const isBot = target === "bot_status";
+    const fileLabel = isBot ? "Bot_Status.md" : "World_Status.md";
+    const current = isBot ? await this.files.readBotStatus() : await this.files.readWorldStatus();
+
+    // 解析并规范化 patch 条目
+    const entries: { find: string; replace: string }[] = [];
+    for (let i = 0; i < patch.length; i++) {
+      const p = patch[i];
+      if (!p || typeof p !== "object") {
+        return `patch 的第 ${i + 1} 项不是对象（{find, replace}），未做任何修改。`;
+      }
+      const find = String((p as Record<string, unknown>).find ?? "");
+      const replace = String((p as Record<string, unknown>).replace ?? "");
+      if (!find) {
+        return `patch 的第 ${i + 1} 项 find 为空，未做任何修改。`;
+      }
+      entries.push({ find, replace });
+    }
+
+    // 预检：每个 find 必须恰好出现一次（精确逐字匹配）
+    for (let i = 0; i < entries.length; i++) {
+      const { find } = entries[i]!;
+      let count = 0;
+      let idx = current.indexOf(find);
+      while (idx !== -1) {
+        count++;
+        idx = current.indexOf(find, idx + find.length);
+      }
+      if (count === 0) {
+        return (
+          `patch 的第 ${i + 1} 项 find 在 ${fileLabel} 里找不到精确匹配，未做任何修改。` +
+          `请先用 check 读取 ${target} 的最新内容，复制你要改的那段原文作为 find，再重试。`
+        );
+      }
+      if (count > 1) {
+        return (
+          `patch 的第 ${i + 1} 项 find 在 ${fileLabel} 里出现了 ${count} 次（不唯一），未做任何修改。` +
+          `请把 find 写得更长、带上前后的上下文，使其能唯一定位到你要改的那一处，再重试。`
+        );
+      }
+    }
+
+    // 全部通过：原子应用
+    let updated = current;
+    for (const { find, replace } of entries) {
+      updated = updated.replace(find, replace);
+    }
+    if (isBot) await this.files.writeBotStatus(updated);
+    else await this.files.writeWorldStatus(updated);
+    return `${fileLabel} 已局部更新（${entries.length} 处替换）。`;
   }
 }
 

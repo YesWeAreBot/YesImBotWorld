@@ -175,6 +175,9 @@ export const WORLD_PROMPT_DEFAULTS: WorldPromptSet = {
     "（如「在手机上回复消息」），不要虚构操作结果，事件中提示它需要亲自去看手机/发消息（它自有相应的能力）\n" +
     "- 状态文件是当前时刻的真实快照：裁定或演化导致状态变化时必须及时 update——" +
     "尤其 Bot 的位置、状态、正在做的事、随身物品发生变化时，一定要更新 bot_status，不要让它过时\n" +
+    "- 更新 bot_status / world_status 时**优先用 patch 局部替换**：只输出变化的那一小段（find→replace），" +
+    "不要整份重写——省时又避免无关段落被误改。先 check（读当前内容）拿到要改段的精确原文作 find，" +
+    "replace 给新文字。状态改动较大、多处重排时，才用 content 整体覆盖\n" +
     "- News 是世界的大事记，不是流水账：只记录重要、之后可能被提起或产生影响的事件，日常背景动静不要写入\n" +
     "- 与 News（世界中心）不同，facts.jsonl 是 Bot 中心的小事记：Bot 的日常习惯、偏好、生活状态这类" +
     "够不上世界大事、但对了解 Bot 有用的私人小事记在这里（用 update(facts)），Bot 会通过 recall 回忆它\n" +
@@ -199,7 +202,8 @@ export const WORLD_PROMPT_DEFAULTS: WorldPromptSet = {
     `什么被怎么样了（允许失败、意外或有趣的转折）；\n` +
     `3. 动作若改变了 Bot 自身——位置、姿态、状态、心情、正在做的事、随身物品——` +
     `**必须** update bot_status 使其与裁定后的现实一致（这一步经常被遗漏，请自查）；` +
-    `若改变了周遭世界，update world_status；\n` +
+    `若只变了其中一两项，用 patch 局部替换（find→replace）而非整份重写；` +
+    `若改变了周遭世界，update world_status（同样优先 patch）；\n` +
     `4. News 是大事记不是流水账：只有足够重要、之后可能被提起或产生影响的结果才 update news 记一条，` +
     `日常小动作不要记录。\n` +
     `5. 若结果改变了 Bot 的私人生活状态（习惯、偏好、心情、日常小事），` +
@@ -209,9 +213,9 @@ export const WORLD_PROMPT_DEFAULTS: WorldPromptSet = {
     `Bot 从 {{issuedAt}} 开始等待 {{n}} 个 TU，等待即将在 ` +
     `{{expectedAt}} 结束（届时它会被自动唤醒）。\n` +
     `请先 check news 和 world_status 了解这段等待期间世界的变化：\n` +
-    `1. 若时间流逝让世界状态发生了变化（时段、天气、进行中事件的推进……），update world_status；\n` +
+    `1. 若时间流逝让世界状态发生了变化（时段、天气、进行中事件的推进……），update world_status（优先 patch 局部替换）；\n` +
     `2. 若 Bot 自身状态也随时间自然变化（等待中的姿态、疲劳、正在做的事已结束等），` +
-    `**一并 update bot_status** 使其反映当前时刻的真实状态；\n` +
+    `**一并 update bot_status** 使其反映当前时刻的真实状态（优先 patch 局部替换，不必整份重写）；\n` +
     `3. 然后必须调用一次 send_event 告诉 Bot：这段时间里发生的、它能感知到的变化——` +
     `用第三人称客观叙述什么发生了变化、什么被怎么样了` +
     `（如果无事发生，就平实地叙述周遭环境此刻的样子）。不必提"等待结束"，唤醒另有提示。`,
@@ -229,7 +233,7 @@ export const WORLD_PROMPT_DEFAULTS: WorldPromptSet = {
     `请推进世界的自然演化：\n` +
     `1. check world_status 与最近 news，保持连贯；\n` +
     `2. 构思一件此刻世界中正在发生的事（大小皆可：天气变化、路人经过、新闻播报、突发事件……），` +
-    `把由此产生的状态变化 update 到 world_status；\n` +
+    `把由此产生的状态变化 update 到 world_status（优先用 patch 局部替换，不必整份重写）；\n` +
     `3. 顺手核对 bot_status 是否过时：若时间流逝或这次演化让 Bot 自身状态发生了自然变化` +
     `（时段更替后的作息、之前在做的事早已结束、疲劳饥饿等），update bot_status 使其与当前时刻一致；\n` +
     `4. News 是世界的大事记，不是心跳流水账：只有足够重要、之后可能被提起或产生影响的事` +
@@ -245,8 +249,8 @@ export const WORLD_PROMPT_DEFAULTS: WorldPromptSet = {
     `请补写这段时间世界的变化：\n` +
     `1. check world_status 与最近 news，保持连贯；\n` +
     `2. 推想这段时间里世界自然发生了什么（时段更替、天气、人物作息、进行中事件的推进……），` +
-    `update world_status 使其反映当前时刻的现状；若 Bot 自身状态也随时间自然变化（比如睡着了、动作早已结束），` +
-    `一并 update bot_status；\n` +
+    `update world_status 使其反映当前时刻的现状（优先 patch 局部替换）；若 Bot 自身状态也随时间自然变化（比如睡着了、动作早已结束），` +
+    `一并 update bot_status（优先 patch）；\n` +
     `3. 只有足够重要的事才用 update news 记录（可以没有）；\n` +
     `4. 最后必须调用一次 send_event：以第三人称客观叙述 Bot 回过神来时能感知到的情形——` +
     `此刻的时间与环境，以及这段时间里它能察觉到的变化。`,
