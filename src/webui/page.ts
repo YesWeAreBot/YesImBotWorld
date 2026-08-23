@@ -574,6 +574,7 @@ function promptAuth(){
     usernameInput.onkeydown = function(e){ if(e.key === 'Enter') doLogin(); };
     pwdInput.onkeydown = function(e){ if(e.key === 'Enter') doLogin(); };
   });
+  return authPromise;
 }
 function showImage(title, url){
   var img = el('img', {src:url, cls:'full'});
