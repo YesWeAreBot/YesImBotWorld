@@ -1643,17 +1643,24 @@ function playerWorldPanel(){
   // act 提交
   var actInp = el('textarea', {rows: 3, placeholder:'描述你的角色想做什么（例如：走向吧台，向老板要一杯酒）', style:'width:100%'});
   var err = el('p', {style:'color:var(--err);font-size:12.5px;min-height:16px'});
-  body.appendChild(el('div', {cls:'toolbar', style:'margin:8px 0 0'}, [
-    actInp
-  ]));
+  body.appendChild(el('div', {cls:'toolbar', style:'margin:8px 0 0'}, [actInp]));
+  var actBtn = el('button', {cls:'primary', text:'行动', onclick:function(){ playerSubmitAct(actInp, err, feed, actBtn); }});
   body.appendChild(el('div', {cls:'toolbar', style:'margin:4px 0 0'}, [
-    el('span', {style:'color:var(--fg-dark);font-size:12px', text: PLAYER_STATE.actBusy ? '等待世界裁定中…' : ''}),
+    el('span', {id:'player-act-state', style:'color:var(--fg-dark);font-size:12px', text: PLAYER_STATE.actBusy ? '等待世界裁定中…' : ''}),
     el('span', {cls:'spacer'}),
-    el('button', {cls:'primary', text:'行动', onclick:function(){ playerSubmitAct(actInp, err, feed); }}),
+    actBtn,
     el('button', {cls:'ghost', text:'离开世界', onclick:function(){ playerLeave(); }})
   ]));
   box.appendChild(body);
   return box;
+}
+
+function playerRefreshActState(){
+  var st = $('#player-act-state');
+  if(st) st.textContent = PLAYER_STATE.actBusy ? '等待世界裁定中…' : '';
+  var btns = $('#main').querySelectorAll('button');
+  // 行动按钮禁用状态跟随 actBusy（宽泛匹配：不影响其它按钮，仅文字为「行动」者）
+  btns.forEach(function(b){ if(b.textContent === '行动'){ b.disabled = !!PLAYER_STATE.actBusy; } });
 }
 
 function playerRenderFeed(feed){
@@ -1663,14 +1670,12 @@ function playerRenderFeed(feed){
     return;
   }
   PLAYER_STATE.events.forEach(function(ev){
-    feed.appendChild(el('div', {style:'padding:6px 0;border-bottom:1px solid var(--line)', html: ev.type === 'act_result'
-      ? '<span style="color:var(--info)">【你的行动结果】</span> ' + esc(ev.content)
-      : '<span style="color:var(--warn)">【世界】</span> ' + esc(ev.content)}));
+    feed.appendChild(el('div', {style:'padding:6px 0;border-bottom:1px solid var(--line)', html: '<span style="color:var(--warn)">【世界】</span> ' + esc(ev.content)}));
   });
   feed.scrollTop = feed.scrollHeight;
 }
 
-function playerSubmitAct(actInp, err, feed){
+function playerSubmitAct(actInp, err, feed, actBtn){
   var desc = actInp.value.trim();
   if(!desc){ err.textContent = '请描述你的角色想做什么'; return; }
   if(PLAYER_STATE.actBusy){ err.textContent = '上一个行动还在裁定中'; return; }
@@ -1678,11 +1683,13 @@ function playerSubmitAct(actInp, err, feed){
   // 尊重 duration：提交后等待，结果异步推送
   PLAYER_STATE.actBusy = true;
   actInp.value = '';
+  playerRefreshActState();
   var taskId = 'p_' + Date.now() + '_' + Math.floor(Math.random()*1e6);
   api('POST', '/api/player/task', {token: PLAYER_STATE.token, taskId: taskId, kind: 'act', payload: {desc: desc}}).then(function(){
     // 已受理，等待 SSE 的 task_result
   }).catch(function(e){
     PLAYER_STATE.actBusy = false;
+    playerRefreshActState();
     err.textContent = e.message || e;
   });
 }
@@ -1698,7 +1705,10 @@ function playerLeave(){
 }
 
 function playerConnectEvents(token){
-  var es = new EventSource('/api/player/events?token=' + encodeURIComponent(token));
+  // 注意：EventSource 无法带 header，需用 URL 参数携带两层 token：
+  // - visitor=访客会话 token（webui /api/player/* 鉴权）
+  // - ctoken=crossing session token（转发到 crossing /events）
+  var es = new EventSource('/api/player/events?visitor=' + encodeURIComponent(VISITOR_TOKEN) + '&ctoken=' + encodeURIComponent(token));
   es.onmessage = function(ev){
     var msg;
     try { msg = JSON.parse(ev.data); } catch(e){ return; }
@@ -1706,9 +1716,11 @@ function playerConnectEvents(token){
       PLAYER_STATE.events.push({type:'world', content: msg.content});
       playerRefreshFeed();
     } else if(msg.type === 'task_result'){
+      // act 完成：解「等待裁定」锁。剧情已通过 event 实时推送，这里不重复聚合内容
       PLAYER_STATE.actBusy = false;
-      if(msg.content) PLAYER_STATE.events.push({type:'act_result', content: msg.content});
-      playerRefreshFeed();
+      if(!msg.ok) toast('行动裁定失败', 'err');
+      // 刷新「等待中」提示（actBusy 已变 false，重渲染面板）
+      playerRefreshActState();
     } else if(msg.type === 'farewell'){
       PLAYER_STATE.inWorld = false;
       PLAYER_STATE.token = '';

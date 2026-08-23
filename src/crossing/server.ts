@@ -41,6 +41,8 @@ interface VisitorSession extends VisitorInfo {
   arrivedAt: number;
   /** World-LLM 写回的访客状态（同步会话内的 persona，并经 SSE 回传访客世界） */
   updateStatus: (content: string) => void;
+  /** 真人玩家（同部署 WebUI 驾驶舱）：World 裁定过程实时推送 event（流式剧情），而非聚合到 task_result */
+  live: boolean;
 }
 
 export interface CrossingServerHost {
@@ -113,6 +115,7 @@ export class CrossingServer {
       pendingTasks: 0,
       absenceTimer: null,
       arrivedAt: Date.now(),
+      live: true,
       updateStatus: (content: string) => {
         session.persona = content.slice(0, CROSSING_LIMITS.maxPersonaChars);
         this.push(session, { type: "status_update", content });
@@ -252,6 +255,7 @@ export class CrossingServer {
       pendingTasks: 0,
       absenceTimer: null,
       arrivedAt: Date.now(),
+      live: false,
       updateStatus: (content: string) => {
         // 同步会话内 persona（后续任务的前言用最新状态）并回传访客世界持久化
         session.persona = content.slice(0, CROSSING_LIMITS.maxPersonaChars);
@@ -341,7 +345,12 @@ export class CrossingServer {
   ): Promise<void> {
     const clip = (s: unknown) => String(s ?? "").slice(0, CROSSING_LIMITS.maxTaskChars);
     const parts: string[] = [];
-    const deliver = (content: string) => parts.push(content);
+    // deliver：真人玩家（live）实时推送每段 send_event（流式剧情）；
+    // 跨部署 Bot 访客保持原来的「收集后聚合到 task_result」（一次 deliver 进意识流）
+    const deliver = (content: string) => {
+      parts.push(content);
+      if (session.live) this.push(session, { type: "event", content });
+    };
     let ok = false;
     if (kind === "act") {
       ok = await this.host.world.visitorAct(session, clip(payload.desc), Number(payload.duration) || 0, deliver);

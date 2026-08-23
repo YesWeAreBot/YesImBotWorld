@@ -512,7 +512,7 @@ export class WebUIServer {
 
     // 事件流：SSE 转发 crossing events
     if (pathname === "/api/player/events" && method === "GET") {
-      const token = String(url.searchParams.get("token") ?? "");
+      const token = String(url.searchParams.get("ctoken") ?? "");
       if (!token) return void sendJSON(res, 400, { error: "缺少 crossing token" });
       return void this.proxyPlayerEvents(token, res);
     }
