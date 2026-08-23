@@ -970,7 +970,7 @@ function overviewCards(o){
     card('World-LLM 队列', String(o.worldQueue)),
     card('手机', o.phoneDown ? '放在一边（通知震动）' : '在手边'),
     card('电脑', o.computerOn ? o.computerOn : '未开机'),
-    card('关注频道', o.focusChannels.length ? o.focusChannels.join('、') : '无', 'small')
+    card('关注频道', (o.focusChannels || []).length ? o.focusChannels.join('、') : '无', 'small')
   ];
   if(o.crossing && (o.crossing.location || (o.crossing.worlds && o.crossing.worlds.length))){
     cards.push(card('所在世界', o.crossing.location ? '异世界「' + o.crossing.location + '」' : '自己的世界', o.crossing.location ? '' : 'small'));
@@ -980,13 +980,14 @@ function overviewCards(o){
     cards.push(card('异世界访客', vs.length ? vs.map(function(v){ return v.name; }).join('、') : '无', vs.length ? '' : 'small'));
   }
   if(o.appOpen) cards.push(card('手机应用', o.appOpen));
-  o.galleryCounts.forEach(function(g){ cards.push(card('相册 · ' + g.category, String(g.count))); });
+  (o.galleryCounts || []).forEach(function(g){ cards.push(card('相册 · ' + g.category, String(g.count))); });
   return cards;
 }
 function newsSection(o){
   var body = el('div', {cls:'body'});
-  if(o.news.length){
-    o.news.forEach(function(n){
+  var news = o.news || [];
+  if(news.length){
+    news.forEach(function(n){
       body.appendChild(el('div', {cls:'news-item'}, [
         el('span', {cls:'clock', text:'[' + n.clock + ']'}),
         el('span', {text: ' ' + n.content, style:'font-size:12.5px'})

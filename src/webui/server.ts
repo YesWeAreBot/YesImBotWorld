@@ -539,9 +539,9 @@ export class WebUIServer {
         computerOn: host.computerOn(),
         phoneDown: host.phoneDown(),
         focusChannels: host.focusChannels(),
-        news: can("news") ? news : undefined,
-        facts: can("facts") ? facts : undefined,
-        galleryCounts: can("gallery") ? counts : undefined,
+        news: can("news") ? news : [],
+        facts: can("facts") ? facts : [],
+        galleryCounts: can("gallery") ? counts : [],
         crossing: can("crossing") ? host.crossingInfo() : undefined,
         ...(isVisitor ? {} : { tokenSet: !!this.cfg.token, addresses: accessUrls(this.cfg.host, this.cfg.port) }),
       });
@@ -610,14 +610,14 @@ export class WebUIServer {
       const isVisitor = access.kind === "visitor";
       const can = (g: VisitorGrant) => !isVisitor || this.visitors.can(access.session, g);
       const payload: Record<string, unknown> = {
-        botStatus: can("bot_status") ? await host.files.readBotStatus() : undefined,
-        worldStatus: can("world_status") ? await host.files.readWorldStatus() : undefined,
-        news: can("news") ? await readAllNews(host.files.news) : undefined,
-        facts: can("facts") ? await readAllNews(host.files.facts) : undefined,
-        botDef: can("definitions") ? await host.files.readText(host.files.botDef) : undefined,
-        worldDef: can("definitions") ? await host.files.readText(host.files.worldDef) : undefined,
-        meta: can("world_status") ? await host.files.readMeta() : undefined,
-        phoneShell: can("world_status") ? await host.files.readPhoneShell() : undefined,
+        botStatus: can("bot_status") ? await host.files.readBotStatus() : "",
+        worldStatus: can("world_status") ? await host.files.readWorldStatus() : "",
+        news: can("news") ? await readAllNews(host.files.news) : [],
+        facts: can("facts") ? await readAllNews(host.files.facts) : [],
+        botDef: can("definitions") ? await host.files.readText(host.files.botDef) : "",
+        worldDef: can("definitions") ? await host.files.readText(host.files.worldDef) : "",
+        meta: can("world_status") ? await host.files.readMeta() : {},
+        phoneShell: can("world_status") ? await host.files.readPhoneShell() : "",
         initialized: await host.isInitialized(),
       };
       sendJSON(res, 200, payload);
