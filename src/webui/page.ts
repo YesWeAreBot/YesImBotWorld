@@ -389,6 +389,10 @@ var MODE = localStorage.getItem('wui_mode') === 'visitor' ? 'visitor' : 'admin';
 var VISITOR_TOKEN = localStorage.getItem('wui_visitor_token') || '';
 var VISITOR_GRANTS = []; // 当前访客会话可见的数据块集合
 try { VISITOR_GRANTS = JSON.parse(localStorage.getItem('wui_visitor_grants') || '[]'); } catch(e) { VISITOR_GRANTS = []; }
+var VISITOR_PRESET = localStorage.getItem('wui_visitor_preset') || '';
+var VISITOR_PLAYER_PROFILE = null; // { name, persona }
+try { VISITOR_PLAYER_PROFILE = JSON.parse(localStorage.getItem('wui_player_profile') || 'null'); } catch(e) { VISITOR_PLAYER_PROFILE = null; }
+var PLAYER_STATE = { token: '', worldName: '', inWorld: false, events: [], actBusy: false };
 var activeView = 'overview';
 // SSE 断线续传锚点：跨页面加载持久化，避免每次无缓存刷新都从 0 重放整段调试历史
 var lastEventId = Number(localStorage.getItem('wui_last_id') || 0);
@@ -539,7 +543,7 @@ function promptAuth(){
           .then(function(res){ return res.json().then(function(d){ return {ok:res.ok, d:d}; }); })
           .then(function(r){
             if(!r.ok){ errLine.textContent = r.d.error || '登录失败'; return; }
-            setVisitor(r.d.token, r.d.grants || []);
+            setVisitor(r.d.token, r.d.grants || [], r.d.preset, r.d.playerProfile || null);
           })
           .catch(function(e){ errLine.textContent = String(e && e.message || e); });
       }
@@ -552,17 +556,23 @@ function promptAuth(){
       localStorage.setItem('wui_mode', 'admin');
       localStorage.removeItem('wui_visitor_token');
       localStorage.removeItem('wui_visitor_grants');
+      localStorage.removeItem('wui_visitor_preset');
+      localStorage.removeItem('wui_player_profile');
       connectSSE();
       finish(t);
     }
-    function setVisitor(tok, grants){
+    function setVisitor(tok, grants, preset, playerProfile){
       VISITOR_TOKEN = tok;
       VISITOR_GRANTS = grants;
+      VISITOR_PRESET = preset || '';
+      VISITOR_PLAYER_PROFILE = playerProfile || null;
       MODE = 'visitor';
       TOKEN = '';
       localStorage.setItem('wui_mode', 'visitor');
       localStorage.setItem('wui_visitor_token', tok);
       localStorage.setItem('wui_visitor_grants', JSON.stringify(grants));
+      localStorage.setItem('wui_visitor_preset', preset || '');
+      localStorage.setItem('wui_player_profile', JSON.stringify(playerProfile || null));
       localStorage.removeItem('wui_token');
       buildNav();
       connectSSE();
@@ -586,8 +596,10 @@ function showImage(title, url){
 function api(method, path, body, retried){
   var opts = {method:method, headers:{}};
   if(MODE === 'visitor'){
-    // 访客只读：写请求直接拒绝，不发请求（安全兜底，即便某个写按钮漏隐藏也不会真正落盘）
-    if(method !== 'GET'){
+    // 访客只读：写请求直接拒绝，不发请求（安全兜底，即便某个写按钮漏隐藏也不会真正落盘）。
+    // 例外：玩家档（player）允许自己的入世界写操作（/api/player/*）
+    var isPlayerOp = VISITOR_PRESET === 'player' && String(path).indexOf('/api/player') === 0;
+    if(method !== 'GET' && !isPlayerOp){
       return Promise.reject(new Error('访客模式为只读，无法执行此操作'));
     }
     if(VISITOR_TOKEN) opts.headers['x-visitor-token'] = VISITOR_TOKEN;
@@ -721,6 +733,7 @@ var NAV = [
   {group:'世界'},
   ['state','状态','file',['world_status','bot_status','news','facts']],
   ['crossing','穿越','portal',['crossing']],
+  ['player','入世界','portal',['__player__']],
   ['prompts','提示词','edit',['prompts']],
   ['gallery','相册','image',['gallery']],
   ['media','媒体','film',['gallery']],
@@ -732,6 +745,8 @@ var NAV = [
 function visitorCanSee(grants){
   if(MODE !== 'visitor') return true;
   if(!grants || !grants.length) return false;
+  // 特殊：玩家入世界入口仅 player 档可见
+  if(grants.indexOf('__player__') >= 0) return VISITOR_PRESET === 'player';
   return grants.some(function(g){ return VISITOR_GRANTS.indexOf(g) >= 0; });
 }
 function isVisitor(){ return MODE === 'visitor'; }
@@ -747,7 +762,9 @@ function syncVisitorGrants(){
     return res.json().then(function(d){
       if(!res.ok) throw new Error(d.error || 'HTTP ' + res.status);
       VISITOR_GRANTS = d.grants || [];
+      VISITOR_PRESET = d.preset || '';
       localStorage.setItem('wui_visitor_grants', JSON.stringify(VISITOR_GRANTS));
+      localStorage.setItem('wui_visitor_preset', VISITOR_PRESET);
       buildNav();
       return d;
     });
@@ -757,9 +774,13 @@ function logoutVisitor(){
   MODE = 'admin';
   VISITOR_TOKEN = '';
   VISITOR_GRANTS = [];
+  VISITOR_PRESET = '';
+  VISITOR_PLAYER_PROFILE = null;
   localStorage.removeItem('wui_mode');
   localStorage.removeItem('wui_visitor_token');
   localStorage.removeItem('wui_visitor_grants');
+  localStorage.removeItem('wui_visitor_preset');
+  localStorage.removeItem('wui_player_profile');
   document.body.classList.remove('visitor-readonly');
   buildNav();
   switchView('overview');
@@ -822,6 +843,7 @@ function switchView(name){
   else if(name === 'media') loadMedia();
   else if(name === 'data') refreshData();
   else if(name === 'visitors') loadVisitors();
+  else if(name === 'player') loadPlayer();
   else $('#main').textContent = '';
 }
 $('#btn-refresh').onclick = function(){ switchView(activeView); };
@@ -1515,13 +1537,227 @@ var PLAT_DANGER = ['deleteFriend','groupKick','groupLeave','groupBan','groupWhol
 function cfgGroupKey(g){
   return g.children && g.children.length === 1 && g.children[0].type === 'object' ? g.children[0].key : 'root';
 }
+
+// ---------- 玩家入世界（真人角色扮演） ----------
+function loadPlayer(){
+  var main = $('#main');
+  main.textContent = '';
+  main.appendChild(viewHead('入世界', '以你的角色身份进入这个虚拟世界，通过行动与世界互动。'));
+  var holder = el('div', {text:'加载中…', cls:'empty'});
+  main.appendChild(holder);
+  // 首次：无角色身份 → 先填角色
+  if(!VISITOR_PLAYER_PROFILE || !VISITOR_PLAYER_PROFILE.name){
+    holder.textContent = '';
+    holder.appendChild(playerProfileForm(function(){
+      loadPlayer();
+    }));
+    return;
+  }
+  // 已有角色身份：显示世界观状态 + 入世界/剧情流
+  holder.textContent = '';
+  playerRenderWorld(holder);
+}
+
+function playerProfileForm(done){
+  var nameInp = el('input', {placeholder:'角色名（世界里的身份）', style:'width:100%'});
+  var personaTa = el('textarea', {rows: 6, placeholder:'角色人设：你是谁、什么性格、什么来历……（世界会根据它来让 NPC/Bot 认识你）', style:'width:100%'});
+  if(VISITOR_PLAYER_PROFILE){
+    nameInp.value = VISITOR_PLAYER_PROFILE.name || '';
+    personaTa.value = VISITOR_PLAYER_PROFILE.persona || '';
+  }
+  var err = el('p', {style:'color:var(--err);font-size:12.5px;min-height:16px'});
+  var form = el('div', {cls:'section'}, [
+    el('h3', {text:'你的角色身份'}),
+    el('div', {cls:'body'}, [
+      el('label', {text:'角色名'}), nameInp,
+      el('label', {text:'人设'}), personaTa,
+      err,
+      el('div', {cls:'toolbar', style:'margin-top:10px'}, [
+        el('button', {cls:'primary', text:'保存并进入世界', onclick:function(){
+          var name = nameInp.value.trim();
+          if(!name){ err.textContent = '角色名不能为空'; return; }
+          var profile = {name: name, persona: personaTa.value.trim()};
+          api('PUT', '/api/player/profile', profile).then(function(){
+            VISITOR_PLAYER_PROFILE = profile;
+            localStorage.setItem('wui_player_profile', JSON.stringify(profile));
+            toast('角色身份已保存', 'ok');
+            done();
+          }).catch(function(e){ err.textContent = e.message || e; });
+        }})
+      ])
+    ])
+  ]);
+  return form;
+}
+
+function playerRenderWorld(holder){
+  // 世界运行状态 + 入世界/剧情
+  var profile = VISITOR_PLAYER_PROFILE;
+  holder.textContent = '';
+  // 顶部：角色身份 + 入世界状态
+  var head = el('div', {cls:'section'}, [
+    el('h3', {html:'角色 <span class="hint">' + esc(profile.name) + '</span>'}),
+    el('div', {cls:'body'}, [
+      el('p', {text:'以「' + profile.name + '」的身份进入世界，用行动推动剧情。', style:'color:var(--fg-dim);font-size:13px'})
+    ])
+  ]);
+  holder.appendChild(head);
+
+  if(!PLAYER_STATE.inWorld){
+    // 未入世界：显示「进入世界」按钮
+    var enterBar = el('div', {cls:'section'}, [
+      el('h3', {text:'进入世界'}),
+      el('div', {cls:'body'}, [
+        el('p', {text:'点击进入世界，你的角色会出现在世界里，可以开始行动。', style:'color:var(--fg-dim);font-size:13px'}),
+        el('button', {cls:'primary', text:'进入世界', onclick:function(){ playerArrive(); }})
+      ])
+    ]);
+    holder.appendChild(enterBar);
+  } else {
+    holder.appendChild(playerWorldPanel());
+  }
+  // 世界剧情（世界状态+新闻，只读）
+  holder.appendChild(playerWorldStatus());
+}
+
+function playerArrive(){
+  api('POST', '/api/player/arrive', {}).then(function(r){
+    PLAYER_STATE.token = r.token;
+    PLAYER_STATE.worldName = r.worldName || '';
+    PLAYER_STATE.inWorld = true;
+    PLAYER_STATE.events = [];
+    toast('已进入世界', 'ok');
+    playerConnectEvents(r.token);
+    loadPlayer();
+  }).catch(showErr);
+}
+
+function playerWorldPanel(){
+  var box = el('div', {cls:'section'});
+  box.appendChild(el('h3', {html:'世界互动 <span class="hint">' + esc(PLAYER_STATE.worldName || '') + '</span>'}));
+  var body = el('div', {cls:'body'});
+  // 剧情流
+  var feed = el('div', {id:'player-feed', style:'max-height:360px;overflow:auto;border:1px solid var(--line);border-radius:8px;padding:10px;margin-bottom:12px'});
+  body.appendChild(feed);
+  playerRenderFeed(feed);
+  // act 提交
+  var actInp = el('textarea', {rows: 3, placeholder:'描述你的角色想做什么（例如：走向吧台，向老板要一杯酒）', style:'width:100%'});
+  var err = el('p', {style:'color:var(--err);font-size:12.5px;min-height:16px'});
+  body.appendChild(el('div', {cls:'toolbar', style:'margin:8px 0 0'}, [
+    actInp
+  ]));
+  body.appendChild(el('div', {cls:'toolbar', style:'margin:4px 0 0'}, [
+    el('span', {style:'color:var(--fg-dark);font-size:12px', text: PLAYER_STATE.actBusy ? '等待世界裁定中…' : ''}),
+    el('span', {cls:'spacer'}),
+    el('button', {cls:'primary', text:'行动', onclick:function(){ playerSubmitAct(actInp, err, feed); }}),
+    el('button', {cls:'ghost', text:'离开世界', onclick:function(){ playerLeave(); }})
+  ]));
+  box.appendChild(body);
+  return box;
+}
+
+function playerRenderFeed(feed){
+  feed.textContent = '';
+  if(!PLAYER_STATE.events.length){
+    feed.appendChild(el('p', {cls:'empty', text:'（还没有剧情——行动后世界会告诉你发生了什么）'}));
+    return;
+  }
+  PLAYER_STATE.events.forEach(function(ev){
+    feed.appendChild(el('div', {style:'padding:6px 0;border-bottom:1px solid var(--line)', html: ev.type === 'act_result'
+      ? '<span style="color:var(--info)">【你的行动结果】</span> ' + esc(ev.content)
+      : '<span style="color:var(--warn)">【世界】</span> ' + esc(ev.content)}));
+  });
+  feed.scrollTop = feed.scrollHeight;
+}
+
+function playerSubmitAct(actInp, err, feed){
+  var desc = actInp.value.trim();
+  if(!desc){ err.textContent = '请描述你的角色想做什么'; return; }
+  if(PLAYER_STATE.actBusy){ err.textContent = '上一个行动还在裁定中'; return; }
+  err.textContent = '';
+  // 尊重 duration：提交后等待，结果异步推送
+  PLAYER_STATE.actBusy = true;
+  actInp.value = '';
+  var taskId = 'p_' + Date.now() + '_' + Math.floor(Math.random()*1e6);
+  api('POST', '/api/player/task', {token: PLAYER_STATE.token, taskId: taskId, kind: 'act', payload: {desc: desc}}).then(function(){
+    // 已受理，等待 SSE 的 task_result
+  }).catch(function(e){
+    PLAYER_STATE.actBusy = false;
+    err.textContent = e.message || e;
+  });
+}
+
+function playerLeave(){
+  api('POST', '/api/player/leave', {token: PLAYER_STATE.token}).then(function(){
+    PLAYER_STATE.inWorld = false;
+    PLAYER_STATE.token = '';
+    PLAYER_STATE.events = [];
+    toast('已离开世界', 'ok');
+    loadPlayer();
+  }).catch(showErr);
+}
+
+function playerConnectEvents(token){
+  var es = new EventSource('/api/player/events?token=' + encodeURIComponent(token));
+  es.onmessage = function(ev){
+    var msg;
+    try { msg = JSON.parse(ev.data); } catch(e){ return; }
+    if(msg.type === 'event' && msg.content){
+      PLAYER_STATE.events.push({type:'world', content: msg.content});
+      playerRefreshFeed();
+    } else if(msg.type === 'task_result'){
+      PLAYER_STATE.actBusy = false;
+      if(msg.content) PLAYER_STATE.events.push({type:'act_result', content: msg.content});
+      playerRefreshFeed();
+    } else if(msg.type === 'farewell'){
+      PLAYER_STATE.inWorld = false;
+      PLAYER_STATE.token = '';
+      toast(msg.reason || '世界送别了你', 'warn');
+      loadPlayer();
+    }
+  };
+  es.onerror = function(){ /* EventSource 自动重连；不做处理 */ };
+}
+
+function playerRefreshFeed(){
+  var feed = $('#player-feed');
+  if(feed) playerRenderFeed(feed);
+}
+
+function playerWorldStatus(){
+  var sec = el('div', {cls:'section'});
+  sec.appendChild(el('h3', {text:'世界观剧情（只读）'}));
+  var body = el('div', {cls:'body'});
+  var holder = el('div', {text:'加载中…', cls:'empty'});
+  body.appendChild(holder);
+  sec.appendChild(body);
+  api('GET', '/api/state').then(function(r){
+    holder.textContent = '';
+    // 世界状态 + 新闻（player 可见的数据块）
+    if(r.worldStatus) holder.appendChild(el('div', {cls:'body', html:'<div style="white-space:pre-wrap;font-size:12.5px">' + esc(r.worldStatus) + '</div>'}));
+    if(r.news && r.news.length){
+      holder.appendChild(el('h4', {text:'最近事件'}));
+      r.news.forEach(function(n){
+        holder.appendChild(el('div', {cls:'news-item'}, [
+          el('span', {cls:'clock', text:'[' + n.clock + ']'}),
+          el('span', {text: ' ' + n.content, style:'font-size:12.5px'})
+        ]));
+      });
+    }
+    if(!r.worldStatus && (!r.news || !r.news.length)){
+      holder.appendChild(el('p', {cls:'empty', text:'（暂无世界剧情）'}));
+    }
+  }).catch(showErr);
+  return sec;
+}
+
 // ---------- 访客账号管理 ----------
 var GRANT_LABELS = [
   ['overview','总览'], ['world_status','世界状态'], ['bot_status','Bot 状态'], ['news','新闻'], ['facts','小事记'],
   ['stream','意识流'], ['notes','笔记'], ['gallery','相册/媒体'], ['archive','归档'], ['devices','设备'],
   ['crossing','穿越'], ['definitions','定义文件'], ['config','配置'], ['prompts','提示词'], ['debug','调试(原始请求)'], ['usage','用量']
 ];
-var PRESET_LABELS = { operator:'运维员', viewer:'观众', custom:'自定义' };
+var PRESET_LABELS = { operator:'运维员', viewer:'观众', player:'玩家', custom:'自定义' };
 function loadVisitors(){
   var main = $('#main');
   main.textContent = '';
@@ -1564,13 +1800,14 @@ function openVisitorEditor(acct, all, done){
   var username = el('input', {placeholder:'用户名', style:'width:100%'});
   var pwd = el('input', {type:'password', placeholder: isNew ? '密码' : '留空则不修改密码', style:'width:100%'});
   var presetSel = el('select', {style:'width:100%'});
-  ['operator','viewer','custom'].forEach(function(p){
+  ['operator','viewer','player','custom'].forEach(function(p){
     presetSel.appendChild(el('option', {value:p, text:PRESET_LABELS[p]}));
   });
   // 预设档的可见块（与后端 PRESET_GRANTS 一致）：选择档位时作为「起点」填入勾选
   var PRESET_GRANTS = {
     operator: ['overview','world_status','news','facts','stream','notes','gallery','archive','devices','crossing','definitions','config','prompts','debug','usage'],
-    viewer: ['overview','world_status','bot_status','news','facts','stream','notes','gallery','archive','devices','crossing']
+    viewer: ['overview','world_status','bot_status','news','facts','stream','notes','gallery','archive','devices','crossing'],
+    player: ['overview','world_status','news']
   };
   var grantsBox = el('div', {style:'max-height:260px;overflow:auto;border:1px solid var(--line);border-radius:6px;padding:8px'});
   // 勾选状态：唯一来源。初始按账号已存 grants（custom）或预设档范围播种
