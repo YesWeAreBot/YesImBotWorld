@@ -28,9 +28,9 @@ import type { ComputerExecResult, ComputerInspection } from "../computer.js";
 import { collectSecretPaths, introspect, validateConfig } from "./schema.js";
 import { debug, type DebugEntry } from "./debug.js";
 import { usageStore } from "./usage.js";
-import { llmFetch } from "../llm/http.js";
+import { llmFetch, forEachStreamLine } from "../llm/http.js";
 import { PAGE_HTML } from "./page.js";
-import { VisitorStore, type VisitorSession, type VisitorGrant, type VisitorPreset } from "./visitors.js";
+import { VisitorStore, type VisitorSession, type VisitorGrant, type VisitorPreset, type PlayerProfile } from "./visitors.js";
 
 export interface BotStatusSummary {
   running: boolean;
@@ -118,6 +118,8 @@ export interface WebUIHost {
   };
   /** 穿越：强制送往某个世界（"home" = 送回自己的世界） */
   crossingForce(target: string): Promise<string>;
+  /** 玩家入世界（同部署真人玩家，不走邀请码）：到达返回 crossing token */
+  arrivePlayer(name: string, persona: string): { ok: true; token: string; worldName: string; timeLine: string } | { ok: false; error: string };
   /** 归档：手动存档（把当前全部世界状态复制成一份新快照） */
   saveArchive(label: string): Promise<string>;
   /** 归档：回档到某个快照（当前状态先自动存档） */
@@ -383,6 +385,11 @@ export class WebUIServer {
         await this.handleVisitors(method, url, req, res);
         return;
       }
+      // 玩家入世界端点：仅 player 档账号可用（有自己的写操作：arrive/task/leave）
+      if (pathname.startsWith("/api/player")) {
+        await this.handlePlayer(pathname, method, url, req, res);
+        return;
+      }
       const access = this.resolveAccess(req, url);
       if (!access) return void sendJSON(res, 401, { error: "需要访问令牌" });
       // 访客只读：所有写方法一律拒绝
@@ -442,6 +449,126 @@ export class WebUIServer {
     });
   }
 
+  /** crossing 服务的本机回环地址（玩家代理端点内部转发用） */
+  private crossingBase(): string {
+    const port = this.host.config.crossing?.port ?? 18112;
+    return `http://127.0.0.1:${port}`;
+  }
+
+  /** 玩家入世界端点：仅 player 档账号可用 */
+  private async handlePlayer(pathname: string, method: string, url: URL, req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    const access = this.resolveAccess(req, url);
+    if (!access || access.kind !== "visitor" || access.session.preset !== "player") {
+      return void sendJSON(res, 403, { error: "仅玩家账号可用" });
+    }
+    const session = access.session;
+
+    // 角色身份：GET 读 / PUT 存（首次登录填完后持久化）
+    if (pathname === "/api/player/profile") {
+      if (method === "GET") {
+        return void sendJSON(res, 200, { profile: session.playerProfile });
+      }
+      if (method === "PUT") {
+        const body = await readJson(req, 1024 * 1024).catch(() => null);
+        if (!body) return void sendJSON(res, 400, { error: "请求体不是合法 JSON" });
+        const profile: PlayerProfile = {
+          name: String(body.name ?? "").trim(),
+          persona: String(body.persona ?? "").trim(),
+        };
+        if (!profile.name) return void sendJSON(res, 400, { error: "角色名不能为空" });
+        const r = await this.visitors.savePlayerProfile(session.accountId, profile);
+        if (!r.ok) return void sendJSON(res, 400, { error: r.error });
+        return void sendJSON(res, 200, { ok: true });
+      }
+      return void sendJSON(res, 405, { error: "不支持的方法" });
+    }
+
+    // 到达：把玩家角色身份作为 crossing arrive 的 name+persona
+    if (pathname === "/api/player/arrive" && method === "POST") {
+      const profile = session.playerProfile;
+      if (!profile || !profile.name) {
+        return void sendJSON(res, 400, { error: "请先填写角色身份" });
+      }
+      const r = this.host.arrivePlayer(profile.name, profile.persona);
+      if (!r.ok) return void sendJSON(res, 400, { error: r.error });
+      return void sendJSON(res, 200, { ok: true, token: r.token, worldName: r.worldName, timeLine: r.timeLine });
+    }
+
+    // 提交行动（act）：转发 crossing task
+    if (pathname === "/api/player/task" && method === "POST") {
+      const body = await readJson(req, 1024 * 1024).catch(() => null);
+      if (!body) return void sendJSON(res, 400, { error: "请求体不是合法 JSON" });
+      const r = await this.crossingPost("/crossing/task", body);
+      if (!r.ok) return void sendJSON(res, 400, { error: String(r.error ?? "任务被拒绝") });
+      return void sendJSON(res, 200, { ok: true });
+    }
+
+    // 离开
+    if (pathname === "/api/player/leave" && method === "POST") {
+      const body = await readJson(req, 64 * 1024).catch(() => ({}));
+      const r = await this.crossingPost("/crossing/leave", body);
+      return void sendJSON(res, 200, { ok: true });
+    }
+
+    // 事件流：SSE 转发 crossing events
+    if (pathname === "/api/player/events" && method === "GET") {
+      const token = String(url.searchParams.get("token") ?? "");
+      if (!token) return void sendJSON(res, 400, { error: "缺少 crossing token" });
+      return void this.proxyPlayerEvents(token, res);
+    }
+
+    sendJSON(res, 404, { error: "Not Found" });
+  }
+
+  /** 转发 POST 到本机 crossing 服务 */
+  private async crossingPost(path: string, body: unknown): Promise<Record<string, unknown>> {
+    const res = await llmFetch(this.crossingBase() + path, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(30_000),
+    });
+    let data: Record<string, unknown> = {};
+    try {
+      data = (await res.json()) as Record<string, unknown>;
+    } catch {
+      /* 非 JSON */
+    }
+    if (!res.ok && data.error === undefined) data.error = `HTTP ${res.status}`;
+    // 给 ok 打标（crossing 返回 {ok,...}；失败时补 ok:false）
+    if (data.ok === undefined) data.ok = res.ok;
+    return data;
+  }
+
+  /** SSE 转发：把本机 crossing 的 events 流透传给浏览器 */
+  private async proxyPlayerEvents(token: string, res: http.ServerResponse): Promise<void> {
+    try {
+      const upstream = await llmFetch(`${this.crossingBase()}/crossing/events?token=${encodeURIComponent(token)}`, {
+        signal: null,
+      });
+      if (!upstream.ok) {
+        return void sendJSON(res, upstream.status, { error: "穿越事件流不可用" });
+      }
+      res.writeHead(200, {
+        "content-type": "text/event-stream; charset=utf-8",
+        "cache-control": "no-cache, no-transform",
+        connection: "keep-alive",
+        "x-accel-buffering": "no",
+      });
+      await forEachStreamLine(upstream, (line) => {
+        res.write(line + "\n\n");
+      });
+      res.end();
+    } catch (err) {
+      if (!res.headersSent) {
+        sendJSON(res, 502, { error: `穿越服务不可用：${(err as Error).message ?? err}` });
+      } else {
+        res.end();
+      }
+    }
+  }
+
+
   /** 访客登录：POST /api/login {username, password} → {token} 或 401 */
   private async handleLogin(req: http.IncomingMessage, url: URL, res: http.ServerResponse): Promise<void> {
     const method = (req.method ?? "GET").toUpperCase();
@@ -450,7 +577,13 @@ export class WebUIServer {
     if (!body) return void sendJSON(res, 400, { error: "请求体不是合法 JSON" });
     const result = await this.visitors.login(String(body.username ?? ""), String(body.password ?? ""));
     if (!result) return void sendJSON(res, 401, { error: "用户名或密码错误" });
-    sendJSON(res, 200, { ok: true, token: result.token, preset: result.preset, grants: result.grants });
+    sendJSON(res, 200, {
+      ok: true,
+      token: result.token,
+      preset: result.preset,
+      grants: result.grants,
+      playerProfile: result.playerProfile ?? null,
+    });
   }
 
   /** 访客账号管理（仅 admin）：GET 列出 / POST 增 / PUT 改 / DELETE 删 */

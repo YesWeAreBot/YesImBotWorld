@@ -36,7 +36,13 @@ export type VisitorGrant =
   | "debug"
   | "usage";
 
-export type VisitorPreset = "operator" | "viewer" | "custom";
+export type VisitorPreset = "operator" | "viewer" | "player" | "custom";
+
+/** 玩家角色身份（入世界穿越时用：name=角色名，persona=角色人设/自我描述） */
+export interface PlayerProfile {
+  name: string;
+  persona: string;
+}
 
 export interface VisitorAccount {
   id: string;
@@ -46,6 +52,8 @@ export interface VisitorAccount {
   preset: VisitorPreset;
   /** 仅 custom 档使用：块 → 是否可见（缺省视为 false） */
   grants?: Partial<Record<VisitorGrant, boolean>>;
+  /** 玩家档：入世界的角色身份（首次登录时填，持久化绑定账号） */
+  playerProfile?: PlayerProfile;
   createdAt: number;
 }
 
@@ -66,6 +74,10 @@ const PRESET_GRANTS: Record<VisitorPreset, VisitorGrant[]> = {
     "notes", "gallery", "archive", "devices", "crossing",
     // 不含 definitions / config / prompts / debug / usage（用户输入 + 调试内部）
   ],
+  player: [
+    // 玩家以「角色视角」入世界：只看世界剧情（世界状态 + 新闻），不看 Bot 内心/状态/意识流/定义等内部
+    "overview", "world_status", "news",
+  ],
   custom: [],
 };
 
@@ -76,6 +88,7 @@ export interface VisitorSession {
   username: string;
   preset: VisitorPreset;
   grants: Set<VisitorGrant>;
+  playerProfile: PlayerProfile | null;
   expiresAt: number;
 }
 
@@ -200,7 +213,7 @@ export class VisitorStore {
 
   // ---------- 登录 / 会话 ----------
 
-  async login(username: string, password: string): Promise<{ token: string; preset: VisitorPreset; grants: VisitorGrant[] } | null> {
+  async login(username: string, password: string): Promise<{ token: string; preset: VisitorPreset; grants: VisitorGrant[]; playerProfile?: PlayerProfile } | null> {
     const accounts = await this.ensureLoaded();
     const acct = accounts.find((a) => a.username === username.trim());
     if (!acct || !VisitorStore.verifyPassword(password, acct.passwordHash)) return null;
@@ -211,9 +224,20 @@ export class VisitorStore {
       username: acct.username,
       preset: acct.preset,
       grants,
+      playerProfile: acct.playerProfile ?? null,
       expiresAt: Date.now() + SESSION_TTL_MS,
     });
-    return { token, preset: acct.preset, grants: [...grants] };
+    return { token, preset: acct.preset, grants: [...grants], playerProfile: acct.playerProfile };
+  }
+
+  /** 玩家保存角色身份（首次登录填完后持久化到账号） */
+  async savePlayerProfile(id: string, profile: PlayerProfile): Promise<{ ok: true } | { ok: false; error: string }> {
+    const accounts = await this.ensureLoaded();
+    const acct = accounts.find((a) => a.id === id);
+    if (!acct) return { ok: false, error: "账号不存在" };
+    acct.playerProfile = { name: profile.name.slice(0, 32), persona: profile.persona.slice(0, 6000) };
+    await this.persist();
+    return { ok: true };
   }
 
   /** 校验会话 token，实时从账号表刷新 grants/preset；账号已被删除则会话失效返回 null */
@@ -235,6 +259,7 @@ export class VisitorStore {
     s.username = acct.username;
     s.preset = acct.preset;
     s.grants = VisitorStore.grantsOf(acct);
+    s.playerProfile = acct.playerProfile ?? null;
     return s;
   }
 

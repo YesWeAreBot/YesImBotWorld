@@ -83,6 +83,56 @@ export class CrossingServer {
     return [...this.sessions.values()].map((s) => ({ name: s.name, arrivedAt: s.arrivedAt }));
   }
 
+  /**
+   * 同部署真人玩家到达（供 WebUI 内部调用，不走 HTTP / 不校验邀请码——玩家已通过 WebUI 登录鉴权）。
+   * 其余与 handleArrive 一致：创建会话、同名顶替、触发到达叙事、通知常驻 Bot。
+   */
+  arrivePlayer(name: string, persona: string): { ok: true; token: string; worldName: string; timeLine: string } | { ok: false; error: string } {
+    if (!this.host.ready()) return { ok: false, error: "这个世界当前未在运行，无法接待访客" };
+    if (this.sessions.size >= Math.max(1, this.host.cfg.maxVisitors)) {
+      return { ok: false, error: "这个世界的访客已满，稍后再来" };
+    }
+    const safeName = name.trim().slice(0, CROSSING_LIMITS.maxNameChars) || "异界来客";
+    const safePersona = persona.slice(0, CROSSING_LIMITS.maxPersonaChars);
+    const dupe = [...this.sessions.values()].find((s) => s.name === safeName);
+    if (dupe && dupe.res) {
+      return { ok: false, error: `已有同名访客「${safeName}」在场` };
+    }
+    if (dupe) {
+      this.sessions.delete(dupe.token);
+      this.closeSession(dupe);
+      this.host.logger.info("[穿越] 玩家「%s」重连，顶替断线的旧会话", safeName);
+    }
+    const session: VisitorSession = {
+      id: crypto.randomUUID(),
+      token: crypto.randomBytes(24).toString("base64url"),
+      name: safeName,
+      persona: safePersona,
+      res: null,
+      outbox: [],
+      pendingTasks: 0,
+      absenceTimer: null,
+      arrivedAt: Date.now(),
+      updateStatus: (content: string) => {
+        session.persona = content.slice(0, CROSSING_LIMITS.maxPersonaChars);
+        this.push(session, { type: "status_update", content });
+      },
+    };
+    this.sessions.set(session.token, session);
+    this.armAbsence(session);
+    const timeLine = this.host.clock()?.timeLine() ?? "";
+    this.host.logger.info("[穿越] 玩家「%s」入世界", safeName);
+    debug.emit("world.task", `穿越·玩家「${safeName}」入世界`, {});
+    this.host.notifyHostBot(`一位真人玩家以角色「${safeName}」的身份进入了这个世界。`);
+    void this.host.world
+      .wakeDormant()
+      .catch((err) => this.host.logger.warn("[穿越] 沉睡补叙失败: %s", err));
+    void this.host.world
+      .visitorArrive(session, (content) => this.push(session, { type: "event", content }))
+      .catch((err) => this.host.logger.warn("[穿越] 玩家到达叙事失败: %s", err));
+    return { ok: true, token: session.token, worldName: this.worldName, timeLine };
+  }
+
   async start(): Promise<void> {
     if (this.server) return;
     this.server = http.createServer((req, res) => {
