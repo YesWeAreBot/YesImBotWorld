@@ -376,6 +376,9 @@ export class WebUIServer {
         await this.handleLogin(req, url, res);
         return;
       }
+      if (pathname === "/api/visitors/me") {
+        return this.handleVisitorMe(req, url, res);
+      }
       if (pathname === "/api/visitors") {
         await this.handleVisitors(method, url, req, res);
         return;
@@ -424,6 +427,19 @@ export class WebUIServer {
 
     // 4. 设置了 admin token 但没给对：拒绝
     return null;
+  }
+
+  /** 当前访客会话的实时身份（前端同步导航过滤用）；会话失效/账号被删返回 401 */
+  private handleVisitorMe(req: http.IncomingMessage, url: URL, res: http.ServerResponse): void {
+    const access = this.resolveAccess(req, url);
+    if (!access || access.kind !== "visitor") {
+      return void sendJSON(res, 401, { error: "访客会话无效" });
+    }
+    sendJSON(res, 200, {
+      username: access.session.username,
+      preset: access.session.preset,
+      grants: [...access.session.grants],
+    });
   }
 
   /** 访客登录：POST /api/login {username, password} → {token} 或 401 */

@@ -735,6 +735,35 @@ function visitorCanSee(grants){
   return grants.some(function(g){ return VISITOR_GRANTS.indexOf(g) >= 0; });
 }
 function isVisitor(){ return MODE === 'visitor'; }
+// 从后端同步当前访客会话的最新 grants（管理员改权限后实时生效）；会话失效则退回登录
+function syncVisitorGrants(){
+  if(MODE !== 'visitor' || !VISITOR_TOKEN) return Promise.resolve();
+  return fetch('/api/visitors/me', {headers:{'x-visitor-token': VISITOR_TOKEN}}).then(function(res){
+    if(res.status === 401){
+      // 会话失效（账号被删/过期）：清凭证并重新登录
+      logoutVisitor();
+      return promptAuth();
+    }
+    return res.json().then(function(d){
+      if(!res.ok) throw new Error(d.error || 'HTTP ' + res.status);
+      VISITOR_GRANTS = d.grants || [];
+      localStorage.setItem('wui_visitor_grants', JSON.stringify(VISITOR_GRANTS));
+      buildNav();
+      return d;
+    });
+  }).catch(function(){ /* 网络失败等：保留旧 grants，不打断 */ });
+}
+function logoutVisitor(){
+  MODE = 'admin';
+  VISITOR_TOKEN = '';
+  VISITOR_GRANTS = [];
+  localStorage.removeItem('wui_mode');
+  localStorage.removeItem('wui_visitor_token');
+  localStorage.removeItem('wui_visitor_grants');
+  document.body.classList.remove('visitor-readonly');
+  buildNav();
+  switchView('overview');
+}
 function buildNav(){
   var nav = $('#nav');
   nav.textContent = '';
@@ -772,6 +801,7 @@ function switchView(name){
   activeView = name;
   if(location.hash !== '#' + name) history.replaceState(null, '', '#' + name);
   clearViewTimers();
+  if(MODE === 'visitor') syncVisitorGrants();
   buildNav();
   // 切换视图时轻微淡入；同视图刷新不动画
   if(changed){
@@ -3372,6 +3402,8 @@ switchView(activeView);
 if(activeView !== 'overview') refreshOverview(false);
 connectSSE();
 setInterval(function(){ refreshOverview(false); }, 8000);
+// 访客：定期同步会话 grants（管理员改权限后实时生效）；被删则退回登录
+if(MODE === 'visitor') setInterval(function(){ syncVisitorGrants(); }, 15000);
 window.addEventListener('hashchange', function(){
   var h = (location.hash || '').slice(1);
   if(h === activeView) return;

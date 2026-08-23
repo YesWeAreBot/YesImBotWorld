@@ -71,6 +71,8 @@ const PRESET_GRANTS: Record<VisitorPreset, VisitorGrant[]> = {
 
 /** 会话：密码登录后派发，内存态 */
 export interface VisitorSession {
+  /** 账号 id（会话只记 id，每次 resolve 实时从账号表重算 grants/preset，使权限修改即时生效） */
+  accountId: string;
   username: string;
   preset: VisitorPreset;
   grants: Set<VisitorGrant>;
@@ -201,6 +203,7 @@ export class VisitorStore {
     const token = crypto.randomBytes(24).toString("base64url");
     const grants = VisitorStore.grantsOf(acct);
     this.sessions.set(token, {
+      accountId: acct.id,
       username: acct.username,
       preset: acct.preset,
       grants,
@@ -209,7 +212,7 @@ export class VisitorStore {
     return { token, preset: acct.preset, grants: [...grants] };
   }
 
-  /** 校验会话 token，返回会话（可见块集合）；无效返回 null */
+  /** 校验会话 token，实时从账号表刷新 grants/preset；账号已被删除则会话失效返回 null */
   resolve(token: string | null | undefined): VisitorSession | null {
     if (!token) return null;
     this.sweep();
@@ -219,6 +222,15 @@ export class VisitorStore {
       this.sessions.delete(token);
       return null;
     }
+    // 实时刷新：账号权限可能在登录后被管理员修改/删除
+    const acct = this.accounts.find((a) => a.id === s.accountId);
+    if (!acct) {
+      this.sessions.delete(token);
+      return null;
+    }
+    s.username = acct.username;
+    s.preset = acct.preset;
+    s.grants = VisitorStore.grantsOf(acct);
     return s;
   }
 
