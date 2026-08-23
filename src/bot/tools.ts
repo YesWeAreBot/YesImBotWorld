@@ -28,6 +28,7 @@ const CHAT_LAYER = new Set([
 const CHANNEL_LAYER = new Set([
   "send", "send_file", "send_voice", "unsend", "react", "get_emoji_likes",
   "forward_msgs", "view_forward", "exit_forward", "poke", "channel_notify",
+  "read_channel",
 ]);
 const GROUP_LAYER = new Set([
   "group_info", "list_members", "member_info", "group_honor", "group_files",
@@ -84,11 +85,17 @@ export const BOT_TOOLS: BotToolDef[] = [
   },
   {
     name: "select_channel",
-    signature: 'select_channel(id: string, n: number)',
+    signature: 'select_channel(id: string)',
     description:
-      '点进消息列表中的一个频道，查看最近 n 条消息（n 至少 10 条）。id 格式为 "platform:channelId"。' +
-      "进入频道页后才能进行频道内的操作（发消息等，进入时会看到可用操作）。" +
-      "此后的一段时间内你会持续留意这个频道，它的新消息会直接呈现在你眼前（发消息给某频道也有同样效果）。",
+      '点进消息列表中的一个频道（id 格式为 "platform:channelId"）。进入频道页后才能进行频道内的操作（发消息等，进入时会看到可用操作）。' +
+      "此后的一段时间内你会持续留意这个频道，它的新消息会直接呈现在你眼前（发消息给某频道也有同样效果）。" +
+      "已经在这个频道里时无需再次点进；想刷新/看更多消息用 read_channel。",
+  },
+  {
+    name: "read_channel",
+    signature: "read_channel(n: number)",
+    description:
+      "读当前所在频道最近 n 条消息（n 至少 10，调大看更早的历史消息）。只看消息、不切换频道。",
   },
   {
     name: "put_down_phone",

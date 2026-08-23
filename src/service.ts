@@ -561,7 +561,7 @@ export class WorldService extends Service<Config> {
             labels.join("、") + (channels.length > shown.length ? ` 等 ${channels.length} 个群` : "");
           this.bot.pushEvent(
             "system",
-            `离线期间你在 ${namesText} 错过的 ${total} 条消息已补录到聊天记录里（用 check_msg / select_channel 翻看）。`,
+            `离线期间你在 ${namesText} 错过的 ${total} 条消息已补录到聊天记录里（用 check_msg / select_channel / read_channel 翻看）。`,
           );
         })
         .catch((err) => this.logger.warn("离线历史补拉失败: %s", err));

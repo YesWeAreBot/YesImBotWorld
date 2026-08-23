@@ -689,15 +689,35 @@ export class BotAgent {
         return this.dispatchLocal(call, async () => {
           const resolved = await this.messenger.resolveKey(id.trim());
           if ("error" in resolved) return resolved.error;
+          // 已经在这个频道里：点进是多余操作，提醒它用 read_channel 刷新/读更多，而不是重复点进
+          if (this.phoneUi.chatOpen && this.phoneUi.channelKey === resolved.key) {
+            return (
+              `你已经在 ${resolved.key} 里了，无需再次点进。` +
+              `想刷新消息或看更多（更早的）消息，用 read_channel 即可。`
+            );
+          }
+          // 进入/切换到新频道：顺手回显这个频道的最近消息，让 Bot 看到这里在聊什么
           await this.enterChannel(resolved.key, resolved.isPrivate);
-          const messages = await this.messenger.channelMessages(resolved.key, clampInt(call.arguments.n, 10, 200, 10));
-          // channelMessages 可能返回 RichText（含附件），不能直接字符串拼接
+          const messages = await this.messenger.channelMessages(resolved.key, 10);
           const text =
             (typeof messages === "string" ? messages : messages.text) +
-            "\n（若你觉得还没读全、没搞懂大家在聊什么，就把 n 调大一些再调用一次 select_channel 看更早的消息。）";
-          return typeof messages === "string"
-            ? text
-            : { ...messages, text };
+            "\n（想刷新或看更早的消息，用 read_channel 调大 n。）";
+          return typeof messages === "string" ? text : { ...messages, text };
+        });
+      }
+      case "read_channel": {
+        // 读当前所在频道的消息（不切换频道）。需先 select_channel 进入某个频道
+        if (!this.phoneUi.chatOpen || !this.phoneUi.channelKey) {
+          this.pushEvent("system", "（你还没进入任何频道：先 open_app 打开聊天应用，再用 select_channel 进入一个频道。）", { ref: call.id });
+          return;
+        }
+        const key = this.phoneUi.channelKey;
+        return this.dispatchLocal(call, async () => {
+          const messages = await this.messenger.channelMessages(key, clampInt(call.arguments.n, 10, 200, 10));
+          const text =
+            (typeof messages === "string" ? messages : messages.text) +
+            "\n（若觉得还没读全，就把 n 调大一些再调用一次 read_channel 看更早的消息。）";
+          return typeof messages === "string" ? text : { ...messages, text };
         });
       }
       case "check_gallery": {
