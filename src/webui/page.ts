@@ -498,16 +498,16 @@ function promptAuth(){
   authPromise = new Promise(function(resolve){
     var finish = function(v){ authPromise = null; hideModal(); resolve(v); };
     var mode = 'admin'; // 'admin' | 'visitor'
-    var usernameInput = el('input', {placeholder:'用户名', style:'width:100%'});
+    var usernameInput = el('input', {placeholder:'用户名', style:'width:100%;margin:0 0 8px'});
     var pwdInput = el('input', {type:'password', placeholder:'密码', style:'width:100%'});
     var tokenInput = el('input', {type:'password', placeholder:'webui.token', style:'width:100%'});
     var errLine = el('p', {style:'color:var(--err);font-size:12.5px;min-height:16px'});
     var adminSec = el('div', null, [
-      el('p', {text:'服务器设置了访问令牌（webui.token），请输入以继续。', style:'color:var(--fg-dim);font-size:13px'}),
+      el('p', {text:'服务器设置了访问令牌（webui.token），请输入以继续。', style:'color:var(--fg-dim);font-size:13px;margin:0 0 8px'}),
       tokenInput
     ]);
     var visitorSec = el('div', null, [
-      el('p', {text:'访客只读访问：输入管理员分配的用户名与密码。', style:'color:var(--fg-dim);font-size:13px'}),
+      el('p', {text:'访客只读访问：输入管理员分配的用户名与密码。', style:'color:var(--fg-dim);font-size:13px;margin:0 0 8px'}),
       usernameInput, pwdInput
     ]);
     var tabs = el('div', {cls:'toolbar', style:'margin:0 0 10px'}, [
