@@ -194,18 +194,19 @@ export class VisitorStore {
 
   // ---------- 登录 / 会话 ----------
 
-  async login(username: string, password: string): Promise<{ token: string } | null> {
+  async login(username: string, password: string): Promise<{ token: string; preset: VisitorPreset; grants: VisitorGrant[] } | null> {
     const accounts = await this.ensureLoaded();
     const acct = accounts.find((a) => a.username === username.trim());
     if (!acct || !VisitorStore.verifyPassword(password, acct.passwordHash)) return null;
     const token = crypto.randomBytes(24).toString("base64url");
+    const grants = VisitorStore.grantsOf(acct);
     this.sessions.set(token, {
       username: acct.username,
       preset: acct.preset,
-      grants: VisitorStore.grantsOf(acct),
+      grants,
       expiresAt: Date.now() + SESSION_TTL_MS,
     });
-    return { token };
+    return { token, preset: acct.preset, grants: [...grants] };
   }
 
   /** 校验会话 token，返回会话（可见块集合）；无效返回 null */

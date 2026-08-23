@@ -434,7 +434,7 @@ export class WebUIServer {
     if (!body) return void sendJSON(res, 400, { error: "请求体不是合法 JSON" });
     const result = await this.visitors.login(String(body.username ?? ""), String(body.password ?? ""));
     if (!result) return void sendJSON(res, 401, { error: "用户名或密码错误" });
-    sendJSON(res, 200, { ok: true, token: result.token });
+    sendJSON(res, 200, { ok: true, token: result.token, preset: result.preset, grants: result.grants });
   }
 
   /** 访客账号管理（仅 admin）：GET 列出 / POST 增 / PUT 改 / DELETE 删 */

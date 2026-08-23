@@ -384,6 +384,11 @@ details.adv>.body{padding:4px 14px 12px}
 var NL = String.fromCharCode(10);
 var VERSION = '?';
 var TOKEN = localStorage.getItem('wui_token') || '';
+// 访问者模式：'admin'（webui.token）或 'visitor'（访客账号）
+var MODE = localStorage.getItem('wui_mode') === 'visitor' ? 'visitor' : 'admin';
+var VISITOR_TOKEN = localStorage.getItem('wui_visitor_token') || '';
+var VISITOR_GRANTS = []; // 当前访客会话可见的数据块集合
+try { VISITOR_GRANTS = JSON.parse(localStorage.getItem('wui_visitor_grants') || '[]'); } catch(e) { VISITOR_GRANTS = []; }
 var activeView = 'overview';
 // SSE 断线续传锚点：跨页面加载持久化，避免每次无缓存刷新都从 0 重放整段调试历史
 var lastEventId = Number(localStorage.getItem('wui_last_id') || 0);
@@ -445,7 +450,8 @@ var ICONS = {
   sliders: svgIcon('<path d="M4 8h10M18 8h2M4 16h4M12 16h8"/><circle cx="16" cy="8" r="2"/><circle cx="10" cy="16" r="2"/>'),
   menu: svgIcon('<path d="M4 7h16M4 12h16M4 17h16"/>'),
   phone: svgIcon('<rect x="7" y="2.5" width="10" height="19" rx="2.5"/><path d="M11 18.5h2"/>'),
-  portal: svgIcon('<circle cx="12" cy="12" r="9"/><path d="M3.5 12h17"/><path d="M12 3a13.5 13.5 0 0 1 0 18"/><path d="M12 3a13.5 13.5 0 0 0 0 18"/>')
+  portal: svgIcon('<circle cx="12" cy="12" r="9"/><path d="M3.5 12h17"/><path d="M12 3a13.5 13.5 0 0 1 0 18"/><path d="M12 3a13.5 13.5 0 0 0 0 18"/>'),
+  users: svgIcon('<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/>')
 };
 function icon(name){ return ICONS[name] || ''; }
 function copyText(text, hint){
@@ -480,26 +486,89 @@ function hideModal(){ $('#modal').classList.remove('show'); }
 $('#modal-x').onclick = hideModal;
 $('#modal').onclick = function(e){ if(e.target === this) hideModal(); };
 function promptToken(){
+  return promptAuth();
+}
+// 登录：管理员令牌（webui.token）或访客账号（用户名+密码）
+function promptAuth(){
   return new Promise(function(resolve){
-    var inp = el('input', {type:'password', placeholder:'webui.token', style:'width:100%'});
-    var body = el('div', null, [
+    var mode = 'admin'; // 'admin' | 'visitor'
+    var usernameInput = el('input', {placeholder:'用户名', style:'width:100%'});
+    var pwdInput = el('input', {type:'password', placeholder:'密码', style:'width:100%'});
+    var tokenInput = el('input', {type:'password', placeholder:'webui.token', style:'width:100%'});
+    var errLine = el('p', {style:'color:var(--err);font-size:12.5px;min-height:16px'});
+    var adminSec = el('div', null, [
       el('p', {text:'服务器设置了访问令牌（webui.token），请输入以继续。', style:'color:var(--fg-dim);font-size:13px'}),
-      inp,
+      tokenInput
+    ]);
+    var visitorSec = el('div', null, [
+      el('p', {text:'访客只读访问：输入管理员分配的用户名与密码。', style:'color:var(--fg-dim);font-size:13px'}),
+      usernameInput, pwdInput
+    ]);
+    var tabs = el('div', {cls:'toolbar', style:'margin:0 0 10px'}, [
+      el('button', {cls: mode==='admin'?'primary':'', text:'管理员', onclick:function(){ setMode('admin'); }}),
+      el('button', {cls: mode==='visitor'?'primary':'', text:'访客', onclick:function(){ setMode('visitor'); }})
+    ]);
+    var body = el('div', null, [tabs, adminSec, errLine,
       el('div', {cls:'toolbar'}, [
         el('button', {text:'取消', onclick:function(){ hideModal(); resolve(null); }}),
-        el('button', {cls:'primary', text:'确定', onclick:function(){ confirmToken(); }})
+        el('button', {cls:'primary', text:'登录', onclick:function(){ doLogin(); }})
       ])
     ]);
-    function confirmToken(){
-      TOKEN = inp.value.trim();
-      localStorage.setItem('wui_token', TOKEN);
-      hideModal();
-      connectSSE(); // 令牌更新后重建 SSE 连接（否则一直 401 重试）
-      resolve(TOKEN);
+    function setMode(m){
+      mode = m;
+      tabs.childNodes[0].className = m==='admin'?'primary':'';
+      tabs.childNodes[1].className = m==='visitor'?'primary':'';
+      adminSec.style.display = m==='admin' ? '' : 'none';
+      visitorSec.style.display = m==='visitor' ? '' : 'none';
+      errLine.textContent = '';
+      if(m==='admin') setTimeout(function(){ tokenInput.focus(); }, 20);
+      else setTimeout(function(){ usernameInput.focus(); }, 20);
     }
-    showModal('需要访问令牌', body);
-    setTimeout(function(){ inp.focus(); }, 50);
-    inp.onkeydown = function(e){ if(e.key === 'Enter') confirmToken(); };
+    function doLogin(){
+      errLine.textContent = '';
+      if(mode === 'admin'){
+        setAdmin(tokenInput.value.trim());
+      } else {
+        fetch('/api/login', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({username: usernameInput.value.trim(), password: pwdInput.value})})
+          .then(function(res){ return res.json().then(function(d){ return {ok:res.ok, d:d}; }); })
+          .then(function(r){
+            if(!r.ok){ errLine.textContent = r.d.error || '登录失败'; return; }
+            setVisitor(r.d.token, r.d.grants || []);
+          })
+          .catch(function(e){ errLine.textContent = String(e && e.message || e); });
+      }
+    }
+    function setAdmin(t){
+      TOKEN = t;
+      MODE = 'admin';
+      VISITOR_TOKEN = '';
+      localStorage.setItem('wui_token', TOKEN);
+      localStorage.setItem('wui_mode', 'admin');
+      localStorage.removeItem('wui_visitor_token');
+      localStorage.removeItem('wui_visitor_grants');
+      hideModal();
+      connectSSE();
+      resolve(t);
+    }
+    function setVisitor(tok, grants){
+      VISITOR_TOKEN = tok;
+      VISITOR_GRANTS = grants;
+      MODE = 'visitor';
+      TOKEN = '';
+      localStorage.setItem('wui_mode', 'visitor');
+      localStorage.setItem('wui_visitor_token', tok);
+      localStorage.setItem('wui_visitor_grants', JSON.stringify(grants));
+      localStorage.removeItem('wui_token');
+      hideModal();
+      buildNav();
+      connectSSE();
+      resolve(tok);
+    }
+    showModal('需要登录', body);
+    setMode('admin');
+    tokenInput.onkeydown = function(e){ if(e.key === 'Enter') doLogin(); };
+    usernameInput.onkeydown = function(e){ if(e.key === 'Enter') doLogin(); };
+    pwdInput.onkeydown = function(e){ if(e.key === 'Enter') doLogin(); };
   });
 }
 function showImage(title, url){
@@ -511,7 +580,11 @@ function showImage(title, url){
 // ---------- API ----------
 function api(method, path, body, retried){
   var opts = {method:method, headers:{}};
-  if(TOKEN) opts.headers['Authorization'] = 'Bearer ' + TOKEN;
+  if(MODE === 'visitor'){
+    if(VISITOR_TOKEN) opts.headers['x-visitor-token'] = VISITOR_TOKEN;
+  } else if(TOKEN){
+    opts.headers['Authorization'] = 'Bearer ' + TOKEN;
+  }
   if(body !== undefined){
     if(body instanceof FormData){ opts.body = body; }
     else if(typeof Blob !== 'undefined' && body instanceof Blob){ opts.headers['Content-Type'] = body.type || 'application/octet-stream'; opts.body = body; }
@@ -519,11 +592,15 @@ function api(method, path, body, retried){
     else { opts.headers['Content-Type'] = 'application/json'; opts.body = JSON.stringify(body); }
   }
   return fetch(path, opts).then(function(res){
-    if(res.status === 401 && !retried){
-      return promptToken().then(function(t){
+    if((res.status === 401) && !retried){
+      return promptAuth().then(function(t){
         if(t == null) throw new Error('未授权');
         return api(method, path, body, true);
       });
+    }
+    if(res.status === 403 && !retried){
+      // 访客越权访问（无读权限）：提示后不再重试，避免死循环
+      throw new Error('无权访问');
     }
     return res.json().then(function(data){
       if(!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
@@ -532,16 +609,21 @@ function api(method, path, body, retried){
   });
 }
 
-// 给 img src 之类无法携带 Authorization 头的 URL 附上令牌参数
+// 给 img src 之类无法携带 Authorization 头的 URL 附上凭证参数
 function withToken(url){
-  if(!TOKEN) return url;
-  return url + (url.indexOf('?') >= 0 ? '&' : '?') + 'token=' + encodeURIComponent(TOKEN);
+  var sep = url.indexOf('?') >= 0 ? '&' : '?';
+  if(MODE === 'visitor'){
+    return VISITOR_TOKEN ? url + sep + 'visitor=' + encodeURIComponent(VISITOR_TOKEN) : url;
+  }
+  return TOKEN ? url + sep + 'token=' + encodeURIComponent(TOKEN) : url;
 }
 
 // ---------- SSE ----------
 function connectSSE(){
   if(evtSource) evtSource.close();
-  var url = '/api/events?since=' + lastEventId + (TOKEN ? '&token=' + encodeURIComponent(TOKEN) : '');
+  var url = '/api/events?since=' + lastEventId;
+  if(MODE === 'visitor'){ if(VISITOR_TOKEN) url += '&visitor=' + encodeURIComponent(VISITOR_TOKEN); }
+  else if(TOKEN){ url += '&token=' + encodeURIComponent(TOKEN); }
   evtSource = new EventSource(url);
   evtSource.onopen = function(){ $('#sse-dot').className = 'on'; };
   evtSource.onerror = function(){ $('#sse-dot').className = 'off'; };
@@ -620,27 +702,35 @@ function seedLive(){
 }
 
 // ---------- 导航 ----------
+// 第 4 项（可选）：访客可见所需的数据块（多个任一满足）；缺省则仅 admin 可见
 var NAV = [
   {group:'观测'},
-  ['overview','总览','gauge'],
-  ['devices','设备','monitor'],
-  ['debug','调试','activity'],
-  ['usage','用量','chart'],
+  ['overview','总览','gauge',['overview']],
+  ['devices','设备','monitor',['devices']],
+  ['debug','调试','activity',['debug']],
+  ['usage','用量','chart',['usage']],
   {group:'世界'},
-  ['state','状态','file'],
-  ['crossing','穿越','portal'],
-  ['prompts','提示词','edit'],
-  ['gallery','相册','image'],
-  ['media','媒体','film'],
-  ['data','数据','folder'],
+  ['state','状态','file',['world_status','bot_status','news','facts']],
+  ['crossing','穿越','portal',['crossing']],
+  ['prompts','提示词','edit',['prompts']],
+  ['gallery','相册','image',['gallery']],
+  ['media','媒体','film',['gallery']],
+  ['data','数据','folder',['notes','archive']],
   {group:'系统'},
-  ['config','配置','sliders'],
+  ['visitors','访客','users',['config']],
+  ['config','配置','sliders',['config']],
 ];
+function visitorCanSee(grants){
+  if(MODE !== 'visitor') return true;
+  if(!grants || !grants.length) return false;
+  return grants.some(function(g){ return VISITOR_GRANTS.indexOf(g) >= 0; });
+}
 function buildNav(){
   var nav = $('#nav');
   nav.textContent = '';
   NAV.forEach(function(it){
     if(it.group){ nav.appendChild(el('div', {cls:'nav-group', text: it.group})); return; }
+    if(!visitorCanSee(it[3])) return;
     var a = el('a', {cls: it[0]===activeView?'active':''});
     a.appendChild(el('span', {cls:'ico', html: icon(it[2])}));
     a.appendChild(el('span', {text: it[1]}));
@@ -677,6 +767,7 @@ function switchView(name){
   else if(name === 'gallery') loadGallery();
   else if(name === 'media') loadMedia();
   else if(name === 'data') refreshData();
+  else if(name === 'visitors') loadVisitors();
   else $('#main').textContent = '';
 }
 $('#btn-refresh').onclick = function(){ switchView(activeView); };
@@ -1369,6 +1460,104 @@ var PLAT_DANGER = ['deleteFriend','groupKick','groupLeave','groupBan','groupWhol
 function cfgGroupKey(g){
   return g.children && g.children.length === 1 && g.children[0].type === 'object' ? g.children[0].key : 'root';
 }
+// ---------- 访客账号管理 ----------
+var GRANT_LABELS = [
+  ['overview','总览'], ['world_status','世界状态'], ['bot_status','Bot 状态'], ['news','新闻'], ['facts','小事记'],
+  ['stream','意识流'], ['notes','笔记'], ['gallery','相册/媒体'], ['archive','归档'], ['devices','设备'],
+  ['crossing','穿越'], ['definitions','定义文件'], ['config','配置'], ['prompts','提示词'], ['debug','调试(原始请求)'], ['usage','用量']
+];
+var PRESET_LABELS = { operator:'运维员', viewer:'观众', custom:'自定义' };
+function loadVisitors(){
+  var main = $('#main');
+  main.textContent = '';
+  main.appendChild(viewHead('访客账号', '创建只读访客账号，分别控制各自可浏览的数据。运维员可看全部（含调试原始请求）但不含 Bot 状态；观众看世界演化产物（含 Bot 状态），屏蔽定义/配置/调试。'));
+  var holder = el('div', {text:'加载中…', cls:'empty'});
+  main.appendChild(holder);
+  api('GET', '/api/visitors').then(function(r){
+    holder.textContent = '';
+    renderVisitors(holder, r.visitors || []);
+  }).catch(showErr);
+}
+function renderVisitors(holder, visitors){
+  holder.textContent = '';
+  // 新增账号
+  var addBtn = el('button', {cls:'primary', text:'新增访客账号', onclick:function(){
+    openVisitorEditor(null, visitors, function(){ loadVisitors(); });
+  }});
+  holder.appendChild(addBtn);
+  if(!visitors.length){
+    holder.appendChild(el('p', {cls:'empty', text:'还没有访客账号。点上方按钮创建。'}));
+    return;
+  }
+  visitors.forEach(function(v){
+    var row = el('div', {cls:'fld', style:'display:flex;align-items:center;gap:10px;padding:8px 0;border-top:1px solid var(--line)'}, [
+      el('div', {style:'flex:1'}, [
+        el('div', {text:v.username || '(未命名)'}),
+        el('div', {cls:'hint', text: PRESET_LABELS[v.preset] + ' · 创建于 ' + fmtTime(v.createdAt), style:'font-size:11.5px;color:var(--fg-dark)'})
+      ]),
+      el('button', {text:'编辑', onclick:function(){ openVisitorEditor(v, visitors, function(){ loadVisitors(); }); }}),
+      el('button', {text:'删除', onclick:function(){
+        if(!confirm('确定删除访客「' + v.username + '」？')) return;
+        api('DELETE', '/api/visitors', {id:v.id}).then(function(){ toast('已删除', 'ok'); loadVisitors(); }).catch(showErr);
+      }})
+    ]);
+    holder.appendChild(row);
+  });
+}
+function openVisitorEditor(acct, all, done){
+  var isNew = !acct;
+  var username = el('input', {placeholder:'用户名', style:'width:100%'});
+  var pwd = el('input', {type:'password', placeholder: isNew ? '密码' : '留空则不修改密码', style:'width:100%'});
+  var presetSel = el('select', {style:'width:100%'});
+  ['operator','viewer','custom'].forEach(function(p){
+    presetSel.appendChild(el('option', {value:p, text:PRESET_LABELS[p]}));
+  });
+  var grantsBox = el('div', {style:'max-height:260px;overflow:auto;border:1px solid var(--line);border-radius:6px;padding:8px'});
+  var grantChecks = {};
+  function refreshGrants(){
+    grantsBox.textContent = '';
+    var isCustom = presetSel.value === 'custom';
+    GRANT_LABELS.forEach(function(x){
+      // 非 custom 档：用预设，勾选框置灰（仅示意）；custom 档：可勾选 grants
+      var checked = isCustom ? !!((acct && acct.grants || {})[x[0]]) : true;
+      grantChecks[x[0]] = checked;
+      var cb = el('input', {type:'checkbox', checked:checked, disabled: !isCustom});
+      if(isCustom) cb.onchange = function(){ grantChecks[x[0]] = cb.checked; };
+      grantsBox.appendChild(el('label', {style:'display:flex;gap:6px;align-items:center;font-size:12.5px'}, [
+        cb,
+        el('span', {text:x[1]})
+      ]));
+    });
+  }
+  if(acct){
+    username.value = acct.username || '';
+    presetSel.value = acct.preset || 'viewer';
+  } else {
+    presetSel.value = 'viewer';
+  }
+  var customOnly = el('p', {cls:'hint', text:'（数据块勾选仅在「自定义」档生效；其它档用预设范围）', style:'font-size:11.5px;color:var(--fg-dark);margin:6px 0 0'});
+  refreshGrants();
+  presetSel.onchange = function(){ refreshGrants(); };
+  var body = el('div', null, [
+    el('label', {text:'用户名'}), username,
+    el('label', {text: isNew ? '密码' : '新密码（留空不修改）'}), pwd,
+    el('label', {text:'档位'}), presetSel,
+    el('label', {text:'可浏览的数据块'}), grantsBox, customOnly,
+    el('div', {cls:'toolbar', style:'margin-top:10px'}, [
+      el('button', {text:'取消', onclick:hideModal}),
+      el('button', {cls:'primary', text:'保存', onclick:function(){
+        var preset = presetSel.value;
+        var payload = {id: acct ? acct.id : undefined, username: username.value.trim(), preset: preset};
+        if(pwd.value) payload.password = pwd.value;
+        if(preset === 'custom') payload.grants = grantChecks;
+        var req = acct ? {method:'PUT', path:'/api/visitors'} : {method:'POST', path:'/api/visitors'};
+        api(req.method, req.path, payload).then(function(){ toast('已保存', 'ok'); hideModal(); done(); }).catch(showErr);
+      }})
+    ])
+  ]);
+  showModal(isNew ? '新增访客账号' : '编辑访客账号', body);
+}
+
 function loadConfig(){
   var main = $('#main');
   main.textContent = '';
@@ -3066,10 +3255,20 @@ function setPath(obj, arr, val){
 (function(){
   var h = (location.hash || '').slice(1);
   for(var i=0;i<NAV.length;i++){
-    if(NAV[i][0] === h){ activeView = h; break; }
+    if(NAV[i][0] === h && (NAV[i][3] === undefined || visitorCanSee(NAV[i][3]))){ activeView = h; break; }
   }
 })();
 buildNav();
+// 访客若当前视图不可见，回落到第一个可见视图
+(function(){
+  var cur = null;
+  for(var i=0;i<NAV.length;i++){ if(NAV[i][0] === activeView){ cur = NAV[i]; break; } }
+  if(cur && !visitorCanSee(cur[3])){
+    for(var j=0;j<NAV.length;j++){
+      if(!NAV[j].group && visitorCanSee(NAV[j][3])){ activeView = NAV[j][0]; break; }
+    }
+  }
+})();
 switchView(activeView);
 if(activeView !== 'overview') refreshOverview(false);
 connectSSE();
@@ -3078,7 +3277,7 @@ window.addEventListener('hashchange', function(){
   var h = (location.hash || '').slice(1);
   if(h === activeView) return;
   for(var i=0;i<NAV.length;i++){
-    if(NAV[i][0] === h){ switchView(h); return; }
+    if(NAV[i][0] === h && visitorCanSee(NAV[i][3])){ switchView(h); return; }
   }
 });
 // 页面隐藏时挂起 SSE 之外的高频轮询由各视图自查 activeView；此处兜底：
