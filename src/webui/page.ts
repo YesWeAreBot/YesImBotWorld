@@ -416,6 +416,8 @@ function el(tag, attrs, children){
     else if(k === 'cls') n.className = attrs[k];
     else if(k === 'text') n.textContent = attrs[k];
     else if(k.indexOf('on') === 0) n.addEventListener(k.slice(2), attrs[k]);
+    // 布尔属性：用真实布尔赋值而非 setAttribute（HTML 里 checked/disabled/readonly 存在即真，值无所谓）
+    else if(k === 'checked' || k === 'disabled' || k === 'readonly' || k === 'selected' || k === 'multiple') n[k] = !!attrs[k];
     else n.setAttribute(k, attrs[k]);
   }
   if(children){
@@ -1517,37 +1519,62 @@ function openVisitorEditor(acct, all, done){
   ['operator','viewer','custom'].forEach(function(p){
     presetSel.appendChild(el('option', {value:p, text:PRESET_LABELS[p]}));
   });
+  // 预设档的可见块（与后端 PRESET_GRANTS 一致）：选择档位时作为「起点」填入勾选
+  var PRESET_GRANTS = {
+    operator: ['overview','world_status','news','facts','stream','notes','gallery','archive','devices','crossing','definitions','config','prompts','debug','usage'],
+    viewer: ['overview','world_status','bot_status','news','facts','stream','notes','gallery','archive','devices','crossing']
+  };
   var grantsBox = el('div', {style:'max-height:260px;overflow:auto;border:1px solid var(--line);border-radius:6px;padding:8px'});
+  // 勾选状态：唯一来源。初始按账号已存 grants（custom）或预设档范围播种
   var grantChecks = {};
-  function refreshGrants(){
+
+  function applyPreset(preset){
+    GRANT_LABELS.forEach(function(x){ grantChecks[x[0]] = (PRESET_GRANTS[preset] || []).indexOf(x[0]) >= 0; });
+  }
+  // 初始状态：账号已有 grants（不管档位，勾选以 grants 为准，避免预设覆盖用户微调）；否则按档位预设播种
+  var seedPreset;
+  if(acct && acct.grants && Object.keys(acct.grants).length){
+    GRANT_LABELS.forEach(function(x){ grantChecks[x[0]] = !!acct.grants[x[0]]; });
+    seedPreset = acct.preset || 'custom';
+  } else {
+    seedPreset = (isNew ? 'viewer' : (acct ? acct.preset : 'viewer')) || 'viewer';
+    if(seedPreset === 'custom') seedPreset = 'viewer'; // custom 无 grants 时以 viewer 为起点
+    applyPreset(seedPreset);
+  }
+  presetSel.value = seedPreset;
+  if(acct) username.value = acct.username || '';
+
+  function renderGrants(){
     grantsBox.textContent = '';
-    var isCustom = presetSel.value === 'custom';
     GRANT_LABELS.forEach(function(x){
-      // 非 custom 档：用预设，勾选框置灰（仅示意）；custom 档：可勾选 grants
-      var checked = isCustom ? !!((acct && acct.grants || {})[x[0]]) : true;
-      grantChecks[x[0]] = checked;
-      var cb = el('input', {type:'checkbox', checked:checked, disabled: !isCustom});
-      if(isCustom) cb.onchange = function(){ grantChecks[x[0]] = cb.checked; };
+      var cb = el('input', {type:'checkbox', checked: !!grantChecks[x[0]]});
+      cb.onchange = function(){
+        grantChecks[x[0]] = cb.checked;
+        // 手动调整 → 档位自动转「自定义」
+        presetSel.value = 'custom';
+      };
       grantsBox.appendChild(el('label', {style:'display:flex;gap:6px;align-items:center;font-size:12.5px'}, [
         cb,
         el('span', {text:x[1]})
       ]));
     });
   }
-  if(acct){
-    username.value = acct.username || '';
-    presetSel.value = acct.preset || 'viewer';
-  } else {
-    presetSel.value = 'viewer';
-  }
-  var customOnly = el('p', {cls:'hint', text:'（数据块勾选仅在「自定义」档生效；其它档用预设范围）', style:'font-size:11.5px;color:var(--fg-dark);margin:6px 0 0'});
-  refreshGrants();
-  presetSel.onchange = function(){ refreshGrants(); };
+  renderGrants();
+  presetSel.onchange = function(){
+    var p = presetSel.value;
+    if(p !== 'custom'){
+      // 选预设档 → 用预设范围作为起点覆盖勾选
+      applyPreset(p);
+      renderGrants();
+    }
+    // 选「自定义」：保留当前勾选，不做任何覆盖
+  };
+  var tip = el('p', {cls:'hint', text:'选「运维员」或「观众」会套用对应预设范围作起点；之后手动勾选/取消任意项，档位会变为「自定义」。', style:'font-size:11.5px;color:var(--fg-dark);margin:6px 0 0'});
   var body = el('div', null, [
     el('label', {text:'用户名'}), username,
     el('label', {text: isNew ? '密码' : '新密码（留空不修改）'}), pwd,
     el('label', {text:'档位'}), presetSel,
-    el('label', {text:'可浏览的数据块'}), grantsBox, customOnly,
+    el('label', {text:'可浏览的数据块'}), grantsBox, tip,
     el('div', {cls:'toolbar', style:'margin-top:10px'}, [
       el('button', {text:'取消', onclick:hideModal}),
       el('button', {cls:'primary', text:'保存', onclick:function(){
