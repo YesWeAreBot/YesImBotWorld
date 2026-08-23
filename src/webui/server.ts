@@ -30,6 +30,7 @@ import { debug, type DebugEntry } from "./debug.js";
 import { usageStore } from "./usage.js";
 import { llmFetch } from "../llm/http.js";
 import { PAGE_HTML } from "./page.js";
+import { VisitorStore, type VisitorSession, type VisitorGrant, type VisitorPreset } from "./visitors.js";
 
 export interface BotStatusSummary {
   running: boolean;
@@ -166,9 +167,11 @@ export class WebUIServer {
   private unsubDebug: (() => void) | null = null;
   private debounce = new Map<string, NodeJS.Timeout>();
   private readonly cfg: WebUIConfig;
+  private readonly visitors: VisitorStore;
 
   constructor(private host: WebUIHost) {
     this.cfg = host.config.webui;
+    this.visitors = new VisitorStore(path.join(host.webuiDir, "visitors.json"));
   }
 
   async start(): Promise<void> {
@@ -358,14 +361,32 @@ export class WebUIServer {
     const method = (req.method ?? "GET").toUpperCase();
 
     if (pathname === "/api/events") {
-      if (!this.authorized(req, url)) return void sendJSON(res, 401, { error: "需要访问令牌" });
+      const access = this.resolveAccess(req, url);
+      if (!access) return void sendJSON(res, 401, { error: "需要访问令牌" });
+      if (access.kind === "visitor" && !access.session.grants.has("debug")) {
+        return void sendJSON(res, 403, { error: "访客无权访问调试事件流" });
+      }
       this.handleSse(req, res, url.searchParams.get("since"));
       return;
     }
 
     if (pathname.startsWith("/api/")) {
-      if (!this.authorized(req, url)) return void sendJSON(res, 401, { error: "需要访问令牌（webui.token 已设置）" });
-      await this.handleApi(method, pathname, url, req, res);
+      // 登录与账号管理端点为独立鉴权，不走通用 access
+      if (pathname === "/api/login") {
+        await this.handleLogin(req, url, res);
+        return;
+      }
+      if (pathname === "/api/visitors") {
+        await this.handleVisitors(method, url, req, res);
+        return;
+      }
+      const access = this.resolveAccess(req, url);
+      if (!access) return void sendJSON(res, 401, { error: "需要访问令牌" });
+      // 访客只读：所有写方法一律拒绝
+      if (access.kind === "visitor" && method !== "GET") {
+        return void sendJSON(res, 403, { error: "访客无写权限" });
+      }
+      await this.handleApi(method, pathname, url, req, res, access);
       return;
     }
 
@@ -379,11 +400,79 @@ export class WebUIServer {
     sendJSON(res, 404, { error: "Not Found" });
   }
 
-  private authorized(req: http.IncomingMessage, url: URL): boolean {
-    if (!this.cfg.token) return true;
+  /** 解析访问者：admin（token 匹配）→ {kind:"admin"}；访客会话 → {kind:"visitor", session}；否则 null */
+  private resolveAccess(req: http.IncomingMessage, url: URL): { kind: "admin" } | { kind: "visitor"; session: VisitorSession } | null {
     const header = req.headers.authorization ?? "";
-    if (header.startsWith("Bearer ")) return header.slice(7).trim() === this.cfg.token;
-    return url.searchParams.get("token") === this.cfg.token;
+    const bearer = header.startsWith("Bearer ") ? header.slice(7).trim() : null;
+    const visitorToken = url.searchParams.get("visitor") ?? (req.headers["x-visitor-token"] as string | undefined) ?? null;
+
+    // 1. 优先精确匹配 admin token（若设置了 webui.token）
+    if (this.cfg.token && (bearer === this.cfg.token || url.searchParams.get("token") === this.cfg.token)) {
+      return { kind: "admin" };
+    }
+
+    // 2. 带了 visitor 会话：只可能按访客处理（无论 token 是否设置）
+    if (visitorToken) {
+      const session = this.visitors.resolve(visitorToken);
+      if (session) return { kind: "visitor", session };
+      // 无效访客会话：拒绝（不要 fallback 成 admin）
+      return null;
+    }
+
+    // 3. 未设置 admin token：视为 admin（保持旧的"不鉴权"行为）
+    if (!this.cfg.token) return { kind: "admin" };
+
+    // 4. 设置了 admin token 但没给对：拒绝
+    return null;
+  }
+
+  /** 访客登录：POST /api/login {username, password} → {token} 或 401 */
+  private async handleLogin(req: http.IncomingMessage, url: URL, res: http.ServerResponse): Promise<void> {
+    const method = (req.method ?? "GET").toUpperCase();
+    if (method !== "POST") return void sendJSON(res, 405, { error: "仅支持 POST" });
+    const body = await readJson(req, 4 * 1024).catch(() => null);
+    if (!body) return void sendJSON(res, 400, { error: "请求体不是合法 JSON" });
+    const result = await this.visitors.login(String(body.username ?? ""), String(body.password ?? ""));
+    if (!result) return void sendJSON(res, 401, { error: "用户名或密码错误" });
+    sendJSON(res, 200, { ok: true, token: result.token });
+  }
+
+  /** 访客账号管理（仅 admin）：GET 列出 / POST 增 / PUT 改 / DELETE 删 */
+  private async handleVisitors(method: string, url: URL, req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    // 仅 admin 可管理访客账号
+    const header = req.headers.authorization ?? "";
+    const bearer = header.startsWith("Bearer ") ? header.slice(7).trim() : null;
+    const isAdmin = this.cfg.token === "" || bearer === this.cfg.token || url.searchParams.get("token") === this.cfg.token;
+    if (!isAdmin) return void sendJSON(res, 403, { error: "仅管理员可管理访客账号" });
+
+    if (method === "GET") {
+      sendJSON(res, 200, { visitors: await this.visitors.list() });
+      return;
+    }
+    const body = await readJson(req, 1024 * 1024).catch(() => null);
+    if (!body) return void sendJSON(res, 400, { error: "请求体不是合法 JSON" });
+    if (method === "POST") {
+      const r = await this.visitors.create(String(body.username ?? ""), String(body.password ?? ""), (body.preset as VisitorPreset) ?? "viewer");
+      if (!r.ok) return void sendJSON(res, 400, { error: r.error });
+      return void sendJSON(res, 200, { ok: true, visitors: await this.visitors.list() });
+    }
+    if (method === "PUT") {
+      const id = String(body.id ?? "");
+      const r = await this.visitors.update(id, {
+        username: body.username !== undefined ? String(body.username) : undefined,
+        password: body.password !== undefined ? String(body.password) : undefined,
+        preset: body.preset !== undefined ? (body.preset as VisitorPreset) : undefined,
+        grants: body.grants as Partial<Record<VisitorGrant, boolean>> | undefined,
+      });
+      if (!r.ok) return void sendJSON(res, 400, { error: r.error });
+      return void sendJSON(res, 200, { ok: true, visitors: await this.visitors.list() });
+    }
+    if (method === "DELETE") {
+      const r = await this.visitors.remove(String(body.id ?? ""));
+      if (!r.ok) return void sendJSON(res, 400, { error: r.error });
+      return void sendJSON(res, 200, { ok: true, visitors: await this.visitors.list() });
+    }
+    sendJSON(res, 405, { error: "不支持的方法" });
   }
 
   private async handleApi(
@@ -392,9 +481,18 @@ export class WebUIServer {
     url: URL,
     req: http.IncomingMessage,
     res: http.ServerResponse,
+    access: { kind: "admin" } | { kind: "visitor"; session: VisitorSession },
   ): Promise<void> {
     const host = this.host;
     const q = url.searchParams;
+
+    // 访客分级过滤：按端点映射到数据块，无授权则 403
+    if (access.kind === "visitor") {
+      const grant = grantForEndpoint(pathname, method);
+      if (grant && !this.visitors.can(access.session, grant)) {
+        return void sendJSON(res, 403, { error: `访客无权访问该数据（需要 ${grant} 权限）` });
+      }
+    }
 
     // ---------- 概览 / 状态 ----------
     if (pathname === "/api/overview" && method === "GET") {
@@ -403,10 +501,12 @@ export class WebUIServer {
       const news = await host.files.readNews(8);
       const facts = await host.files.readFacts(8);
       const counts = await host.gallery.counts();
+      const isVisitor = access.kind === "visitor";
+      const can = (g: VisitorGrant) => !isVisitor || this.visitors.can(access.session, g);
       sendJSON(res, 200, {
         version: host.version,
-        baseDir: host.baseDir,
-        webuiDir: host.webuiDir,
+        // 敏感路径（baseDir / webuiDir / tokenSet / addresses）仅 admin 可见
+        ...(isVisitor ? {} : { baseDir: host.baseDir, webuiDir: host.webuiDir }),
         initialized: await host.isInitialized(),
         worldRunning: host.worldRunning(),
         worldQueue: host.worldQueue(),
@@ -423,12 +523,11 @@ export class WebUIServer {
         computerOn: host.computerOn(),
         phoneDown: host.phoneDown(),
         focusChannels: host.focusChannels(),
-        news,
-        facts,
-        galleryCounts: counts,
-        crossing: host.crossingInfo(),
-        tokenSet: !!this.cfg.token,
-        addresses: accessUrls(this.cfg.host, this.cfg.port),
+        news: can("news") ? news : undefined,
+        facts: can("facts") ? facts : undefined,
+        galleryCounts: can("gallery") ? counts : undefined,
+        crossing: can("crossing") ? host.crossingInfo() : undefined,
+        ...(isVisitor ? {} : { tokenSet: !!this.cfg.token, addresses: accessUrls(this.cfg.host, this.cfg.port) }),
       });
       return;
     }
@@ -491,17 +590,21 @@ export class WebUIServer {
     }
 
     if (pathname === "/api/state" && method === "GET") {
-      sendJSON(res, 200, {
-        botStatus: await host.files.readBotStatus(),
-        worldStatus: await host.files.readWorldStatus(),
-        news: await readAllNews(host.files.news),
-        facts: await readAllNews(host.files.facts),
-        botDef: await host.files.readText(host.files.botDef),
-        worldDef: await host.files.readText(host.files.worldDef),
-        meta: await host.files.readMeta(),
-        phoneShell: await host.files.readPhoneShell(),
+      // 打包端点：对访客按 grant 裁剪字段（user 输入的 botDef/worldDef 需 definitions 权限）
+      const isVisitor = access.kind === "visitor";
+      const can = (g: VisitorGrant) => !isVisitor || this.visitors.can(access.session, g);
+      const payload: Record<string, unknown> = {
+        botStatus: can("bot_status") ? await host.files.readBotStatus() : undefined,
+        worldStatus: can("world_status") ? await host.files.readWorldStatus() : undefined,
+        news: can("news") ? await readAllNews(host.files.news) : undefined,
+        facts: can("facts") ? await readAllNews(host.files.facts) : undefined,
+        botDef: can("definitions") ? await host.files.readText(host.files.botDef) : undefined,
+        worldDef: can("definitions") ? await host.files.readText(host.files.worldDef) : undefined,
+        meta: can("world_status") ? await host.files.readMeta() : undefined,
+        phoneShell: can("world_status") ? await host.files.readPhoneShell() : undefined,
         initialized: await host.isInitialized(),
-      });
+      };
+      sendJSON(res, 200, payload);
       return;
     }
 
@@ -1259,6 +1362,47 @@ async function sendFile(res: http.ServerResponse, file: string, mime?: string): 
 
 function safeBasename(name: string): boolean {
   return !!name && !name.includes("/") && !name.includes("\\") && !name.includes("..");
+}
+
+/**
+ * 端点 → 数据块映射（用于访客分级过滤）。返回 null 表示「无需整端点授权」：
+ * 打包端点（overview/state）的字段级裁剪已在 handleApi 内处理，或（health）本就公开。
+ * 写端点也会走进这里，但访客的写请求已在 handle 层统一 403，不会到达。
+ */
+function grantForEndpoint(pathname: string, method: string): VisitorGrant | null {
+  // 设备
+  if (pathname === "/api/devices" || pathname === "/api/computer/screen") return "devices";
+
+  // 打包端点：字段级裁剪
+  if (pathname === "/api/overview" || pathname === "/api/state") return null;
+  if (pathname === "/api/state/phone-shell") return "world_status";
+
+  // 定义 / 配置 / 提示词 / 用量 / 调试
+  if (pathname === "/api/definitions/bot" || pathname === "/api/definitions/world") return "definitions";
+  if (pathname === "/api/config") return "config";
+  if (pathname === "/api/prompts") return "prompts";
+  if (pathname === "/api/usage") return "usage";
+  if (pathname === "/api/debug") return "debug";
+
+  // 意识流 / 归档
+  if (pathname === "/api/stream") return "stream";
+  if (pathname === "/api/archive" || pathname === "/api/archive/file") return "archive";
+
+  // 相册 / 媒体
+  if (pathname === "/api/gallery" || pathname === "/api/gallery/file") return "gallery";
+  if (pathname === "/api/media" || pathname === "/api/media/file") return "gallery";
+
+  // 笔记 / 数据文件
+  if (pathname === "/api/notes" || pathname === "/api/data" || pathname === "/api/data/file") return "notes";
+
+  // 穿越状态
+  if (pathname === "/api/crossing") return "crossing";
+
+  // 健康检查：公开
+  if (pathname === "/api/health") return null;
+
+  // 未匹配：默认无需整端点授权（admin 场景或已在字段裁剪内覆盖）
+  return null;
 }
 
 async function readBody(req: http.IncomingMessage, limit: number): Promise<Buffer> {
