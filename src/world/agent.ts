@@ -143,6 +143,23 @@ const WORLD_TOOLS: ChatToolDef[] = [
   {
     type: "function",
     function: {
+      name: "rename_bot",
+      description:
+        "更新常驻 Bot 的名字（meta 里机器可读的那份）。**仅当**剧情里 Bot 的名字实际发生变更时使用" +
+        "（被赐名、改姓、伪装新身份、称号变化、更名等）。新名字要同步写进 bot_status 的状态档案（用 update(bot_status)），" +
+        "并通过 send_event 以符合世界观的方式告知 Bot 本人。此后访客接待等任务都会用这个新名字来称呼常驻 Bot。",
+      parameters: {
+        type: "object",
+        properties: {
+          name: { type: "string", description: "Bot 的新名字（它在世界里被人如何称呼的新称呼）" },
+        },
+        required: ["name"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "expel_visitor",
       description:
         "（有访客在场时可用）强行驱逐某位访客离开本世界，切断其后续一切主动互动能力。**仅当**世界演化中" +
@@ -1358,6 +1375,16 @@ export class WorldAgent {
         }
         case "check_time":
           return this.clock.timeLine();
+        case "rename_bot": {
+          const name = String(args.name ?? "").trim();
+          if (!name) return "新名字不能为空";
+          if (name.length > 64) return "名字过长（最多 64 字符）";
+          const meta = await this.files.readMeta();
+          await this.files.writeMeta({ ...meta, botName: name });
+          this.botName = name;
+          this.logger.info("常驻 Bot 更名：%s -> %s", meta.botName ?? "（未命名）", name);
+          return `常驻 Bot 现在叫「${name}」（机器可读的名字已更新；请记得同步 update bot_status 里的名字，并 send_event 告知 Bot 本人）。`;
+        }
         case "set_tingle": {
           const units = Number(args.units);
           if (!Number.isFinite(units) || units <= 0) return "units 必须是大于 0 的数字";
