@@ -1636,6 +1636,10 @@ function playerWorldPanel(){
   var box = el('div', {cls:'section'});
   box.appendChild(el('h3', {html:'世界互动 <span class="hint">' + esc(PLAYER_STATE.worldName || '') + '</span>'}));
   var body = el('div', {cls:'body'});
+  // 角色状态（World 维护：身份 + 当前位置/状态/随身物/正在做的事）
+  var statusSec = el('div', {id:'player-status', style:'margin-bottom:12px;padding:10px;background:var(--panel);border:1px solid var(--line);border-radius:8px'});
+  body.appendChild(statusSec);
+  playerRenderStatus(statusSec);
   // 剧情流
   var feed = el('div', {id:'player-feed', style:'max-height:360px;overflow:auto;border:1px solid var(--line);border-radius:8px;padding:10px;margin-bottom:12px'});
   body.appendChild(feed);
@@ -1661,6 +1665,23 @@ function playerRefreshActState(){
   var btns = $('#main').querySelectorAll('button');
   // 行动按钮禁用状态跟随 actBusy（宽泛匹配：不影响其它按钮，仅文字为「行动」者）
   btns.forEach(function(b){ if(b.textContent === '行动'){ b.disabled = !!PLAYER_STATE.actBusy; } });
+}
+
+// 渲染玩家的角色状态（World 维护的 persona：身份 + 状态）
+function playerRenderStatus(sec){
+  sec.textContent = '';
+  var profile = VISITOR_PLAYER_PROFILE;
+  sec.appendChild(el('div', {style:'font-size:12px;color:var(--fg-dark);margin-bottom:4px', text:'你的角色'}));
+  if(profile){
+    sec.appendChild(el('div', {style:'font-size:12.5px;white-space:pre-wrap', html: esc(profile.persona || '（尚无状态）')}));
+  } else {
+    sec.appendChild(el('div', {style:'font-size:12.5px;color:var(--fg-dark)', text:'（尚未设定角色）'}));
+  }
+}
+
+function playerRefreshStatus(){
+  var sec = $('#player-status');
+  if(sec) playerRenderStatus(sec);
 }
 
 function playerRenderFeed(feed){
@@ -1721,6 +1742,12 @@ function playerConnectEvents(token){
       if(!msg.ok) toast('行动裁定失败', 'err');
       // 刷新「等待中」提示（actBusy 已变 false，重渲染面板）
       playerRefreshActState();
+    } else if(msg.type === 'status_update' && msg.content){
+      // World 更新了玩家的状态档案（整体覆盖：身份 + 状态）。本地更新并持久化到账号
+      VISITOR_PLAYER_PROFILE = { name: VISITOR_PLAYER_PROFILE.name, persona: msg.content };
+      localStorage.setItem('wui_player_profile', JSON.stringify(VISITOR_PLAYER_PROFILE));
+      api('PUT', '/api/player/profile', { name: VISITOR_PLAYER_PROFILE.name, persona: msg.content }).catch(function(){});
+      playerRefreshStatus();
     } else if(msg.type === 'farewell'){
       PLAYER_STATE.inWorld = false;
       PLAYER_STATE.token = '';
