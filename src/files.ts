@@ -6,6 +6,8 @@ import type { NewsEntry } from "./types.js";
 export interface WorldMeta {
   /** 世界是否是现实地球世界（决定天气应用查真实天气还是由 World-LLM 生成） */
   realWorld?: boolean;
+  /** 常驻 Bot 的名字（创世时由 World-LLM 从 Bot_Definition 判定；用户改定义后可重判/手动改） */
+  botName?: string;
   /** 手机屏幕分辨率（配置 apps.phoneResolution 为 auto 时创世由 World-LLM 决定） */
   phone?: { width?: number; height?: number };
   /**

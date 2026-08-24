@@ -270,6 +270,8 @@ export class WorldAgent {
    * - check：系统提示只放名单，档案用 check_visitor 工具按需查看（省上下文窗口）。
    */
   visitorPersonaMode: "pinned" | "check" = "pinned";
+  /** 常驻 Bot 的名字（创世判定，内存缓存，供 visitor prompt 硬区分；systemPrompt 每次读 meta 刷新） */
+  private botName = "";
   /** 穿越：最近离开的访客（下一次 Tingle 时提醒世界清理其在场记述、停止续写其情节） */
   private departedVisitors: string[] = [];
   /**
@@ -341,6 +343,14 @@ export class WorldAgent {
   /** 注册/清除现实世界新闻素材提供者（service 调用；现实世界设定下 Tingle 用它抓真实新闻摘编） */
   setRealNewsProvider(fn: (() => Promise<string[]>) | null): void {
     this.realNewsProvider = fn;
+  }
+
+  /** 世界启动时若 meta.json 还没有 botName（旧世界），从定义补判一次（失败静默，下次仍会重试） */
+  async ensureBotName(): Promise<void> {
+    const meta = await this.files.readMeta();
+    if (meta.botName) return;
+    const { botDef } = await this.files.readDefinitions();
+    await this.setupBotName(botDef);
   }
 
   /** 世界是否是现实地球世界（创世判定持久化在 meta.json；旧世界回退到时钟同步模式） */
@@ -680,6 +690,7 @@ export class WorldAgent {
       persona: v.persona || "（访客没有留下自我描述）",
       personaWhere: this.personaWhere(),
       modeSemantic: this.modeSemantic(v),
+      botName: this.botName || "（常驻 Bot，名字未定）",
     });
     if (this.remote) {
       text +=
@@ -701,6 +712,7 @@ export class WorldAgent {
   async visitorArrive(v: VisitorRef, deliver: (content: string) => void): Promise<boolean> {
     const task = fill(this.prompts.world.visitorArrive, {
       name: v.name,
+      botName: this.botName || "（常驻 Bot，名字未定）",
       persona: v.persona || "（访客没有留下自我描述）",
       personaWhere: this.personaWhere(),
       modeSemantic: this.modeSemantic(v),
@@ -741,6 +753,7 @@ export class WorldAgent {
       "\n\n" +
       fill(this.prompts.world.visitorAct, {
         name: v.name,
+        botName: this.botName || "（常驻 Bot，名字未定）",
         desc,
         issuedAt: this.clock.timeLine(now),
         duration,
@@ -757,6 +770,7 @@ export class WorldAgent {
       "\n\n" +
       fill(this.prompts.world.visitorWait, {
         name: v.name,
+        botName: this.botName || "（常驻 Bot，名字未定）",
         issuedAt: this.clock.timeLine(now),
         n,
         expectedAt: this.clock.timeLine(now + Math.max(n, 0)),
@@ -770,7 +784,11 @@ export class WorldAgent {
     const task =
       this.visitorPreamble(v) +
       "\n\n" +
-      fill(this.prompts.world.visitorCheckTime, { name: v.name, timeLine: this.clock.timeLine() });
+      fill(this.prompts.world.visitorCheckTime, {
+        name: v.name,
+        botName: this.botName || "（常驻 Bot，名字未定）",
+        timeLine: this.clock.timeLine(),
+      });
     // 只读任务：走并行队列（不写状态，只 check + send_event）
     return this.invokeWithTools({ task, deliver, ...this.visitorInvocationExtras() }, true);
   }
@@ -795,6 +813,18 @@ export class WorldAgent {
   }
 
   /** 创世第一步：判定世界性质并持久化（天气应用等依赖它区分现实/虚构） */
+  private async assessBotName(botDef: string): Promise<string | null> {
+    const system = this.prompts.world.assessBotNameSystem;
+    const user = fill(this.prompts.world.assessBotNameUser, { botDef });
+    const result = await this.client.complete([
+      { role: "system", content: system },
+      { role: "user", content: user },
+    ]);
+    const parsed = extractJson(result.content) as Record<string, unknown> | null;
+    const name = parsed && typeof parsed.name === "string" ? parsed.name.trim() : "";
+    return name || null;
+  }
+
   private async setupWorldMeta(worldDef: string): Promise<void> {
     let real: boolean | null = null;
     try {
@@ -808,6 +838,23 @@ export class WorldAgent {
     const meta = await this.files.readMeta();
     await this.files.writeMeta({ ...meta, realWorld });
     this.logger.info("世界性质：%s", realWorld ? "现实地球世界" : "虚构世界");
+  }
+
+  /** 创世/改定义：从 Bot_Definition 判定常驻 Bot 名字并持久化到 meta.json（供访客 prompt 硬区分） */
+  private async setupBotName(botDef: string): Promise<void> {
+    let name: string | null = null;
+    try {
+      name = await this.assessBotName(botDef);
+    } catch (err) {
+      this.logger.warn("Bot 名字判定调用失败: %s", err);
+    }
+    const meta = await this.files.readMeta();
+    if (name) {
+      await this.files.writeMeta({ ...meta, botName: name });
+      this.logger.info("常驻 Bot 名字（判定）：%s", name);
+    } else {
+      this.logger.warn("Bot_Definition 中未识别出明确名字，botName 保持 %s", meta.botName ?? "空");
+    }
   }
 
   /** 创世：依据世界定义与用户设定的初始时刻，生成世界的历法 */
@@ -927,6 +974,7 @@ export class WorldAgent {
   /** 初始化：判定世界性质、生成历法（同步模式跳过）、判定手机规格，再根据用户定义生成状态文件 */
   async initialize(botDef: string, worldDef: string): Promise<void> {
     await this.enqueue(() => this.setupWorldMeta(worldDef));
+    await this.enqueue(() => this.setupBotName(botDef));
     if (this.clock.syncRealTime) {
       this.logger.info("世界时间与现实同步，跳过历法生成；创世时刻 %s", this.clock.clockString(0));
     } else {
@@ -951,6 +999,8 @@ export class WorldAgent {
     worldDef: string,
     deliver: (content: string) => void,
   ): Promise<void> {
+    // 定义可能改了 Bot 名字：先重判（失败沿用旧名），再据此调整世界状态
+    await this.enqueue(() => this.setupBotName(botDef));
     const task = fill(this.prompts.world.reconcileDefinitions, {
       timeLine: this.clock.timeLine(),
       botDef,
@@ -1091,8 +1141,11 @@ export class WorldAgent {
 
   private async systemPrompt(): Promise<string> {
     const { worldDef } = await this.files.readDefinitions();
+    const meta = await this.files.readMeta();
+    this.botName = meta.botName ?? "";
     let sys = fill(this.prompts.world.system, {
       worldDef,
+      botName: this.botName || "（未命名）",
       timeLine: this.clock.timeLine(),
     });
     // 在场访客集中放在系统提示末尾（按到达顺序，逐字稳定）：

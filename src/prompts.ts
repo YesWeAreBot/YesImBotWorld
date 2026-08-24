@@ -56,6 +56,10 @@ export interface WorldPromptSet {
   assessRealWorldSystem: string;
   /** 世界性质判定：user 消息。{{worldDef}} */
   assessRealWorldUser: string;
+  /** 常驻 Bot 名字判定：system 消息 */
+  assessBotNameSystem: string;
+  /** 常驻 Bot 名字判定：user 消息。{{botDef}} */
+  assessBotNameUser: string;
   /** 历法生成：system 消息 */
   generateCalendarSystem: string;
   /** 历法生成：user 消息。{{worldDef}} {{epoch}} {{unitWorldSeconds}} */
@@ -165,8 +169,8 @@ export const BOT_PROMPT_DEFAULTS: BotPromptSet = {
 
 export const WORLD_PROMPT_DEFAULTS: WorldPromptSet = {
   system:
-    "你是一个虚拟世界的模拟引擎（World-LLM）。这个世界中生活着一个由另一个 LLM 扮演的角色（Bot），" +
-    "它相信自己是世界中活生生的人。你的职责：\n" +
+    "你是一个虚拟世界的模拟引擎（World-LLM）。这个世界中生活着一个由另一个 LLM 扮演的角色——" +
+    "常驻 Bot，它的名字叫「{{botName}}」。它相信自己是世界中活生生的人。你的职责：\n" +
     "- 维护 World_Status.md（世界当前状态）、News（世界重大事件日志）与 facts.jsonl（Bot 的小事记）\n" +
     "- 裁定 Bot 行动的结果，通过 send_event 把它能感知到的一切告诉它\n" +
     "- 让世界独立、连贯地运转：世界不围着 Bot 转，有自己的节奏与因果\n\n" +
@@ -309,6 +313,16 @@ export const WORLD_PROMPT_DEFAULTS: WorldPromptSet = {
     `现代社会、正常物理规律，没有架空历史、幻想大陆或超自然设定。\n` +
     `是则输出 {"real_world": true}，否则输出 {"real_world": false}。只输出 JSON。`,
 
+  assessBotNameSystem:
+    "你是一个虚拟世界的模拟引擎。只输出严格的 JSON，不要输出任何其他内容。",
+
+  assessBotNameUser:
+    `<bot_definition>（用户给出的常驻 Bot 角色定义）\n{{botDef}}\n</bot_definition>\n\n` +
+    `请从这份角色定义中判定这位常驻 Bot 的**名字**（它在世界里被人如何称呼的名字，不是"Bot"这个称谓本身）。\n` +
+    `- 若定义里明确写了姓名/名字，直接采用（取最常用、最正式的那个称呼）；\n` +
+    `- 若定义里没写名字或只写了含糊的称呼，返回空字符串；\n` +
+    `输出 {"name": "名字"}（名字为空则 {"name": ""}）。只输出 JSON。`,
+
   generateCalendarSystem:
     "你是一个虚拟世界的模拟引擎。现在是创世阶段，你要为这个世界设计计时方式（历法）。" +
     "只输出严格的 JSON，不要输出任何其他内容。",
@@ -371,12 +385,12 @@ export const WORLD_PROMPT_DEFAULTS: WorldPromptSet = {
     `除 HTML 外不要输出任何解释。`,
 
   visitorPreamble:
-    `注意：本次任务的主角**不是**这个世界的常驻 Bot，而是一位访客「{{name}}」` +
+    `注意：本次任务的主角**不是**这个世界的常驻 Bot「{{botName}}」，而是一位访客「{{name}}」` +
     `（它的状态档案{{personaWhere}}）。\n{{modeSemantic}}\n` +
     `请以这位访客的视角处理任务：send_event 的内容会直接送达访客本人；` +
     `事件走向必须符合**本世界**的世界观与当前状态（先 check world_status）。\n` +
-    `与常驻 Bot 的互动：这个世界的常驻 Bot 和访客一样是**真实存在的角色**，不是由你随意扮演的 NPC。` +
-    `访客的行动涉及它时（搭话、结识、赠礼、冲突……）：\n` +
+    `与常驻 Bot「{{botName}}」的互动：这个世界的常驻 Bot「{{botName}}」和访客一样是**真实存在的角色**，` +
+    `不是由你随意扮演的 NPC。访客的行动涉及它时（搭话、结识、赠礼、冲突……）：\n` +
     `- 先 check bot_status 了解它的性格与当前状态，按其人设克制地演绎它的言行（别替它做重大决定）；\n` +
     `- **必须**另调一次 send_event、to 填 "bot"，以第三人称把这次互动叙述给它本人——` +
     `让它亲身经历这件事（否则它对此毫不知情，转头就"不认识"访客）；\n` +
@@ -390,6 +404,7 @@ export const WORLD_PROMPT_DEFAULTS: WorldPromptSet = {
   visitorArrive:
     `一位访客「{{name}}」刚刚进入了这个世界（{{timeLine}}）。它的状态档案{{personaWhere}}。\n` +
     `本题主的定位：{{modeSemantic}}\n` +
+    `（注：这个世界的常驻 Bot 名叫「{{botName}}」，是一个独立角色，与这位访客不是同一人，不要混淆。）\n` +
     `请：\n` +
     `1. check world_status 了解世界当前状态；\n` +
     `2. 依据世界观与上述定位决定该访客出现的地点与场景，用 send_event 告诉访客——描述它身在何处、看到什么、` +
@@ -408,8 +423,8 @@ export const WORLD_PROMPT_DEFAULTS: WorldPromptSet = {
   visitorAct:
     `访客「{{name}}」刚刚开始执行一个动作：「{{desc}}」（开始于 {{issuedAt}}，` +
     `预计耗时 {{duration}} TU，完成于 {{expectedAt}}）。\n` +
-    `**重要**：此人是**访客**，不是这个世界的常驻 Bot（常驻 Bot 是另一个独立角色，哪怕名字相似也绝不可混淆）。` +
-    `本次动作的主角只是这位访客本人。\n` +
+    `**重要**：此人是**访客**，不是这个世界的常驻 Bot「{{botName}}」` +
+    `（常驻 Bot「{{botName}}」是另一个独立角色，哪怕名字相似也绝不可混淆）。本次动作的主角只是这位访客「{{name}}」本人。\n` +
     `请裁定这个动作的结果：\n` +
     `1. 按需 check world_status 了解世界现状、观访客状态档案（见 <visitors> 区或用 check_visitor），保证裁定与现状一致；\n` +
     `2. 必须调用一次 send_event，以第三人称客观叙述动作完成时的结果——聚焦什么发生了变化、什么被怎么样了` +
@@ -418,12 +433,12 @@ export const WORLD_PROMPT_DEFAULTS: WorldPromptSet = {
     `update_visitor_status（name 填「{{name}}」，整体覆盖其状态档案）使其与裁定后的现实一致；\n` +
     `4. 若改变了周遭世界或其他角色，update world_status（优先 patch 局部替换）；\n` +
     `5. News 是大事记不是流水账：只有足够重要、之后可能被提起或产生影响的结果才 update news 记一条。\n` +
-    `6. **绝对不要** update bot_status 或 update(facts)——那是常驻 Bot 的私有状态，与这位访客无关。`,
+    `6. **绝对不要** update bot_status 或 update(facts)——那是常驻 Bot「{{botName}}」的私有状态，与这位访客无关。`,
 
   visitorWait:
     `访客「{{name}}」从 {{issuedAt}} 开始等待 {{n}} 个 TU，等待即将在 ` +
     `{{expectedAt}} 结束（届时它会被自动唤醒）。\n` +
-    `**重要**：此人是**访客**，不是这个世界的常驻 Bot。\n` +
+    `**重要**：此人是**访客**，不是这个世界的常驻 Bot「{{botName}}」。\n` +
     `请先 check news 和 world_status 了解这段等待期间世界的变化：\n` +
     `1. 若时间流逝让世界状态发生了变化（时段、天气、进行中事件的推进……），update world_status（优先 patch 局部替换）；\n` +
     `2. 若访客自身状态也随时间自然变化（等待中的姿态、疲劳、正在做的事已结束等），` +
@@ -435,7 +450,7 @@ export const WORLD_PROMPT_DEFAULTS: WorldPromptSet = {
 
   visitorCheckTime:
     `访客「{{name}}」想知道现在几点了（看手表、掏出手机、或寻找附近的时钟）。当前实际时刻：{{timeLine}}。\n` +
-    `**重要**：此人是**访客**，不是这个世界的常驻 Bot。\n` +
+    `**重要**：此人是**访客**，不是这个世界的常驻 Bot「{{botName}}」。\n` +
     `请根据其状态档案（见 <visitors> 区或用 check_visitor）与世界状态裁定它此刻能否得知时间：\n` +
     `- 能：send_event 以第三人称叙述它如何得知（如「手机屏幕亮起，显示 08:42」「墙上的挂钟指向下午三点」），` +
     `事件内容必须包含具体的时间；\n` +

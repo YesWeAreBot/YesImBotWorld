@@ -536,6 +536,9 @@ export class WorldService extends Service<Config> {
     // 访客与 Bot 的互动送达 Bot 本人（wake：有人当面互动应唤醒等待中的 Bot）
     this.world.setHostBotDeliver((content) => this.bot?.pushEvent("world", content, { wake: true }));
 
+    // 旧世界 meta.json 缺 botName（新字段）：从定义补判一次（不阻塞启动，失败下次启动再试）
+    void this.world.ensureBotName().catch((err) => this.logger.warn("Bot 名字补判失败: %s", err));
+
     this.bot.start();
     this.tingle = new TingleTimer(
       this.config.clock,
