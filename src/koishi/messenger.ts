@@ -496,6 +496,9 @@ export class KoishiMessenger implements MessengerApi {
           elements.push(h("at", { id: quoted.userId, name: quoted.username || undefined }), h.text(" "));
           stored += `@${quoted.username || quoted.userId} `;
           atNote = `，并 @ 了 ${quoted.username || quoted.userId}`;
+          // 去重兜底：reply_to 已自动 @ 了原发送人，把 msg 里指向同一人的 <at id> 剥掉（避免连续重复 @）。
+          // 只剥"恰好这个 user id"的标签，不伤及 @ 他人的正常写法。
+          msg = stripAtTagById(msg, quoted.userId).trimStart();
         }
       }
     }
@@ -1971,6 +1974,19 @@ export function parseTagAttrs(raw: string): Record<string, string> {
     attrs[a[1]!] = unescTag(a[2] ?? a[3] ?? a[4] ?? "");
   }
   return attrs;
+}
+
+/**
+ * 从文本里剥离指向指定 user id 的 <at …/> 标签（去重兜底：reply_to 已自动 @ 了此人，
+ * Bot 又在 msg 里手写了同一个 <at id>，这里剥掉后者避免连续重复 @）。
+ * 只匹配 id 恰好等于目标 id 的标签；不伤及 @ 他人、<at type="all"/> 或裸 @名字。
+ */
+function stripAtTagById(text: string, userId: string): string {
+  if (!userId) return text;
+  return text.replace(/<at\s+([^<>]*?)\/?>/g, (whole, attrsRaw: string) => {
+    const attrs = parseTagAttrs(attrsRaw);
+    return attrs.id === userId ? "" : whole;
+  });
 }
 
 /**
