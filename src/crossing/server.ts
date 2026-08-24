@@ -67,6 +67,16 @@ export class CrossingServer {
     return this.host.cfg.worldName.trim() || "未命名世界";
   }
 
+  /** 当前世界观时间戳（`T=12.5（世界时间 ...）`）；World 未运行则为空串 */
+  private worldTimeLine(): string {
+    return this.host.clock()?.timeLine() ?? "";
+  }
+
+  /** 推一条剧情事件给访客，附带当前世界观时间戳 */
+  private pushEvent(session: VisitorSession, content: string): void {
+    this.push(session, { type: "event", content, timeLine: this.worldTimeLine() });
+  }
+
   /**
    * 当前在场访客的完整通道（按到达顺序，逐字稳定）：
    * 状态档案进 World-LLM 系统提示的 <visitors> 区、send_event to= 定向投递、
@@ -76,7 +86,7 @@ export class CrossingServer {
     return [...this.sessions.values()].map((s) => ({
       name: s.name,
       persona: s.persona,
-      deliver: (content: string) => this.push(s, { type: "event", content }),
+      deliver: (content: string) => this.pushEvent(s, content),
       updateStatus: s.updateStatus,
     }));
   }
@@ -131,7 +141,7 @@ export class CrossingServer {
       .wakeDormant()
       .catch((err) => this.host.logger.warn("[穿越] 沉睡补叙失败: %s", err));
     void this.host.world
-      .visitorArrive(session, (content) => this.push(session, { type: "event", content }))
+      .visitorArrive(session, (content) => this.pushEvent(session, content))
       .catch((err) => this.host.logger.warn("[穿越] 玩家到达叙事失败: %s", err));
     return { ok: true, token: session.token, worldName: this.worldName, timeLine };
   }
@@ -277,7 +287,7 @@ export class CrossingServer {
       .wakeDormant()
       .catch((err) => this.host.logger.warn("[穿越] 沉睡补叙失败: %s", err));
     void this.host.world
-      .visitorArrive(session, (content) => this.push(session, { type: "event", content }))
+      .visitorArrive(session, (content) => this.pushEvent(session, content))
       .catch((err) => this.host.logger.warn("[穿越] 到达叙事失败: %s", err));
   }
 
@@ -349,7 +359,7 @@ export class CrossingServer {
     // 跨部署 Bot 访客保持原来的「收集后聚合到 task_result」（一次 deliver 进意识流）
     const deliver = (content: string) => {
       parts.push(content);
-      if (session.live) this.push(session, { type: "event", content });
+      if (session.live) this.pushEvent(session, content);
     };
     this.host.logger.info("[穿越] 访客「%s」任务 %s 开始（kind=%s, live=%s）", session.name, taskId, kind, session.live);
     let ok = false;

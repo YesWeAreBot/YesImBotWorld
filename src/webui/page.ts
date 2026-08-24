@@ -392,7 +392,7 @@ try { VISITOR_GRANTS = JSON.parse(localStorage.getItem('wui_visitor_grants') || 
 var VISITOR_PRESET = localStorage.getItem('wui_visitor_preset') || '';
 var VISITOR_PLAYER_PROFILE = null; // { name, persona }
 try { VISITOR_PLAYER_PROFILE = JSON.parse(localStorage.getItem('wui_player_profile') || 'null'); } catch(e) { VISITOR_PLAYER_PROFILE = null; }
-var PLAYER_STATE = { token: '', worldName: '', inWorld: false, events: [], actBusy: false };
+var PLAYER_STATE = { token: '', worldName: '', inWorld: false, events: [], actBusy: false, sortAsc: false, lastTimeLine: '' };
 var activeView = 'overview';
 // SSE 断线续传锚点：跨页面加载持久化，避免每次无缓存刷新都从 0 重放整段调试历史
 var lastEventId = Number(localStorage.getItem('wui_last_id') || 0);
@@ -1721,16 +1721,39 @@ function playerRefreshStatus(){
   if(sec) playerRenderStatus(sec);
 }
 
+// 事件流渲染：默认倒序（最新在上），可切换为正序；玩家行动与世界剧情交替显示并带世界观时间戳
 function playerRenderFeed(feed){
   feed.textContent = '';
-  if(!PLAYER_STATE.events.length){
+  // 排序切换按钮
+  var sortBtn = el('button', {cls:'ghost', text: PLAYER_STATE.sortAsc ? '改为最新在上 ▲' : '改为最早在上 ▼', onclick:function(){
+    PLAYER_STATE.sortAsc = !PLAYER_STATE.sortAsc;
+    playerRefreshFeed();
+  }});
+  feed.appendChild(el('div', {cls:'toolbar', style:'margin-bottom:6px'}, [sortBtn, el('span', {cls:'spacer'})]));
+  var list = PLAYER_STATE.events.slice();
+  if(!PLAYER_STATE.sortAsc) list.reverse(); // 默认倒序：最新在上
+  if(!list.length){
     feed.appendChild(el('p', {cls:'empty', text:'（还没有剧情——行动后世界会告诉你发生了什么）'}));
     return;
   }
-  PLAYER_STATE.events.forEach(function(ev){
-    feed.appendChild(el('div', {style:'padding:6px 0;border-bottom:1px solid var(--line)', html: '<span style="color:var(--warn)">【世界】</span> ' + esc(ev.content)}));
+  list.forEach(function(ev){
+    var t = el('div', {style:'font-size:11px;color:var(--fg-dim);margin-bottom:2px', text: ev.timeLine ? '◷ ' + ev.timeLine : ''});
+    var row;
+    if(ev.type === 'player'){
+      // 玩家行动：右侧气泡
+      row = el('div', {style:'text-align:right;padding:4px 0 6px'}, [
+        el('div', {style:'display:inline-block;max-width:86%;text-align:left;padding:6px 10px;border-radius:10px 10px 2px 10px;background:var(--info);color:#fff;font-size:12.5px;white-space:pre-wrap', html: esc(ev.content)])
+      ]);
+    } else {
+      // 世界剧情：左侧气泡 + 【世界】标签
+      row = el('div', {style:'padding:4px 0 6px'}, [
+        el('div', {style:'display:inline-block;max-width:86%;padding:6px 10px;border-radius:10px 10px 10px 2px;background:var(--panel);border:1px solid var(--line);font-size:12.5px;white-space:pre-wrap', html: '<span style="color:var(--warn)">【世界】</span> ' + esc(ev.content)})
+      ]);
+    }
+    feed.appendChild(el('div', {style:'padding:4px 0;border-bottom:1px solid var(--line)'}, [t, row]));
   });
-  feed.scrollTop = feed.scrollHeight;
+  // 倒序（最新在上）时定位顶部；正序则滚动到底部
+  if(PLAYER_STATE.sortAsc) feed.scrollTop = feed.scrollHeight; else feed.scrollTop = 0;
 }
 
 function playerSubmitAct(actInp, err, feed, actBtn){
@@ -1741,6 +1764,9 @@ function playerSubmitAct(actInp, err, feed, actBtn){
   // 尊重 duration：提交后等待，结果异步推送
   PLAYER_STATE.actBusy = true;
   actInp.value = '';
+  // 立马上屏：玩家行动与世界剧情交替呈现
+  PLAYER_STATE.events.push({type:'player', name: VISITOR_PLAYER_PROFILE && VISITOR_PLAYER_PROFILE.name, content: desc, timeLine: PLAYER_STATE.lastTimeLine || ''});
+  playerRefreshFeed();
   playerRefreshActState();
   var taskId = 'p_' + Date.now() + '_' + Math.floor(Math.random()*1e6);
   api('POST', '/api/player/task', {token: PLAYER_STATE.token, taskId: taskId, kind: 'act', payload: {desc: desc}}).then(function(){
@@ -1770,8 +1796,13 @@ function playerConnectEvents(token){
   es.onmessage = function(ev){
     var msg;
     try { msg = JSON.parse(ev.data); } catch(e){ return; }
-    if(msg.type === 'event' && msg.content){
-      PLAYER_STATE.events.push({type:'world', content: msg.content});
+    if(msg.type === 'hello'){
+      // 记录初始世界观时间戳（后续本地事件用它作近似时间戳）
+      if(msg.timeLine) PLAYER_STATE.lastTimeLine = msg.timeLine;
+    } else if(msg.type === 'event' && msg.content){
+      // 世界推送的剧情事件（带世界观时间戳）；更新时间锚点
+      if(msg.timeLine) PLAYER_STATE.lastTimeLine = msg.timeLine;
+      PLAYER_STATE.events.push({type:'world', content: msg.content, timeLine: msg.timeLine || PLAYER_STATE.lastTimeLine || ''});
       playerRefreshFeed();
     } else if(msg.type === 'task_result'){
       // act 完成：解「等待裁定」锁。剧情已通过 event 实时推送，这里不重复聚合内容
