@@ -20,6 +20,7 @@ import { WorldClock } from "./clock.js";
 import { BotComputer } from "./computer.js";
 import { Config, needsMsgIds, type ModalitySupport } from "./config.js";
 import { CrossingClient } from "./crossing/client.js";
+import type { PlayerMode } from "./crossing/protocol.js";
 import { CrossingServer } from "./crossing/server.js";
 import { WorldFiles } from "./files.js";
 import { resolvePhoneResolution } from "./phone.js";
@@ -727,9 +728,9 @@ export class WorldService extends Service<Config> {
   }
 
   /** WebUI：玩家入世界（同部署真人玩家，复用 crossing server，不走邀请码） */
-  arrivePlayer(name: string, persona: string): { ok: true; token: string; worldName: string; timeLine: string } | { ok: false; error: string } {
+  arrivePlayer(name: string, persona: string, mode: PlayerMode = "cross"): { ok: true; token: string; worldName: string; timeLine: string } | { ok: false; error: string } {
     if (!this.crossingServer) return { ok: false, error: "穿越服务未开启（crossing.serverEnabled）" };
-    return this.crossingServer.arrivePlayer(name, persona);
+    return this.crossingServer.arrivePlayer(name, persona, mode);
   }
 
   /** WebUI：穿越面板信息 */

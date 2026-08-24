@@ -31,6 +31,7 @@ import { usageStore } from "./usage.js";
 import { llmFetch, forEachStreamLine } from "../llm/http.js";
 import { PAGE_HTML } from "./page.js";
 import { VisitorStore, type VisitorSession, type VisitorGrant, type VisitorPreset, type PlayerProfile } from "./visitors.js";
+import type { PlayerMode } from "../crossing/protocol.js";
 
 export interface BotStatusSummary {
   running: boolean;
@@ -119,7 +120,7 @@ export interface WebUIHost {
   /** 穿越：强制送往某个世界（"home" = 送回自己的世界） */
   crossingForce(target: string): Promise<string>;
   /** 玩家入世界（同部署真人玩家，不走邀请码）：到达返回 crossing token */
-  arrivePlayer(name: string, persona: string): { ok: true; token: string; worldName: string; timeLine: string } | { ok: false; error: string };
+  arrivePlayer(name: string, persona: string, mode?: PlayerMode): { ok: true; token: string; worldName: string; timeLine: string } | { ok: false; error: string };
   /** 归档：手动存档（把当前全部世界状态复制成一份新快照） */
   saveArchive(label: string): Promise<string>;
   /** 归档：回档到某个快照（当前状态先自动存档） */
@@ -474,6 +475,7 @@ export class WebUIServer {
         const profile: PlayerProfile = {
           name: String(body.name ?? "").trim(),
           persona: String(body.persona ?? "").trim(),
+          mode: body.mode === "avatar" || body.mode === "puppet" || body.mode === "cross" ? body.mode : undefined,
         };
         if (!profile.name) return void sendJSON(res, 400, { error: "角色名不能为空" });
         const r = await this.visitors.savePlayerProfile(session.accountId, profile);
@@ -483,15 +485,19 @@ export class WebUIServer {
       return void sendJSON(res, 405, { error: "不支持的方法" });
     }
 
-    // 到达：把玩家角色身份作为 crossing arrive 的 name+persona
+    // 到达：把玩家角色身份作为 crossing arrive 的 name+persona（mode=进入语义，前进前选定）
     if (pathname === "/api/player/arrive" && method === "POST") {
       const profile = session.playerProfile;
       if (!profile || !profile.name) {
         return void sendJSON(res, 400, { error: "请先填写角色身份" });
       }
-      const r = this.host.arrivePlayer(profile.name, profile.persona);
+      const body = await readJson(req, 1024 * 1024).catch(() => null);
+      const mode: PlayerMode = body && (body.mode === "avatar" || body.mode === "puppet" || body.mode === "cross")
+        ? body.mode
+        : (profile.mode ?? "cross");
+      const r = this.host.arrivePlayer(profile.name, profile.persona, mode);
       if (!r.ok) return void sendJSON(res, 400, { error: r.error });
-      return void sendJSON(res, 200, { ok: true, token: r.token, worldName: r.worldName, timeLine: r.timeLine });
+      return void sendJSON(res, 200, { ok: true, token: r.token, worldName: r.worldName, timeLine: r.timeLine, mode });
     }
 
     // 提交行动（act）：转发 crossing task

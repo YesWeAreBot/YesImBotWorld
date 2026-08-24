@@ -365,8 +365,8 @@ export const WORLD_PROMPT_DEFAULTS: WorldPromptSet = {
     `除 HTML 外不要输出任何解释。`,
 
   visitorPreamble:
-    `注意：本次任务的主角**不是**这个世界的常驻 Bot，而是一位从异世界穿越来作客的访客「{{name}}」` +
-    `（它的状态档案{{personaWhere}}）。\n` +
+    `注意：本次任务的主角**不是**这个世界的常驻 Bot，而是一位访客「{{name}}」` +
+    `（它的状态档案{{personaWhere}}）。\n{{modeSemantic}}\n` +
     `请以这位访客的视角处理任务：send_event 的内容会直接送达访客本人；` +
     `事件走向必须符合**本世界**的世界观与当前状态（先 check world_status）。\n` +
     `与常驻 Bot 的互动：这个世界的常驻 Bot 和访客一样是**真实存在的角色**，不是由你随意扮演的 NPC。` +
@@ -382,12 +382,14 @@ export const WORLD_PROMPT_DEFAULTS: WorldPromptSet = {
     `- bot_status 仅在常驻 Bot 本人也被这次互动实际改变时才更新（如收下了访客的礼物），不要越权改写它。`,
 
   visitorArrive:
-    `一位异世界的访客「{{name}}」刚刚穿越降临到这个世界（{{timeLine}}）。` +
-    `它的状态档案{{personaWhere}}。\n` +
+    `一位访客「{{name}}」刚刚进入了这个世界（{{timeLine}}）。它的状态档案{{personaWhere}}。\n` +
+    `本题主的定位：{{modeSemantic}}\n` +
     `请：\n` +
     `1. check world_status 了解世界当前状态；\n` +
-    `2. 依据世界观决定访客出现的地点与场景，用 send_event 告诉访客——描述它身在何处、看到什么、` +
-    `这个世界给它的第一印象（第三人称客观叙述，内容会直接送达访客）；\n` +
+    `2. 依据世界观与上述定位决定该访客出现的地点与场景，用 send_event 告诉访客——描述它身在何处、看到什么、` +
+    `这个世界给它的第一印象（第三人称客观叙述，内容会直接送达访客）；` +
+    `   · 若它扮演/操纵的是本世界既有角色，应让这个角色出现在符合其人设的地方，世界对他的存在视作理所当然；\n` +
+    `   · 若它是穿越而来的访客，则世界可能对它感到陌生（也可以将其视作异象）；\n` +
     `3. update world_status 记录这位访客在场（在哪、什么状态），保证后续裁定一致。`,
 
   visitorLeave:

@@ -14,6 +14,7 @@ import {
 } from "../phone.js";
 import { fill, type Prompts } from "../prompts.js";
 import type { CompressionResult, ToolCallRecord } from "../types.js";
+import type { PlayerMode } from "../crossing/protocol.js";
 import { debug } from "../webui/debug.js";
 
 /** 只读查询（query）的排队超时：避免被同源端点锁 + 持续生成的 Bot 饿死时无限悬挂 */
@@ -186,6 +187,8 @@ export interface PresentVisitor {
   name: string;
   /** 状态档案（会注入系统提示的 <visitors> 区） */
   persona: string;
+  /** 真人玩家的进入语义（cross=穿越/avatar=扮演/puppet=操纵）；Bot 访客恒为 cross */
+  mode?: PlayerMode;
   /** 事件送达访客 */
   deliver: (content: string) => void;
   /** 状态写回访客世界（update_visitor_status 工具） */
@@ -196,6 +199,7 @@ export interface PresentVisitor {
 export interface VisitorRef {
   name: string;
   persona: string;
+  mode?: PlayerMode;
 }
 
 /**
@@ -600,12 +604,36 @@ export class WorldAgent {
       : "见系统提示的 <visitors> 区";
   }
 
+  /** 按进入语义生成「这位玩家/角色在本世界的定位」说明（注入到达/接待 prompt） */
+  private modeSemantic(v: VisitorRef): string {
+    const name = v.name;
+    switch (v.mode ?? "cross") {
+      case "avatar":
+        return (
+          `「${name}」是一位真人玩家**扮演**的本世界既有角色（入替）：他完全接管这个角色的身份与言行，` +
+          `角色就是玩家本人，不存在另一个独立的角色意识。按角色人设与世界观正常演绎，把他当作世界的一部分。`
+        );
+      case "puppet":
+        return (
+          `「${name}」是一位真人玩家**操纵**的本世界既有角色：这个角色仍保有自己的意识与内心活动` +
+          `（可能对被操纵有"身体不听使唤"式的内心 OS、抗拒或困惑）。真人玩家通过"行动"指令驱使其身体行动，` +
+          `裁定行动时既要如实执行玩家的指令，也要留意角色本人对这一切的感受与反应——二者都写进叙事。`
+        );
+      default:
+        return (
+          `「${name}」是从外界穿越降临到本世界的访客：他本人及其自我认知来自另一个世界，` +
+          `与本世界的世界观体系无关。他可能对这个世界的规则与风物感到陌生。`
+        );
+    }
+  }
+
   /** 接待任务里的访客前言（常驻 Bot 外出时附加提示，避免"幽灵互动"） */
   private visitorPreamble(v: VisitorRef): string {
     let text = fill(this.prompts.world.visitorPreamble, {
       name: v.name,
       persona: v.persona || "（访客没有留下自我描述）",
       personaWhere: this.personaWhere(),
+      modeSemantic: this.modeSemantic(v),
     });
     if (this.remote) {
       text +=
@@ -629,6 +657,7 @@ export class WorldAgent {
       name: v.name,
       persona: v.persona || "（访客没有留下自我描述）",
       personaWhere: this.personaWhere(),
+      modeSemantic: this.modeSemantic(v),
       timeLine: this.clock.timeLine(),
     });
     // 到达叙事也用 priority：既插到后台任务（Tingle 等）之前，又保证先于该玩家的 act 执行
@@ -1016,17 +1045,19 @@ export class WorldAgent {
     // check 模式只放名单（省上下文窗口，档案用 check_visitor 按需查看）
     const visitors = this.visitorsProvider?.() ?? [];
     if (visitors.length) {
+      const modeTag = (m: PlayerMode | undefined) =>
+        m === "avatar" ? "（真人玩家扮演·入替）" : m === "puppet" ? "（真人玩家操纵·角色保有自身意识）" : "（异世界访客）";
       if (this.visitorPersonaMode === "check") {
         sys +=
-          "\n\n<visitors>（当前在场的异世界访客名单——状态档案用 check_visitor 工具按需查看；" +
+          "\n\n<visitors>（当前在场的访客名单——状态档案用 check_visitor 工具按需查看；" +
           "档案变更用 update_visitor_status，事件送达用 send_event 的 to 参数）\n" +
-          visitors.map((v) => `- 「${v.name}」`).join("\n") +
+          visitors.map((v) => `- 「${v.name}」${modeTag(v.mode)}`).join("\n") +
           "\n</visitors>";
       } else {
         sys +=
-          "\n\n<visitors>（当前在场的异世界访客——他们的状态档案，接待任务的裁定依据；" +
+          "\n\n<visitors>（当前在场的访客——他们的状态档案，接待任务的裁定依据；" +
           "档案变更用 update_visitor_status 工具，事件送达用 send_event 的 to 参数）\n" +
-          visitors.map((v) => `## 访客「${v.name}」\n${v.persona || "（无自我描述）"}`).join("\n\n") +
+          visitors.map((v) => `## 「${v.name}」${modeTag(v.mode)}\n${v.persona || "（无自我描述）"}`).join("\n\n") +
           "\n</visitors>";
       }
     }

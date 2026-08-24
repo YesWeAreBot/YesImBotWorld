@@ -11,6 +11,9 @@
  * - POST /crossing/leave   {token}                     → {ok}
  */
 
+/** 真人玩家进入世界的语义（进入前选定，进入后不可更改） */
+export type PlayerMode = "cross" | "avatar" | "puppet";
+
 /** 访客提交给主世界的任务类型 */
 export type CrossingTaskKind = "act" | "wait" | "checkTime" | "query";
 
@@ -38,6 +41,8 @@ export type CrossingSseMsg =
 export interface VisitorProfile {
   name: string;
   persona: string;
+  /** 真人玩家的进入语义（默认 cross=穿越；Bot 访客恒为 cross） */
+  mode?: PlayerMode;
 }
 
 /** 主世界视角的一位访客 */

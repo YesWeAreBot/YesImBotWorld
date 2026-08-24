@@ -23,6 +23,7 @@ import {
   type CrossingSseMsg,
   type CrossingTaskKind,
   type CrossingTaskPayload,
+  type PlayerMode,
   type VisitorInfo,
 } from "./protocol.js";
 
@@ -30,6 +31,18 @@ import {
 const ABSENCE_MS = 180_000;
 /** SSE 心跳间隔 */
 const HEARTBEAT_MS = 20_000;
+
+/** 真人玩家到达时告知常驻 Bot 的语义说明（按进入语义区分） */
+function playerArriveNotice(name: string, mode: PlayerMode): string {
+  switch (mode) {
+    case "avatar":
+      return `一位真人玩家以角色「${name}」的身份进入了这个世界——他要**扮演**这位角色（入替，完全接管其言行）。`;
+    case "puppet":
+      return `一位真人玩家以角色「${name}」的身份进入了这个世界——他要**操纵**这位角色的身体行动，但该角色仍保有自己的意识（身体可能不听使唤、有内心活动）。`;
+    default:
+      return `一位真人玩家以角色「${name}」的身份进入了这个世界（从外界穿越降临）。`;
+  }
+}
 
 interface VisitorSession extends VisitorInfo {
   token: string;
@@ -82,10 +95,11 @@ export class CrossingServer {
    * 状态档案进 World-LLM 系统提示的 <visitors> 区、send_event to= 定向投递、
    * update_visitor_status 状态写回。
    */
-  visitors(): { name: string; persona: string; deliver: (content: string) => void; updateStatus: (content: string) => void }[] {
+  visitors(): { name: string; persona: string; mode: PlayerMode; deliver: (content: string) => void; updateStatus: (content: string) => void }[] {
     return [...this.sessions.values()].map((s) => ({
       name: s.name,
       persona: s.persona,
+      mode: s.mode ?? "cross",
       deliver: (content: string) => this.pushEvent(s, content),
       updateStatus: s.updateStatus,
     }));
@@ -99,13 +113,14 @@ export class CrossingServer {
    * 同部署真人玩家到达（供 WebUI 内部调用，不走 HTTP / 不校验邀请码——玩家已通过 WebUI 登录鉴权）。
    * 其余与 handleArrive 一致：创建会话、同名顶替、触发到达叙事、通知常驻 Bot。
    */
-  arrivePlayer(name: string, persona: string): { ok: true; token: string; worldName: string; timeLine: string } | { ok: false; error: string } {
+  arrivePlayer(name: string, persona: string, mode: PlayerMode = "cross"): { ok: true; token: string; worldName: string; timeLine: string } | { ok: false; error: string } {
     if (!this.host.ready()) return { ok: false, error: "这个世界当前未在运行，无法接待访客" };
     if (this.sessions.size >= Math.max(1, this.host.cfg.maxVisitors)) {
       return { ok: false, error: "这个世界的访客已满，稍后再来" };
     }
     const safeName = name.trim().slice(0, CROSSING_LIMITS.maxNameChars) || "异界来客";
     const safePersona = persona.slice(0, CROSSING_LIMITS.maxPersonaChars);
+    const safeMode: PlayerMode = mode === "avatar" || mode === "puppet" ? mode : "cross";
     const dupe = [...this.sessions.values()].find((s) => s.name === safeName);
     if (dupe && dupe.res) {
       return { ok: false, error: `已有同名访客「${safeName}」在场` };
@@ -120,6 +135,7 @@ export class CrossingServer {
       token: crypto.randomBytes(24).toString("base64url"),
       name: safeName,
       persona: safePersona,
+      mode: safeMode,
       res: null,
       outbox: [],
       pendingTasks: 0,
@@ -136,7 +152,7 @@ export class CrossingServer {
     const timeLine = this.host.clock()?.timeLine() ?? "";
     this.host.logger.info("[穿越] 玩家「%s」入世界", safeName);
     debug.emit("world.task", `穿越·玩家「${safeName}」入世界`, {});
-    this.host.notifyHostBot(`一位真人玩家以角色「${safeName}」的身份进入了这个世界。`);
+    this.host.notifyHostBot(playerArriveNotice(safeName, safeMode));
     void this.host.world
       .wakeDormant()
       .catch((err) => this.host.logger.warn("[穿越] 沉睡补叙失败: %s", err));
@@ -260,6 +276,7 @@ export class CrossingServer {
       token: crypto.randomBytes(24).toString("base64url"),
       name,
       persona,
+      mode: "cross",
       res: null,
       outbox: [],
       pendingTasks: 0,

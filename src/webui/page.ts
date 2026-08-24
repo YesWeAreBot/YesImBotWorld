@@ -392,7 +392,7 @@ try { VISITOR_GRANTS = JSON.parse(localStorage.getItem('wui_visitor_grants') || 
 var VISITOR_PRESET = localStorage.getItem('wui_visitor_preset') || '';
 var VISITOR_PLAYER_PROFILE = null; // { name, persona }
 try { VISITOR_PLAYER_PROFILE = JSON.parse(localStorage.getItem('wui_player_profile') || 'null'); } catch(e) { VISITOR_PLAYER_PROFILE = null; }
-var PLAYER_STATE = { token: '', worldName: '', inWorld: false, events: [], actBusy: false, lastTimeLine: '' };
+var PLAYER_STATE = { token: '', worldName: '', inWorld: false, events: [], actBusy: false, lastTimeLine: '', mode: '' };
 var activeView = 'overview';
 var playerNewsAsc = false; // 世界观剧情「最近事件」排序：false=倒序(最新在上,默认) true=正序
 var worldStatusCache = null; // 最近一次 /api/state 结果，供 news 排序切换时免重复拉取
@@ -1607,12 +1607,26 @@ function playerRenderWorld(holder){
   playerRenderStatus($('#player-status'));
 
   if(!PLAYER_STATE.inWorld){
-    // 未入世界：显示「进入世界」按钮
+    // 未入世界：显示「进入世界」+ 进入语义选择（仅进入前可选，进入后锁定）
+    var curMode = (profile.mode === 'avatar' || profile.mode === 'puppet' || profile.mode === 'cross') ? profile.mode : 'cross';
+    var modeOpts = [
+      ['cross', '穿越', '你的角色本不属于这个世界，从外界降临而来。'],
+      ['avatar', '扮演（入替）', '完全接管这个世界里已有的某位角色，替它行动、以它的身份生活。'],
+      ['puppet', '操纵', '只操纵世界里已有角色的身体，角色仍保有自己的意识（身体可能不听使唤）。']
+    ];
+    var modeRadios = modeOpts.map(function(o){
+      return el('label', {cls:'mode-opt', style:'display:block;padding:8px 10px;margin:6px 0;border:1px solid var(--line);border-radius:8px;cursor:pointer'}, [
+        el('input', {type:'radio', name:'player-mode', value:o[0], checked: o[0]===curMode, onchange:function(){ curMode = o[0]; }}),
+        el('span', {text: ' ' + o[1], style:'font-weight:600;font-size:13px'}),
+        el('div', {text: o[2], style:'font-size:12px;color:var(--fg-dim);margin:2px 0 0 22px'})
+      ]);
+    });
     var enterBar = el('div', {cls:'section'}, [
       el('h3', {text:'进入世界'}),
       el('div', {cls:'body'}, [
-        el('p', {text:'点击进入世界，你的角色会出现在世界里，可以开始行动。', style:'color:var(--fg-dim);font-size:13px'}),
-        el('button', {cls:'primary', text:'进入世界', onclick:function(){ playerArrive(); }})
+        el('p', {text:'选择你与这个角色的关系，然后进入世界。进入后不可再更改，直到退出世界。', style:'color:var(--fg-dim);font-size:13px'}),
+        el('div', {}, modeRadios),
+        el('button', {cls:'primary', text:'进入世界', onclick:function(){ playerArrive(curMode); }})
       ])
     ]);
     holder.appendChild(enterBar);
@@ -1623,12 +1637,20 @@ function playerRenderWorld(holder){
   holder.appendChild(playerWorldStatus());
 }
 
-function playerArrive(){
-  api('POST', '/api/player/arrive', {}).then(function(r){
+function playerArrive(mode){
+  mode = (mode === 'avatar' || mode === 'puppet') ? mode : 'cross';
+  api('POST', '/api/player/arrive', {mode: mode}).then(function(r){
     PLAYER_STATE.token = r.token;
     PLAYER_STATE.worldName = r.worldName || '';
     PLAYER_STATE.inWorld = true;
+    PLAYER_STATE.mode = r.mode || mode;
     PLAYER_STATE.events = [];
+    // 持久化进入语义：下次进入默认沿用
+    if(VISITOR_PLAYER_PROFILE){
+      VISITOR_PLAYER_PROFILE.mode = mode;
+      localStorage.setItem('wui_player_profile', JSON.stringify(VISITOR_PLAYER_PROFILE));
+      api('PUT', '/api/player/profile', { name: VISITOR_PLAYER_PROFILE.name, persona: VISITOR_PLAYER_PROFILE.persona || '', mode: mode }).catch(function(){});
+    }
     toast('已进入世界', 'ok');
     playerConnectEvents(r.token);
     loadPlayer();
@@ -1809,10 +1831,11 @@ function playerConnectEvents(token){
       // 刷新「等待中」提示（actBusy 已变 false，重渲染面板）
       playerRefreshActState();
     } else if(msg.type === 'status_update' && msg.content){
-      // World 更新了玩家的状态档案（整体覆盖：身份 + 状态）。本地更新并持久化到账号
-      VISITOR_PLAYER_PROFILE = { name: VISITOR_PLAYER_PROFILE.name, persona: msg.content };
+      // World 更新了玩家的状态档案（整体覆盖：身份 + 状态）。本地更新并持久化到账号（保留 mode）
+      var _m = VISITOR_PLAYER_PROFILE && VISITOR_PLAYER_PROFILE.mode;
+      VISITOR_PLAYER_PROFILE = { name: VISITOR_PLAYER_PROFILE.name, persona: msg.content, mode: _m };
       localStorage.setItem('wui_player_profile', JSON.stringify(VISITOR_PLAYER_PROFILE));
-      api('PUT', '/api/player/profile', { name: VISITOR_PLAYER_PROFILE.name, persona: msg.content }).catch(function(){});
+      api('PUT', '/api/player/profile', { name: VISITOR_PLAYER_PROFILE.name, persona: msg.content, mode: _m }).catch(function(){});
       playerRefreshStatus();
     } else if(msg.type === 'farewell'){
       PLAYER_STATE.inWorld = false;

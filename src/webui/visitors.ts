@@ -42,6 +42,8 @@ export type VisitorPreset = "operator" | "viewer" | "player" | "custom";
 export interface PlayerProfile {
   name: string;
   persona: string;
+  /** 进入世界的语义（前进前选定，进入后不可改）：cross=穿越 / avatar=扮演(入替) / puppet=操纵 */
+  mode?: "cross" | "avatar" | "puppet";
 }
 
 export interface VisitorAccount {
@@ -235,7 +237,12 @@ export class VisitorStore {
     const accounts = await this.ensureLoaded();
     const acct = accounts.find((a) => a.id === id);
     if (!acct) return { ok: false, error: "账号不存在" };
-    acct.playerProfile = { name: profile.name.slice(0, 32), persona: profile.persona.slice(0, 6000) };
+    const mode = profile.mode === "avatar" || profile.mode === "puppet" ? profile.mode : profile.mode === "cross" ? "cross" : undefined;
+    acct.playerProfile = {
+      name: profile.name.slice(0, 32),
+      persona: profile.persona.slice(0, 6000),
+      ...(mode ? { mode } : {}),
+    };
     await this.persist();
     return { ok: true };
   }
