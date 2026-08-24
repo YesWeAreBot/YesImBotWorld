@@ -739,7 +739,8 @@ export class WorldAgent {
     const task =
       this.visitorPreamble(v) +
       "\n\n" +
-      fill(this.prompts.world.adjudicateAct, {
+      fill(this.prompts.world.visitorAct, {
+        name: v.name,
         desc,
         issuedAt: this.clock.timeLine(now),
         duration,
@@ -754,7 +755,8 @@ export class WorldAgent {
     const task =
       this.visitorPreamble(v) +
       "\n\n" +
-      fill(this.prompts.world.resolveWait, {
+      fill(this.prompts.world.visitorWait, {
+        name: v.name,
         issuedAt: this.clock.timeLine(now),
         n,
         expectedAt: this.clock.timeLine(now + Math.max(n, 0)),
@@ -768,7 +770,7 @@ export class WorldAgent {
     const task =
       this.visitorPreamble(v) +
       "\n\n" +
-      fill(this.prompts.world.resolveCheckTime, { timeLine: this.clock.timeLine() });
+      fill(this.prompts.world.visitorCheckTime, { name: v.name, timeLine: this.clock.timeLine() });
     // 只读任务：走并行队列（不写状态，只 check + send_event）
     return this.invokeWithTools({ task, deliver, ...this.visitorInvocationExtras() }, true);
   }

@@ -74,6 +74,12 @@ export interface WorldPromptSet {
   visitorArrive: string;
   /** 穿越：访客离开（按进入语义分化）。{{name}} {{timeLine}} {{leaveSemantic}} */
   visitorLeave: string;
+  /** 穿越：裁定访客的 act。{{name}} {{desc}} {{issuedAt}} {{duration}} {{expectedAt}} */
+  visitorAct: string;
+  /** 穿越：访客 wait 补叙。{{name}} {{issuedAt}} {{n}} {{expectedAt}} */
+  visitorWait: string;
+  /** 穿越：访客查看时间。{{name}} {{timeLine}} */
+  visitorCheckTime: string;
   /** 穿越：世界沉睡后苏醒的补叙（无人在场期间的演化）。{{fromTimeLine}} {{toTimeLine}} {{gapTU}} */
   dormantCatchup: string;
 }
@@ -398,6 +404,43 @@ export const WORLD_PROMPT_DEFAULTS: WorldPromptSet = {
     `请务必完成以下善后（必须调用 update）：\n` +
     `1. check world_status，找出所有与这位访客有关的记述；\n` +
     `2. update world_status 输出**完整的新版本**，按上述「离开语义」处理它留在这个世界的状态。`,
+
+  visitorAct:
+    `访客「{{name}}」刚刚开始执行一个动作：「{{desc}}」（开始于 {{issuedAt}}，` +
+    `预计耗时 {{duration}} TU，完成于 {{expectedAt}}）。\n` +
+    `**重要**：此人是**访客**，不是这个世界的常驻 Bot（常驻 Bot 是另一个独立角色，哪怕名字相似也绝不可混淆）。` +
+    `本次动作的主角只是这位访客本人。\n` +
+    `请裁定这个动作的结果：\n` +
+    `1. 按需 check world_status 了解世界现状、观访客状态档案（见 <visitors> 区或用 check_visitor），保证裁定与现状一致；\n` +
+    `2. 必须调用一次 send_event，以第三人称客观叙述动作完成时的结果——聚焦什么发生了变化、什么被怎么样了` +
+    `（允许失败、意外或曲折）；\n` +
+    `3. 动作若改变了访客自身——位置、姿态、状态、心情、正在做的事、随身物品——**必须** ` +
+    `update_visitor_status（name 填「{{name}}」，整体覆盖其状态档案）使其与裁定后的现实一致；\n` +
+    `4. 若改变了周遭世界或其他角色，update world_status（优先 patch 局部替换）；\n` +
+    `5. News 是大事记不是流水账：只有足够重要、之后可能被提起或产生影响的结果才 update news 记一条。\n` +
+    `6. **绝对不要** update bot_status 或 update(facts)——那是常驻 Bot 的私有状态，与这位访客无关。`,
+
+  visitorWait:
+    `访客「{{name}}」从 {{issuedAt}} 开始等待 {{n}} 个 TU，等待即将在 ` +
+    `{{expectedAt}} 结束（届时它会被自动唤醒）。\n` +
+    `**重要**：此人是**访客**，不是这个世界的常驻 Bot。\n` +
+    `请先 check news 和 world_status 了解这段等待期间世界的变化：\n` +
+    `1. 若时间流逝让世界状态发生了变化（时段、天气、进行中事件的推进……），update world_status（优先 patch 局部替换）；\n` +
+    `2. 若访客自身状态也随时间自然变化（等待中的姿态、疲劳、正在做的事已结束等），` +
+    `**一并 update_visitor_status**（name 填「{{name}}」）使其反映当前时刻的真实状态；\n` +
+    `3. 然后必须调用一次 send_event 告诉访客：这段时间里发生的、它能感知到的变化——` +
+    `用第三人称客观叙述什么发生了变化、什么被怎么样了（如果无事发生，就平实地叙述周遭环境此刻的样子）。` +
+    `不必提"等待结束"，唤醒另有提示。\n` +
+    `4. **绝对不要** update bot_status 或 update(facts)。`,
+
+  visitorCheckTime:
+    `访客「{{name}}」想知道现在几点了（看手表、掏出手机、或寻找附近的时钟）。当前实际时刻：{{timeLine}}。\n` +
+    `**重要**：此人是**访客**，不是这个世界的常驻 Bot。\n` +
+    `请根据其状态档案（见 <visitors> 区或用 check_visitor）与世界状态裁定它此刻能否得知时间：\n` +
+    `- 能：send_event 以第三人称叙述它如何得知（如「手机屏幕亮起，显示 08:42」「墙上的挂钟指向下午三点」），` +
+    `事件内容必须包含具体的时间；\n` +
+    `- 不能（例如身处荒野、没有任何计时工具、手表停了）：send_event 叙述它找不到时间来源，不要透露时间。` +
+    `\n绝对不要 update bot_status 或 update(facts)。`,
 
   dormantCatchup:
     `这个世界从 {{fromTimeLine}} 到 {{toTimeLine}} 之间处于无人在场的状态` +
