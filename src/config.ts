@@ -27,6 +27,8 @@ export interface BotModelConfig {
   disableWait: boolean;
   ignoreSendDuration: boolean;
   blockingAct: boolean;
+  /** send 系工具（send/send_file/send_voice）的阻塞：上一条还没完成回显前，拒绝新的 send 系调用 */
+  sendBlocking: boolean;
   waitRateThreshold: number;
   waitRateWindow: number;
   restCompressMinChars: number;
@@ -378,6 +380,13 @@ export const Config: Schema<Config> = Schema.intersect([
           "act() 的专注模式（默认开启）：上一个动作还没完成（结果交付）前，新的 act 会被直接拒绝并提示——" +
             "不能被 repeat 等参数绕过；但其他工具调用（发消息、等待、看状态等）不受影响、照常进行。" +
             "一个人同时只能专注做一件事，做别的不受影响。关闭后允许一个 act 进行中再开下一个 act",
+        ),
+      sendBlocking: Schema.boolean()
+        .default(true)
+        .description(
+          "send 系工具（send / send_file / send_voice）的阻塞（默认开启）：上一条消息还没发出、结果还没回显前，" +
+            "新的 send 系调用会被直接拒绝并提示——避免 Bot 在看不到自己上一条消息的情况下连发意思相近、前后不连贯的消息。" +
+            "其他工具调用不受影响。关闭后允许在上一条消息未回显时继续发下一条",
         ),
       waitRateThreshold: Schema.natural()
         .max(100)

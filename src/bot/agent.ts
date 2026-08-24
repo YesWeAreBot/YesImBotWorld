@@ -1655,6 +1655,14 @@ export class BotAgent {
   }
 
   private dispatchSend(call: ToolCallRecord): void {
+    // sendBlocking：上一条 send 系消息还没回显前，拒绝新的 send（避免连发相近/不连贯的消息）
+    if (this.config.bot.sendBlocking) {
+      const busy = sendBusyMessage(SEND_TOOL_NAMES.flatMap((n) => this.scheduler.pendingByName(n)));
+      if (busy) {
+        this.pushEvent("system", busy, { ref: call.id });
+        return;
+      }
+    }
     const id = this.channelArg(call) ?? "";
     const msg = String(call.arguments.msg ?? "");
     const mediaRaw = call.arguments.media ?? call.arguments.images;
@@ -1724,6 +1732,13 @@ export class BotAgent {
   }
 
   private dispatchSendFile(call: ToolCallRecord): void {
+    if (this.config.bot.sendBlocking) {
+      const busy = sendBusyMessage(SEND_TOOL_NAMES.flatMap((n) => this.scheduler.pendingByName(n)));
+      if (busy) {
+        this.pushEvent("system", busy, { ref: call.id });
+        return;
+      }
+    }
     const id = this.channelArg(call) ?? "";
     const file = String(call.arguments.file ?? "");
     if (!id) {
@@ -1761,6 +1776,13 @@ export class BotAgent {
   }
 
   private dispatchSendVoice(call: ToolCallRecord): void {
+    if (this.config.bot.sendBlocking) {
+      const busy = sendBusyMessage(SEND_TOOL_NAMES.flatMap((n) => this.scheduler.pendingByName(n)));
+      if (busy) {
+        this.pushEvent("system", busy, { ref: call.id });
+        return;
+      }
+    }
     const id = this.channelArg(call) ?? "";
     const text = String(call.arguments.text ?? "");
     if (!id) {
@@ -2044,6 +2066,28 @@ export function actBusyMessage(pendingActs: ToolCallRecord[]): string | null {
     `（你正在做${pdesc ? `「${truncate(pdesc, 60)}」` : "上一件事"}，它还在进行中，` +
     `结果会自动以事件的形式送到你这里。你手头的事照常推进，` +
     `也可以顺着它想想接下来准备做什么。）`
+  );
+}
+
+/** send 系工具（send/send_file/send_voice）的名字集合 */
+const SEND_TOOL_NAMES = ["send", "send_file", "send_voice"];
+
+/**
+ * sendBlocking 阻塞模式：存在未完成（未回显）的 send 系调用时，返回提示文本，否则 null。
+ * 供 dispatchSend / dispatchSendFile / dispatchSendVoice 使用。
+ */
+export function sendBusyMessage(pending: ToolCallRecord[]): string | null {
+  if (!pending.length) return null;
+  const first = pending[0]!;
+  const preview =
+    first.name === "send"
+      ? String(first.arguments.msg ?? "").trim()
+      : first.name === "send_voice"
+        ? String(first.arguments.text ?? "").trim()
+        : String(first.arguments.file ?? "").trim();
+  return (
+    `（你上一条消息${preview ? `「${truncate(preview, 40)}」` : ""}还在发送中、还没看到结果，` +
+    `这次没有发出。等它的结果回显后再接着说——可以先做点别的，或整理一下接下来想说的话。）`
   );
 }
 
