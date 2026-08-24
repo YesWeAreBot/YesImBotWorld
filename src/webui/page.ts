@@ -1728,7 +1728,11 @@ function playerConnectEvents(token){
       loadPlayer();
     }
   };
-  es.onerror = function(){ /* EventSource 自动重连；不做处理 */ };
+  es.onopen = function(){ console.log('[player] SSE 已连接'); };
+  es.onerror = function(){
+    // EventSource 自动重连；首次失败提示（便于排查）
+    console.warn('[player] SSE 连接出错，将自动重连');
+  };
 }
 
 function playerRefreshFeed(){

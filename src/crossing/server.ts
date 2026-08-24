@@ -351,6 +351,7 @@ export class CrossingServer {
       parts.push(content);
       if (session.live) this.push(session, { type: "event", content });
     };
+    this.host.logger.info("[穿越] 访客「%s」任务 %s 开始（kind=%s, live=%s）", session.name, taskId, kind, session.live);
     let ok = false;
     if (kind === "act") {
       ok = await this.host.world.visitorAct(session, clip(payload.desc), Number(payload.duration) || 0, deliver);
@@ -366,6 +367,7 @@ export class CrossingServer {
         ok = false;
       }
     }
+    this.host.logger.info("[穿越] 访客「%s」任务 %s 完成（ok=%s, parts=%d, 正在推 task_result）", session.name, taskId, ok, parts.length);
     this.push(session, { type: "task_result", taskId, ok, content: parts.join("\n") });
   }
 
