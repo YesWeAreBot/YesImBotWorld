@@ -392,8 +392,10 @@ try { VISITOR_GRANTS = JSON.parse(localStorage.getItem('wui_visitor_grants') || 
 var VISITOR_PRESET = localStorage.getItem('wui_visitor_preset') || '';
 var VISITOR_PLAYER_PROFILE = null; // { name, persona }
 try { VISITOR_PLAYER_PROFILE = JSON.parse(localStorage.getItem('wui_player_profile') || 'null'); } catch(e) { VISITOR_PLAYER_PROFILE = null; }
-var PLAYER_STATE = { token: '', worldName: '', inWorld: false, events: [], actBusy: false, sortAsc: false, lastTimeLine: '' };
+var PLAYER_STATE = { token: '', worldName: '', inWorld: false, events: [], actBusy: false, lastTimeLine: '' };
 var activeView = 'overview';
+var playerNewsAsc = false; // 世界观剧情「最近事件」排序：false=倒序(最新在上,默认) true=正序
+var worldStatusCache = null; // 最近一次 /api/state 结果，供 news 排序切换时免重复拉取
 // SSE 断线续传锚点：跨页面加载持久化，避免每次无缓存刷新都从 0 重放整段调试历史
 var lastEventId = Number(localStorage.getItem('wui_last_id') || 0);
 var evtSource = null;
@@ -1721,17 +1723,10 @@ function playerRefreshStatus(){
   if(sec) playerRenderStatus(sec);
 }
 
-// 事件流渲染：默认倒序（最新在上），可切换为正序；玩家行动与世界剧情交替显示并带世界观时间戳
+// 事件流渲染：始终正序（时间先后），玩家行动与世界剧情交替显示并带世界观时间戳
 function playerRenderFeed(feed){
   feed.textContent = '';
-  // 排序切换按钮
-  var sortBtn = el('button', {cls:'ghost', text: PLAYER_STATE.sortAsc ? '改为最新在上 ▲' : '改为最早在上 ▼', onclick:function(){
-    PLAYER_STATE.sortAsc = !PLAYER_STATE.sortAsc;
-    playerRefreshFeed();
-  }});
-  feed.appendChild(el('div', {cls:'toolbar', style:'margin-bottom:6px'}, [sortBtn, el('span', {cls:'spacer'})]));
   var list = PLAYER_STATE.events.slice();
-  if(!PLAYER_STATE.sortAsc) list.reverse(); // 默认倒序：最新在上
   if(!list.length){
     feed.appendChild(el('p', {cls:'empty', text:'（还没有剧情——行动后世界会告诉你发生了什么）'}));
     return;
@@ -1755,8 +1750,8 @@ function playerRenderFeed(feed){
     }
     feed.appendChild(el('div', {style:'padding:4px 0;border-bottom:1px solid var(--line)'}, [t, row]));
   });
-  // 倒序（最新在上）时定位顶部；正序则滚动到底部
-  if(PLAYER_STATE.sortAsc) feed.scrollTop = feed.scrollHeight; else feed.scrollTop = 0;
+  // 正序：滚动到底部（最新）
+  feed.scrollTop = feed.scrollHeight;
 }
 
 function playerSubmitAct(actInp, err, feed, actBtn){
@@ -1838,6 +1833,41 @@ function playerRefreshFeed(){
   if(feed) playerRenderFeed(feed);
 }
 
+// 渲染「世界观剧情」内容（世界状态 + 最近事件）；news 切换排序时复用，避免整块重建
+function playerRenderWorldStatus(holder, r){
+  holder.textContent = '';
+  // 世界状态 + 新闻（player 可见的数据块）
+  if(r.worldStatus) holder.appendChild(el('div', {cls:'body', html:'<div style="white-space:pre-wrap;font-size:12.5px">' + esc(r.worldStatus) + '</div>'}));
+  if(r.news && r.news.length){
+    // 标题 + 排序切换按钮（默认倒序：最新事件在上）
+    var toolbar = el('div', {cls:'toolbar', style:'margin:8px 0 6px'}, [
+      el('h4', {text:'最近事件', style:'margin:0'}),
+      el('span', {cls:'spacer'}),
+      el('button', {cls:'ghost', text: playerNewsAsc ? '改为最新在上 ▲' : '改为最早在上 ▼', onclick:function(){
+        playerNewsAsc = !playerNewsAsc;
+        playerRenderWorldStatus(holder, worldStatusCache);
+      }})
+    ]);
+    holder.appendChild(toolbar);
+    var newsList = r.news.slice();
+    // 按世界时刻 t 排序：倒序(默认)或正序；无 t 字段时保持原顺序（文件仍为追加序）
+    newsList.sort(function(a, b){
+      var ta = Number(a && a.t), tb = Number(b && b.t);
+      if(!isFinite(ta) || !isFinite(tb)) return 0;
+      return playerNewsAsc ? ta - tb : tb - ta;
+    });
+    newsList.forEach(function(n){
+      holder.appendChild(el('div', {cls:'news-item'}, [
+        el('span', {cls:'clock', text:'[' + n.clock + ']'}),
+        el('span', {text: ' ' + n.content, style:'font-size:12.5px'})
+      ]));
+    });
+  }
+  if(!r.worldStatus && (!r.news || !r.news.length)){
+    holder.appendChild(el('p', {cls:'empty', text:'（暂无世界剧情）'}));
+  }
+}
+
 function playerWorldStatus(){
   var sec = el('div', {cls:'section'});
   sec.appendChild(el('h3', {text:'世界观剧情（只读）'}));
@@ -1846,21 +1876,8 @@ function playerWorldStatus(){
   body.appendChild(holder);
   sec.appendChild(body);
   api('GET', '/api/state').then(function(r){
-    holder.textContent = '';
-    // 世界状态 + 新闻（player 可见的数据块）
-    if(r.worldStatus) holder.appendChild(el('div', {cls:'body', html:'<div style="white-space:pre-wrap;font-size:12.5px">' + esc(r.worldStatus) + '</div>'}));
-    if(r.news && r.news.length){
-      holder.appendChild(el('h4', {text:'最近事件'}));
-      r.news.forEach(function(n){
-        holder.appendChild(el('div', {cls:'news-item'}, [
-          el('span', {cls:'clock', text:'[' + n.clock + ']'}),
-          el('span', {text: ' ' + n.content, style:'font-size:12.5px'})
-        ]));
-      });
-    }
-    if(!r.worldStatus && (!r.news || !r.news.length)){
-      holder.appendChild(el('p', {cls:'empty', text:'（暂无世界剧情）'}));
-    }
+    worldStatusCache = r;
+    playerRenderWorldStatus(holder, r);
   }).catch(showErr);
   return sec;
 }
