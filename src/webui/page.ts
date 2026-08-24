@@ -1667,16 +1667,57 @@ function playerRefreshActState(){
   btns.forEach(function(b){ if(b.textContent === '行动'){ b.disabled = !!PLAYER_STATE.actBusy; } });
 }
 
-// 渲染玩家的角色状态（World 维护的 persona：身份 + 状态）
+// 解析玩家状态档案（World 生成的 markdown）为若干「节」：{label, body}
+function parsePlayerStatus(text){
+  if(!text) return [];
+  var lines = String(text).split('\n');
+  var sections = [];
+  var cur = null; // {label, lines:[]}
+  function flush(){
+    if(cur && cur.lines.join('\n').trim()){
+      sections.push({ label: cur.label, body: cur.lines.join('\n').trim() });
+    }
+    cur = null;
+  }
+  lines.forEach(function(line){
+    var m = line.match(/^#{1,4}\s+(.+?)\s*#*\s*$/);   // 「## 标题」或「# 标题」
+    if(m){
+      flush();
+      cur = { label: m[1].trim(), lines: [] };
+    } else if(cur){
+      cur.lines.push(line);
+    } else {
+      // 没有 heading 的开头自由文本：归入「档案」
+      cur = { label: '档案', lines: [] };
+      cur.lines.push(line);
+    }
+  });
+  flush();
+  return sections;
+}
+
+// 渲染玩家的角色状态（World 维护的 persona：身份 + 状态），按 markdown 分节结构化展示
 function playerRenderStatus(sec){
   sec.textContent = '';
   var profile = VISITOR_PLAYER_PROFILE;
-  sec.appendChild(el('div', {style:'font-size:12px;color:var(--fg-dark);margin-bottom:4px', text:'你的角色'}));
-  if(profile){
-    sec.appendChild(el('div', {style:'font-size:12.5px;white-space:pre-wrap', html: esc(profile.persona || '（尚无状态）')}));
-  } else {
-    sec.appendChild(el('div', {style:'font-size:12.5px;color:var(--fg-dark)', text:'（尚未设定角色）'}));
+  sec.appendChild(el('div', {style:'font-size:12px;color:var(--fg-dark);margin-bottom:6px', text:'你的角色'}));
+  if(!profile || !profile.persona){
+    sec.appendChild(el('div', {style:'font-size:12.5px;color:var(--fg-dark)', text:'（尚无状态）'}));
+    return;
   }
+  var sections = parsePlayerStatus(profile.persona);
+  if(!sections.length){
+    sec.appendChild(el('div', {style:'font-size:12.5px;white-space:pre-wrap', html: esc(profile.persona)}));
+    return;
+  }
+  sections.forEach(function(s, i){
+    var block = el('div', {style: i ? 'margin-top:8px' : ''});
+    block.appendChild(el('div', {style:'font-size:11.5px;font-weight:600;color:var(--info);margin-bottom:2px', text: s.label}));
+    // 列表项：每行一条，键值美观化；否则整段保留
+    var body = el('div', {style:'font-size:12.5px;white-space:pre-wrap;line-height:1.55', html: esc(s.body)});
+    block.appendChild(body);
+    sec.appendChild(block);
+  });
 }
 
 function playerRefreshStatus(){
