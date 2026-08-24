@@ -1575,7 +1575,7 @@ function playerProfileForm(done){
       el('label', {text:'人设'}), personaTa,
       err,
       el('div', {cls:'toolbar', style:'margin-top:10px'}, [
-        el('button', {cls:'primary', text:'保存并进入世界', onclick:function(){
+        el('button', {cls:'primary', text:'保存角色', onclick:function(){
           var name = nameInp.value.trim();
           if(!name){ err.textContent = '角色名不能为空'; return; }
           var profile = {name: name, persona: personaTa.value.trim()};
@@ -1596,13 +1596,22 @@ function playerRenderWorld(holder){
   // 世界运行状态 + 入世界/剧情
   var profile = VISITOR_PLAYER_PROFILE;
   holder.textContent = '';
-  // 顶部：角色身份 + 入世界状态
-  var head = el('div', {cls:'section'}, [
-    el('h3', {html:'角色 <span class="hint">' + esc(profile.name) + '</span>'}),
-    el('div', {cls:'body'}, [
-      el('div', {id:'player-status', style:'padding:10px;background:var(--panel);border:1px solid var(--line);border-radius:8px'})
-    ])
-  ]);
+  // 顶部：角色身份 + 入世界状态（未入世界时可重新编辑身份，创建新角色）
+  var head = el('div', {cls:'section'});
+  var headTitle = el('h3', {html:'角色 <span class="hint">' + esc(profile.name) + '</span>'});
+  head.appendChild(headTitle);
+  if(!PLAYER_STATE.inWorld){
+    headTitle.appendChild(el('button', {cls:'ghost', text:'重新编辑角色', style:'margin-left:8px', onclick:function(){
+      // 重新编辑角色身份（创建新角色 / 换人设），编辑后回到入世界界面
+      holder.textContent = '';
+      holder.appendChild(playerProfileForm(function(){
+        loadPlayer();
+      }));
+    }}));
+  }
+  head.appendChild(el('div', {cls:'body'}, [
+    el('div', {id:'player-status', style:'padding:10px;background:var(--panel);border:1px solid var(--line);border-radius:8px'})
+  ]));
   holder.appendChild(head);
   playerRenderStatus($('#player-status'));
 
@@ -1840,6 +1849,10 @@ function playerConnectEvents(token){
     } else if(msg.type === 'farewell'){
       PLAYER_STATE.inWorld = false;
       PLAYER_STATE.token = '';
+      PLAYER_STATE.mode = '';
+      PLAYER_STATE.events = [];
+      PLAYER_STATE.lastTimeLine = '';
+      PLAYER_STATE.actBusy = false;
       toast(msg.reason || '世界送别了你', 'warn');
       loadPlayer();
     }
