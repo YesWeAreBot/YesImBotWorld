@@ -1006,6 +1006,11 @@ export class WorldService extends Service<Config> {
     await Prompts.save(this.webuiDir, overrides);
   }
 
+  /** 用户手动设置常驻 Bot 名字（写 meta.json + 刷新内存，立即生效） */
+  async setBotName(name: string): Promise<void> {
+    await this.world.setBotName(name);
+  }
+
   /** 重载定义：与 world.reload 指令行为一致（World-LLM 调整世界状态并告知 Bot） */
   async reloadWorld(): Promise<string> {
     if (this.notReady()) return this.notReady()!;

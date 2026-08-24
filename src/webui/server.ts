@@ -97,6 +97,8 @@ export interface WebUIHost {
   reloadWorld(): Promise<string>;
   resetWorld(): Promise<string>;
   clearMsg(): Promise<string>;
+  /** 用户手动设置常驻 Bot 名字（写 meta.json + 刷新内存，立即生效） */
+  setBotName(name: string): Promise<void>;
   injectEvent(text: string): Promise<string>;
   applyConfig(next: Config): Promise<{ message: string; port: number }>;
   notes(): Promise<NoteEntry[]>;
@@ -789,6 +791,14 @@ export class WebUIServer {
     if (pathname === "/api/state/world-status" && method === "PUT") {
       const { content } = await readJson(req);
       await host.files.writeWorldStatus(String(content ?? ""));
+      sendJSON(res, 200, { ok: true });
+      return;
+    }
+
+    // 常驻 Bot 名字（用户手动编辑，写 meta.json + 刷新内存）
+    if (pathname === "/api/state/bot-name" && method === "PUT") {
+      const { name } = await readJson(req);
+      await host.setBotName(String(name ?? ""));
       sendJSON(res, 200, { ok: true });
       return;
     }

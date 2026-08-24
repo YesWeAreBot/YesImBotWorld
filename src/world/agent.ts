@@ -377,6 +377,15 @@ export class WorldAgent {
     await this.setupBotName(botDef);
   }
 
+  /** 用户手动设置常驻 Bot 名字（WebUI 编辑）：写 meta.json 并刷新内存字段，立即生效 */
+  async setBotName(name: string): Promise<void> {
+    const trimmed = name.trim().slice(0, 64);
+    const meta = await this.files.readMeta();
+    await this.files.writeMeta({ ...meta, botName: trimmed || undefined });
+    this.botName = trimmed;
+    this.logger.info("常驻 Bot 名字（用户设置）：%s", trimmed || "（清空）");
+  }
+
   /** 世界是否是现实地球世界（创世判定持久化在 meta.json；旧世界回退到时钟同步模式） */
   private async isRealWorld(): Promise<boolean> {
     const meta = await this.files.readMeta();

@@ -2623,7 +2623,28 @@ function renderStateEditor(s){
   frag.appendChild(tabs);
   frag.appendChild(panes);
   if(s.meta && Object.keys(s.meta).length && (MODE !== 'visitor' || VISITOR_GRANTS.indexOf('world_status') >= 0)){
-    frag.appendChild(el('div', {cls:'section'}, [el('h3', {text:'元数据 meta.json'}), el('div', {cls:'body'}, [el('pre', {text: JSON.stringify(s.meta, null, 2)})])]));
+    var metaSec = el('div', {cls:'section'}, [el('h3', {text:'元数据 meta.json'})]);
+    var metaBody = el('div', {cls:'body'});
+    // 常驻 Bot 名字：管理员可编辑（写 meta.json，立即生效）；访客只读
+    var curName = (s.meta.botName || '').toString();
+    if(MODE !== 'visitor'){
+      var nameInp = el('input', {placeholder:'常驻 Bot 名字（留空 = 从定义判定）', value: curName, style:'width:100%'});
+      var nameMsg = el('p', {style:'color:var(--fg-dim);font-size:12px;margin:4px 0 0', text:'常驻 Bot 的名字：供 Bot 自己的提示词与访客接待时区分「常驻 Bot vs 访客」用。留空则下次启动/重载定义时从 Bot_Definition 重新判定。'});
+      metaBody.appendChild(el('label', {text:'Bot 名字'}));
+      metaBody.appendChild(nameInp);
+      metaBody.appendChild(nameMsg);
+      metaBody.appendChild(el('div', {cls:'toolbar', style:'margin:6px 0 10px'}, [
+        el('button', {cls:'primary', text:'保存名字', onclick:function(){
+          api('PUT', '/api/state/bot-name', {name: nameInp.value.trim()}).then(function(){
+            toast('Bot 名字已保存', 'ok');
+            loadState();
+          }).catch(showErr);
+        }})
+      ]));
+    }
+    metaBody.appendChild(el('pre', {text: JSON.stringify(s.meta, null, 2)}));
+    metaSec.appendChild(metaBody);
+    frag.appendChild(metaSec);
   }
   // 默认显示第一个可见标签页
   var firstId = visible.length ? visible[0].id : null;
