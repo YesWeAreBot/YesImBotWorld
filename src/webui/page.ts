@@ -1598,10 +1598,11 @@ function playerRenderWorld(holder){
   var head = el('div', {cls:'section'}, [
     el('h3', {html:'角色 <span class="hint">' + esc(profile.name) + '</span>'}),
     el('div', {cls:'body'}, [
-      el('p', {text:'以「' + profile.name + '」的身份进入世界，用行动推动剧情。', style:'color:var(--fg-dim);font-size:13px'})
+      el('div', {id:'player-status', style:'padding:10px;background:var(--panel);border:1px solid var(--line);border-radius:8px'})
     ])
   ]);
   holder.appendChild(head);
+  playerRenderStatus($('#player-status'));
 
   if(!PLAYER_STATE.inWorld){
     // 未入世界：显示「进入世界」按钮
@@ -1636,10 +1637,6 @@ function playerWorldPanel(){
   var box = el('div', {cls:'section'});
   box.appendChild(el('h3', {html:'世界互动 <span class="hint">' + esc(PLAYER_STATE.worldName || '') + '</span>'}));
   var body = el('div', {cls:'body'});
-  // 角色状态（World 维护：身份 + 当前位置/状态/随身物/正在做的事）
-  var statusSec = el('div', {id:'player-status', style:'margin-bottom:12px;padding:10px;background:var(--panel);border:1px solid var(--line);border-radius:8px'});
-  body.appendChild(statusSec);
-  playerRenderStatus(statusSec);
   // 剧情流
   var feed = el('div', {id:'player-feed', style:'max-height:360px;overflow:auto;border:1px solid var(--line);border-radius:8px;padding:10px;margin-bottom:12px'});
   body.appendChild(feed);
@@ -1700,9 +1697,8 @@ function parsePlayerStatus(text){
 function playerRenderStatus(sec){
   sec.textContent = '';
   var profile = VISITOR_PLAYER_PROFILE;
-  sec.appendChild(el('div', {style:'font-size:12px;color:var(--fg-dark);margin-bottom:6px', text:'你的角色'}));
   if(!profile || !profile.persona){
-    sec.appendChild(el('div', {style:'font-size:12.5px;color:var(--fg-dark)', text:'（尚无状态）'}));
+    sec.appendChild(el('p', {text:'以「' + (profile && profile.name ? profile.name : '你的角色') + '」的身份进入世界，用行动推动剧情。', style:'color:var(--fg-dim);font-size:13px'}));
     return;
   }
   var sections = parsePlayerStatus(profile.persona);
