@@ -1006,9 +1006,18 @@ export class WorldService extends Service<Config> {
     await Prompts.save(this.webuiDir, overrides);
   }
 
-  /** 用户手动设置常驻 Bot 名字（写 meta.json + 刷新内存，立即生效） */
+  /** 用户手动设置常驻 Bot 名字：写 meta + 刷内存，并通知 World 这是同一角色改名（异步，不阻塞保存） */
   async setBotName(name: string): Promise<void> {
-    await this.world.setBotName(name);
+    const trimmed = name.trim().slice(0, 64);
+    const oldName = this.world.residentBotName;
+    await this.world.setBotName(trimmed);
+    if (trimmed === oldName) return; // 没变化，不折腾 World
+    // 世界在运行时，异步让 World 知道「同一角色改名」并同步状态/告知 Bot 本人
+    if (this.worldActive && this.bot) {
+      void this.world
+        .notifyBotRename(oldName, trimmed, (content) => this.bot?.pushEvent("world", content, { wake: true }))
+        .catch((err) => this.logger.warn("Bot 改名通知 World 失败: %s", err));
+    }
   }
 
   /** 重载定义：与 world.reload 指令行为一致（World-LLM 调整世界状态并告知 Bot） */

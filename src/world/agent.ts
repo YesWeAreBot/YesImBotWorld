@@ -386,6 +386,20 @@ export class WorldAgent {
     this.logger.info("常驻 Bot 名字（用户设置）：%s", trimmed || "（清空）");
   }
 
+  /**
+   * 用户手动改名后，通知 World：这是同一个角色改名（不是新角色），
+   * 让 World 同步 bot_status / world_status 里的名字，并 send_event 告知 Bot 本人。
+   * deliver = 常驻 Bot 的实时事件通道（service 传入）；世界未运行时跳过。
+   */
+  async notifyBotRename(oldName: string, newName: string, deliver: (content: string) => void): Promise<void> {
+    const task = fill(this.prompts.world.botRename, {
+      oldName: oldName || "（此前未判定）",
+      newName: newName || "（已清空）",
+      timeLine: this.clock.timeLine(),
+    });
+    await this.invokeWithTools({ task, deliver, botDeliver: deliver, visitors: this.visitorsProvider?.() ?? [] });
+  }
+
   /** 世界是否是现实地球世界（创世判定持久化在 meta.json；旧世界回退到时钟同步模式） */
   private async isRealWorld(): Promise<boolean> {
     const meta = await this.files.readMeta();

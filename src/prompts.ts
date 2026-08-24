@@ -46,6 +46,8 @@ export interface WorldPromptSet {
   resolveOfflineGap: string;
   /** 用户修改定义后重载。{{timeLine}} {{botDef}} {{worldDef}} */
   reconcileDefinitions: string;
+  /** 用户手动改常驻 Bot 名字（同一角色，仅名字变化）。{{oldName}} {{newName}} {{timeLine}} */
+  botRename: string;
   /** 创世初始化。{{timeLine}} {{botDef}} {{worldDef}} */
   initialize: string;
   /** 上下文压缩：system 消息 */
@@ -274,6 +276,17 @@ export const WORLD_PROMPT_DEFAULTS: WorldPromptSet = {
     `请 check 当前的 bot_status 与 world_status，把与新定义冲突的部分更新过来（update），` +
     `并用 update news 记录这次变化。若变化是 Bot 能感知到的，用 send_event 以符合世界观的方式告诉它` +
     `（比如以某个世界内事件为幌子，而不是说"设定被修改了"）。`,
+
+  botRename:
+    `用户（世界的创造者）把常驻 Bot 的名字从「{{oldName}}」改成了「{{newName}}」（当前 {{timeLine}}）。` +
+    `**这是同一个角色，只是名字变了，不是一个新出现的人。**\n` +
+    `请：\n` +
+    `1. check bot_status 与 world_status，找出所有用到旧名字「{{oldName}}」的地方；\n` +
+    `2. update 它们，把旧名字替换成新名字「{{newName}}」——身份、经历、关系、位置等一概不变，仅名字变化` +
+    `（优先用 patch 局部替换，oldName/newName 都可能为空：oldName 为空说明之前还没判定名字，newName 为空说明名字被清空了）；\n` +
+    `3. 用 update news 记一条这件事（若值得记录）；\n` +
+    `4. send_event 以符合世界观的方式告知 Bot 本人它的新名字——例如以某个自然的由头（登记、自我介绍、别人改叫它等）` +
+    `让它知道「我现在叫 {{newName}} 了」，而不是"设定被修改了"。`,
 
   initialize:
     `这是世界的创世时刻（{{timeLine}}）。用户给出了以下定义：\n\n` +
