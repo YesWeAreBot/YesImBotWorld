@@ -1740,9 +1740,12 @@ function playerRenderFeed(feed){
     var t = el('div', {style:'font-size:11px;color:var(--fg-dim);margin-bottom:2px', text: ev.timeLine ? '◷ ' + ev.timeLine : ''});
     var row;
     if(ev.type === 'player'){
-      // 玩家行动：右侧气泡
+      // 玩家行动：右侧气泡，带角色名标签
       row = el('div', {style:'text-align:right;padding:4px 0 6px'}, [
-        el('div', {style:'display:inline-block;max-width:86%;text-align:left;padding:6px 10px;border-radius:10px 10px 2px 10px;background:var(--info);color:#fff;font-size:12.5px;white-space:pre-wrap', html: esc(ev.content)])
+        el('div', {style:'display:inline-block;max-width:86%;text-align:left'}, [
+          el('div', {style:'font-size:11px;color:var(--fg-dim);margin-bottom:2px;text-align:right', text: ev.name ? ev.name : '你'}),
+          el('div', {style:'padding:6px 10px;border-radius:10px 10px 2px 10px;background:var(--info);color:#fff;font-size:12.5px;white-space:pre-wrap', html: esc(ev.content)})
+        ])
       ]);
     } else {
       // 世界剧情：左侧气泡 + 【世界】标签
