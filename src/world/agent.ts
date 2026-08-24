@@ -407,11 +407,11 @@ export class WorldAgent {
     return this.invokeWithTools({ task, deliver, botDeliver: deliver, visitors: this.visitorsProvider?.() ?? [] });
   }
 
-  /** Bot 主动查看时间：由世界裁定它此刻能否得知时间（允许失败） */
+  /** Bot 主动查看时间：由世界裁定它此刻能否得知时间（允许失败）。只读任务，走并行队列 */
   async resolveCheckTime(deliver: (content: string) => void): Promise<boolean> {
     if (this.remote) return this.remote.resolveCheckTime(deliver);
     const task = fill(this.prompts.world.resolveCheckTime, { timeLine: this.clock.timeLine() });
-    return this.invokeWithTools({ task, deliver });
+    return this.invokeWithTools({ task, deliver }, true);
   }
 
   /** Tingle：世界心跳，推进世界演化。返回 World 为下一次心跳设定的间隔（TU），未设定则返回 null */
@@ -628,7 +628,8 @@ export class WorldAgent {
       this.visitorPreamble(v) +
       "\n\n" +
       fill(this.prompts.world.resolveCheckTime, { timeLine: this.clock.timeLine() });
-    return this.invokeWithTools({ task, deliver, ...this.visitorInvocationExtras() });
+    // 只读任务：走并行队列（不写状态，只 check + send_event）
+    return this.invokeWithTools({ task, deliver, ...this.visitorInvocationExtras() }, true);
   }
 
   /** 访客的世界查询（天气 / 虚构网页等——访客的手机连的是这个世界的"互联网"） */
@@ -920,12 +921,12 @@ export class WorldAgent {
 
   // ---------- 工具循环 ----------
 
-  private async invokeWithTools(invocation: WorldInvocation): Promise<boolean> {
+  private async invokeWithTools(invocation: WorldInvocation, parallel = false): Promise<boolean> {
     debug.emit("world.task", `任务·${invocation.task.slice(0, 60)}`, {
       task: invocation.task,
       deliver: !!invocation.deliver,
     });
-    return this.enqueue(async () => {
+    const run = async () => {
       try {
         const finalContent = await this.runToolLoop(invocation);
         debug.emit("world.result", "任务完成", { finalContent: finalContent.slice(0, 2000) });
@@ -935,7 +936,14 @@ export class WorldAgent {
         this.logger.warn("World-LLM 调用失败: %s", err);
         return false;
       }
-    });
+    };
+    // parallel：只读任务（不写状态文件、只 check + send_event）走独立并行队列，
+    // 不被写任务的串行队列（tail）饿死——例如"看时间"不该排在 act 裁定后面。
+    if (parallel) {
+      const signal = AbortSignal.timeout(QUERY_TIMEOUT_MS);
+      return this.enqueueQuery(run, signal);
+    }
+    return this.enqueue(run);
   }
 
   private async systemPrompt(): Promise<string> {
