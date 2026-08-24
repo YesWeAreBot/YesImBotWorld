@@ -219,8 +219,10 @@ export interface RemoteWorldLink {
  */
 export class WorldAgent {
   private client: ChatClient;
-  private tail: Promise<unknown> = Promise.resolve();
-  /** 只读查询（终端虚拟输出、天气等）的独立队列：不与写状态的主队列（tail）串行，避免被 act 裁定积压饿死 */
+  /** 写状态任务的可抢占队列：玩家 act 等高优先级任务会插到队头（在未开始的普通任务之前） */
+  private queue: { fn: () => Promise<unknown>; priority: boolean; resolve: (v: unknown) => void; reject: (e: unknown) => void }[] = [];
+  private draining = false;
+  /** 只读查询（终端虚拟输出、天气等）的独立队列：不与写状态的主队列串行，避免被 act 裁定积压饿死 */
   private queryTail: Promise<unknown> = Promise.resolve();
   private pending = 0;
   /** World 通过 set_tingle 为下一次心跳设定的间隔（TU）；读取后清空 */
@@ -349,16 +351,50 @@ export class WorldAgent {
    * 只能驻留单模型的端点（llama-swap 等换载层）时，任务期间 Bot 的生成请求
    * 排队等待，避免跨模型并发把请求饿死或把推理进程搞崩；不同源时无影响。
    */
-  private enqueue<T>(fn: () => Promise<T>): Promise<T> {
+  /**
+   * 写状态任务入队。priority=true 时插到队头（在尚未开始的普通任务之前），
+   * 使玩家 act 等交互式任务被优先处理，不被 Tingle / 到达叙事等积压饿死。
+   * 正在执行中的任务不会被抢占（LLM 推理无法安全中断）。
+   */
+  private enqueue<T>(fn: () => Promise<T>, priority = false): Promise<T> {
     this.pending++;
-    const wrapped = () =>
-      withEndpointLock(this.cfg.baseURL, fn).finally(() => this.pending--);
-    const next = this.tail.then(wrapped, wrapped);
-    this.tail = next.then(
-      () => undefined,
-      () => undefined,
-    );
-    return next;
+    return new Promise<T>((resolve, reject) => {
+      const wrapped = () =>
+        withEndpointLock(this.cfg.baseURL, fn).finally(() => this.pending--);
+      const entry = {
+        fn: wrapped as () => Promise<unknown>,
+        priority,
+        resolve: (v: unknown) => resolve(v as T),
+        reject,
+      };
+      if (priority) {
+        // 插到第一个普通任务之前（多个高优任务之间保持 FIFO）
+        const idx = this.queue.findIndex((t) => !t.priority);
+        if (idx === -1) this.queue.push(entry);
+        else this.queue.splice(idx, 0, entry);
+      } else {
+        this.queue.push(entry);
+      }
+      void this.drain();
+    });
+  }
+
+  /** 串行排空写队列（队头优先，高优先任务已在队头） */
+  private async drain(): Promise<void> {
+    if (this.draining) return;
+    this.draining = true;
+    try {
+      while (this.queue.length) {
+        const task = this.queue.shift()!;
+        try {
+          task.resolve(await task.fn());
+        } catch (err) {
+          task.reject(err);
+        }
+      }
+    } finally {
+      this.draining = false;
+    }
   }
 
   /**
@@ -576,7 +612,8 @@ export class WorldAgent {
       personaWhere: this.personaWhere(),
       timeLine: this.clock.timeLine(),
     });
-    return this.invokeWithTools({ task, deliver, ...this.visitorInvocationExtras() });
+    // 到达叙事也用 priority：既插到后台任务（Tingle 等）之前，又保证先于该玩家的 act 执行
+    return this.invokeWithTools({ task, deliver, ...this.visitorInvocationExtras() }, false, true);
   }
 
   /** 访客离开：World_Status 善后（无需向访客交付事件），并在下次心跳时提醒世界不要续写它的情节 */
@@ -605,7 +642,7 @@ export class WorldAgent {
         duration,
         expectedAt: this.clock.timeLine(now + Math.max(duration, 0)),
       });
-    return this.invokeWithTools({ task, deliver, ...this.visitorInvocationExtras() });
+    return this.invokeWithTools({ task, deliver, ...this.visitorInvocationExtras() }, false, true);
   }
 
   /** 访客 wait 补叙 */
@@ -921,7 +958,7 @@ export class WorldAgent {
 
   // ---------- 工具循环 ----------
 
-  private async invokeWithTools(invocation: WorldInvocation, parallel = false): Promise<boolean> {
+  private async invokeWithTools(invocation: WorldInvocation, parallel = false, priority = false): Promise<boolean> {
     debug.emit("world.task", `任务·${invocation.task.slice(0, 60)}`, {
       task: invocation.task,
       deliver: !!invocation.deliver,
@@ -938,12 +975,12 @@ export class WorldAgent {
       }
     };
     // parallel：只读任务（不写状态文件、只 check + send_event）走独立并行队列，
-    // 不被写任务的串行队列（tail）饿死——例如"看时间"不该排在 act 裁定后面。
+    // 不被写任务的串行队列饿死——例如"看时间"不该排在 act 裁定后面。
     if (parallel) {
       const signal = AbortSignal.timeout(QUERY_TIMEOUT_MS);
       return this.enqueueQuery(run, signal);
     }
-    return this.enqueue(run);
+    return this.enqueue(run, priority);
   }
 
   private async systemPrompt(): Promise<string> {
