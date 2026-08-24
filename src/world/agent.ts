@@ -143,6 +143,25 @@ const WORLD_TOOLS: ChatToolDef[] = [
   {
     type: "function",
     function: {
+      name: "expel_visitor",
+      description:
+        "（有访客在场时可用）强行驱逐某位访客离开本世界，切断其后续一切主动互动能力。**仅当**世界演化中" +
+        "该角色被认定为死亡、消散、升天、被放逐、永久封印等「不可能再主动与这个世界互动」的结局时使用。" +
+        "调用后该访客会立即退出、无法再提交行动，其已有身份也随之失效。reason 会告知对方发生了什么。" +
+        "注意：普通离开、暂时离开、失联都不要用这个工具——那属于访客自己的主动离开。",
+      parameters: {
+        type: "object",
+        properties: {
+          name: { type: "string", description: "要驱逐的访客名（只有一位访客在场时可省略）" },
+          reason: { type: "string", description: "驱逐原因（如「角色被处决」「形体消散」「飞升成神」），会告知对方" },
+        },
+        required: ["reason"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "send_event",
       description:
         "向 Bot 的意识流中追加一个事件。这是 Bot 唯一能感知到你的方式。用第三人称、符合世界观的口吻客观叙述发生了什么、" +
@@ -185,7 +204,7 @@ export interface WorldInvocation {
 /** 在场访客的完整通道（穿越服务提供） */
 export interface PresentVisitor {
   name: string;
-  /** 状态档案（会注入系统提示的 <visitors> 区） */
+  /** 状态档案（会注入系统提示的 <visitors> 区 */
   persona: string;
   /** 真人玩家的进入语义（cross=穿越/avatar=扮演/puppet=操纵）；Bot 访客恒为 cross */
   mode?: PlayerMode;
@@ -193,6 +212,8 @@ export interface PresentVisitor {
   deliver: (content: string) => void;
   /** 状态写回访客世界（update_visitor_status 工具） */
   updateStatus: (content: string) => void;
+  /** 强行驱逐该访客（角色死亡/消散/升天等，切断其后续主动互动能力） */
+  expel: (reason: string) => void;
 }
 
 /** 接待任务里的访客引用（穿越服务传入；状态写回通道统一走 WorldInvocation.visitors） */
@@ -1108,7 +1129,8 @@ export class WorldAgent {
       (t) =>
         (invocation.deliver || invocation.visitors?.length || t.function.name !== "send_event") &&
         (invocation.allowTingle || t.function.name !== "set_tingle") &&
-        (invocation.visitors?.length || t.function.name !== "update_visitor_status") &&
+        (invocation.visitors?.length ||
+          (t.function.name !== "update_visitor_status" && t.function.name !== "expel_visitor")) &&
         ((this.visitorPersonaMode === "check" && invocation.visitors?.length) ||
           t.function.name !== "check_visitor"),
     );
@@ -1326,6 +1348,25 @@ export class WorldAgent {
           }
           target.updateStatus(content.slice(0, 20000));
           return `访客「${target.name}」的状态已更新（将回传到它的世界）`;
+        }
+        case "expel_visitor": {
+          const reason = String(args.reason ?? "").trim();
+          const visitors = invocation.visitors ?? [];
+          if (!visitors.length) return "当前没有访客在场";
+          const vname = String(args.name ?? "").trim();
+          const target = vname
+            ? visitors.find((x) => x.name === vname)
+            : visitors.length === 1
+              ? visitors[0]
+              : undefined;
+          if (!target) {
+            const names = visitors.map((x) => `「${x.name}」`).join("、");
+            return vname
+              ? `没有名为「${vname}」的访客在场（在场：${names}）`
+              : `在场访客不止一位（${names}），请用 name 参数指定要驱逐谁`;
+          }
+          target.expel(reason || "被这个世界排除");
+          return `访客「${target.name}」已被驱逐（${reason || "未说明原因"}），无法再主动互动。`;
         }
         case "send_event": {
           const content = String(args.content ?? "");

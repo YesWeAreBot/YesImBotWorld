@@ -115,14 +115,35 @@ export class CrossingServer {
    * 状态档案进 World-LLM 系统提示的 <visitors> 区、send_event to= 定向投递、
    * update_visitor_status 状态写回。
    */
-  visitors(): { name: string; persona: string; mode: PlayerMode; deliver: (content: string) => void; updateStatus: (content: string) => void }[] {
+  visitors(): { name: string; persona: string; mode: PlayerMode; deliver: (content: string) => void; updateStatus: (content: string) => void; expel: (reason: string) => void }[] {
     return [...this.sessions.values()].map((s) => ({
       name: s.name,
       persona: s.persona,
       mode: s.mode ?? "cross",
       deliver: (content: string) => this.pushEvent(s, content),
       updateStatus: s.updateStatus,
+      expel: (reason: string) => this.expelVisitor(s.name, reason),
     }));
+  }
+
+  /**
+   * 强行驱逐一位在场访客（World-LLM 在演化中判定该角色死亡/消散/升天等，
+   * 不应再有任何可能主动互动）。与主动离开不同：直接关闭会话、切断后续任务通道，
+   * **不**触发 visitorLeave 的"离开善后"叙事——死亡结局由 World 自己写进 world_status。
+   */
+  expelVisitor(name: string, reason: string): void {
+    const session = [...this.sessions.values()].find((s) => s.name === name);
+    if (!session) return;
+    this.sessions.delete(session.token);
+    this.push(session, { type: "farewell", reason: reason || "你已被这个世界排除，无法再主动互动。" });
+    this.closeSession(session);
+    this.host.logger.info("[穿越] 访客「%s」被世界驱逐（%s）", name, reason || "未说明原因");
+    debug.emit("world.task", `穿越·访客「${name}」被驱逐`, { reason });
+    this.host.notifyHostBot(`${name ? `「${name}」` : "一位访客"}已被这个世界排除（${reason || "死亡/消散/升天等"}），不再在场。`);
+    // 清掉它尚未开始执行的 act/wait，避免"已死角色"的旧行动照常演出来
+    this.host.world.cancelPending(name);
+    // 最后一位访客离场且常驻 Bot 在外：世界重新进入沉睡
+    if (this.sessions.size === 0) this.host.world.notePresenceChange();
   }
 
   visitorList(): { name: string; arrivedAt: number }[] {
