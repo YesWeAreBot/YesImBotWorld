@@ -184,6 +184,8 @@ export class BotContext {
   timeInfo = "";
   /** 聊天账号列表提供者（service 注入）：只含 platform:id，保持前缀稳定 */
   accountsProvider: (() => string) | null = null;
+  /** 常驻 Bot 名字提供者（service 注入）：运行时可变（世界演化可改名），渲染时实时取值 */
+  botNameProvider: (() => string) | null = null;
   /** 工具走原生 function calling 声明（service 按 bot.nativeToolCalls 与 mode 注入）：切换行为准则的输出格式段 */
   nativeToolCalls = false;
   /** wait 工具被移除（service 按 bot.disableWait 注入）：行为准则不再提及等待 */
@@ -191,11 +193,13 @@ export class BotContext {
 
   renderSystemText(timeLine: string): string {
     const accounts = this.accountsProvider?.() ?? "";
+    const botName = this.botNameProvider?.()?.trim() ?? "";
     const c = this.constitution;
     const original = this.pinned.botDefinition?.trim();
     return [
       ...(original ? ["# 最初的你\n" + original] : []),
       "# 你是谁\n" + (this.pinned.persona.trim() || "（角色设定缺失）"),
+      ...(botName ? [`# 你的名字\n你叫「${botName}」——这就是你，别人这样称呼你、@ 你时就是在跟你说话。`] : []),
       c.constitutionHead +
         "\n\n" +
         (this.nativeToolCalls ? c.outputFormatNative : c.outputFormatJson) +
@@ -207,7 +211,9 @@ export class BotContext {
         ? [
             "# 你的聊天账号\n" +
               accounts +
-              "\n消息里的 <at id=\"…\"/> 指向这些 id、或说话人标为「你自己」时，那都是你——被 @ 是别人在叫你，「你自己」的消息是你说过的话。",
+              (botName
+                ? `\n消息里的 <at id=\"…\"/> 指向这些 id 时，那是别人在 @ 你、在叫「${botName}」（你的名字）——那就是在跟你说话；说话人标为「你自己」的消息是你之前说过的，不要回复它。`
+                : `\n消息里的 <at id=\"…\"/> 指向这些 id、或说话人标为「你自己」时，那都是你——被 @ 是别人在叫你，「你自己」的消息是你说过的话。`),
           ]
         : []),
       "# 可用工具\n" + this.pinned.toolsText,

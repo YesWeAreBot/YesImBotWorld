@@ -351,6 +351,8 @@ export class WorldService extends Service<Config> {
       const ids = [...new Set(this.ctx.bots.filter((b) => b.selfId).map((b) => `${b.platform}:${b.selfId}`))];
       return ids.sort().join("、");
     };
+    // 常驻 Bot 名字：渲染时实时取值（世界演化改名前/后都会反映到 prompt）
+    this.botContext.botNameProvider = () => this.world.residentBotName;
     // TU 换算锚点：Bot 估算 duration / wait 时长的依据（如「1 TU = 1 秒」）
     this.botContext.timeInfo =
       `1 TU = ${this.clock.unitWorldSeconds} 秒` +
@@ -755,7 +757,8 @@ export class WorldService extends Service<Config> {
 
   /** 出行档案：名字 + 自我认知摘录（发给对方世界供裁定；不含任何配置或密钥） */
   private async crossingProfile(): Promise<{ name: string; persona: string }> {
-    const name = this.config.crossing.botName.trim() || "异界来客";
+    // 名字优先级：显式配置的出行名 > 世界判定的常驻 Bot 名 > "异界来客"
+    const name = this.config.crossing.botName.trim() || this.world.residentBotName || "异界来客";
     const persona = (await this.files.readBotStatus().catch(() => "")).trim();
     return { name, persona };
   }

@@ -289,6 +289,10 @@ export class WorldAgent {
   visitorPersonaMode: "pinned" | "check" = "pinned";
   /** 常驻 Bot 的名字（创世判定，内存缓存，供 visitor prompt 硬区分；systemPrompt 每次读 meta 刷新） */
   private botName = "";
+  /** 供 service/BotContext 读取的常驻 Bot 名字（可能为空=尚未判定） */
+  get residentBotName(): string {
+    return this.botName;
+  }
   /** 穿越：最近离开的访客（下一次 Tingle 时提醒世界清理其在场记述、停止续写其情节） */
   private departedVisitors: string[] = [];
   /**
@@ -362,10 +366,13 @@ export class WorldAgent {
     this.realNewsProvider = fn;
   }
 
-  /** 世界启动时若 meta.json 还没有 botName（旧世界），从定义补判一次（失败静默，下次仍会重试） */
+  /** 世界启动时：把 meta 里的 botName 刷进内存字段；若还没有（旧世界），从定义补判一次 */
   async ensureBotName(): Promise<void> {
     const meta = await this.files.readMeta();
-    if (meta.botName) return;
+    if (meta.botName) {
+      this.botName = meta.botName;
+      return;
+    }
     const { botDef } = await this.files.readDefinitions();
     await this.setupBotName(botDef);
   }
