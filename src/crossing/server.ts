@@ -44,6 +44,26 @@ function playerArriveNotice(name: string, mode: PlayerMode): string {
   }
 }
 
+/** 真人玩家离开时告知常驻 Bot 的语义说明（按进入语义 + 离场原因区分） */
+function playerLeaveNotice(name: string, mode: PlayerMode, cause: "returned" | "lost"): string {
+  const gone = cause === "lost";
+  const how = gone ? "与这个世界的联系突然断开（失联）" : "";
+  switch (mode) {
+    case "avatar":
+      return gone
+        ? `真人玩家扮演的角色「${name}」${how}——玩家不再操控，这个角色已归还给世界，之后可继续演化其后续。`
+        : `真人玩家扮演的角色「${name}」停止了扮演——这个角色仍在世界，之后由世界继续演化它的后续行动与决策。`;
+    case "puppet":
+      return gone
+        ? `真人玩家操纵的角色「${name}」${how}——操纵中断，这个角色恢复了自主意识，之后由世界继续演化。`
+        : `真人玩家对角色「${name}」放开了操纵——它挣脱束缚、恢复自主意识，之后由世界继续演化。`;
+    default:
+      return gone
+        ? `异世界的访客「${name}」${how}，身影消散了。`
+        : `异世界的访客「${name}」回自己的世界去了。`;
+  }
+}
+
 interface VisitorSession extends VisitorInfo {
   token: string;
   res: http.ServerResponse | null;
@@ -412,10 +432,9 @@ export class CrossingServer {
   private depart(session: VisitorSession, cause: "returned" | "lost"): void {
     if (!this.sessions.delete(session.token)) return;
     this.closeSession(session);
-    const how = cause === "returned" ? "回自己的世界去了" : "与这个世界的联系突然断开，身影消散了";
-    this.host.logger.info("[穿越] 访客「%s」离开（%s）", session.name, cause);
-    debug.emit("world.task", `穿越·访客「${session.name}」离开`, { cause });
-    this.host.notifyHostBot(`异世界的访客「${session.name}」${how}。`);
+    this.host.logger.info("[穿越] 访客「%s」离开（%s，mode=%s）", session.name, cause, session.mode ?? "cross");
+    debug.emit("world.task", `穿越·访客「${session.name}」离开`, { cause, mode: session.mode ?? "cross" });
+    this.host.notifyHostBot(playerLeaveNotice(session.name, session.mode ?? "cross", cause));
     // 先清掉该玩家尚未开始执行的 act/wait（避免它离开后，队列里的旧行动还照常演一遍）
     this.host.world.cancelPending(session.name);
     void this.host.world

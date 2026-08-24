@@ -627,6 +627,31 @@ export class WorldAgent {
     }
   }
 
+  /** 按进入语义生成「离开时该如何处理该角色」说明（注入离开善后 prompt） */
+  private leaveSemantic(v: VisitorRef): string {
+    const name = v.name;
+    switch (v.mode ?? "cross") {
+      case "avatar":
+        return (
+          `「${name}」是一位真人玩家扮演的本世界既有角色，现在玩家离开了。` +
+          `这个角色**仍然属于这个世界**：请保留它的身份与所在，世界之后可以在剧情中继续提到它、` +
+          `自然演化它的后续行动与决策（如同世界上其他未被玩家操控的角色一样），不要再把它当作"来访者离开"。`
+        );
+      case "puppet":
+        return (
+          `「${name}」是一位真人玩家操纵的本世界既有角色，现在玩家放开了操纵。` +
+          `这个角色**恢复了完全自主**（它本就保有自己的意识）：请让它挣脱束缚、恢复自己的意志，` +
+          `世界之后正常演化它的后续行动与决策（可能对被操纵的经历有所反应），不要让它就此消失。`
+        );
+      default:
+        return (
+          `「${name}」是从外界穿越降临的访客，现在离开了这个世界、返回它自己的世界，它的身影已从本世界消失。` +
+          `删除一切"它在场/正在做某事/正与谁互动"的现在时记述——它做过的事可以改写为已完成的过去时痕迹` +
+          `（如别人对它的印象、它留下的物品或影响），酌情保留。此后世界演化不应再出现它本人的情节（除非它再次到访）。`
+        );
+    }
+  }
+
   /** 接待任务里的访客前言（常驻 Bot 外出时附加提示，避免"幽灵互动"） */
   private visitorPreamble(v: VisitorRef): string {
     let text = fill(this.prompts.world.visitorPreamble, {
@@ -664,12 +689,20 @@ export class WorldAgent {
     return this.invokeWithTools({ task, deliver, ...this.visitorInvocationExtras() }, false, true);
   }
 
-  /** 访客离开：World_Status 善后（无需向访客交付事件），并在下次心跳时提醒世界不要续写它的情节 */
-  async visitorLeave(v: { name: string }): Promise<boolean> {
+  /** 访客离开：按进入语义分化——穿越则彻底离场；扮演/操纵则角色留在世界由世界继续演化 */
+  async visitorLeave(v: VisitorRef): Promise<boolean> {
     const timeLine = this.clock.timeLine();
-    this.departedVisitors.push(`「${v.name}」（${timeLine} 离开）`);
-    if (this.departedVisitors.length > 5) this.departedVisitors.splice(0, this.departedVisitors.length - 5);
-    const task = fill(this.prompts.world.visitorLeave, { name: v.name, timeLine });
+    const mode = v.mode ?? "cross";
+    // 仅「穿越」离开需要后续 Tingle 提醒世界停止续写其情节；扮演/操纵的角色留在世界，无需停止
+    if (mode === "cross") {
+      this.departedVisitors.push(`「${v.name}」（${timeLine} 离开）`);
+      if (this.departedVisitors.length > 5) this.departedVisitors.splice(0, this.departedVisitors.length - 5);
+    }
+    const task = fill(this.prompts.world.visitorLeave, {
+      name: v.name,
+      timeLine,
+      leaveSemantic: this.leaveSemantic(v),
+    });
     // 离开善后插队：优先于其它积压任务执行
     return this.invokeWithTools({ task }, false, true);
   }
@@ -1060,6 +1093,11 @@ export class WorldAgent {
           visitors.map((v) => `## 「${v.name}」${modeTag(v.mode)}\n${v.persona || "（无自我描述）"}`).join("\n\n") +
           "\n</visitors>";
       }
+      // 真人玩家在场：他们的角色由玩家本人驱动，World 演化时不要替其做决定
+      sys +=
+        "\n\n（重要约束：上面这些访客是**真人玩家在驱动**的角色，其下一步行动与决策由玩家本人给出。" +
+        "世界演化时**不要替他们决定要做什么、替他们行动或替他们说话**——你只能让世界/其他角色对**已发生的**事做出反应，" +
+        "并把仅发生在他们身上的事用 send_event 的 to 参数送达本人。只有玩家明确通过「行动」指令要求时，才裁定其结果。）";
     }
     return sys;
   }

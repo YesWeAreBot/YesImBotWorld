@@ -72,7 +72,7 @@ export interface WorldPromptSet {
   visitorPreamble: string;
   /** 穿越：访客到达。{{name}} {{persona}} {{personaWhere}} {{timeLine}} */
   visitorArrive: string;
-  /** 穿越：访客离开。{{name}} {{timeLine}} */
+  /** 穿越：访客离开（按进入语义分化）。{{name}} {{timeLine}} {{leaveSemantic}} */
   visitorLeave: string;
   /** 穿越：世界沉睡后苏醒的补叙（无人在场期间的演化）。{{fromTimeLine}} {{toTimeLine}} {{gapTU}} */
   dormantCatchup: string;
@@ -393,12 +393,11 @@ export const WORLD_PROMPT_DEFAULTS: WorldPromptSet = {
     `3. update world_status 记录这位访客在场（在哪、什么状态），保证后续裁定一致。`,
 
   visitorLeave:
-    `异世界访客「{{name}}」已经离开了这个世界，返回它自己的世界（{{timeLine}}）。它的身影已从本世界消失。\n` +
+    `访客「{{name}}」现在离开了（{{timeLine}}）。\n` +
+    `{{leaveSemantic}}\n` +
     `请务必完成以下善后（必须调用 update）：\n` +
     `1. check world_status，找出所有与这位访客有关的记述；\n` +
-    `2. update world_status 输出**完整的新版本**：删除一切"它在场/正在做某事/正与谁互动"的现在时记述——` +
-    `它做过的事可以改写为已完成的过去时痕迹（如别人对它的印象、它留下的物品或影响），酌情保留；\n` +
-    `3. 此后这位访客不在这个世界里，世界演化不应再出现它本人的情节（除非它再次到访）。`,
+    `2. update world_status 输出**完整的新版本**，按上述「离开语义」处理它留在这个世界的状态。`,
 
   dormantCatchup:
     `这个世界从 {{fromTimeLine}} 到 {{toTimeLine}} 之间处于无人在场的状态` +
