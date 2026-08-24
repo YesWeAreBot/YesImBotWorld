@@ -220,7 +220,7 @@ export interface RemoteWorldLink {
 export class WorldAgent {
   private client: ChatClient;
   /** 写状态任务的可抢占队列：玩家 act 等高优先级任务会插到队头（在未开始的普通任务之前） */
-  private queue: { fn: () => Promise<unknown>; priority: boolean; resolve: (v: unknown) => void; reject: (e: unknown) => void }[] = [];
+  private queue: { fn: () => Promise<unknown>; priority: boolean; cancelKey?: string; resolve: (v: unknown) => void; reject: (e: unknown) => void }[] = [];
   private draining = false;
   /** 只读查询（终端虚拟输出、天气等）的独立队列：不与写状态的主队列串行，避免被 act 裁定积压饿死 */
   private queryTail: Promise<unknown> = Promise.resolve();
@@ -356,7 +356,7 @@ export class WorldAgent {
    * 使玩家 act 等交互式任务被优先处理，不被 Tingle / 到达叙事等积压饿死。
    * 正在执行中的任务不会被抢占（LLM 推理无法安全中断）。
    */
-  private enqueue<T>(fn: () => Promise<T>, priority = false): Promise<T> {
+  private enqueue<T>(fn: () => Promise<T>, priority = false, cancelKey?: string): Promise<T> {
     this.pending++;
     return new Promise<T>((resolve, reject) => {
       const wrapped = () =>
@@ -364,6 +364,7 @@ export class WorldAgent {
       const entry = {
         fn: wrapped as () => Promise<unknown>,
         priority,
+        cancelKey,
         resolve: (v: unknown) => resolve(v as T),
         reject,
       };
@@ -377,6 +378,24 @@ export class WorldAgent {
       }
       void this.drain();
     });
+  }
+
+  /**
+   * 取消队列里「尚未开始执行」的、带指定 cancelKey 的任务（如某访客离开时清掉它未开始的 act）。
+   * 正在执行中的任务无法取消（已 shift 出队列）。
+   */
+  cancelPending(cancelKey: string): void {
+    let removed = 0;
+    for (let i = this.queue.length - 1; i >= 0; i--) {
+      const t = this.queue[i]!;
+      if (t.cancelKey === cancelKey) {
+        this.queue.splice(i, 1);
+        this.pending--; // 补偿：这些任务的 fn 不会再执行，pending 计数须手动回收
+        t.reject(new Error("任务已取消（玩家已离开世界）"));
+        removed++;
+      }
+    }
+    if (removed) this.logger.info("[世界] 取消 %s 的 %d 个未开始任务", cancelKey, removed);
   }
 
   /** 串行排空写队列（队头优先，高优先任务已在队头） */
@@ -622,7 +641,8 @@ export class WorldAgent {
     this.departedVisitors.push(`「${v.name}」（${timeLine} 离开）`);
     if (this.departedVisitors.length > 5) this.departedVisitors.splice(0, this.departedVisitors.length - 5);
     const task = fill(this.prompts.world.visitorLeave, { name: v.name, timeLine });
-    return this.invokeWithTools({ task });
+    // 离开善后插队：优先于其它积压任务执行
+    return this.invokeWithTools({ task }, false, true);
   }
 
   /** 裁定访客的 act 动作（时刻按本世界时钟换算） */
@@ -642,7 +662,7 @@ export class WorldAgent {
         duration,
         expectedAt: this.clock.timeLine(now + Math.max(duration, 0)),
       });
-    return this.invokeWithTools({ task, deliver, ...this.visitorInvocationExtras() }, false, true);
+    return this.invokeWithTools({ task, deliver, ...this.visitorInvocationExtras() }, false, true, v.name);
   }
 
   /** 访客 wait 补叙 */
@@ -656,7 +676,8 @@ export class WorldAgent {
         n,
         expectedAt: this.clock.timeLine(now + Math.max(n, 0)),
       });
-    return this.invokeWithTools({ task, deliver, ...this.visitorInvocationExtras() });
+    // 玩家的等待也是交互操作：优先 + 可被离开取消
+    return this.invokeWithTools({ task, deliver, ...this.visitorInvocationExtras() }, false, true, v.name);
   }
 
   /** 访客查看时间（按本世界的时钟与历法） */
@@ -958,7 +979,7 @@ export class WorldAgent {
 
   // ---------- 工具循环 ----------
 
-  private async invokeWithTools(invocation: WorldInvocation, parallel = false, priority = false): Promise<boolean> {
+  private async invokeWithTools(invocation: WorldInvocation, parallel = false, priority = false, cancelKey?: string): Promise<boolean> {
     debug.emit("world.task", `任务·${invocation.task.slice(0, 60)}`, {
       task: invocation.task,
       deliver: !!invocation.deliver,
@@ -980,7 +1001,7 @@ export class WorldAgent {
       const signal = AbortSignal.timeout(QUERY_TIMEOUT_MS);
       return this.enqueueQuery(run, signal);
     }
-    return this.enqueue(run, priority);
+    return this.enqueue(run, priority, cancelKey);
   }
 
   private async systemPrompt(): Promise<string> {

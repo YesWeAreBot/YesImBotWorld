@@ -389,6 +389,8 @@ export class CrossingServer {
     this.host.logger.info("[穿越] 访客「%s」离开（%s）", session.name, cause);
     debug.emit("world.task", `穿越·访客「${session.name}」离开`, { cause });
     this.host.notifyHostBot(`异世界的访客「${session.name}」${how}。`);
+    // 先清掉该玩家尚未开始执行的 act/wait（避免它离开后，队列里的旧行动还照常演一遍）
+    this.host.world.cancelPending(session.name);
     void this.host.world
       .visitorLeave(session)
       .catch((err) => this.host.logger.warn("[穿越] 离开善后失败: %s", err));
