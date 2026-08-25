@@ -499,6 +499,11 @@ export class WebUIServer {
           mode: body.mode === "avatar" || body.mode === "puppet" || body.mode === "cross" ? body.mode : undefined,
         };
         if (!profile.name) return void sendJSON(res, 400, { error: "角色名不能为空" });
+        // 玩家角色不能与常驻 Bot 同名（避免世界裁决时主体混淆）
+        const botName = (await this.host.files.readMeta()).botName?.trim();
+        if (botName && profile.name === botName) {
+          return void sendJSON(res, 400, { error: `角色名不能与常驻 Bot「${botName}」相同` });
+        }
         const r = await this.visitors.savePlayerProfile(session.accountId, profile);
         if (!r.ok) return void sendJSON(res, 400, { error: r.error });
         return void sendJSON(res, 200, { ok: true });

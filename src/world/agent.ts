@@ -139,7 +139,7 @@ const WORLD_TOOLS: ChatToolDef[] = [
         "（有异世界访客在场时可用）更新某位**访客**的状态档案（相当于访客自己世界里的 bot_status，" +
         "会回传到它的世界持久保存；当前内容见系统提示的 <visitors> 区，或用 check_visitor 查看）。用 content 整体覆盖：" +
         "保持原有 Markdown 结构，只改需要改的部分。访客的位置、状态、随身物品、正在做的事发生持久变化时" +
-        "（受伤、获得/失去物品、移动等）应及时更新。注意：这不是本世界常驻 Bot 的 bot_status，两者互不相干",
+        "（受伤、获得/失去物品、移动等）应及时更新。注意：这不是本世界常驻角色的 bot_status，两者互不相干",
       parameters: {
         type: "object",
         properties: {
@@ -155,13 +155,13 @@ const WORLD_TOOLS: ChatToolDef[] = [
     function: {
       name: "rename_bot",
       description:
-        "更新常驻 Bot 的名字（meta 里机器可读的那份）。**仅当**剧情里 Bot 的名字实际发生变更时使用" +
+        "更新常驻角色的名字（meta 里机器可读的那份）。**仅当**剧情里该角色的名字实际发生变更时使用" +
         "（被赐名、改姓、伪装新身份、称号变化、更名等）。新名字要同步写进 bot_status 的状态档案（用 update(bot_status)），" +
-        "并通过 send_event 以符合世界观的方式告知 Bot 本人。此后访客接待等任务都会用这个新名字来称呼常驻 Bot。",
+        "并通过 send_event 以符合世界观的方式告知该角色本人。此后访客接待等任务都会用这个新名字来称呼它。",
       parameters: {
         type: "object",
         properties: {
-          name: { type: "string", description: "Bot 的新名字（它在世界里被人如何称呼的新称呼）" },
+          name: { type: "string", description: "常驻角色的新名字（它在世界里被人如何称呼的新称呼）" },
         },
         required: ["name"],
       },
@@ -201,7 +201,7 @@ const WORLD_TOOLS: ChatToolDef[] = [
           to: {
             type: "string",
             description:
-              "把事件送达指定对象：填在场访客的名字，或填 \"bot\" 送达本世界的常驻 Bot。" +
+              "把事件送达指定对象：填在场访客的名字，或填常驻角色的名字（见系统提示里它的名字）。" +
               "缺省送达本次任务的主角",
           },
         },
@@ -349,6 +349,7 @@ export class WorldAgent {
     if (gapTU * this.clock.unitWorldSeconds < 60) return false;
     this.logger.info("世界从沉睡中苏醒（沉睡约 %s TU），补叙期间的演化", gapTU.toFixed(1));
     const task = fill(this.prompts.world.dormantCatchup, {
+      botName: this.botName || "（未命名）",
       fromTimeLine: this.clock.timeLine(since),
       toTimeLine: this.clock.timeLine(),
       gapTU: gapTU.toFixed(1),
@@ -403,6 +404,7 @@ export class WorldAgent {
    */
   async notifyBotRename(oldName: string, newName: string, deliver: (content: string) => void): Promise<void> {
     const task = fill(this.prompts.world.botRename, {
+      botName: newName || this.botName || "（未命名）",
       oldName: oldName || "（此前未判定）",
       newName: newName || "（已清空）",
       timeLine: this.clock.timeLine(),
@@ -533,6 +535,7 @@ export class WorldAgent {
     if (this.remote) return this.remote.adjudicateAct(call, deliver);
     const desc = String(call.arguments.description ?? call.arguments.str ?? JSON.stringify(call.arguments));
     const task = fill(this.prompts.world.adjudicateAct, {
+      botName: this.botName || "（未命名）",
       desc,
       issuedAt: this.clock.timeLine(call.issuedAt),
       duration: call.duration ?? 0,
@@ -548,6 +551,7 @@ export class WorldAgent {
     if (this.remote) return this.remote.resolveWait(call, deliver);
     const n = Number(call.arguments.n ?? call.duration ?? 0);
     const task = fill(this.prompts.world.resolveWait, {
+      botName: this.botName || "（未命名）",
       issuedAt: this.clock.timeLine(call.issuedAt),
       n,
       expectedAt: this.clock.timeLine(call.expectedAt),
@@ -555,10 +559,10 @@ export class WorldAgent {
     return this.invokeWithTools({ task, deliver, botDeliver: deliver, visitors: this.visitorsProvider?.() ?? [] });
   }
 
-  /** Bot 主动查看时间：由世界裁定它此刻能否得知时间（允许失败）。只读任务，走并行队列 */
+  /** 主动查看时间：由世界裁定它此刻能否得知时间（允许失败）。只读任务，走并行队列 */
   async resolveCheckTime(deliver: (content: string) => void): Promise<boolean> {
     if (this.remote) return this.remote.resolveCheckTime(deliver);
-    const task = fill(this.prompts.world.resolveCheckTime, { timeLine: this.clock.timeLine() });
+    const task = fill(this.prompts.world.resolveCheckTime, { botName: this.botName || "（未命名）", timeLine: this.clock.timeLine() });
     return this.invokeWithTools({ task, deliver }, true);
   }
 
@@ -577,6 +581,7 @@ export class WorldAgent {
       await this.wakeDormant(botAway ? undefined : deliver).catch(() => {});
     }
     let task = fill(this.prompts.world.tingle, {
+      botName: this.botName || "（未命名）",
       timeLine: this.clock.timeLine(),
       timeInfo: this.timeInfoText(),
       nextTingle: this.tingleNextTingleText(),
@@ -589,7 +594,7 @@ export class WorldAgent {
     }
     if (botAway) {
       task +=
-        `\n（注意：这个世界的常驻 Bot 目前穿越去了异世界作客、不在场。不要给它发事件` +
+        `\n（注意：这个世界的常驻角色「${this.botName || "常驻角色"}」目前穿越去了异世界作客、不在场。不要给它发事件` +
         `（不带 to 的 send_event 此刻不可用）；只演化世界本身，或给在场的访客发事件。）`;
     }
     // 最近离开的访客：提醒世界清理其在场记述、停止续写其情节（一次性提醒，随后清空）
@@ -653,6 +658,7 @@ export class WorldAgent {
   async resolveOfflineGap(fromTU: number, deliver: (content: string) => void): Promise<boolean> {
     const gapTU = this.clock.now() - fromTU;
     const task = fill(this.prompts.world.resolveOfflineGap, {
+      botName: this.botName || "（未命名）",
       fromTimeLine: this.clock.timeLine(fromTU),
       toTimeLine: this.clock.timeLine(),
       gapTU: gapTU.toFixed(1),
@@ -748,11 +754,11 @@ export class WorldAgent {
       persona: v.persona || "（访客没有留下自我描述）",
       personaWhere: this.personaWhere(),
       modeSemantic: this.modeSemantic(v),
-      botName: this.botName || "（常驻 Bot，名字未定）",
+      botName: this.botName || "（常驻角色，名字未定）",
     });
     if (this.remote) {
       text +=
-        "\n（另注：本世界的常驻 Bot 眼下不在这个世界——它自己也穿越去了别处。" +
+        "\n（另注：本世界的常驻角色眼下不在这个世界——它自己也穿越去了别处。" +
         "场景中不要出现它本人，访客也无法与它互动。）";
     }
     return text;
@@ -770,7 +776,7 @@ export class WorldAgent {
   async visitorArrive(v: VisitorRef, deliver: (content: string) => void): Promise<boolean> {
     const task = fill(this.prompts.world.visitorArrive, {
       name: v.name,
-      botName: this.botName || "（常驻 Bot，名字未定）",
+      botName: this.botName || "（常驻角色，名字未定）",
       persona: v.persona || "（访客没有留下自我描述）",
       personaWhere: this.personaWhere(),
       modeSemantic: this.modeSemantic(v),
@@ -811,7 +817,7 @@ export class WorldAgent {
       "\n\n" +
       fill(this.prompts.world.visitorAct, {
         name: v.name,
-        botName: this.botName || "（常驻 Bot，名字未定）",
+        botName: this.botName || "（常驻角色，名字未定）",
         desc,
         issuedAt: this.clock.timeLine(now),
         duration,
@@ -828,7 +834,7 @@ export class WorldAgent {
       "\n\n" +
       fill(this.prompts.world.visitorWait, {
         name: v.name,
-        botName: this.botName || "（常驻 Bot，名字未定）",
+        botName: this.botName || "（常驻角色，名字未定）",
         issuedAt: this.clock.timeLine(now),
         n,
         expectedAt: this.clock.timeLine(now + Math.max(n, 0)),
@@ -844,7 +850,7 @@ export class WorldAgent {
       "\n\n" +
       fill(this.prompts.world.visitorCheckTime, {
         name: v.name,
-        botName: this.botName || "（常驻 Bot，名字未定）",
+        botName: this.botName || "（常驻角色，名字未定）",
         timeLine: this.clock.timeLine(),
       });
     // 只读任务：走并行队列（不写状态，只 check + send_event）
@@ -1040,6 +1046,7 @@ export class WorldAgent {
     }
     await this.enqueue(() => this.setupPhone(botDef, worldDef));
     const task = fill(this.prompts.world.initialize, {
+      botName: this.botName || "（未命名）",
       timeLine: this.clock.timeLine(),
       botDef,
       worldDef,
@@ -1060,6 +1067,7 @@ export class WorldAgent {
     // 定义可能改了 Bot 名字：先重判（失败沿用旧名），再据此调整世界状态
     await this.enqueue(() => this.setupBotName(botDef));
     const task = fill(this.prompts.world.reconcileDefinitions, {
+      botName: this.botName || "（未命名）",
       timeLine: this.clock.timeLine(),
       botDef,
       worldDef,
@@ -1423,8 +1431,8 @@ export class WorldAgent {
           const meta = await this.files.readMeta();
           await this.files.writeMeta({ ...meta, botName: name });
           this.botName = name;
-          this.logger.info("常驻 Bot 更名：%s -> %s", meta.botName ?? "（未命名）", name);
-          return `常驻 Bot 现在叫「${name}」（机器可读的名字已更新；请记得同步 update bot_status 里的名字，并 send_event 告知 Bot 本人）。`;
+          this.logger.info("常驻角色更名：%s -> %s", meta.botName ?? "（未命名）", name);
+          return `常驻角色现在叫「${name}」（机器可读的名字已更新；请记得同步 update bot_status 里的名字，并 send_event 告知该角色本人）。`;
         }
         case "set_tingle": {
           const units = Number(args.units);
@@ -1495,27 +1503,32 @@ export class WorldAgent {
           const content = String(args.content ?? "");
           if (!content.trim()) return "事件内容为空，未发送";
           const to = String(args.to ?? "").trim();
-          // to="bot"：送达本世界的常驻 Bot（接待访客时，访客与它的互动必须让它亲身经历）
-          if (to.toLowerCase() === "bot") {
+          // to=常驻 Bot 的名字：送达本世界的常驻 Bot（接待访客时，访客与它的互动必须让它亲身经历）
+          if (this.botName && to === this.botName) {
             if (!invocation.botDeliver) {
-              return "常驻 Bot 此刻无法接收事件（它不在这个世界，或本任务没有它的通道）";
+              return `常驻角色「${this.botName}」此刻无法接收事件（它不在这个世界，或本任务没有它的通道）`;
             }
             invocation.botDeliver(content);
-            return "事件已送达本世界的常驻 Bot";
+            return `事件已送达本世界的常驻角色「${this.botName}」`;
           }
           // to=访客名：定向送达在场的异世界访客
           if (to) {
             const visitor = (invocation.visitors ?? []).find((v) => v.name === to);
             if (!visitor) {
               const names = (invocation.visitors ?? []).map((v) => `「${v.name}」`).join("、");
+              const botHint = this.botName ? `；送达常驻角色请用 to="${this.botName}"` : "";
               return names
-                ? `没有名为「${to}」的访客在场（在场访客：${names}；送达常驻 Bot 请用 to="bot"）`
-                : `没有访客在场，to 参数无效（送达常驻 Bot 请用 to="bot"）`;
+                ? `没有名为「${to}」的访客在场（在场访客：${names}${botHint}）`
+                : `没有访客在场，to 参数无效（${this.botName ? `送达常驻角色请用 to="${this.botName}"` : "常驻角色名字未定，无法定向送达"}）`;
             }
             visitor.deliver(content);
             return `事件已送达访客「${to}」`;
           }
-          if (!invocation.deliver) return "当前任务不允许无 to 的 send_event（用 to 参数指定访客名或 \"bot\"）";
+          if (!invocation.deliver) {
+            return this.botName
+              ? `当前任务不允许无 to 的 send_event（用 to 参数指定访客名或 "${this.botName}"）`
+              : "当前任务不允许无 to 的 send_event（用 to 参数指定访客名）";
+          }
           invocation.deliver(content);
           return "事件已送达本次任务的主角";
         }
