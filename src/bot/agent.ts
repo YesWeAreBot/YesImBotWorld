@@ -2063,8 +2063,8 @@ export function actBusyMessage(pendingActs: ToolCallRecord[]): string | null {
   const pdesc = String(pendingActs[0]?.arguments.description ?? "").trim();
   return (
     `（你正在做${pdesc ? `「${truncate(pdesc, 60)}」` : "上一件事"}，它还在进行中，` +
-    `结果会自动以事件的形式送到你这里。你手头的事照常推进，` +
-    `也可以顺着它想想接下来准备做什么。）`
+    `结果会自动以事件的形式送到你这里。现在不用急着接着做什么，也别自己去叙述这件事的结果——` +
+    `耐心等它的结果送达，然后再考虑下一步。）`
   );
 }
 
