@@ -85,29 +85,35 @@ export class UsageStore {
    */
   private loadAggregateSync(): void {
     let raw = "";
+    let agg: UsageAggregate | null = null;
     try {
       raw = readFileSync(this.aggFile, "utf8");
-      this.agg = normalizeAggregate(JSON.parse(raw));
-      return;
+      agg = normalizeAggregate(JSON.parse(raw));
     } catch {
-      /* 无累计文件：迁移 */
+      /* 无累计文件或损坏：迁移 */
     }
-    // 迁移：无 agg 文件时，从明细 jsonl 全量重建累计（不裁剪）
+    // 读到且版本不是旧版（cacheReportedPromptTokens 统计口径修复前）→ 直接采用
+    if (agg && agg.version === AGG_VERSION) {
+      this.agg = agg;
+      return;
+    }
+    // 迁移：无 agg 文件、agg 损坏、或 agg 是旧版（命中率分母口径已修复）时，
+    // 从明细 jsonl 全量重建累计（用新的 normalizeRecordForLoad：cached>0 才算已上报）
     try {
       raw = readFileSync(this.file, "utf8");
-      const agg = emptyAggregate();
+      const rebuilt = emptyAggregate();
       for (const line of raw.split("\n")) {
         if (!line.trim()) continue;
         try {
           const r = JSON.parse(line) as UsageRecord;
           if (typeof r.id !== "number" || typeof r.ts !== "number") continue;
           normalizeRecordForLoad(r);
-          accumulateRecord(agg, r);
+          accumulateRecord(rebuilt, r);
         } catch {
           /* skip */
         }
       }
-      this.agg = agg;
+      this.agg = rebuilt;
       // 迁移结果落盘，此后走增量
       void this.persistAgg().catch(() => {});
     } catch {
@@ -210,6 +216,8 @@ export class UsageStore {
 
 /** 全程累计聚合（持久化到 usage.agg.json） */
 interface UsageAggregate {
+  /** 聚合格式版本：旧版（无 version）的 cacheReportedPromptTokens 计算有误，读到即强制重建 */
+  version: number;
   totals: UsageTotals;
   byLabel: Record<string, UsageTotals>;
   byModel: Record<string, UsageTotals>;
@@ -217,8 +225,11 @@ interface UsageAggregate {
   byDay: Record<string, UsageTotals>;
 }
 
+/** 当前聚合格式版本（version < AGG_VERSION 视为旧版，需从明细重建） */
+const AGG_VERSION = 2;
+
 function emptyAggregate(): UsageAggregate {
-  return { totals: emptyTotals(), byLabel: {}, byModel: {}, byDay: {} };
+  return { version: AGG_VERSION, totals: emptyTotals(), byLabel: {}, byModel: {}, byDay: {} };
 }
 
 /** 从磁盘读取的聚合对象补全缺失字段（容错旧版本/损坏） */
@@ -226,6 +237,8 @@ function normalizeAggregate(raw: unknown): UsageAggregate {
   const base = emptyAggregate();
   if (!raw || typeof raw !== "object") return base;
   const obj = raw as Partial<UsageAggregate>;
+  // 读回旧 agg（无 version）：标记为 0，由 loadAggregateSync 判断需要重建
+  base.version = typeof obj.version === "number" ? obj.version : 0;
   if (obj.totals && typeof obj.totals === "object") base.totals = normalizeTotals(obj.totals);
   if (obj.byLabel && typeof obj.byLabel === "object") base.byLabel = normalizeTotalsMap(obj.byLabel as Record<string, unknown>);
   if (obj.byModel && typeof obj.byModel === "object") base.byModel = normalizeTotalsMap(obj.byModel as Record<string, unknown>);
@@ -270,9 +283,11 @@ function num(v: unknown): number {
 /** 规范化从磁盘读回的单条明细记录：补齐旧版本缺失的字段（cachedTokens / cacheReported） */
 function normalizeRecordForLoad(r: UsageRecord): void {
   if (typeof r.cachedTokens !== "number") r.cachedTokens = 0;
-  // 旧记录没有 cacheReported 字段：无法区分“真未命中”与“未上报”，
-  // 按“全部已上报”保守回退，避免误触发“统计可能不准确”提示、也避免命中率分母塌成 0。
-  if (typeof r.cacheReported !== "boolean") r.cacheReported = true;
+  // 旧记录没有 cacheReported 字段：无法区分"真未命中"与"未上报"。
+  // 按「cachedTokens > 0 即视为已上报」回退——有缓存命中数就说明上游确实上报了缓存信息；
+  // cachedTokens === 0 则视为「未上报」（可能是真未命中，也可能是后端没报），
+  // 排除出命中率分母，避免历史噪声稀释命中率。
+  if (typeof r.cacheReported !== "boolean") r.cacheReported = r.cachedTokens > 0;
 }
 
 /** 把一条记录累加进聚合（totals / byLabel / byModel / byDay） */
