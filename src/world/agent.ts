@@ -20,23 +20,6 @@ import { debug } from "../webui/debug.js";
 /** 只读查询（query）的排队超时：避免被同源端点锁 + 持续生成的 Bot 饿死时无限悬挂 */
 const QUERY_TIMEOUT_MS = 60_000;
 
-/**
- * 一个待裁定的 act（批量合并的单元）。Bot 的 act 与真人玩家的 act 统一成这一结构，
- * 好让写队列里相邻的多个 act 合并成一次 World 请求同时裁定。
- */
-interface ActItem {
-  /** 行为者：常驻 Bot 或某位访客的名字（用于 send_event 的 to 路由与状态写回目标） */
-  actor: "bot" | string;
-  /** 是常驻 Bot 的动作（true）还是访客的动作（false） */
-  isBot: boolean;
-  desc: string;
-  issuedAt: string;
-  expectedAt: string;
-  duration: number;
-  /** 该 act 结果的事件交付（Bot 的结果收集/玩家实时推送各自的通道） */
-  deliver: (content: string) => void;
-}
-
 const WORLD_TOOLS: ChatToolDef[] = [
   {
     type: "function",
@@ -279,7 +262,7 @@ export interface RemoteWorldLink {
 export class WorldAgent {
   private client: ChatClient;
   /** 写状态任务的可抢占队列：玩家 act 等高优先级任务会插到队头（在未开始的普通任务之前） */
-  private queue: { fn: () => Promise<unknown>; priority: boolean; cancelKey?: string; actItem?: ActItem; resolve: (v: unknown) => void; reject: (e: unknown) => void }[] = [];
+  private queue: { fn: () => Promise<unknown>; priority: boolean; cancelKey?: string; resolve: (v: unknown) => void; reject: (e: unknown) => void }[] = [];
   private draining = false;
   /** 只读查询（终端虚拟输出、天气等）的独立队列：不与写状态的主队列串行，避免被 act 裁定积压饿死 */
   private queryTail: Promise<unknown> = Promise.resolve();
@@ -455,7 +438,7 @@ export class WorldAgent {
    * 使玩家 act 等交互式任务被优先处理，不被 Tingle / 到达叙事等积压饿死。
    * 正在执行中的任务不会被抢占（LLM 推理无法安全中断）。
    */
-  private enqueue<T>(fn: () => Promise<T>, priority = false, cancelKey?: string, actItem?: ActItem): Promise<T> {
+  private enqueue<T>(fn: () => Promise<T>, priority = false, cancelKey?: string): Promise<T> {
     this.pending++;
     return new Promise<T>((resolve, reject) => {
       const wrapped = () =>
@@ -464,7 +447,6 @@ export class WorldAgent {
         fn: wrapped as () => Promise<unknown>,
         priority,
         cancelKey,
-        actItem,
         resolve: (v: unknown) => resolve(v as T),
         reject,
       };
@@ -498,25 +480,13 @@ export class WorldAgent {
     if (removed) this.logger.info("[世界] 取消 %s 的 %d 个未开始任务", cancelKey, removed);
   }
 
-  /** 串行排空写队列（队头优先，高优先任务已在队头）；相邻的 act 合并成一次批量裁定 */
+  /** 串行排空写队列（队头优先，高优先任务已在队头） */
   private async drain(): Promise<void> {
     if (this.draining) return;
     this.draining = true;
     try {
       while (this.queue.length) {
         const task = this.queue.shift()!;
-        // act 合并：队列里紧跟其后的、同是 act 的任务一并取出，合成一次 World 请求同时裁定
-        if (task.actItem) {
-          const batch: { entry: typeof task; item: ActItem }[] = [{ entry: task, item: task.actItem }];
-          while (this.queue.length && this.queue[0]!.actItem) {
-            const next = this.queue.shift()!;
-            batch.push({ entry: next, item: next.actItem! });
-          }
-          this.pending -= batch.length; // 补偿：这些 act 的 fn（含 pending--）不会执行
-          const ok = await this.runActBatch(batch.map((b) => b.item));
-          for (const b of batch) b.entry.resolve(ok);
-          continue;
-        }
         try {
           task.resolve(await task.fn());
         } catch (err) {
@@ -548,71 +518,19 @@ export class WorldAgent {
 
   // ---------- 对外任务 ----------
 
-  /**
-   * 批量裁定多个 act（Bot 与/或访客的动作合并成一次 World 请求）。
-   * 每个 act 的结果用 send_event 的 to 参数路由：Bot 的动作 to="bot"（→ botDeliver），
-   * 访客的动作 to=访客名（→ 该访客本次 act 的 deliver，含实时推送/聚合，与单发语义一致）。
-   */
-  private async runActBatch(items: ActItem[]): Promise<boolean> {
-    const botItem = items.find((i) => i.isBot);
-    const actsText = items
-      .map((it, i) => {
-        const who = it.isBot ? `常驻 Bot（to="bot"）` : `访客「${it.actor}」（to="${it.actor}"）`;
-        const time = it.duration > 0 ? `，耗时 ${it.duration} TU` : "";
-        return `${i + 1}. ${who}：${it.desc}（${it.issuedAt}${time}）`;
-      })
-      .join("\n");
-    const task = fill(this.prompts.world.adjudicateActBatch, {
-      acts: actsText,
-      botName: this.botName || "（常驻 Bot，名字未定）",
-    });
-    // 定制 visitors：让「有本次 act 的访客」的 deliver 指向其 act 的结果通道（实时推送 + 聚合），
-    // 与单发 visitorAct 的 deliver 语义一致；其余访客保持全局广播通道。
-    const visitors = (this.visitorsProvider?.() ?? []).map((p) => {
-      const item = items.find((i) => !i.isBot && i.actor === p.name);
-      return item ? { ...p, deliver: item.deliver } : p;
-    });
-    // deliver 留空禁用「无 to」的 send_event；Bot 的结果经 botDeliver（延迟交付）。
-    const invocation: WorldInvocation = { task, botDeliver: botItem?.deliver, visitors };
-    // 直接执行（已在 drain 层持有写队列的串行锁）；同源端点互斥仍需 withEndpointLock
-    return withEndpointLock(this.cfg.baseURL, async () => {
-      try {
-        const finalContent = await this.runToolLoop(invocation);
-        debug.emit("world.result", "批量裁定完成", { finalContent: finalContent.slice(0, 2000) });
-        return true;
-      } catch (err) {
-        this.logger.warn("World-LLM 批量裁定失败: %s", err);
-        return false;
-      }
-    });
-  }
-
-  /** 把单个 act 投进写队列（priority + 可合并）。发给访客的 act 用 cancelKey 以便离场时取消 */
-  private enqueueAct(item: ActItem, cancelKey?: string): Promise<boolean> {
-    return this.enqueue(
-      () => this.runActBatch([item]),
-      true,
-      cancelKey,
-      item,
-    );
-  }
-
   /** 裁定 Bot 的 act 动作。产出的事件通过 deliver 交付（由调度器压到期望完成时刻） */
   async adjudicateAct(call: ToolCallRecord, deliver: (content: string) => void): Promise<boolean> {
     if (this.remote) return this.remote.adjudicateAct(call, deliver);
     const desc = String(call.arguments.description ?? call.arguments.str ?? JSON.stringify(call.arguments));
-    const item: ActItem = {
-      actor: "bot",
-      isBot: true,
+    const task = fill(this.prompts.world.adjudicateAct, {
       desc,
       issuedAt: this.clock.timeLine(call.issuedAt),
-      expectedAt: this.clock.timeLine(call.expectedAt),
       duration: call.duration ?? 0,
-      deliver,
-    };
-    // Bot 的 act 与真人玩家的 act 同级：priority=true 插到普通任务（Tingle 等）之前，不被积压饿死；
-    // 相邻的 act（Bot + 玩家）会在 drain 时合并成一次 World 请求同时裁定。
-    return this.enqueueAct(item);
+      expectedAt: this.clock.timeLine(call.expectedAt),
+    });
+    // 有访客在场时携带 visitors：Bot 的行动波及某位访客时，send_event to= 可直接送达对方
+    // Bot 的 act 与真人玩家的 act 同级：priority=true 插到普通任务（Tingle 等）之前，不被积压饿死
+    return this.invokeWithTools({ task, deliver, botDeliver: deliver, visitors: this.visitorsProvider?.() ?? [] }, false, true);
   }
 
   /** wait 补叙：等待即将结束（由计时器准时唤醒），提前生成期间发生的事 */
@@ -878,17 +796,18 @@ export class WorldAgent {
     deliver: (content: string) => void,
   ): Promise<boolean> {
     const now = this.clock.now();
-    const item: ActItem = {
-      actor: v.name,
-      isBot: false,
-      desc,
-      issuedAt: this.clock.timeLine(now),
-      expectedAt: this.clock.timeLine(now + Math.max(duration, 0)),
-      duration,
-      deliver,
-    };
-    // 玩家的 act：priority（交互式）+ cancelKey=v.name（离场时取消）；相邻 act 会在 drain 合并批量裁定
-    return this.enqueueAct(item, v.name);
+    const task =
+      this.visitorPreamble(v) +
+      "\n\n" +
+      fill(this.prompts.world.visitorAct, {
+        name: v.name,
+        botName: this.botName || "（常驻 Bot，名字未定）",
+        desc,
+        issuedAt: this.clock.timeLine(now),
+        duration,
+        expectedAt: this.clock.timeLine(now + Math.max(duration, 0)),
+      });
+    return this.invokeWithTools({ task, deliver, ...this.visitorInvocationExtras() }, false, true, v.name);
   }
 
   /** 访客 wait 补叙 */
@@ -1311,7 +1230,7 @@ export class WorldAgent {
   private async runToolLoop(invocation: WorldInvocation): Promise<string> {
     const tools = WORLD_TOOLS.filter(
       (t) =>
-        (invocation.deliver || invocation.botDeliver || invocation.visitors?.length || t.function.name !== "send_event") &&
+        (invocation.deliver || invocation.visitors?.length || t.function.name !== "send_event") &&
         (invocation.allowTingle || t.function.name !== "set_tingle") &&
         (invocation.visitors?.length ||
           (t.function.name !== "update_visitor_status" && t.function.name !== "expel_visitor")) &&
