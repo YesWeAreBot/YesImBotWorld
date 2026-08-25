@@ -15,6 +15,13 @@ import { Scheduler } from "./scheduler.js";
 import { typingSlackTU } from "./typing.js";
 import { BOT_TOOLS, renderToolsText, toolLayer, type BotToolDef } from "./tools.js";
 
+/** 代理执行单个工具调用的回传结果（管理员「手动驾驶」Bot） */
+export interface ManualToolResult {
+  ok: boolean;
+  /** 工具结果 / 校验拒绝原因 */
+  text: string;
+}
+
 /** 穿越能力（前往异世界作客），由 service 层实现注入 */
 export interface BotCrossingApi {
   /** 当前所在的异世界名；null = 在自己的世界 */
@@ -158,6 +165,17 @@ export class BotAgent {
   /** 连续几次模型输出不是合法工具调用，用于在反馈里提示模型直接输出 JSON */
   private parseFailures = 0;
   /**
+   * 手动驾驶标志：管理员「扮演（avatar）接管 Bot」时开启，runLoop 只排空邮箱、
+   * 处理外部注入的工具调用，不再自主 generate；「操纵（puppet）」不暂停。
+   */
+  private manualPaused = false;
+  /**
+   * 外部注入（管理员代理）工具调用的结果回传表：callId → 解析器。
+   * 结果经 scheduler 的 deliver 通道（source=tool）回传；校验拒绝时的 system 提示在此暂存，
+   * 由 injectExternalToolCall 在 dispatch 返回后判定「未进入调度」时兜底回传。
+   */
+  private externalToolResults = new Map<string, { resolve: (r: ManualToolResult) => void; systemText: string | null }>();
+  /**
    * 注入 system 段的"醒来时刻"：仅在 start() 与 rest 结束时更新。
    * 决不能用实时时间——那会让 system 段随时间不断变化，
    * 前缀在 system 处断裂，整个 Tool Call 流每次请求都重新 prompt eval（缓存全灭）。
@@ -197,7 +215,17 @@ export class BotAgent {
     this.backend = createBackend(config.bot, this.layerNames("core"), this.toolDefs);
     this.scheduler = new Scheduler(
       clock,
-      (content, ref) => this.pushEvent("tool", content, { ref }),
+      (content, ref) => {
+        // 手动驾驶（管理员代理）工具结果回传：真正执行结果在此交付，回传给发起方
+        if (ref) {
+          const pending = this.externalToolResults.get(ref);
+          if (pending) {
+            this.externalToolResults.delete(ref);
+            pending.resolve({ ok: true, text: toPlainText(content) });
+          }
+        }
+        this.pushEvent("tool", content, { ref });
+      },
       logger,
     );
   }
@@ -312,6 +340,8 @@ export class BotAgent {
     streamLength: number;
     approxChars: number;
     pendingTasks: number;
+    /** 手动驾驶（管理员接管 Bot）是否暂停了自主生成 */
+    paused: boolean;
     /** 手机界面状态（WebUI「设备」页窥视手机用） */
     phoneUi: { chatOpen: boolean; channelKey: string | null; channelIsGroup: boolean; forwardDepth: number };
   } {
@@ -321,6 +351,7 @@ export class BotAgent {
       streamLength: this.context.stream.length,
       approxChars: this.context.approxChars(),
       pendingTasks: this.scheduler.pendingCount,
+      paused: this.manualPaused,
       phoneUi: {
         chatOpen: this.phoneUi.chatOpen,
         channelKey: this.phoneUi.channelKey,
@@ -342,6 +373,12 @@ export class BotAgent {
     opts: { ref?: string; wake?: boolean } = {},
   ): void {
     const rich: RichText = typeof content === "string" ? { text: content } : content;
+    // 手动驾驶（管理员代理）结果回传：捕获被校验拒绝时的 system 提示（source=system 且 ref 命中）。
+    // 真正执行结果由 scheduler deliver 通道回传，不在此处理。
+    if (opts.ref && source === "system") {
+      const pending = this.externalToolResults.get(opts.ref);
+      if (pending && pending.systemText === null) pending.systemText = rich.text;
+    }
     const isWaitResult = this.waiting !== null && opts.ref === this.waiting.callId;
     // 唤醒规则：等待中的工具结果必定唤醒；wake 事件可以提前唤醒 wait（等待本来就是"直到有事发生"）。
     // act 不再阻塞生成（blockingAct 只管住下一个 act），因此没有"专注做事顾不上别的"的暂停态。
@@ -403,6 +440,94 @@ export class BotAgent {
     this.noteDeferredSelfSent(channelKey);
   }
 
+  // ---------- 手动驾驶（管理员接管 Bot） ----------
+
+  /**
+   * 开启/关闭手动驾驶。管理员「扮演（avatar）接管 Bot」时传 true：runLoop 暂停自主 generate，
+   * 只排空邮箱并处理外部注入的工具调用；「操纵（puppet）」不暂停（Bot-LLM 继续自主运行，
+   * 管理员额外操纵其行动）。交还 Bot 时传 false 恢复自主生成。
+   */
+  setManualPaused(paused: boolean): void {
+    if (this.manualPaused === paused) return;
+    this.manualPaused = paused;
+    this.logger.info("Bot-LLM 手动驾驶%s", paused ? "接管（暂停自主生成）" : "交还（恢复自主生成）");
+    // 交还/唤醒时若 runLoop 正停在暂停等待，立即唤醒推进
+    if (!paused) this.wakeFn?.();
+  }
+
+  /** 当前是否处于手动驾驶（自主生成已暂停） */
+  get manualMode(): boolean {
+    return this.manualPaused;
+  }
+
+  /**
+   * 管理员代理 Bot 执行任意工具调用（send/act/check_status/check_time/wait/open_app/gallery 等）：
+   * 构造一个合法的 ToolCallRecord，append 进上下文后走 dispatch 真正执行（复用全部参数校验、
+   * 调度与结果回显），结果经 Promise 回传。等价于「手动驾驶」Bot。
+   *
+   * @param name 工具名（BotAgent 已声明的工具）
+   * @param args 工具参数
+   * @param opts.duration 可选期望耗时（TU）；wait 类工具忽略此参数、以 args.n 为准（与 finalize 一致）
+   * @returns { ok, text }：ok=false 表示参数校验拒绝（text 为拒绝原因）或世界未运行
+   */
+  async injectExternalToolCall(
+    name: string,
+    args: Record<string, unknown> = {},
+    opts: { duration?: number } = {},
+  ): Promise<ManualToolResult> {
+    if (!this.running) {
+      return { ok: false, text: "（Bot-LLM 当前未在运行，无法代理其工具调用。）" };
+    }
+    const issuedAt = this.clock.now();
+    let duration = opts.duration;
+    // 与 finalize 一致：wait 以参数 n 为准（模型常输出 duration:0 + n:x 的组合）
+    if (name === "wait" && !(duration && duration > 0)) {
+      const n = Number(args.n ?? 0);
+      if (Number.isFinite(n) && n > 0) duration = n;
+    }
+    if (duration && duration > 0) duration = Math.max(0, duration);
+    const call: ToolCallRecord = {
+      id: this.context.nextToolId(),
+      role: "system", // 运行时强制（管理员代理），非 Bot 自主生成
+      name,
+      arguments: args,
+      ...(duration && duration > 0 ? { duration } : {}),
+      issuedAt,
+      expectedAt: issuedAt + (duration && duration > 0 ? duration : 0),
+    };
+    await this.context.appendToolCall(call);
+    debug.emit("bot.tool", `${call.id} ${call.name}`, {
+      id: call.id,
+      name: call.name,
+      arguments: call.arguments,
+      duration: call.duration,
+      issuedAt: call.issuedAt,
+      expectedAt: call.expectedAt,
+      source: "manual",
+    });
+    this.logger.info(
+      "[tool:manual] %s %s(%s)",
+      call.id,
+      call.name,
+      truncate(JSON.stringify(call.arguments), 100),
+    );
+
+    const resultPromise = new Promise<ManualToolResult>((resolve) => {
+      this.externalToolResults.set(call.id, { resolve, systemText: null });
+    });
+
+    await this.dispatch(call);
+
+    // 校验拒绝（未进入调度）：dispatch 已同步经 pushEvent(system) 推送了拒绝原因（ref=call.id），
+    // 且 scheduler 无对应 pending 任务 → 兜底以该拒绝原因回传；否则等待 scheduler deliver 的结果。
+    const entry = this.externalToolResults.get(call.id);
+    if (entry && !this.scheduler.isPending(call.id)) {
+      this.externalToolResults.delete(call.id);
+      entry.resolve({ ok: false, text: entry.systemText ?? `（${name} 未被接受。）` });
+    }
+    return resultPromise;
+  }
+
   // ---------- 主循环 ----------
 
   private async runLoop(): Promise<void> {
@@ -410,6 +535,13 @@ export class BotAgent {
     while (this.running) {
       try {
         await this.drainMailbox();
+
+        // 手动驾驶（管理员扮演接管）：暂停自主生成，仅负责排空邮箱 + 处理外部注入的工具/事件。
+        // 短睡后回到循环顶部重排邮箱，保证注入的事件及时进入上下文。
+        if (this.manualPaused) {
+          await sleep(250);
+          continue;
+        }
 
         // 上下文满：强制休息（带世界观内的合理解释）
         if (this.context.approxChars() > this.config.bot.maxWindowChars) {
@@ -2050,6 +2182,11 @@ export function misusedTargetKeys(args: Record<string, unknown>): string[] {
 function truncate(text: string, max: number): string {
   const single = text.replace(/\n/g, "\\n");
   return single.length > max ? single.slice(0, max) + "…" : single;
+}
+
+/** RichText / string 统一取纯文本 */
+function toPlainText(content: string | RichText): string {
+  return typeof content === "string" ? content : content.text;
 }
 
 /**

@@ -392,7 +392,12 @@ try { VISITOR_GRANTS = JSON.parse(localStorage.getItem('wui_visitor_grants') || 
 var VISITOR_PRESET = localStorage.getItem('wui_visitor_preset') || '';
 var VISITOR_PLAYER_PROFILE = null; // { name, persona }
 try { VISITOR_PLAYER_PROFILE = JSON.parse(localStorage.getItem('wui_player_profile') || 'null'); } catch(e) { VISITOR_PLAYER_PROFILE = null; }
-var PLAYER_STATE = { token: '', worldName: '', inWorld: false, events: [], actBusy: false, lastTimeLine: '', mode: '' };
+// 管理员的玩家角色档案（独立 key，避免与访客串）：管理员无账号档案，仅存本地
+var ADMIN_PLAYER_PROFILE = null; // { name, persona, mode }
+try { ADMIN_PLAYER_PROFILE = JSON.parse(localStorage.getItem('wui_admin_player_profile') || 'null'); } catch(e) { ADMIN_PLAYER_PROFILE = null; }
+// 常驻 Bot 名字（来自 /api/state meta.botName；管理员同名判定 / 工具面板用）
+var RESIDENT_BOT_NAME = '';
+var PLAYER_STATE = { token: '', worldName: '', inWorld: false, events: [], actBusy: false, lastTimeLine: '', mode: '', isAdmin: false, takeover: false, botName: '' };
 var activeView = 'overview';
 var playerNewsAsc = false; // 世界观剧情「最近事件」排序：false=倒序(最新在上,默认) true=正序
 var worldStatusCache = null; // 最近一次 /api/state 结果，供 news 排序切换时免重复拉取
@@ -1584,14 +1589,39 @@ function cfgGroupKey(g){
 }
 
 // ---------- 玩家入世界（真人角色扮演） ----------
+// 当前玩家的角色档案（管理员用本地 ADMIN_PLAYER_PROFILE，访客用 VISITOR_PLAYER_PROFILE）
+function getPlayerProfile(){
+  return MODE === 'visitor' ? VISITOR_PLAYER_PROFILE : ADMIN_PLAYER_PROFILE;
+}
+function setPlayerProfile(p){
+  if(MODE === 'visitor'){
+    VISITOR_PLAYER_PROFILE = p;
+    if(p) localStorage.setItem('wui_player_profile', JSON.stringify(p));
+    else localStorage.removeItem('wui_player_profile');
+  } else {
+    ADMIN_PLAYER_PROFILE = p;
+    if(p) localStorage.setItem('wui_admin_player_profile', JSON.stringify(p));
+    else localStorage.removeItem('wui_admin_player_profile');
+  }
+}
+// 管理员是否处于「接管 Bot」模式（角色名 === 常驻 Bot 名，且为扮演/操纵）
+function isAdminTakeover(){
+  return MODE !== 'visitor' && !!RESIDENT_BOT_NAME && !!getPlayerProfile()
+    && getPlayerProfile().name === RESIDENT_BOT_NAME
+    && (getPlayerProfile().mode === 'avatar' || getPlayerProfile().mode === 'puppet');
+}
 function loadPlayer(){
   var main = $('#main');
   main.textContent = '';
   main.appendChild(viewHead('入世界', '以你的角色身份进入这个虚拟世界，通过行动与世界互动。'));
+  // 先拉取常驻 Bot 名字（管理员同名判定 / 接管 Bot 用）
+  api('GET', '/api/state').then(function(r){
+    RESIDENT_BOT_NAME = (r.meta && r.meta.botName ? String(r.meta.botName).trim() : '');
+  }).catch(function(){});
   var holder = el('div', {text:'加载中…', cls:'empty'});
   main.appendChild(holder);
   // 首次：无角色身份 → 先填角色
-  if(!VISITOR_PLAYER_PROFILE || !VISITOR_PLAYER_PROFILE.name){
+  if(!getPlayerProfile() || !getPlayerProfile().name){
     holder.textContent = '';
     holder.appendChild(playerProfileForm(function(){
       loadPlayer();
@@ -1606,29 +1636,46 @@ function loadPlayer(){
 function playerProfileForm(done){
   var nameInp = el('input', {placeholder:'角色名（世界里的身份）', style:'width:100%'});
   var personaTa = el('textarea', {rows: 6, placeholder:'角色人设：你是谁、什么性格、什么来历……（世界会根据它来让 NPC/Bot 认识你）', style:'width:100%'});
-  if(VISITOR_PLAYER_PROFILE){
-    nameInp.value = VISITOR_PLAYER_PROFILE.name || '';
-    personaTa.value = VISITOR_PLAYER_PROFILE.persona || '';
+  var cur = getPlayerProfile();
+  if(cur){
+    nameInp.value = cur.name || '';
+    personaTa.value = cur.persona || '';
   }
   var err = el('p', {style:'color:var(--err);font-size:12.5px;min-height:16px'});
+  // 管理员同名提示：填常驻 Bot 名即可进入「接管 Bot」模式
+  var botHint = null;
+  if(MODE !== 'visitor' && RESIDENT_BOT_NAME){
+    botHint = el('p', {style:'color:var(--fg-dim);font-size:12px;margin:6px 0 0', html:
+      '常驻 Bot 名为「' + esc(RESIDENT_BOT_NAME) + '」。用它作角色名并选择「扮演/操纵」即可接管该 Bot（代理其全部工具调用）。'});
+  }
+  var saveProfile = function(){
+    var name = nameInp.value.trim();
+    if(!name){ err.textContent = '角色名不能为空'; return; }
+    var profile = {name: name, persona: personaTa.value.trim()};
+    if(MODE === 'visitor'){
+      // 访客：持久化到账号（服务端校验同名）
+      api('PUT', '/api/player/profile', profile).then(function(){
+        setPlayerProfile(profile);
+        toast('角色身份已保存', 'ok');
+        done();
+      }).catch(function(e){ err.textContent = e.message || e; });
+    } else {
+      // 管理员：仅存本地（管理员同名是「接管 Bot」，不校验）
+      setPlayerProfile(profile);
+      toast('角色身份已保存', 'ok');
+      done();
+    }
+  };
+  nameInp.onkeydown = function(e){ if(e.key === 'Enter'){ saveProfile(); } };
   var form = el('div', {cls:'section'}, [
     el('h3', {text:'你的角色身份'}),
     el('div', {cls:'body'}, [
       el('label', {text:'角色名'}), nameInp,
       el('label', {text:'人设'}), personaTa,
+      botHint,
       err,
       el('div', {cls:'toolbar', style:'margin-top:10px'}, [
-        el('button', {cls:'primary', text:'保存角色', onclick:function(){
-          var name = nameInp.value.trim();
-          if(!name){ err.textContent = '角色名不能为空'; return; }
-          var profile = {name: name, persona: personaTa.value.trim()};
-          api('PUT', '/api/player/profile', profile).then(function(){
-            VISITOR_PLAYER_PROFILE = profile;
-            localStorage.setItem('wui_player_profile', JSON.stringify(profile));
-            toast('角色身份已保存', 'ok');
-            done();
-          }).catch(function(e){ err.textContent = e.message || e; });
-        }})
+        el('button', {cls:'primary', text:'保存角色', onclick:saveProfile})
       ])
     ])
   ]);
@@ -1637,7 +1684,7 @@ function playerProfileForm(done){
 
 function playerRenderWorld(holder){
   // 世界运行状态 + 入世界/剧情
-  var profile = VISITOR_PLAYER_PROFILE;
+  var profile = getPlayerProfile();
   holder.textContent = '';
   // 顶部：角色身份 + 入世界状态（未入世界时可重新编辑身份，创建新角色）
   var head = el('div', {cls:'section'});
@@ -1673,10 +1720,17 @@ function playerRenderWorld(holder){
         el('div', {text: o[2], style:'font-size:12px;color:var(--fg-dim);margin:2px 0 0 22px'})
       ]);
     });
+    // 管理员 + 同名：进入语义里扮演/操纵即「接管 Bot」的说明
+    var takeoverHint = null;
+    if(isAdminTakeover()){
+      takeoverHint = el('p', {style:'color:var(--warn);font-size:12.5px', html:
+        '你将<b>接管常驻 Bot「' + esc(RESIDENT_BOT_NAME) + '」</b>：扮演（入替）会暂停它的自主思考，由你代理其全部工具调用；操纵则让它继续自主运行、你额外操控其行动。'});
+    }
     var enterBar = el('div', {cls:'section'}, [
       el('h3', {text:'进入世界'}),
       el('div', {cls:'body'}, [
         el('p', {text:'选择你与这个角色的关系，然后进入世界。进入后不可再更改，直到退出世界。', style:'color:var(--fg-dim);font-size:13px'}),
+        takeoverHint,
         el('div', {}, modeRadios),
         el('button', {cls:'primary', text:'进入世界', onclick:function(){ playerArrive(curMode); }})
       ])
@@ -1684,6 +1738,8 @@ function playerRenderWorld(holder){
     holder.appendChild(enterBar);
   } else {
     holder.appendChild(playerWorldPanel());
+    // 管理员接管 Bot：附上「工具调用面板」（代理 Bot 全部工具）
+    if(isAdminTakeover()) holder.appendChild(adminToolPanel());
   }
   // 世界剧情（世界状态+新闻，只读）
   holder.appendChild(playerWorldStatus());
@@ -1691,19 +1747,28 @@ function playerRenderWorld(holder){
 
 function playerArrive(mode){
   mode = (mode === 'avatar' || mode === 'puppet') ? mode : 'cross';
-  api('POST', '/api/player/arrive', {mode: mode}).then(function(r){
+  var profile = getPlayerProfile();
+  // 管理员：角色身份随请求体传入（无账号档案）；访客沿用服务端档案
+  var body = MODE === 'visitor' ? {mode: mode} : {name: profile.name, persona: profile.persona || '', mode: mode};
+  api('POST', '/api/player/arrive', body).then(function(r){
     PLAYER_STATE.token = r.token;
     PLAYER_STATE.worldName = r.worldName || '';
     PLAYER_STATE.inWorld = true;
     PLAYER_STATE.mode = r.mode || mode;
+    PLAYER_STATE.isAdmin = MODE !== 'visitor';
+    PLAYER_STATE.botName = r.botName || RESIDENT_BOT_NAME || '';
+    if(PLAYER_STATE.botName) RESIDENT_BOT_NAME = PLAYER_STATE.botName;
+    PLAYER_STATE.takeover = PLAYER_STATE.isAdmin && !!PLAYER_STATE.botName && profile.name === PLAYER_STATE.botName;
     PLAYER_STATE.events = [];
     // 持久化进入语义：下次进入默认沿用
-    if(VISITOR_PLAYER_PROFILE){
-      VISITOR_PLAYER_PROFILE.mode = mode;
-      localStorage.setItem('wui_player_profile', JSON.stringify(VISITOR_PLAYER_PROFILE));
-      api('PUT', '/api/player/profile', { name: VISITOR_PLAYER_PROFILE.name, persona: VISITOR_PLAYER_PROFILE.persona || '', mode: mode }).catch(function(){});
+    if(profile){
+      profile.mode = mode;
+      setPlayerProfile(profile);
+      if(MODE === 'visitor'){
+        api('PUT', '/api/player/profile', { name: profile.name, persona: profile.persona || '', mode: mode }).catch(function(){});
+      }
     }
-    toast('已进入世界', 'ok');
+    toast(PLAYER_STATE.takeover ? '已接管 Bot' : '已进入世界', 'ok');
     playerConnectEvents(r.token);
     loadPlayer();
   }).catch(showErr);
@@ -1740,6 +1805,89 @@ function playerRefreshActState(){
   btns.forEach(function(b){ if(b.textContent === '行动'){ b.disabled = !!PLAYER_STATE.actBusy; } });
 }
 
+// 管理员「接管 Bot」时可手动代理的 Bot 工具（核心高频工具 + 可自由输入任意工具名）
+var ADMIN_TOOL_LIST = [
+  ['act', 'act(description: string, duration?: number)', '在世界中做一件事（自然语言描述）。'],
+  ['send', 'send(msg: string, id?: string, media?: string[])', '发送消息（id 缺省为当前频道）。'],
+  ['wait', 'wait(n: number)', '等待 n 个 Time Unit。'],
+  ['check_status', 'check_status(target: "self"|"world", full?: boolean)', '查看自身或世界状态。'],
+  ['check_time', 'check_time()', '看一眼现在几点。'],
+  ['check_msg', 'check_msg(n: number)', '刷新消息列表。'],
+  ['select_channel', 'select_channel(id: string)', '点进一个频道。'],
+  ['read_channel', 'read_channel(n: number)', '读当前频道最近消息。'],
+  ['check_gallery', 'check_gallery(category?: string)', '翻看收藏夹。'],
+  ['check_media', 'check_media(n?: number)', '翻看媒体缓存。'],
+  ['open_app', 'open_app(name: string)', '打开手机里的一个应用。'],
+  ['recall', 'recall(keyword?: string, n?: number)', '回忆自己的过往。'],
+  ['react', 'react(id: string, msg_id: string, emoji: string)', '给某条消息贴表情回应。'],
+  ['unsend', 'unsend(id: string, msg_id: string)', '撤回一条已发消息。']
+];
+
+// 管理员「接管 Bot」时的工具调用面板：代理 Bot 全部工具，经 /api/player/tool 真正执行
+function adminToolPanel(){
+  var box = el('div', {cls:'section'});
+  box.appendChild(el('h3', {html:'工具调用面板 <span class="hint">手动驾驶常驻 Bot「' + esc(RESIDENT_BOT_NAME || '') + '」</span>'}));
+  var body = el('div', {cls:'body'});
+
+  var sel = el('select', {style:'width:100%'});
+  var customOpt = el('option', {value:'__custom__', text:'自定义工具名…'});
+  sel.appendChild(customOpt);
+  ADMIN_TOOL_LIST.forEach(function(t){
+    sel.appendChild(el('option', {value:t[0], text: t[1] + ' — ' + t[2]}));
+  });
+  var nameInp = el('input', {placeholder:'自定义工具名（如 send_group_notice）', style:'width:100%;margin-top:8px;display:none'});
+  sel.onchange = function(){
+    if(sel.value === '__custom__'){ nameInp.style.display = ''; nameInp.focus(); }
+    else { nameInp.style.display = 'none'; }
+  };
+  var argsTa = el('textarea', {rows: 4, placeholder:'参数（JSON 对象，例如 {"msg":"你好","id":"platform:123"}；act 填 {"description":"..."}）', style:'width:100%;font-family:var(--mono);font-size:12px'});
+  var resultPre = el('pre', {cls:'', style:'max-height:280px;overflow:auto;margin-top:10px;white-space:pre-wrap;word-break:break-word'});
+  var errLine = el('p', {style:'color:var(--err);font-size:12.5px;min-height:16px'});
+  var busy = false;
+
+  body.appendChild(el('label', {text:'工具', style:'font-size:12px;color:var(--fg-dim)'}));
+  body.appendChild(sel);
+  body.appendChild(nameInp);
+  body.appendChild(el('label', {text:'参数', style:'font-size:12px;color:var(--fg-dim);display:block;margin:10px 0 4px'}));
+  body.appendChild(argsTa);
+  body.appendChild(errLine);
+  var callBtn = el('button', {cls:'primary', text:'调用工具'});
+  body.appendChild(el('div', {cls:'toolbar', style:'margin:6px 0 0'}, [callBtn,
+    el('button', {cls:'ghost', text:'清空结果', onclick:function(){ resultPre.textContent = ''; }})
+  ]));
+  body.appendChild(resultPre);
+
+  function runTool(){
+    if(busy) return;
+    var name = sel.value === '__custom__' ? nameInp.value.trim() : sel.value;
+    if(!name){ errLine.textContent = '请选择或输入工具名'; return; }
+    var args = {};
+    if(argsTa.value.trim()){
+      try { args = JSON.parse(argsTa.value); }
+      catch(e){ errLine.textContent = '参数不是合法 JSON：' + e.message; return; }
+    }
+    if(typeof args !== 'object' || Array.isArray(args)){ errLine.textContent = '参数必须是 JSON 对象'; return; }
+    errLine.textContent = '';
+    busy = true;
+    callBtn.disabled = true;
+    resultPre.textContent = '（正在调用 ' + name + ' …）';
+    api('POST', '/api/player/tool', {name: name, arguments: args}).then(function(r){
+      busy = false;
+      callBtn.disabled = false;
+      resultPre.textContent = (r.ok ? '' : '⚠ 拒绝/失败\n') + (r.text || '（无返回内容）');
+    }).catch(function(e){
+      busy = false;
+      callBtn.disabled = false;
+      errLine.textContent = e.message || e;
+      resultPre.textContent = '';
+    });
+  }
+  callBtn.onclick = runTool;
+  nameInp.onkeydown = function(e){ if(e.key === 'Enter') runTool(); };
+  box.appendChild(body);
+  return box;
+}
+
 // 解析玩家状态档案（World 生成的 markdown）为若干「节」：{label, body}
 function parsePlayerStatus(text){
   if(!text) return [];
@@ -1772,7 +1920,7 @@ function parsePlayerStatus(text){
 // 渲染玩家的角色状态（World 维护的 persona：身份 + 状态），按 markdown 分节结构化展示
 function playerRenderStatus(sec){
   sec.textContent = '';
-  var profile = VISITOR_PLAYER_PROFILE;
+  var profile = getPlayerProfile();
   if(!profile || !profile.persona){
     sec.appendChild(el('p', {text:'以「' + (profile && profile.name ? profile.name : '你的角色') + '」的身份进入世界，用行动推动剧情。', style:'color:var(--fg-dim);font-size:13px'}));
     return;
@@ -1837,12 +1985,22 @@ function playerSubmitAct(actInp, err, feed, actBtn){
   PLAYER_STATE.actBusy = true;
   actInp.value = '';
   // 立马上屏：玩家行动与世界剧情交替呈现
-  PLAYER_STATE.events.push({type:'player', name: VISITOR_PLAYER_PROFILE && VISITOR_PLAYER_PROFILE.name, content: desc, timeLine: PLAYER_STATE.lastTimeLine || ''});
+  var prof = getPlayerProfile();
+  PLAYER_STATE.events.push({type:'player', name: prof && prof.name, content: desc, timeLine: PLAYER_STATE.lastTimeLine || ''});
   playerRefreshFeed();
   playerRefreshActState();
   var taskId = 'p_' + Date.now() + '_' + Math.floor(Math.random()*1e6);
-  api('POST', '/api/player/task', {token: PLAYER_STATE.token, taskId: taskId, kind: 'act', payload: {desc: desc}}).then(function(){
-    // 已受理，等待 SSE 的 task_result
+  // 管理员接管 Bot：act 走 Bot 通道（服务端路由到 adjudicateAct），否则走 crossing visitorAct
+  var body = {token: PLAYER_STATE.token, taskId: taskId, kind: 'act', payload: {desc: desc}};
+  if(MODE !== 'visitor' && PLAYER_STATE.takeover) body.actorName = prof && prof.name;
+  api('POST', '/api/player/task', body).then(function(r){
+    // 已受理，等待 SSE 的 task_result（管理员接管 Bot 时 act 结果由正文 r.text 返回，不再有 SSE task_result）
+    if(MODE !== 'visitor' && PLAYER_STATE.takeover && r && r.text){
+      PLAYER_STATE.events.push({type:'world', content: r.text, timeLine: PLAYER_STATE.lastTimeLine || ''});
+      playerRefreshFeed();
+      PLAYER_STATE.actBusy = false;
+      playerRefreshActState();
+    }
   }).catch(function(e){
     PLAYER_STATE.actBusy = false;
     playerRefreshActState();
@@ -1855,6 +2013,8 @@ function playerLeave(){
     PLAYER_STATE.inWorld = false;
     PLAYER_STATE.token = '';
     PLAYER_STATE.events = [];
+    PLAYER_STATE.takeover = false;
+    PLAYER_STATE.isAdmin = false;
     toast('已离开世界', 'ok');
     loadPlayer();
   }).catch(showErr);
@@ -1862,9 +2022,12 @@ function playerLeave(){
 
 function playerConnectEvents(token){
   // 注意：EventSource 无法带 header，需用 URL 参数携带两层 token：
-  // - visitor=访客会话 token（webui /api/player/* 鉴权）
+  // - visitor=访客会话 token / token=管理员 webui.token（webui /api/player/* 鉴权）
   // - ctoken=crossing session token（转发到 crossing /events）
-  var es = new EventSource('/api/player/events?visitor=' + encodeURIComponent(VISITOR_TOKEN) + '&ctoken=' + encodeURIComponent(token));
+  var authQuery = MODE === 'visitor'
+    ? 'visitor=' + encodeURIComponent(VISITOR_TOKEN)
+    : 'token=' + encodeURIComponent(TOKEN);
+  var es = new EventSource('/api/player/events?' + authQuery + '&ctoken=' + encodeURIComponent(token));
   es.onmessage = function(ev){
     var msg;
     try { msg = JSON.parse(ev.data); } catch(e){ return; }
@@ -1883,11 +2046,13 @@ function playerConnectEvents(token){
       // 刷新「等待中」提示（actBusy 已变 false，重渲染面板）
       playerRefreshActState();
     } else if(msg.type === 'status_update' && msg.content){
-      // World 更新了玩家的状态档案（整体覆盖：身份 + 状态）。本地更新并持久化到账号（保留 mode）
-      var _m = VISITOR_PLAYER_PROFILE && VISITOR_PLAYER_PROFILE.mode;
-      VISITOR_PLAYER_PROFILE = { name: VISITOR_PLAYER_PROFILE.name, persona: msg.content, mode: _m };
-      localStorage.setItem('wui_player_profile', JSON.stringify(VISITOR_PLAYER_PROFILE));
-      api('PUT', '/api/player/profile', { name: VISITOR_PLAYER_PROFILE.name, persona: msg.content, mode: _m }).catch(function(){});
+      // World 更新了玩家的状态档案（整体覆盖：身份 + 状态）。本地更新并持久化（仅访客账号；管理员存本地）
+      var prof = getPlayerProfile();
+      var _m = prof && prof.mode;
+      setPlayerProfile({ name: prof.name, persona: msg.content, mode: _m });
+      if(MODE === 'visitor' && prof){
+        api('PUT', '/api/player/profile', { name: prof.name, persona: msg.content, mode: _m }).catch(function(){});
+      }
       playerRefreshStatus();
     } else if(msg.type === 'farewell'){
       PLAYER_STATE.inWorld = false;
@@ -1896,6 +2061,7 @@ function playerConnectEvents(token){
       PLAYER_STATE.events = [];
       PLAYER_STATE.lastTimeLine = '';
       PLAYER_STATE.actBusy = false;
+      PLAYER_STATE.takeover = false;
       toast(msg.reason || '世界送别了你', 'warn');
       loadPlayer();
     }

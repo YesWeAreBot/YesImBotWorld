@@ -39,6 +39,8 @@ export interface BotStatusSummary {
   streamLength: number;
   approxChars: number;
   pendingTasks: number;
+  /** 手动驾驶（管理员接管 Bot）是否暂停了自主生成 */
+  paused?: boolean;
   /** 手机界面状态（设备页窥视用）；老版本 Bot 可能不提供 */
   phoneUi?: { chatOpen: boolean; channelKey: string | null; channelIsGroup: boolean; forwardDepth: number };
 }
@@ -123,6 +125,14 @@ export interface WebUIHost {
   crossingForce(target: string): Promise<string>;
   /** 玩家入世界（同部署真人玩家，不走邀请码）：到达返回 crossing token */
   arrivePlayer(name: string, persona: string, mode?: PlayerMode): { ok: true; token: string; worldName: string; timeLine: string } | { ok: false; error: string };
+  /** 管理员代理 Bot 执行任意工具调用（手动驾驶） */
+  botToolCall(name: string, args: Record<string, unknown>, duration?: number): Promise<{ ok: boolean; text: string }>;
+  /** 管理员接管 Bot 时暂停/恢复其自主生成（扮演=暂停；操纵/交还=恢复） */
+  botSetManualPaused(paused: boolean): void;
+  /** Bot 是否处于手动驾驶（自主生成已暂停） */
+  botManualMode(): boolean;
+  /** 常驻 Bot 名字（供管理员同名判定） */
+  residentBotName(): string;
   /** 归档：手动存档（把当前全部世界状态复制成一份新快照） */
   saveArchive(label: string): Promise<string>;
   /** 归档：回档到某个快照（当前状态先自动存档） */
@@ -477,18 +487,26 @@ export class WebUIServer {
     return `http://127.0.0.1:${port}`;
   }
 
-  /** 玩家入世界端点：仅 player 档账号可用 */
+  /**
+   * 玩家入世界端点：player 档账号 与 管理员 均可用。
+   * - 玩家（visitor, preset=player）：角色档案持久化在账号（session.playerProfile）。
+   * - 管理员（admin）：无账号档案，角色身份由前端 localStorage 保存、arrive 时随请求体传入。
+   */
   private async handlePlayer(pathname: string, method: string, url: URL, req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     const access = this.resolveAccess(req, url);
-    if (!access || access.kind !== "visitor" || access.session.preset !== "player") {
-      return void sendJSON(res, 403, { error: "仅玩家账号可用" });
+    if (!access) return void sendJSON(res, 401, { error: "需要访问令牌" });
+    const isAdmin = access.kind === "admin";
+    const isPlayer = access.kind === "visitor" && access.session.preset === "player";
+    if (!isAdmin && !isPlayer) {
+      return void sendJSON(res, 403, { error: "仅玩家账号或管理员可用" });
     }
-    const session = access.session;
+    const session = access.kind === "visitor" ? access.session : null;
 
-    // 角色身份：GET 读 / PUT 存（首次登录填完后持久化）
+    // 角色身份：GET 读 / PUT 存（玩家首次登录填完后持久化；管理员无账号档案，不走此端点）
     if (pathname === "/api/player/profile") {
+      if (isAdmin) return void sendJSON(res, 200, { profile: null });
       if (method === "GET") {
-        return void sendJSON(res, 200, { profile: session.playerProfile });
+        return void sendJSON(res, 200, { profile: session!.playerProfile });
       }
       if (method === "PUT") {
         const body = await readJson(req, 1024 * 1024).catch(() => null);
@@ -499,37 +517,84 @@ export class WebUIServer {
           mode: body.mode === "avatar" || body.mode === "puppet" || body.mode === "cross" ? body.mode : undefined,
         };
         if (!profile.name) return void sendJSON(res, 400, { error: "角色名不能为空" });
-        // 玩家角色不能与常驻 Bot 同名（避免世界裁决时主体混淆）
+        // 玩家角色不能与常驻 Bot 同名（避免世界裁决时主体混淆）——仅对真人玩家档生效；
+        // 管理员是例外：可与常驻 Bot 同名，以进入「接管 Bot」模式。
         const botName = (await this.host.files.readMeta()).botName?.trim();
         if (botName && profile.name === botName) {
           return void sendJSON(res, 400, { error: `角色名不能与常驻 Bot「${botName}」相同` });
         }
-        const r = await this.visitors.savePlayerProfile(session.accountId, profile);
+        const r = await this.visitors.savePlayerProfile(session!.accountId, profile);
         if (!r.ok) return void sendJSON(res, 400, { error: r.error });
         return void sendJSON(res, 200, { ok: true });
       }
       return void sendJSON(res, 405, { error: "不支持的方法" });
     }
 
-    // 到达：把玩家角色身份作为 crossing arrive 的 name+persona（mode=进入语义，前进前选定）
+    // 到达：玩家用账号档案；管理员用请求体里的角色身份（含 mode=进入语义）
     if (pathname === "/api/player/arrive" && method === "POST") {
-      const profile = session.playerProfile;
-      if (!profile || !profile.name) {
-        return void sendJSON(res, 400, { error: "请先填写角色身份" });
-      }
       const body = await readJson(req, 1024 * 1024).catch(() => null);
-      const mode: PlayerMode = body && (body.mode === "avatar" || body.mode === "puppet" || body.mode === "cross")
-        ? body.mode
-        : (profile.mode ?? "cross");
-      const r = this.host.arrivePlayer(profile.name, profile.persona, mode);
+      let name: string;
+      let persona: string;
+      let mode: PlayerMode;
+      if (isAdmin) {
+        name = String(body?.name ?? "").trim();
+        persona = String(body?.persona ?? "").trim();
+        mode = body && (body.mode === "avatar" || body.mode === "puppet" || body.mode === "cross") ? body.mode : "cross";
+        if (!name) return void sendJSON(res, 400, { error: "请先填写角色身份" });
+      } else {
+        const profile = session!.playerProfile;
+        if (!profile || !profile.name) {
+          return void sendJSON(res, 400, { error: "请先填写角色身份" });
+        }
+        name = profile.name;
+        persona = profile.persona;
+        mode = body && (body.mode === "avatar" || body.mode === "puppet" || body.mode === "cross")
+          ? body.mode
+          : (profile.mode ?? "cross");
+      }
+      const r = this.host.arrivePlayer(name, persona, mode);
       if (!r.ok) return void sendJSON(res, 400, { error: r.error });
-      return void sendJSON(res, 200, { ok: true, token: r.token, worldName: r.worldName, timeLine: r.timeLine, mode });
+      // 管理员与常驻 Bot 同名（扮演/操纵）＝接管 Bot：扮演=暂停 Bot-LLM 自主生成，操纵=继续自主运行
+      const botName = this.host.residentBotName().trim();
+      if (isAdmin && botName && name === botName && (mode === "avatar" || mode === "puppet")) {
+        this.host.botSetManualPaused(mode === "avatar");
+      }
+      return void sendJSON(res, 200, { ok: true, token: r.token, worldName: r.worldName, timeLine: r.timeLine, mode, botName });
     }
 
-    // 提交行动（act）：转发 crossing task
+    // 代理 Bot 工具调用（管理员手动驾驶）：管理员接管 Bot 时经此真正执行任意 Bot 工具
+    if (pathname === "/api/player/tool" && method === "POST") {
+      if (!isAdmin) return void sendJSON(res, 403, { error: "仅管理员可代理 Bot 工具调用" });
+      const body = await readJson(req, 1024 * 1024).catch(() => null);
+      if (!body) return void sendJSON(res, 400, { error: "请求体不是合法 JSON" });
+      const name = String(body.name ?? "").trim();
+      if (!name) return void sendJSON(res, 400, { error: "缺少工具名 name" });
+      const args = (body.arguments ?? body.args ?? {}) as Record<string, unknown>;
+      if (typeof args !== "object" || Array.isArray(args)) {
+        return void sendJSON(res, 400, { error: "arguments 必须是 JSON 对象" });
+      }
+      const duration = body.duration != null ? Number(body.duration) : undefined;
+      const r = await this.host.botToolCall(name, args, Number.isFinite(duration) ? duration : undefined);
+      return void sendJSON(res, 200, r);
+    }
+
+    // 提交行动（act）：真人玩家走 crossing 的 visitorAct；管理员接管 Bot（同名扮演/操纵）走 Bot 的 adjudicateAct
     if (pathname === "/api/player/task" && method === "POST") {
       const body = await readJson(req, 1024 * 1024).catch(() => null);
       if (!body) return void sendJSON(res, 400, { error: "请求体不是合法 JSON" });
+      const kind = String(body.kind ?? "");
+      const payload = (body.payload ?? {}) as Record<string, unknown>;
+      // 管理员接管 Bot（同名）时，act 交由 BotAgent.dispatchAct → world.adjudicateAct（它就是常驻 Bot，应走 Bot 通道）
+      if (isAdmin && kind === "act") {
+        const botName = this.host.residentBotName().trim();
+        const actorName = String(body.actorName ?? "").trim();
+        if (botName && actorName === botName) {
+          const desc = String(payload.desc ?? "").trim();
+          if (!desc) return void sendJSON(res, 400, { error: "缺少行动描述 desc" });
+          const r = await this.host.botToolCall("act", { description: desc, ...(payload.duration ? { duration: Number(payload.duration) } : {}) });
+          return void sendJSON(res, 200, { ok: r.ok, text: r.text });
+        }
+      }
       const r = await this.crossingPost("/crossing/task", body);
       if (!r.ok) return void sendJSON(res, 400, { error: String(r.error ?? "任务被拒绝") });
       return void sendJSON(res, 200, { ok: true });
@@ -538,6 +603,8 @@ export class WebUIServer {
     // 离开
     if (pathname === "/api/player/leave" && method === "POST") {
       const body = await readJson(req, 64 * 1024).catch(() => ({}));
+      // 管理员离开：解除 Bot 接管（恢复自主生成）
+      if (isAdmin) this.host.botSetManualPaused(false);
       const r = await this.crossingPost("/crossing/leave", body);
       return void sendJSON(res, 200, { ok: true });
     }

@@ -738,6 +738,27 @@ export class WorldService extends Service<Config> {
     return this.crossingServer.arrivePlayer(name, persona, mode);
   }
 
+  /** WebUI：管理员代理 Bot 执行任意工具调用（手动驾驶） */
+  async botToolCall(name: string, args: Record<string, unknown>, duration?: number): Promise<{ ok: boolean; text: string }> {
+    if (!this.bot) return { ok: false, text: "（Bot-LLM 当前未在运行。）" };
+    return this.bot.injectExternalToolCall(name, args, { duration });
+  }
+
+  /** WebUI：管理员接管 Bot 时暂停/恢复其自主生成 */
+  botSetManualPaused(paused: boolean): void {
+    this.bot?.setManualPaused(paused);
+  }
+
+  /** WebUI：Bot 是否处于手动驾驶（自主生成已暂停） */
+  botManualMode(): boolean {
+    return this.bot?.manualMode ?? false;
+  }
+
+  /** WebUI：常驻 Bot 名字（供管理员同名判定） */
+  residentBotName(): string {
+    return this.world.residentBotName;
+  }
+
   /** WebUI：穿越面板信息 */
   crossingInfo(): {
     location: string | null;
