@@ -460,6 +460,7 @@ var ICONS = {
   phone: svgIcon('<rect x="7" y="2.5" width="10" height="19" rx="2.5"/><path d="M11 18.5h2"/>'),
   portal: svgIcon('<circle cx="12" cy="12" r="9"/><path d="M3.5 12h17"/><path d="M12 3a13.5 13.5 0 0 1 0 18"/><path d="M12 3a13.5 13.5 0 0 0 0 18"/>'),
   door: svgIcon('<path d="M5 21V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v16"/><path d="M13 21v-7a2 2 0 0 1 2-2h1.5"/><circle cx="16" cy="10.5" r="0.8"/>'),
+  logout: svgIcon('<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="M15 8l4 4-4 4"/><path d="M19 12H9"/>'),
   users: svgIcon('<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/>')
 };
 function icon(name){ return ICONS[name] || ''; }
@@ -850,7 +851,7 @@ function buildNav(){
     cp.onclick = function(){ openChangePassword(); closeDrawer(); };
     nav.appendChild(cp);
     var lo = el('a', {cls:'nav-action'});
-    lo.appendChild(el('span', {cls:'ico', html: icon('portal')}));
+    lo.appendChild(el('span', {cls:'ico', html: icon('logout')}));
     lo.appendChild(el('span', {text:'退出登录'}));
     lo.onclick = function(){ logoutVisitor(); closeDrawer(); };
     nav.appendChild(lo);
