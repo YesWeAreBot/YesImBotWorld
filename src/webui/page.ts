@@ -459,6 +459,7 @@ var ICONS = {
   menu: svgIcon('<path d="M4 7h16M4 12h16M4 17h16"/>'),
   phone: svgIcon('<rect x="7" y="2.5" width="10" height="19" rx="2.5"/><path d="M11 18.5h2"/>'),
   portal: svgIcon('<circle cx="12" cy="12" r="9"/><path d="M3.5 12h17"/><path d="M12 3a13.5 13.5 0 0 1 0 18"/><path d="M12 3a13.5 13.5 0 0 0 0 18"/>'),
+  door: svgIcon('<path d="M5 21V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v16"/><path d="M13 21v-7a2 2 0 0 1 2-2h1.5"/><circle cx="16" cy="10.5" r="0.8"/>'),
   users: svgIcon('<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/>')
 };
 function icon(name){ return ICONS[name] || ''; }
@@ -737,7 +738,7 @@ var NAV = [
   {group:'世界'},
   ['state','状态','file',['world_status','bot_status','news','facts']],
   ['crossing','穿越','portal',['crossing']],
-  ['player','入世界','portal',['__player__']],
+  ['player','入世界','door',['__player__']],
   ['prompts','提示词','edit',['prompts']],
   ['gallery','相册','image',['gallery']],
   ['media','媒体','film',['gallery']],
