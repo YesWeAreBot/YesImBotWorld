@@ -36,6 +36,8 @@ export interface WorldPromptSet {
   system: string;
   /** 裁定 Bot 的 act 动作。{{desc}} {{issuedAt}} {{duration}} {{expectedAt}} */
   adjudicateAct: string;
+  /** 批量裁定多个 act（Bot + 访客合并成一次请求）。{{acts}} */
+  adjudicateActBatch: string;
   /** wait 补叙。{{issuedAt}} {{n}} {{expectedAt}} */
   resolveWait: string;
   /** Bot 主动查看时间。{{timeLine}} */
@@ -224,6 +226,16 @@ export const WORLD_PROMPT_DEFAULTS: WorldPromptSet = {
     `日常小动作不要记录。\n` +
     `5. 若结果改变了 Bot 的私人生活状态（习惯、偏好、心情、日常小事），` +
     `用 update(facts) 记进它的私人小事记（facts 是 Bot 中心的小事，News 是世界中心的大事，别混用）。`,
+
+  adjudicateActBatch:
+    `现在有多个动作**同时**需要裁定（合并成这一次请求）。每个动作的归属、描述、时间如下：\n` +
+    `{{acts}}\n` +
+    `请**逐个**裁定每个动作的结果，规则同单个 act：\n` +
+    `- 每个动作调用一次 send_event，用**第三人称客观叙述**该动作完成时的结果（聚焦什么变了、什么被怎么样了，允许失败/意外）；\n` +
+    `- send_event 的 to 参数**必须填该动作的行为者**：行为者是常驻 Bot「{{botName}}」就填 "bot"，行为者是某位访客就填该访客的名字——这样结果才会送达正确的人；\n` +
+    `- 动作改变了行为者自身（位置/状态/心情/随身物/正在做的事）时，分别 update 对应状态：常驻 Bot 用 update(bot_status)，访客用 update_visitor_status（name 填该访客名字）；\n` +
+    `- 改变了周遭世界则 update world_status（优先 patch）；足够重要才 update news 记一条。\n` +
+    `- 各动作是同时发生的，裁定尽量让它们在同一时刻、同一世界快照下连贯一致。`,
 
   resolveWait:
     `Bot 从 {{issuedAt}} 开始等待 {{n}} 个 TU，等待即将在 ` +
