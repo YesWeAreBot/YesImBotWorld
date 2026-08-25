@@ -599,9 +599,11 @@ function api(method, path, body, retried){
   var opts = {method:method, headers:{}};
   if(MODE === 'visitor'){
     // 访客只读：写请求直接拒绝，不发请求（安全兜底，即便某个写按钮漏隐藏也不会真正落盘）。
-    // 例外：玩家档（player）允许自己的入世界写操作（/api/player/*）
+    // 例外：玩家档（player）允许自己的入世界写操作（/api/player/*）；
+    //       所有访客允许改自己的密码（/api/account/password）
     var isPlayerOp = VISITOR_PRESET === 'player' && String(path).indexOf('/api/player') === 0;
-    if(method !== 'GET' && !isPlayerOp){
+    var isPasswordOp = String(path) === '/api/account/password';
+    if(method !== 'GET' && !isPlayerOp && !isPasswordOp){
       return Promise.reject(new Error('访客模式为只读，无法执行此操作'));
     }
     if(VISITOR_TOKEN) opts.headers['x-visitor-token'] = VISITOR_TOKEN;
@@ -787,6 +789,31 @@ function logoutVisitor(){
   buildNav();
   switchView('overview');
 }
+// 访客自助改密码：弹窗填旧密码 + 新密码
+function openChangePassword(){
+  var oldInp = el('input', {type:'password', placeholder:'当前密码', style:'width:100%'});
+  var newInp = el('input', {type:'password', placeholder:'新密码', style:'width:100%'});
+  var err = el('p', {style:'color:var(--err);font-size:12.5px;min-height:16px'});
+  showModal('修改密码', el('div', null, [
+    el('label', {text:'当前密码'}), oldInp,
+    el('label', {text:'新密码'}), newInp,
+    err,
+    el('div', {cls:'toolbar', style:'margin:8px 0 0'}, [
+      el('button', {text:'取消', onclick:hideModal}),
+      el('button', {cls:'primary', text:'保存', onclick:function(){
+        var oldP = oldInp.value;
+        var newP = newInp.value;
+        if(!oldP){ err.textContent = '请输入当前密码'; return; }
+        if(!newP){ err.textContent = '请输入新密码'; return; }
+        api('POST', '/api/account/password', {oldPassword: oldP, newPassword: newP}).then(function(){
+          hideModal();
+          toast('密码已修改', 'ok');
+        }).catch(function(e){ err.textContent = e.message || e; });
+      }})
+    ])
+  ]));
+  setTimeout(function(){ oldInp.focus(); }, 20);
+}
 function buildNav(){
   var nav = $('#nav');
   nav.textContent = '';
@@ -812,6 +839,20 @@ function buildNav(){
     a.onclick = function(){ switchView(it[0]); closeDrawer(); };
     nav.appendChild(a);
     i++;
+  }
+  // 访客专属操作：改密码 / 退出登录
+  if(MODE === 'visitor'){
+    nav.appendChild(el('div', {cls:'nav-group', text:'账号'}));
+    var cp = el('a', {cls:'nav-action'});
+    cp.appendChild(el('span', {cls:'ico', html: icon('sliders')}));
+    cp.appendChild(el('span', {text:'修改密码'}));
+    cp.onclick = function(){ openChangePassword(); closeDrawer(); };
+    nav.appendChild(cp);
+    var lo = el('a', {cls:'nav-action'});
+    lo.appendChild(el('span', {cls:'ico', html: icon('portal')}));
+    lo.appendChild(el('span', {text:'退出登录'}));
+    lo.onclick = function(){ logoutVisitor(); closeDrawer(); };
+    nav.appendChild(lo);
   }
 }
 function clearViewTimers(){
@@ -1951,7 +1992,10 @@ function renderVisitors(holder, visitors){
     var row = el('div', {cls:'fld', style:'display:flex;align-items:center;gap:10px;padding:8px 0;border-top:1px solid var(--line)'}, [
       el('div', {style:'flex:1'}, [
         el('div', {text:v.username || '(未命名)'}),
-        el('div', {cls:'hint', text: PRESET_LABELS[v.preset] + ' · 创建于 ' + fmtTime(v.createdAt), style:'font-size:11.5px;color:var(--fg-dark)'})
+        el('div', {style:'font-size:11.5px;color:var(--fg-dark)'}, [
+          PRESET_LABELS[v.preset] + ' · 创建于 ' + fmtTime(v.createdAt),
+          v.passwordPlain ? el('span', {text:' · 密码 ' + v.passwordPlain, style:'color:var(--warn);font-family:var(--mono)'}) : null
+        ])
       ]),
       el('button', {text:'编辑', onclick:function(){ openVisitorEditor(v, visitors, function(){ loadVisitors(); }); }}),
       el('button', {text:'删除', onclick:function(){

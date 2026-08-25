@@ -384,6 +384,10 @@ export class WebUIServer {
       if (pathname === "/api/visitors/me") {
         return this.handleVisitorMe(req, url, res);
       }
+      // 访客自主修改密码（任何访客档，需旧密码验证）
+      if (pathname === "/api/account/password" && method === "POST") {
+        return this.handleChangePassword(req, url, res);
+      }
       if (pathname === "/api/visitors") {
         await this.handleVisitors(method, url, req, res);
         return;
@@ -450,6 +454,21 @@ export class WebUIServer {
       preset: access.session.preset,
       grants: [...access.session.grants],
     });
+  }
+
+  /** 访客自主修改自己的密码（需旧密码验证） */
+  private async handleChangePassword(req: http.IncomingMessage, url: URL, res: http.ServerResponse): Promise<void> {
+    const access = this.resolveAccess(req, url);
+    if (!access || access.kind !== "visitor") {
+      return void sendJSON(res, 401, { error: "访客会话无效" });
+    }
+    const body = await readJson(req, 64 * 1024).catch(() => null);
+    if (!body) return void sendJSON(res, 400, { error: "请求体不是合法 JSON" });
+    const oldPassword = String(body.oldPassword ?? "");
+    const newPassword = String(body.newPassword ?? "");
+    const r = await this.visitors.changePassword(access.session.accountId, oldPassword, newPassword);
+    if (!r.ok) return void sendJSON(res, 400, { error: r.error });
+    sendJSON(res, 200, { ok: true });
   }
 
   /** crossing 服务的本机回环地址（玩家代理端点内部转发用） */
