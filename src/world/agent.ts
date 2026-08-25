@@ -529,7 +529,8 @@ export class WorldAgent {
       expectedAt: this.clock.timeLine(call.expectedAt),
     });
     // 有访客在场时携带 visitors：Bot 的行动波及某位访客时，send_event to= 可直接送达对方
-    return this.invokeWithTools({ task, deliver, botDeliver: deliver, visitors: this.visitorsProvider?.() ?? [] });
+    // Bot 的 act 与真人玩家的 act 同级：priority=true 插到普通任务（Tingle 等）之前，不被积压饿死
+    return this.invokeWithTools({ task, deliver, botDeliver: deliver, visitors: this.visitorsProvider?.() ?? [] }, false, true);
   }
 
   /** wait 补叙：等待即将结束（由计时器准时唤醒），提前生成期间发生的事 */
