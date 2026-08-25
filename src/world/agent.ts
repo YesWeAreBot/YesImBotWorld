@@ -20,6 +20,16 @@ import { debug } from "../webui/debug.js";
 /** 只读查询（query）的排队超时：避免被同源端点锁 + 持续生成的 Bot 饿死时无限悬挂 */
 const QUERY_TIMEOUT_MS = 60_000;
 
+/** 写队列任务优先级：数值越大越优先 */
+const PRIORITY = {
+  /** 普通后台任务（Tingle、reconcile、initialize、wait 补叙等） */
+  normal: 0,
+  /** Bot 的 act：高于普通任务，低于真人玩家交互 */
+  botAct: 1,
+  /** 真人玩家交互（act / 到达 / 离开）：最高，绝不被积压饿死 */
+  visitor: 2,
+} as const;
+
 const WORLD_TOOLS: ChatToolDef[] = [
   {
     type: "function",
@@ -262,7 +272,7 @@ export interface RemoteWorldLink {
 export class WorldAgent {
   private client: ChatClient;
   /** 写状态任务的可抢占队列：玩家 act 等高优先级任务会插到队头（在未开始的普通任务之前） */
-  private queue: { fn: () => Promise<unknown>; priority: boolean; cancelKey?: string; resolve: (v: unknown) => void; reject: (e: unknown) => void }[] = [];
+  private queue: { fn: () => Promise<unknown>; priority: number; cancelKey?: string; resolve: (v: unknown) => void; reject: (e: unknown) => void }[] = [];
   private draining = false;
   /** 只读查询（终端虚拟输出、天气等）的独立队列：不与写状态的主队列串行，避免被 act 裁定积压饿死 */
   private queryTail: Promise<unknown> = Promise.resolve();
@@ -434,11 +444,11 @@ export class WorldAgent {
    * 排队等待，避免跨模型并发把请求饿死或把推理进程搞崩；不同源时无影响。
    */
   /**
-   * 写状态任务入队。priority=true 时插到队头（在尚未开始的普通任务之前），
-   * 使玩家 act 等交互式任务被优先处理，不被 Tingle / 到达叙事等积压饿死。
+   * 写状态任务入队。priority 越大越靠前（0=普通如 Tingle；数字越大越优先）。
+   * 真人玩家的 act/到达/离开最优先（避免交互饿死），Bot 的 act 次之，普通后台任务最低。
    * 正在执行中的任务不会被抢占（LLM 推理无法安全中断）。
    */
-  private enqueue<T>(fn: () => Promise<T>, priority = false, cancelKey?: string): Promise<T> {
+  private enqueue<T>(fn: () => Promise<T>, priority = 0, cancelKey?: string): Promise<T> {
     this.pending++;
     return new Promise<T>((resolve, reject) => {
       const wrapped = () =>
@@ -450,9 +460,9 @@ export class WorldAgent {
         resolve: (v: unknown) => resolve(v as T),
         reject,
       };
-      if (priority) {
-        // 插到第一个普通任务之前（多个高优任务之间保持 FIFO）
-        const idx = this.queue.findIndex((t) => !t.priority);
+      if (priority > 0) {
+        // 插到第一个优先级严格低于自己的任务之前（同优先级保持 FIFO）
+        const idx = this.queue.findIndex((t) => t.priority < priority);
         if (idx === -1) this.queue.push(entry);
         else this.queue.splice(idx, 0, entry);
       } else {
@@ -529,7 +539,8 @@ export class WorldAgent {
       expectedAt: this.clock.timeLine(call.expectedAt),
     });
     // 有访客在场时携带 visitors：Bot 的行动波及某位访客时，send_event to= 可直接送达对方
-    return this.invokeWithTools({ task, deliver, botDeliver: deliver, visitors: this.visitorsProvider?.() ?? [] });
+    // Bot 的 act 优先于普通后台任务（Tingle 等），但低于真人玩家的交互（玩家 act 绝不被饿死）
+    return this.invokeWithTools({ task, deliver, botDeliver: deliver, visitors: this.visitorsProvider?.() ?? [] }, false, PRIORITY.botAct);
   }
 
   /** wait 补叙：等待即将结束（由计时器准时唤醒），提前生成期间发生的事 */
@@ -766,7 +777,7 @@ export class WorldAgent {
       timeLine: this.clock.timeLine(),
     });
     // 到达叙事也用 priority：既插到后台任务（Tingle 等）之前，又保证先于该玩家的 act 执行
-    return this.invokeWithTools({ task, deliver, ...this.visitorInvocationExtras() }, false, true);
+    return this.invokeWithTools({ task, deliver, ...this.visitorInvocationExtras() }, false, PRIORITY.visitor);
   }
 
   /** 访客离开：按进入语义分化——穿越则彻底离场；扮演/操纵则角色留在世界由世界继续演化 */
@@ -784,7 +795,7 @@ export class WorldAgent {
       leaveSemantic: this.leaveSemantic(v),
     });
     // 离开善后插队：优先于其它积压任务执行
-    return this.invokeWithTools({ task }, false, true);
+    return this.invokeWithTools({ task }, false, PRIORITY.visitor);
   }
 
   /** 裁定访客的 act 动作（时刻按本世界时钟换算） */
@@ -806,7 +817,7 @@ export class WorldAgent {
         duration,
         expectedAt: this.clock.timeLine(now + Math.max(duration, 0)),
       });
-    return this.invokeWithTools({ task, deliver, ...this.visitorInvocationExtras() }, false, true, v.name);
+    return this.invokeWithTools({ task, deliver, ...this.visitorInvocationExtras() }, false, PRIORITY.visitor, v.name);
   }
 
   /** 访客 wait 补叙 */
@@ -823,7 +834,7 @@ export class WorldAgent {
         expectedAt: this.clock.timeLine(now + Math.max(n, 0)),
       });
     // 玩家的等待也是交互操作：优先 + 可被离开取消
-    return this.invokeWithTools({ task, deliver, ...this.visitorInvocationExtras() }, false, true, v.name);
+    return this.invokeWithTools({ task, deliver, ...this.visitorInvocationExtras() }, false, PRIORITY.visitor, v.name);
   }
 
   /** 访客查看时间（按本世界的时钟与历法） */
@@ -1161,7 +1172,7 @@ export class WorldAgent {
 
   // ---------- 工具循环 ----------
 
-  private async invokeWithTools(invocation: WorldInvocation, parallel = false, priority = false, cancelKey?: string): Promise<boolean> {
+  private async invokeWithTools(invocation: WorldInvocation, parallel = false, priority = 0, cancelKey?: string): Promise<boolean> {
     debug.emit("world.task", `任务·${invocation.task.slice(0, 60)}`, {
       task: invocation.task,
       deliver: !!invocation.deliver,
