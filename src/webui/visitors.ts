@@ -51,8 +51,6 @@ export interface VisitorAccount {
   username: string;
   /** "salt:hash"（scrypt），登录验证用 */
   passwordHash: string;
-  /** 明文密码（仅管理员可见，供查看/找回）。与 passwordHash 并行维护：设/改密码时同时写入 */
-  passwordPlain?: string;
   preset: VisitorPreset;
   /** 仅 custom 档使用：块 → 是否可见（缺省视为 false） */
   grants?: Partial<Record<VisitorGrant, boolean>>;
@@ -162,8 +160,10 @@ export class VisitorStore {
 
   async list(): Promise<VisitorAccount[]> {
     const accounts = await this.ensureLoaded();
-    // 管理员可见明文密码（passwordPlain）；口令哈希留在本地、一并返回但前端不展示（除非管理员界面需要）
-    return accounts.map((a) => ({ ...a }));
+    return accounts.map(({ passwordHash: _ph, ...safe }) => ({
+      ...safe,
+      passwordHash: "",
+    }));
   }
 
   async create(username: string, password: string, preset: VisitorPreset): Promise<{ ok: true } | { ok: false; error: string }> {
@@ -176,7 +176,6 @@ export class VisitorStore {
       id: `v_${crypto.randomBytes(8).toString("hex")}`,
       username: uname,
       passwordHash: VisitorStore.hashPassword(password),
-      passwordPlain: password,
       preset,
       createdAt: Date.now(),
     });
@@ -194,10 +193,7 @@ export class VisitorStore {
       if (accounts.some((a) => a.id !== id && a.username === uname)) return { ok: false, error: "用户名已存在" };
       acct.username = uname;
     }
-    if (patch.password) {
-      acct.passwordHash = VisitorStore.hashPassword(patch.password);
-      acct.passwordPlain = patch.password;
-    }
+    if (patch.password) acct.passwordHash = VisitorStore.hashPassword(patch.password);
     if (patch.preset !== undefined) {
       acct.preset = patch.preset;
       // 档位切出「自定义」时清空 grants：预设档用内置范围，残留的旧 grants 会造成下次编辑时误用旧勾选
@@ -246,7 +242,6 @@ export class VisitorStore {
       return { ok: false, error: "旧密码不正确" };
     }
     acct.passwordHash = VisitorStore.hashPassword(newPassword);
-    acct.passwordPlain = newPassword;
     await this.persist();
     return { ok: true };
   }

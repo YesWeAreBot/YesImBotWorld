@@ -1993,8 +1993,7 @@ function renderVisitors(holder, visitors){
       el('div', {style:'flex:1'}, [
         el('div', {text:v.username || '(未命名)'}),
         el('div', {style:'font-size:11.5px;color:var(--fg-dark)'}, [
-          el('span', {text: PRESET_LABELS[v.preset] + ' · 创建于 ' + fmtTime(v.createdAt)}),
-          v.passwordPlain ? el('span', {text:' · 密码 ' + v.passwordPlain, style:'color:var(--warn);font-family:var(--mono)'}) : null
+          el('span', {text: PRESET_LABELS[v.preset] + ' · 创建于 ' + fmtTime(v.createdAt)})
         ])
       ]),
       el('button', {text:'编辑', onclick:function(){ openVisitorEditor(v, visitors, function(){ loadVisitors(); }); }}),
