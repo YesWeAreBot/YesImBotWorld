@@ -522,7 +522,7 @@ export class WebUIServer {
     if (pathname === "/api/player/events" && method === "GET") {
       const token = String(url.searchParams.get("ctoken") ?? "");
       if (!token) return void sendJSON(res, 400, { error: "缺少 crossing token" });
-      return void this.proxyPlayerEvents(token, res);
+      return void this.proxyPlayerEvents(token, res, req);
     }
 
     sendJSON(res, 404, { error: "Not Found" });
@@ -549,10 +549,15 @@ export class WebUIServer {
   }
 
   /** SSE 转发：把本机 crossing 的 events 流透传给浏览器 */
-  private async proxyPlayerEvents(token: string, res: http.ServerResponse): Promise<void> {
+  private async proxyPlayerEvents(token: string, res: http.ServerResponse, req: http.IncomingMessage): Promise<void> {
+    // 玩家浏览器断开（关网页/断网/刷新）时，必须把断连传导给上游 crossing 的 SSE，
+    // 否则 crossing 永远以为玩家还在场（session.res 不置 null），下次进入会报"同名在场"。
+    const abort = new AbortController();
+    const onClientClose = () => abort.abort();
+    req.on("close", onClientClose);
     try {
       const upstream = await llmFetch(`${this.crossingBase()}/crossing/events?token=${encodeURIComponent(token)}`, {
-        signal: null,
+        signal: abort.signal,
       });
       if (!upstream.ok) {
         return void sendJSON(res, upstream.status, { error: "穿越事件流不可用" });
@@ -568,11 +573,15 @@ export class WebUIServer {
       });
       res.end();
     } catch (err) {
+      // 客户端断开导致的 abort：静默结束，不写错误
+      if (abort.signal.aborted) return;
       if (!res.headersSent) {
         sendJSON(res, 502, { error: `穿越服务不可用：${(err as Error).message ?? err}` });
       } else {
         res.end();
       }
+    } finally {
+      req.off("close", onClientClose);
     }
   }
 
