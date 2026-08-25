@@ -332,8 +332,8 @@ export const WORLD_PROMPT_DEFAULTS: WorldPromptSet = {
     "你是一个虚拟世界的模拟引擎。只输出严格的 JSON，不要输出任何其他内容。",
 
   assessBotNameUser:
-    `<bot_definition>（用户给出的常驻角色的角色定义）\n{{botDef}}\n</bot_definition>\n\n` +
-    `请从这份角色定义中判定这位常驻角色的**名字**（它在世界里被人如何称呼的名字，不是"{{botName}}"这个称谓本身）。\n` +
+    `<bot_definition>（用户给出的常驻 Bot 角色定义）\n{{botDef}}\n</bot_definition>\n\n` +
+    `请从这份角色定义中判定这位常驻 Bot 的**名字**（它在世界里被人如何称呼的名字，不是"Bot"这个称谓本身）。\n` +
     `- 若定义里明确写了姓名/名字，直接采用（取最常用、最正式的那个称呼）；\n` +
     `- 若定义里没写名字或只写了含糊的称呼，返回空字符串；\n` +
     `输出 {"name": "名字"}（名字为空则 {"name": ""}）。只输出 JSON。`,
