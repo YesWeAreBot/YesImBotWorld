@@ -437,10 +437,6 @@ export class BotAgent {
           if (!this.running) break;
           if (err instanceof ToolCallParseError) {
             this.parseFailures++;
-            const raw = err.raw?.trim();
-            const excerpt = raw
-              ? `\n你刚才的原始输出：\n${raw.slice(0, 1200)}${raw.length > 1200 ? "\n…（已截断）" : ""}`
-              : "";
             this.logger.warn(
               "Bot-LLM 输出未解析（第 %d 次）: %s",
               this.parseFailures,
@@ -453,9 +449,11 @@ export class BotAgent {
                   ? "不要写正文或解释，先想清楚要调用哪个工具，然后通过工具调用接口调用它。"
                   : "不要写正文或解释，先想清楚要调用哪个工具，然后只输出那一个 JSON。"
                 : "";
+            // 关键：不要把原始错误输出（尤其是模型自己拼的 <event>…</event>）回灌进上下文——
+            // 那会污染意识流，让模型把它当成真实发生的事件并继续模仿。
             this.pushEvent(
               "system",
-              `（意识有些恍惚，刚才的想法没有成形：${err.message}。${excerpt}${emphasis}请重新输出一个合法的工具调用。）`,
+              `（意识有些恍惚，刚才的想法没有成形。${emphasis}请重新输出一个合法的工具调用。）`,
             );
             continue;
           }
@@ -1668,7 +1666,8 @@ export class BotAgent {
     const mediaRaw = call.arguments.media ?? call.arguments.images;
     const media = Array.isArray(mediaRaw) ? (mediaRaw as (string | number)[]) : [];
     const replyRaw = call.arguments.reply_to ?? call.arguments.replyTo ?? call.arguments.quote;
-    const replyTo = replyRaw !== undefined && replyRaw !== null ? String(replyRaw) : undefined;
+    // 归一化引用目标：Bot 可能照抄消息记录里的 (msg:xxx) 编号，去掉前缀只留数字 id
+    const replyTo = normalizeMsgId(replyRaw);
     // 引用回复默认自动 @ 原发送人（模拟 QQ 客户端），Bot 显式给 at_sender: false 时去掉
     const atRaw = call.arguments.at_sender ?? call.arguments.atSender ?? call.arguments.at;
     const atSender = !(atRaw === false || atRaw === "false" || atRaw === 0);
@@ -2100,6 +2099,24 @@ function clampInt(value: unknown, min: number, max: number, fallback: number): n
 /** 宽松解析布尔参数（模型可能输出 true / "true" / 1） */
 function isTruthy(value: unknown): boolean {
   return value === true || value === "true" || value === 1;
+}
+
+/**
+ * 归一化消息 id：Bot 可能照抄消息记录里的 "(msg:283828113)" 编号，
+ * 把 "msg:283828113" 或 "283828113" 都归一到纯数字 "283828113"；
+ * 空值 / 非数字（如 "msg:0" 这种无效值）返回 undefined（未引用）。
+ */
+function normalizeMsgId(value: unknown): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  let s = String(value).trim();
+  if (!s) return undefined;
+  // 去前缀：msg: 或带方括号 "(msg:xxx)" 之类
+  const m = s.match(/(?:msg\s*:\s*)?(\d+)/i);
+  if (!m) return undefined;
+  const id = m[1]!;
+  // "0" 是无效引用（Bot 幻觉或没拿到真实 id）
+  if (id === "0") return undefined;
+  return id;
 }
 
 /** 解析可选数字参数；非有限数值（含 undefined / null / 空串）返回 null（表示"没给"） */

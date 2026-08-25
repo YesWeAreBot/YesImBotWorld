@@ -599,7 +599,7 @@ export function availableTools(opts: {
         ),
         description:
           def.description +
-          "引用回复某条消息时用 reply_to 参数，填消息记录里 (msg:xxx) 的编号（这是唯一的方式，不要再在 msg 里另加 <quote>/<at> 标签）。" +
+          "引用回复某条消息时用 reply_to 参数，填消息记录里 (msg:xxx) 的**数字编号**（即 xxx 这串数字，不要带 \"msg:\" 前缀，这是唯一方式，不要再在 msg 里另加 <quote>/<at> 标签）。" +
           "群聊里用 reply_to 引用会像 QQ 一样自动在开头 @ 对方——大多数时候保留即可；" +
           "如果不想 @（比如只是顺带提到、或不想打扰对方），加 at_sender: false 去掉，就像真人删掉自动加上的 @。" +
           "要 @ 某人但不想引用它的话，才在 msg 里写 <at id=\"QQ号\"/>（而不要用 reply_to）。",
