@@ -88,6 +88,8 @@ export interface WorldPromptSet {
   visitorCheckTime: string;
   /** 穿越：世界沉睡后苏醒的补叙（无人在场期间的演化）。{{fromTimeLine}} {{toTimeLine}} {{gapTU}} */
   dormantCatchup: string;
+  /** act 结果叙述后的状态补记（并行后台任务）。{{botName}} {{desc}} {{eventContent}} {{timeLine}} */
+  updateStateAfterAct: string;
 }
 
 export interface PromptOverrides {
@@ -213,17 +215,12 @@ export const WORLD_PROMPT_DEFAULTS: WorldPromptSet = {
     `**绝不能虚构软件操作成功的结果**（不得出现「截图已保存」「消息已发出」之类的叙述）——` +
     `裁定为徒劳：send_event 如实叙述它对着手机划拉了几下、没有得到想要的结果，` +
     `并点明这类事应该用手机里对应的应用或操作来完成。物理动作（掏出手机、把手机放进口袋）不受此限。\n` +
-    `1. 按需 check 世界/{{botName}} 状态，保证裁定与现状一致；\n` +
+    `1. {{botName}} 此刻的状态已附在下方 <current_bot_status>、世界状态已附在 <current_world_status> 里，` +
+    `无需再 check；若确需参考近期 News/facts，再按需 check news / facts；\n` +
     `2. 必须调用一次 send_event，以第三人称客观叙述动作完成时的结果——聚焦什么发生了变化、` +
-    `什么被怎么样了（允许失败、意外或有趣的转折）；\n` +
-    `3. 动作若改变了 {{botName}} 自身——位置、姿态、状态、心情、正在做的事、随身物品——` +
-    `**必须** update bot_status 使其与裁定后的现实一致（这一步经常被遗漏，请自查）；` +
-    `若只变了其中一两项，用 patch 局部替换（find→replace）而非整份重写；` +
-    `若改变了周遭世界，update world_status（同样优先 patch）；\n` +
-    `4. News 是大事记不是流水账：只有足够重要、之后可能被提起或产生影响的结果才 update news 记一条，` +
-    `日常小动作不要记录。\n` +
-    `5. 若结果改变了 {{botName}} 的私人生活状态（习惯、偏好、心情、日常小事），` +
-    `用 update(facts) 记进它的私人小事记（facts 是 {{botName}} 中心的小事，News 是世界中心的大事，别混用）。`,
+    `什么被怎么样了（允许失败、意外或有趣的转折）。\n` +
+    `（状态落盘不用你做——结果给出后，会另有一个专门的任务据你的叙述去更新 bot_status / world_status，` +
+    `你只需把动作的结果讲清楚即可。）`,
 
   resolveWait:
     `{{botName}} 从 {{issuedAt}} 开始等待 {{n}} 个 TU，等待即将在 ` +
@@ -480,6 +477,16 @@ export const WORLD_PROMPT_DEFAULTS: WorldPromptSet = {
     `2. 按世界自身的节奏推演这段时间发生的事——不必事无巨细，几件符合世界惯性的合理进展即可；\n` +
     `3. update world_status 使状态与当前时刻相符；有影响世界走向的大事可 update news 记录；\n` +
     `4. 若事件通道可用（send_event 未被禁用），可以把"归来后一眼能看到的变化"简要叙述给刚回来的 {{botName}}；通道不可用就只更新状态。`,
+
+  updateStateAfterAct:
+    `{{botName}} 刚刚执行了一个动作：「{{desc}}」，其结果是：「{{eventContent}}」（发生于 {{timeLine}}）。\n` +
+    `现在请你把这个动作对 {{botName}} 自身状态的持久影响补记下来：\n` +
+    `1. 若动作改变了 {{botName}} 的位置、姿态、状态、心情、正在做的事、随身物品，` +
+    `用 update bot_status 的 content 参数**整体覆盖**写一份更新后的 Bot_Status.md 全文` +
+    `（先 check bot_status 拿到当前原文，在其基础上改动易变部分，角色设定与个性保持稳定）；\n` +
+    `2. 若改变了周遭世界，同样 update world_status（整体覆盖 content）；\n` +
+    `3. 只有足够重要、之后可能被提起的事才 update news 记一条；{{botName}} 的私人小事（习惯、偏好、心情）用 update facts 记一条。\n` +
+    `注意：这里**不要**用 send_event（结果已经告知 {{botName}} 了），你只做状态落盘。`,
 };
 
 export const DEFAULT_PROMPTS: PromptOverrides = {

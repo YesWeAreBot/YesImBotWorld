@@ -218,6 +218,13 @@ export interface WorldInvocation {
   deliver?: (content: string) => void;
   /** 是否允许 set_tingle（仅 Tingle 任务） */
   allowTingle?: boolean;
+  /**
+   * 结果型任务（act 裁定）：禁用 update 工具——本次循环只负责 send_event（结果叙述），
+   * 状态记账由独立的、可合并的 updateStateAfterAct 后台任务并行完成。
+   */
+  noUpdate?: boolean;
+  /** 可选的取消信号：状态更新任务用它在中途（两轮 LLM 之间）被终止并丢弃 */
+  signal?: AbortSignal;
   /** 在场的异世界访客（send_event to= 定向送达、update_visitor_status 状态写回；穿越服务提供） */
   visitors?: PresentVisitor[];
   /**
@@ -310,6 +317,12 @@ export class WorldAgent {
    * token；再次有人出现（Bot 回家 / 访客到达）时由 wakeDormant 补叙期间的演化。
    */
   private dormantSinceTU: number | null = null;
+  /**
+   * 当前正在跑的状态更新任务（act 结果叙述后并行补记 bot_status/world_status）。
+   * 新的 send_event 触发时，用 AbortSignal 终止并丢弃它，只保留最新一个——防止更新任务堆积，
+   * 保证状态最终收敛到最新一次裁决（最终一致）。
+   */
+  private inFlightStateUpdate: { abort: AbortController } | null = null;
 
   /** 排队中（含执行中）的调用数，用于观测积压 */
   get queueLength(): number {
@@ -534,16 +547,72 @@ export class WorldAgent {
   async adjudicateAct(call: ToolCallRecord, deliver: (content: string) => void): Promise<boolean> {
     if (this.remote) return this.remote.adjudicateAct(call, deliver);
     const desc = String(call.arguments.description ?? call.arguments.str ?? JSON.stringify(call.arguments));
-    const task = fill(this.prompts.world.adjudicateAct, {
+    let task = fill(this.prompts.world.adjudicateAct, {
       botName: this.botName || "（未命名）",
       desc,
       issuedAt: this.clock.timeLine(call.issuedAt),
       duration: call.duration ?? 0,
       expectedAt: this.clock.timeLine(call.expectedAt),
     });
+    // 性能优化：World-LLM 无前缀缓存、每次全新对话，状态全靠 check 工具按需读取。
+    // act 裁决几乎必然要读 bot_status 与 world_status（判定「Bot 此刻在哪、周围什么环境」才能裁定结果），
+    // 把两份状态文件全文直接内嵌进任务，省掉 check(bot_status)/check(world_status) 的 LLM 往返。
+    // World-LLM 不在乎上下文长度（无缓存、无历史），内嵌不带来任何缓存损失。
+    const [botStatus, worldStatus] = await Promise.all([
+      this.files.readBotStatus(),
+      this.files.readWorldStatus(),
+    ]);
+    const bot = botStatus.trim();
+    if (bot) {
+      task += `\n\n<current_bot_status>（${this.botName || "常驻角色"} 此刻的状态，已直接提供，无需再 check bot_status）\n${bot}\n</current_bot_status>`;
+    }
+    const world = worldStatus.trim();
+    if (world) {
+      task += `\n\n<current_world_status>（世界此刻的状态，已直接提供，无需再 check world_status）\n${world}\n</current_world_status>`;
+    }
     // 有访客在场时携带 visitors：Bot 的行动波及某位访客时，send_event to= 可直接送达对方
-    // Bot 的 act 优先于普通后台任务（Tingle 等），但低于真人玩家的交互（玩家 act 绝不被饿死）
-    return this.invokeWithTools({ task, deliver, botDeliver: deliver, visitors: this.visitorsProvider?.() ?? [] }, false, PRIORITY.botAct);
+    // noUpdate：本次循环只做 send_event（结果叙述）、不写状态文件 → 走只读并发队列（parallel=true），
+    // 与「上一个 act 的状态更新（串行写队列）」真正并行；状态记账由 deliver 触发独立任务补上。
+    const emitEvent = (content: string) => {
+      deliver(content);
+      // 结果叙述已出 → fire-and-forget 调起状态更新任务（可合并，丢弃上一个 in-flight）
+      this.kickStateUpdate(desc, content);
+    };
+    return this.invokeWithTools(
+      {
+        task,
+        deliver: emitEvent,
+        botDeliver: emitEvent,
+        visitors: this.visitorsProvider?.() ?? [],
+        noUpdate: true,
+      },
+      true,
+    );
+  }
+
+  /**
+   * act 结果叙述后的状态补记（并行后台任务）。
+   * 每个 send_event 都触发一次：用 AbortSignal 终止并丢弃上一个仍在跑的更新任务，
+   * 只保留最新一个——防止更新任务堆积，状态最终收敛到最新裁决（最终一致，你已确认可接受）。
+   */
+  private kickStateUpdate(desc: string, eventContent: string): void {
+    // 终止上一个 in-flight 的状态更新
+    this.inFlightStateUpdate?.abort.abort();
+    const abort = new AbortController();
+    this.inFlightStateUpdate = { abort };
+    const task = fill(this.prompts.world.updateStateAfterAct, {
+      botName: this.botName || "（未命名）",
+      desc,
+      eventContent,
+      timeLine: this.clock.timeLine(),
+    });
+    // 低优先级（normal=0）入串行写队列：不抢占 act 裁定（botAct=1）/玩家交互（visitor=2）
+    void this.invokeWithTools({ task, noUpdate: false, signal: abort.signal }, false, PRIORITY.normal).finally(() => {
+      // 自己是被丢弃的那个（已被新的取代）时不清理——保持引用指向最新的
+      if (this.inFlightStateUpdate?.abort === abort) {
+        this.inFlightStateUpdate = null;
+      }
+    });
   }
 
   /** wait 补叙：等待即将结束（由计时器准时唤醒），提前生成期间发生的事 */
@@ -1198,8 +1267,10 @@ export class WorldAgent {
     };
     // parallel：只读任务（不写状态文件、只 check + send_event）走独立并行队列，
     // 不被写任务的串行队列饿死——例如"看时间"不该排在 act 裁定后面。
+    // 注意：act 裁定现在也走这里（noUpdate 后不写状态文件），它需要真并发、不做 60s 超时，
+    // 所以 signal 用 invocation.signal（缺省 undefined=无超时）；纯查询才用 60s 超时。
     if (parallel) {
-      const signal = AbortSignal.timeout(QUERY_TIMEOUT_MS);
+      const signal = invocation.signal ?? AbortSignal.timeout(QUERY_TIMEOUT_MS);
       return this.enqueueQuery(run, signal);
     }
     return this.enqueue(run, priority, cancelKey);
@@ -1250,6 +1321,7 @@ export class WorldAgent {
       (t) =>
         (invocation.deliver || invocation.visitors?.length || t.function.name !== "send_event") &&
         (invocation.allowTingle || t.function.name !== "set_tingle") &&
+        (!invocation.noUpdate || t.function.name !== "update") &&
         (invocation.visitors?.length ||
           (t.function.name !== "update_visitor_status" && t.function.name !== "expel_visitor")) &&
         ((this.visitorPersonaMode === "check" && invocation.visitors?.length) ||
@@ -1263,14 +1335,18 @@ export class WorldAgent {
     let finalContent = "";
     let lastCallSig = "";
     for (let round = 0; round < this.cfg.maxToolRounds; round++) {
+      // 被外部中止（状态更新任务被更新的取代、丢弃）：提前结束，不再继续调用
+      if (invocation.signal?.aborted) break;
       // 每轮耗时观测：非流式响应在服务端生成完毕前不会返回任何字节，
       // 失败时把"第几轮、悬挂了多久"带进错误信息——这是区分病因的关键数据
       // （悬挂 ~300s = 被 undici 响应头超时掐断；瞬间失败 = 连接层问题）
       const startedAt = Date.now();
       let result: Awaited<ReturnType<ChatClient["complete"]>>;
       try {
-        result = await this.client.complete(messages, { tools });
+        result = await this.client.complete(messages, { tools, signal: invocation.signal });
       } catch (err) {
+        // 被外部中止（状态更新任务被更新的取代、丢弃）：静默结束，不当错误上报
+        if (invocation.signal?.aborted) return finalContent;
         const elapsed = ((Date.now() - startedAt) / 1000).toFixed(1);
         throw new Error(
           `第 ${round + 1} 轮请求失败（悬挂 ${elapsed}s，${messages.length} 条消息）: ${(err as Error).message ?? err}`,
