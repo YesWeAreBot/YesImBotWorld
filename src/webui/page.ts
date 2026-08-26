@@ -1633,10 +1633,14 @@ function setPlayerProfile(p){
     else localStorage.removeItem('wui_admin_player_profile');
   }
 }
+// 管理员角色名是否与常驻 Bot 同名（尚未选进入语义前即可判定「可接管」）
+function isAdminSameName(){
+  return MODE !== 'visitor' && !!RESIDENT_BOT_NAME && !!getPlayerProfile()
+    && getPlayerProfile().name === RESIDENT_BOT_NAME;
+}
 // 管理员是否处于「接管 Bot」模式（角色名 === 常驻 Bot 名，且为扮演/操纵）
 function isAdminTakeover(){
-  return MODE !== 'visitor' && !!RESIDENT_BOT_NAME && !!getPlayerProfile()
-    && getPlayerProfile().name === RESIDENT_BOT_NAME
+  return isAdminSameName()
     && (getPlayerProfile().mode === 'avatar' || getPlayerProfile().mode === 'puppet');
 }
 function loadPlayer(){
@@ -1681,11 +1685,22 @@ function playerProfileForm(done){
     personaTa.value = cur.persona || '';
   }
   var err = el('p', {style:'color:var(--err);font-size:12.5px;min-height:16px'});
-  // 管理员同名提示：填常驻 Bot 名即可进入「接管 Bot」模式
+  // 管理员同名提示：填常驻 Bot 名即可进入「接管 Bot」模式（随输入实时更新，名字命中即高亮提醒）
   var botHint = null;
+  function refreshBotHint(){
+    if(!botHint) return;
+    var name = nameInp.value.trim();
+    var hit = MODE !== 'visitor' && RESIDENT_BOT_NAME && name === RESIDENT_BOT_NAME;
+    if(hit){
+      botHint.style.color = 'var(--warn)';
+      botHint.innerHTML = '✔ 角色名与常驻 Bot「' + esc(RESIDENT_BOT_NAME) + '」相同：保存后进入世界时选「扮演/操纵」即可<b>接管该 Bot</b>（代理其全部工具调用）。';
+    } else {
+      botHint.style.color = 'var(--fg-dim)';
+      botHint.innerHTML = '常驻 Bot 名为「' + esc(RESIDENT_BOT_NAME) + '」。用它作角色名并选择「扮演/操纵」即可接管该 Bot（代理其全部工具调用）。';
+    }
+  }
   if(MODE !== 'visitor' && RESIDENT_BOT_NAME){
-    botHint = el('p', {style:'color:var(--fg-dim);font-size:12px;margin:6px 0 0', html:
-      '常驻 Bot 名为「' + esc(RESIDENT_BOT_NAME) + '」。用它作角色名并选择「扮演/操纵」即可接管该 Bot（代理其全部工具调用）。'});
+    botHint = el('p', {style:'color:var(--fg-dim);font-size:12px;margin:6px 0 0'});
   }
   var saveProfile = function(){
     var name = nameInp.value.trim();
@@ -1706,6 +1721,8 @@ function playerProfileForm(done){
     }
   };
   nameInp.onkeydown = function(e){ if(e.key === 'Enter'){ saveProfile(); } };
+  nameInp.oninput = refreshBotHint;
+  refreshBotHint();
   var form = el('div', {cls:'section'}, [
     el('h3', {text:'你的角色身份'}),
     el('div', {cls:'body'}, [
@@ -1759,11 +1776,11 @@ function playerRenderWorld(holder){
         el('div', {text: o[2], style:'font-size:12px;color:var(--fg-dim);margin:2px 0 0 22px'})
       ]);
     });
-    // 管理员 + 同名：进入语义里扮演/操纵即「接管 Bot」的说明
+    // 管理员 + 同名：进入语义里扮演/操纵即「接管 Bot」的说明（改名后立即提示，不依赖进入语义）
     var takeoverHint = null;
-    if(isAdminTakeover()){
+    if(isAdminSameName()){
       takeoverHint = el('p', {style:'color:var(--warn);font-size:12.5px', html:
-        '你将<b>接管常驻 Bot「' + esc(RESIDENT_BOT_NAME) + '」</b>：扮演（入替）会暂停它的自主思考，由你代理其全部工具调用；操纵则让它继续自主运行、你额外操控其行动。'});
+        '你的角色名与常驻 Bot「' + esc(RESIDENT_BOT_NAME) + '」相同。选择上方「扮演（入替）」或「操纵」进入，即可<b>接管该 Bot</b>：扮演会暂停它的自主思考、由你代理其全部工具调用；操纵则让它继续自主运行、你额外操控其行动。'});
     }
     var enterBar = el('div', {cls:'section'}, [
       el('h3', {text:'进入世界'}),
