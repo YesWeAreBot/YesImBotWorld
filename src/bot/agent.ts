@@ -1992,6 +1992,13 @@ export class BotAgent {
             `（你最近已经说过「${truncate(msg, 24)}」${recentRepeat} 次了。这句话反复出现，就像一个复读机——这次没有发出。换一种说法，或真的没有新内容就别说。）`,
             `（又是这句「${truncate(msg, 24)}」？近期你已经发了 ${recentRepeat} 次几乎相同的话。请别变成只会复读的机器，想点新的话说。）`,
             `（「${truncate(msg, 24)}」这句你最近反复说了 ${recentRepeat} 遍。收一收，说说别的，或沉默也比复读强。）`,
+            `（这句话「${truncate(msg, 24)}」你已经说过 ${recentRepeat} 回了，怎么还在原地说。它没有被发出去——换句新鲜的吧。）`,
+            `（停一下，你又要说「${truncate(msg, 24)}」？这已经是近期第 ${recentRepeat} 次了。重复的话不如不说，想点新东西。）`,
+            `（又是老一套：「${truncate(msg, 24)}」。你已经第 ${recentRepeat} 次想发这句了，忍住，说点不一样的。）`,
+            `（这是你第 ${recentRepeat} 次想说「${truncate(msg, 24)}」了，这句早说过。消息没发，请换个表达，别老重复。）`,
+            `（词穷了吗？「${truncate(msg, 24)}」你最近说过 ${recentRepeat} 次，再说就没意思了。这次不发了，想想别的。）`,
+            `（「${truncate(msg, 24)}」翻来覆去就是它，已经是第 ${recentRepeat} 次。别再借这句话应付了，认真回应眼前的情况。）`,
+            `（这句「${truncate(msg, 24)}」已经讲过 ${recentRepeat} 次，再讲就是嚼别人嚼过的馍。消息被拦下，换措辞。）`,
           ],
         ),
         { ref: call.id },
@@ -2106,7 +2113,20 @@ export class BotAgent {
     ) {
       this.pushEvent(
         "system",
-        `（这句「${truncate(text, 24)}」你最近已经发过 ${vRepeat} 次了——别反复说同一句话，换点新鲜的。）`,
+        pickMeta(
+          [
+            `（这句「${truncate(text, 24)}」你最近已经说过 ${vRepeat} 次了——别反复说同一句话，换点新鲜的。）`,
+            `（又是「${truncate(text, 24)}」，近期第 ${vRepeat} 次了。这句没发出去，别再复读，想点别的话。）`,
+            `（「${truncate(text, 24)}」你翻来覆去说了 ${vRepeat} 遍，说点别的吧，重复的话没人爱听。）`,
+            `（打住，这句「${truncate(text, 24)}」你已经第 ${vRepeat} 次想说了。语音没发，换个说法。）`,
+            `（又是这套「${truncate(text, 24)}」，都说 ${vRepeat} 回了。歇一歇，想想新的内容。）`,
+            `（这句「${truncate(text, 24)}」近期讲过 ${vRepeat} 次，再讲就成复读了。拦住，重新组织语言。）`,
+            `（你又要说「${truncate(text, 24)}」？已经第 ${vRepeat} 次了，句穷了就先别发。）`,
+            `（「${truncate(text, 24)}」又是它，第 ${vRepeat} 回了。这条被拦下，请说点跟刚才不一样的。）`,
+            `（同一句「${truncate(text, 24)}」你已经念了 ${vRepeat} 遍，像卡带的录音。停一下，换台。）`,
+            `（别再「${truncate(text, 24)}」了，这是第 ${vRepeat} 次。语音没发出，想点新鲜的。）`,
+          ],
+        ),
         { ref: call.id },
       );
       return;
