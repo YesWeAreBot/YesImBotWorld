@@ -225,6 +225,11 @@ export interface WorldInvocation {
   noUpdate?: boolean;
   /** 可选的取消信号：状态更新任务用它在中途（两轮 LLM 之间）被终止并丢弃 */
   signal?: AbortSignal;
+  /**
+   * 写文件前的前置守卫（状态更新任务用）：返回 true 表示本任务已过时（被更新的取代），
+   * 应跳过 update 落盘——即使任务已在排队/执行中，也能保证过时的中间态不被写入。
+   */
+  staleCheck?: () => boolean;
   /** 在场的异世界访客（send_event to= 定向送达、update_visitor_status 状态写回；穿越服务提供） */
   visitors?: PresentVisitor[];
   /**
@@ -319,10 +324,19 @@ export class WorldAgent {
   private dormantSinceTU: number | null = null;
   /**
    * 当前正在跑的状态更新任务（act 结果叙述后并行补记 bot_status/world_status）。
-   * 新的 send_event 触发时，用 AbortSignal 终止并丢弃它，只保留最新一个——防止更新任务堆积，
-   * 保证状态最终收敛到最新一次裁决（最终一致）。
+   * 新的 send_event 触发时，用 AbortSignal 终止并丢弃它，只保留最新一个——防止更新任务堆积。
+   * pendingEvents 累积「尚未落地的 act 结果」：每次新 act 触发时先把上一个任务的事件并入，
+   * 保证连续快速 act 时（A→B→C）不会有任何一次的结果在状态里被静默吞掉。
    */
-  private inFlightStateUpdate: { abort: AbortController } | null = null;
+  private inFlightStateUpdate: {
+    abort: AbortController;
+    desc: string;
+    eventContent: string;
+    pendingEvents: { desc: string; eventContent: string }[];
+  } | null = null;
+  /** 状态更新任务的单调递增序号：每个任务记自己的 seq，写文件前自检是否仍是最新，过时则不写 */
+  private stateUpdateSeq = 0;
+  private latestStateUpdateSeq = 0;
 
   /** 排队中（含执行中）的调用数，用于观测积压 */
   get queueLength(): number {
@@ -596,18 +610,43 @@ export class WorldAgent {
    * 只保留最新一个——防止更新任务堆积，状态最终收敛到最新裁决（最终一致，你已确认可接受）。
    */
   private kickStateUpdate(desc: string, eventContent: string): void {
-    // 终止上一个 in-flight 的状态更新
-    this.inFlightStateUpdate?.abort.abort();
+    // 累积「尚未落地的 act 结果」：上一个任务（若存在）自己对应的事件 + 它已累积的前序事件，
+    // 全部并入本次任务——连续快速 act（A→B→C）时不会丢失中间任何一次的结果。
+    const prev = this.inFlightStateUpdate;
+    prev?.abort.abort();
     const abort = new AbortController();
-    this.inFlightStateUpdate = { abort };
+    const seq = ++this.stateUpdateSeq;
+    this.latestStateUpdateSeq = seq;
+    // pendingEvents：本次要补记的完整事件清单 = 前序累积 + 上一个自己 + 本次自己（本次 desc/event 单列在 prompt 主体）
+    const pendingEvents = prev
+      ? [...prev.pendingEvents, { desc: prev.desc, eventContent: prev.eventContent }]
+      : [];
+    this.inFlightStateUpdate = { abort, desc, eventContent, pendingEvents };
     const task = fill(this.prompts.world.updateStateAfterAct, {
       botName: this.botName || "（未命名）",
       desc,
       eventContent,
       timeLine: this.clock.timeLine(),
     });
+    // 把前序未落地的事件一并纳入本次补记（倒序：最近的在前），保证每一段都不丢。
+    let prevEvent = "";
+    if (pendingEvents.length) {
+      const list = pendingEvents
+        .map((e) => `- 动作「${e.desc}」→ 结果「${e.eventContent}」`)
+        .join("\n");
+      prevEvent =
+        `\n\n（注意：以下动作的结果**尚未落盘**（前序状态补记被中断了），请你一并在本次把它们造成的持久变化补上：\n${list}\n` +
+        `按时间顺序先补这些前序的变化，再补本次「${desc}」的变化；若同一对象同一属性有多次变化，以时间最新的一次为准。）`;
+    }
+    const mergedTask = task + prevEvent;
+    // 过时自弃守卫：本任务入队后，若又有更新的状态更新触发（seq 被超越），写文件前跳过。
+    const staleCheck = () => seq !== this.latestStateUpdateSeq;
     // 低优先级（normal=0）入串行写队列：不抢占 act 裁定（botAct=1）/玩家交互（visitor=2）
-    void this.invokeWithTools({ task, noUpdate: false, signal: abort.signal }, false, PRIORITY.normal).finally(() => {
+    void this.invokeWithTools(
+      { task: mergedTask, noUpdate: false, signal: abort.signal, staleCheck },
+      false,
+      PRIORITY.normal,
+    ).finally(() => {
       // 自己是被丢弃的那个（已被新的取代）时不清理——保持引用指向最新的
       if (this.inFlightStateUpdate?.abort === abort) {
         this.inFlightStateUpdate = null;
@@ -1461,6 +1500,11 @@ export class WorldAgent {
           const target = String(args.target ?? "");
           const content = String(args.content ?? "");
           const patch = Array.isArray(args.patch) ? args.patch : [];
+          // 过时自弃：本任务（状态更新）已被更新的取代时，不再写任何状态文件——
+          // 它的影响已由更新的任务合并补记，这里跳过落盘避免写入过时中间态。
+          if (invocation.staleCheck?.()) {
+            return "本状态补记任务已被更新的补记取代，跳过落盘（影响由后续任务合并补上）。";
+          }
           if (target === "bot_status" || target === "world_status") {
             // 局部替换：给了 patch 就忽略 content，做 find→replace（精确匹配、唯一匹配、原子应用）
             if (patch.length) {
