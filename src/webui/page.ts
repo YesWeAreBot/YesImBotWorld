@@ -10,7 +10,7 @@ export const PAGE_HTML = String.raw`<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
 <meta name="color-scheme" content="dark">
 <meta name="theme-color" content="#07090f">
 <title>YesImBot World · 世界观测台</title>
@@ -27,6 +27,7 @@ export const PAGE_HTML = String.raw`<!DOCTYPE html>
 }
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
 html,body{height:100%}
+/* 移动端视口高度：优先用动态视口 dvh（iOS 地址栏收起/展开时高度会变），老浏览器回退 vh */
 body{
   margin:0;color:var(--fg);font:14px/1.65 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei","Segoe UI",sans-serif;
   background:
@@ -34,7 +35,6 @@ body{
     radial-gradient(900px 480px at -8% 18%, rgba(110,231,255,.08), transparent 58%),
     radial-gradient(700px 500px at 50% 115%, rgba(110,231,255,.05), transparent 60%),
     var(--bg);
-  background-attachment:fixed;
 }
 a{color:var(--accent);text-decoration:none}
 ::selection{background:rgba(110,231,255,.28)}
@@ -64,9 +64,9 @@ details summary::before{content:"▸";display:inline-block;margin-right:6px;colo
 details[open]>summary::before{transform:rotate(90deg)}
 
 /* ---------- 布局骨架 ---------- */
-#app{display:flex;min-height:100vh}
+#app{display:flex;min-height:100vh;min-height:100dvh}
 #sidebar{
-  width:228px;flex:none;position:sticky;top:0;height:100vh;display:flex;flex-direction:column;z-index:40;
+  width:228px;flex:none;position:sticky;top:0;height:100vh;height:100dvh;display:flex;flex-direction:column;z-index:40;
   background:rgba(9,12,19,.72);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);
   border-right:1px solid var(--line);
 }
