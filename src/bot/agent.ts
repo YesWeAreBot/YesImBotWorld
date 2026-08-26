@@ -2403,15 +2403,28 @@ export function repeatingActMessage(sig: string, repeatCount: number, callId: st
 
 /** 依据连续重复次数，生成越来越直白的"别重复"提示（空串 = 无需额外加压）。
  *  刻意不指向任何具体替代动作（不暗示 wait、不暗示 act），避免与其它拦截互相推诿、
- *  把模型逼进「act 被拦→去 wait、wait 被拦→去 act」的死循环。 */
+ *  把模型逼进「act 被拦→去 wait、wait 被拦→去 act」的死循环。
+ *  每一档都做多套语义等价变体随机返回（真随机，打破固定文案的循环感）。 */
 function escalatingRepeatHint(repeatCount: number): string {
   if (repeatCount >= 4) {
-    return `这已经是你连续第 ${repeatCount} 次重复发起同一个动作了——它既不会因此变快，也不会重复执行；请停止重复提交同一个动作`;
+    return pickMeta([
+      `这已经是你连续第 ${repeatCount} 次重复发起同一个动作了——它既不会因此变快，也不会重复执行；请停止重复提交同一个动作`,
+      `同一个动作你已经连着第 ${repeatCount} 次发起了——多发起几次它也不会更快或更慢，白白消耗；现在请停下来，别再提交它了`,
+      `这已经是第 ${repeatCount} 次了，还是那个动作——重复它带不来任何新的东西；就此打住，换个思路`,
+    ]);
   }
   if (repeatCount >= 2) {
-    return `这是你第 ${repeatCount} 次重复发起同一动作——不必再重复，它已经在进行中了`;
+    return pickMeta([
+      `这是你第 ${repeatCount} 次重复发起同一动作——不必再重复，它已经在进行中了`,
+      `同一个动作你已经是第 ${repeatCount} 次发起了——它还在进行中，无需再补一次`,
+      `这动作你已重复到第 ${repeatCount} 次——停下吧，它正在进行，结果会自然来到`,
+    ]);
   }
-  return "它已经在进行中了，结果会自动送达，不用再发起一次";
+  return pickMeta([
+    "它已经在进行中了，结果会自动送达，不用再发起一次",
+    "这件事已经在推进了，结果会自己送过来，不必再重复",
+    "已经在做了，等结果到即可，无需再来一次",
+  ]);
 }
 
 /** send 系工具（send/send_file/send_voice）的名字集合 */

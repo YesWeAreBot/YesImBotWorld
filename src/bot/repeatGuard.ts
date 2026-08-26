@@ -59,35 +59,54 @@ export interface RepeatGuardConfig {
   cycleMaxPeriod?: number;
 }
 
-/** 温和首阈值提醒（不点名工具与参数） */
-const GENTLE_REMINDER =
-  "你正在用完全相同的参数重复调用同一个工具。仔细分析上一次的结果再决定是否要继续：" +
-  "如果事情还没完成，试着换一种做法或换一组参数，而不是原样再调用一次；如果已经掌握足够信息，也可以就此收尾。";
+/**
+ * 从多套语义等价的文案里随机挑一套（本地实现，避免与 agent 循环依赖）。
+ * 只用于非事实性的引导话术；事实性内容（工具名、次数、参数）由调用方在外层拼接，绝不随机。
+ * 不传 seed 时用真随机，让同一档每次都可能有不同表述，最大限度打破"固定文案"的循环感。
+ */
+function pickMeta(variants: string[], seed?: number): string {
+  if (variants.length <= 1) return variants[0] ?? "";
+  const n = seed !== undefined && Number.isFinite(seed) ? Math.abs(Math.floor(seed)) : Math.floor(Math.random() * 0x7fffffff);
+  return variants[n % variants.length]!;
+}
 
-/** 详细提醒：点名工具、连击数、规范化参数 */
+/** 温和首阈值提醒（不点名工具与参数），多套变体随机 */
+function gentleReminder(): string {
+  return pickMeta([
+    "你正在用完全相同的参数重复调用同一个工具。仔细分析上一次的结果再决定是否要继续：" +
+      "如果事情还没完成，试着换一种做法或换一组参数，而不是原样再调用一次；如果已经掌握足够信息，也可以就此收尾。",
+    "你连续用一模一样的参数调用同一个工具。先别急着再来一次——回头看上一次的结果：" +
+      "没做完就换个方法或换个参数，做完了就不必再调。",
+    "同一个工具、同样的参数，你已经在反复调用了。停下来想想：这是不是真的还需要？" +
+      "需要就换个方式，不需要就到此为止。",
+  ]);
+}
+
+/** 详细提醒：点名工具、连击数、规范化参数。事实部分（工具/次数/参数）原样保留，只随机引导语骨架 */
 function detailedReminder(toolName: string, count: number, canonicalArguments: string, previewChars: number): string {
   const preview =
     canonicalArguments.length <= previewChars
       ? canonicalArguments
       : `${canonicalArguments.slice(0, previewChars)}… (+${canonicalArguments.length - previewChars} more chars)`;
-  return (
-    `检测到重复的工具调用：\n` +
-    `- 工具：${toolName}\n` +
-    `- 连续调用次数：${count}\n` +
-    `- 参数：${preview}\n` +
-    `这些重复调用没有在推进进度。不要再用这组参数调用这个工具；请查看最新一次结果，` +
-    `换一个动作、换一组参数，或在证据已足够时结束当前任务。`
-  );
+  const guidance = pickMeta([
+    "这些重复调用没有在推进进度。不要再用这组参数调用这个工具；请查看最新一次结果，换一个动作、换一组参数，或在证据已足够时结束当前任务。",
+    "这样重复下去只是在原地踏步。别再原样调用它了——看最新结果，换个动作或参数，或者就此收尾。",
+    "同样的调用反复出现，没有带来任何新东西。请停止原样重复：要么换个做法，要么确认任务已完成、直接收尾。",
+  ]);
+  return `检测到重复的工具调用：\n- 工具：${toolName}\n- 连续调用次数：${count}\n- 参数：${preview}\n${guidance}`;
 }
 
-/** 交替循环提醒：点明这是一段周期性反复、没有新结果的循环 */
+/** 交替循环提醒：点明这是一段周期性反复、没有新结果的循环，多套变体随机 */
 function cycleReminder(pattern: string[], periods: number): string {
   const seq = pattern.join(" → ");
-  return (
+  return pickMeta([
     `检测到你在反复执行同一组动作：${seq}（这一组动作已连续重复了 ${periods} 轮，每轮完全相同）。` +
-    `你陷入了循环——没有任何新结果、没有任何进展。请立即停下这个模式：` +
-    `换一件完全不同的事情做，或者如果手头的事其实已经做完，就明确收尾，不要再重复这一组动作。`
-  );
+      `你陷入了循环——没有任何新结果、没有任何进展。请立即停下这个模式：换一件完全不同的事情做，或者如果手头的事其实已经做完，就明确收尾，不要再重复这一组动作。`,
+    `你在一遍又一遍地做同一组事：${seq}（已经 ${periods} 轮，毫无变化）。这是循环陷阱，没有任何进展。` +
+      `现在立刻换一件完全不同的事，或确认完成、就此收尾——别再走这一圈了。`,
+    `警告：你在原地打转——${seq} 这组动作已经反复了 ${periods} 轮，每轮都一样，毫无推进。` +
+      `请立即打破它：去做别的、完全不同的事，或者如果确实没事可做了就明确结束。`,
+  ]);
 }
 
 /** 校验阈值（dsh 同款 fail-loud：空/非整数/小于 2/重复都抛错，绝不静默回退） */
@@ -175,7 +194,7 @@ export class RepeatGuard {
     const notice = !this.thresholdSet.has(count)
       ? null
       : count === this.firstThreshold
-        ? GENTLE_REMINDER
+        ? gentleReminder()
         : detailedReminder(call.name, count, canonical, this.argumentsPreviewChars);
     return { notice, toolName: call.name, count, cycle: false };
   }
