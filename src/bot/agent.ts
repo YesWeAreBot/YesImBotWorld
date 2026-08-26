@@ -146,8 +146,11 @@ export class BotAgent {
   private lastStatus = new Map<string, string>();
   /** check_status(world) 已看过的最新一条 News 的世界时刻 */
   private lastNewsT: number | null = null;
-  /** 上一次 send 的签名（频道+内容+图片），用于拦截连续的重复发送 */
-  private lastSendSig: string | null = null;
+  /**
+   * 近期已发消息的签名滑动窗口（频道+内容+图片），用于拦截"近期反复说同一句"——
+   * 不只是相邻两条，而是同一句话在最近 N 条里重复出现就拦（治"口头禅式复读"）。
+   */
+  private recentSendSigs: string[] = [];
   /** 延期发送意图（"过会儿再发"），到点询问、三类情况打断 */
   private pendingDeferred: PendingDeferred[] = [];
   /** 上一次 act 的描述与调用编号，用于拦截“结果未出就重复做同一件事” */
@@ -1974,18 +1977,28 @@ export class BotAgent {
     // duration 明显超过打字时间 → 视为"过会儿再发"，延期后询问而不是自动发出
     if (this.maybeDeferSend(call, "text", id, msg)) return;
     if (this.gateSendDuration(call, "打字")) return;
-    // 拦截与上一条完全相同的发送（模型常见的复读行为），除非显式声明 resend
-    const sig = JSON.stringify([id, msg, media.map(String), replyTo ?? "", atSender]);
-    if (sig === this.lastSendSig && !isTruthy(call.arguments.resend)) {
+    // 拦截"近期反复发同一句"（口头禅式复读）：同一签名在最近 N 条里重复达到阈值就拦，
+    // 除非显式声明 resend。用滑动窗口而非只跟上一条比——治"每隔几句又把同一句话说一遍"。
+    // 注意：sig 只按「频道 + 内容 + 图片」判重，显式排除 reply_to / at_sender——
+    // 同一句话无论是否在引用回复别人、是否 @ 了对方，都是同一句，都要拦。
+    const sig = JSON.stringify([id, msg, media.map(String)]);
+    const recentRepeat = this.recentSendSigs.filter((s) => s === sig).length;
+    const repeatThreshold = this.config.messaging.recentRepeatThreshold;
+    if (repeatThreshold > 0 && recentRepeat >= repeatThreshold && !isTruthy(call.arguments.resend)) {
       this.pushEvent(
         "system",
-        `（你刚刚已经向 ${id} 发过一模一样的消息了，这次没有发出——请不要复读。` +
-          `如果你确定要把相同的内容再发一遍，请在参数里加上 resend: true。）`,
+        pickMeta(
+          [
+            `（你最近已经说过「${truncate(msg, 24)}」${recentRepeat} 次了。这句话反复出现，就像一个复读机——这次没有发出。换一种说法，或真的没有新内容就别说。）`,
+            `（又是这句「${truncate(msg, 24)}」？近期你已经发了 ${recentRepeat} 次几乎相同的话。请别变成只会复读的机器，想点新的话说。）`,
+            `（「${truncate(msg, 24)}」这句你最近反复说了 ${recentRepeat} 遍。收一收，说说别的，或沉默也比复读强。）`,
+          ],
+        ),
         { ref: call.id },
       );
       return;
     }
-    this.lastSendSig = sig;
+    this.recordSendSig(sig);
     this.ackStart(call);
     const insist = isTruthy(call.arguments.insist);
     this.scheduler.schedule(call, {
@@ -1999,6 +2012,15 @@ export class BotAgent {
         return this.echoChannelRecent(id, out);
       },
     });
+  }
+
+  /** 记录一条已发出的 send 签名，滑窗维护「最近 N 条」（超窗滑出最老） */
+  private recordSendSig(sig: string): void {
+    this.recentSendSigs.push(sig);
+    const window = this.config.messaging.recentRepeatWindow;
+    if (this.recentSendSigs.length > window) {
+      this.recentSendSigs = this.recentSendSigs.slice(this.recentSendSigs.length - window);
+    }
   }
 
   private dispatchSendFile(call: ToolCallRecord): void {
@@ -2074,6 +2096,22 @@ export class BotAgent {
     }
     if (this.maybeDeferSend(call, "voice", id, text)) return;
     if (this.gateSendDuration(call, "说话")) return;
+    // 近期反复说同一句（同 send 的滑动窗口去重）
+    const vsig = JSON.stringify(["voice", id, text]);
+    const vRepeat = this.recentSendSigs.filter((s) => s === vsig).length;
+    if (
+      this.config.messaging.recentRepeatThreshold > 0 &&
+      vRepeat >= this.config.messaging.recentRepeatThreshold &&
+      !isTruthy(call.arguments.resend)
+    ) {
+      this.pushEvent(
+        "system",
+        `（这句「${truncate(text, 24)}」你最近已经发过 ${vRepeat} 次了——别反复说同一句话，换点新鲜的。）`,
+        { ref: call.id },
+      );
+      return;
+    }
+    this.recordSendSig(vsig);
     this.ackStart(call);
     this.scheduler.schedule(call, {
       executeAt: "expected", // 说完的那一刻语音才发出（此前可 cancel）
@@ -2090,8 +2128,8 @@ export class BotAgent {
   private dispatchCancel(call: ToolCallRecord): void {
     const target = String(call.arguments.id ?? call.arguments.toolcall_id ?? "");
     const result = this.scheduler.cancel(target);
-    // 撤回成功后，重发相同内容是合理操作，不应再被重复拦截
-    if (result === "cancelled") this.lastSendSig = null;
+    // 撤回成功后，重发相同内容是合理操作，不应再被重复拦截——清空近期发送窗口
+    if (result === "cancelled") this.recentSendSigs = [];
     const text =
       result === "cancelled"
         ? `你及时停下了 ${target}。`

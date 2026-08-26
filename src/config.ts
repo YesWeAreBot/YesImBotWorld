@@ -136,6 +136,10 @@ export interface MessagingConfig {
   typingCharsPerSec: number;
   /** "模拟打字"的 duration 上限 = 打字估算 × 该倍数；超过视为"过会儿再发" */
   sendDeferFactor: number;
+  /** 近期重复发同一句的拦截阈值：同一句话在最近 N 条里已出现这么多次就拦（默认 2，即第 3 次拦） */
+  recentRepeatThreshold: number;
+  /** 近期重复检测的滑动窗口大小（默认 20 条） */
+  recentRepeatWindow: number;
 }
 
 /** 聊天平台扩展操作（收发消息之外的能力），每个接口独立开关，默认全部关闭 */
@@ -1141,6 +1145,16 @@ export const Config: Schema<Config> = Schema.intersect([
             "而是视为「过会儿再发」的意图：到点后系统会询问 Bot 到底要不要发；" +
             "延期期间目标频道来了新消息、自己的账号在那边发了消息、或注意力转去了别处，都会打断这个念头",
         ),
+      recentRepeatThreshold: Schema.natural()
+        .default(1)
+        .description(
+          "近期重复发同一句的拦截阈值：同一句话（相同频道 + 相同内容，忽略引用目标）在「最近 N 条」里已经出现这么多次时，" +
+            "新的同句发送会被拦下提醒（口头禅式复读治理）。默认 1 = 第 2 次发同一句就拦。0 表示关闭检测",
+        ),
+      recentRepeatWindow: Schema.natural()
+        .min(5)
+        .default(20)
+        .description("近期重复检测的滑动窗口大小：统计最近多少条已发消息里的重复。默认 20 条"),
     }).description("Koishi 消息接入"),
   }),
 ]);
