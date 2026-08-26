@@ -30,11 +30,17 @@ html,body{height:100%}
 /* 移动端视口高度：优先用动态视口 dvh（iOS 地址栏收起/展开时高度会变），老浏览器回退 vh */
 body{
   margin:0;color:var(--fg);font:14px/1.65 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei","Segoe UI",sans-serif;
+  background:var(--bg);
+}
+/* 背景柔光渐变：用固定定位伪元素实现，避免 background-attachment:fixed 在 iOS 上的兼容问题，
+   同时避免渐变随滚动内容平铺重复拼接 */
+body::before{
+  content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;
   background:
     radial-gradient(1100px 520px at 85% -8%, rgba(138,123,255,.13), transparent 62%),
     radial-gradient(900px 480px at -8% 18%, rgba(110,231,255,.08), transparent 58%),
-    radial-gradient(700px 500px at 50% 115%, rgba(110,231,255,.05), transparent 60%),
-    var(--bg);
+    radial-gradient(700px 500px at 50% 115%, rgba(110,231,255,.08), transparent 60%);
+  background-repeat:no-repeat;
 }
 a{color:var(--accent);text-decoration:none}
 ::selection{background:rgba(110,231,255,.28)}
