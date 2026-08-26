@@ -398,6 +398,29 @@ try { ADMIN_PLAYER_PROFILE = JSON.parse(localStorage.getItem('wui_admin_player_p
 // 常驻 Bot 名字（来自 /api/state meta.botName；管理员同名判定 / 工具面板用）
 var RESIDENT_BOT_NAME = '';
 var PLAYER_STATE = { token: '', worldName: '', inWorld: false, events: [], actBusy: false, lastTimeLine: '', mode: '', isAdmin: false, takeover: false, botName: '' };
+// 刷新后恢复「是否已入世界」的关键状态（token 用于重连 SSE，避免刷新后误当全新进入、与 crossing 里的旧会话冲突）
+function savePlayerState(){
+  var keep = { token: PLAYER_STATE.token, worldName: PLAYER_STATE.worldName, inWorld: PLAYER_STATE.inWorld, mode: PLAYER_STATE.mode, isAdmin: PLAYER_STATE.isAdmin, takeover: PLAYER_STATE.takeover, botName: PLAYER_STATE.botName };
+  localStorage.setItem('wui_player_state', JSON.stringify(keep));
+}
+function loadPlayerState(){
+  try {
+    var d = JSON.parse(localStorage.getItem('wui_player_state') || 'null');
+    if(d && typeof d === 'object'){
+      if(d.token) PLAYER_STATE.token = d.token;
+      if(typeof d.worldName === 'string') PLAYER_STATE.worldName = d.worldName;
+      if(d.inWorld) PLAYER_STATE.inWorld = true;
+      if(d.mode) PLAYER_STATE.mode = d.mode;
+      if(d.isAdmin) PLAYER_STATE.isAdmin = true;
+      if(d.takeover) PLAYER_STATE.takeover = true;
+      if(d.botName) PLAYER_STATE.botName = d.botName;
+      if(PLAYER_STATE.botName) RESIDENT_BOT_NAME = PLAYER_STATE.botName;
+    }
+  } catch(e) { /* ignore */ }
+}
+function clearPlayerState(){
+  localStorage.removeItem('wui_player_state');
+}
 var activeView = 'overview';
 var playerNewsAsc = false; // 世界观剧情「最近事件」排序：false=倒序(最新在上,默认) true=正序
 var worldStatusCache = null; // 最近一次 /api/state 结果，供 news 排序切换时免重复拉取
@@ -1611,26 +1634,37 @@ function isAdminTakeover(){
     && (getPlayerProfile().mode === 'avatar' || getPlayerProfile().mode === 'puppet');
 }
 function loadPlayer(){
+  // 刷新恢复：先从 localStorage 恢复「已入世界」状态（token 用于重连 SSE，避免误当全新进入）
+  loadPlayerState();
   var main = $('#main');
   main.textContent = '';
   main.appendChild(viewHead('入世界', '以你的角色身份进入这个虚拟世界，通过行动与世界互动。'));
-  // 先拉取常驻 Bot 名字（管理员同名判定 / 接管 Bot 用）
-  api('GET', '/api/state').then(function(r){
-    RESIDENT_BOT_NAME = (r.meta && r.meta.botName ? String(r.meta.botName).trim() : '');
-  }).catch(function(){});
   var holder = el('div', {text:'加载中…', cls:'empty'});
   main.appendChild(holder);
-  // 首次：无角色身份 → 先填角色
-  if(!getPlayerProfile() || !getPlayerProfile().name){
+  // 先拉取常驻 Bot 名字（管理员同名判定 / 接管 Bot 用），拿到后再渲染——否则首次进入时 RESIDENT_BOT_NAME 还是空，
+  // 导致「接管 Bot」提示 / 工具面板不出现。
+  api('GET', '/api/state').then(function(r){
+    RESIDENT_BOT_NAME = (r.meta && r.meta.botName ? String(r.meta.botName).trim() : '');
     holder.textContent = '';
-    holder.appendChild(playerProfileForm(function(){
-      loadPlayer();
-    }));
-    return;
-  }
-  // 已有角色身份：显示世界观状态 + 入世界/剧情流
-  holder.textContent = '';
-  playerRenderWorld(holder);
+    // 首次：无角色身份 → 先填角色
+    if(!getPlayerProfile() || !getPlayerProfile().name){
+      holder.appendChild(playerProfileForm(function(){
+        loadPlayer();
+      }));
+      return;
+    }
+    // 刷新后已入世界：重连 SSE 恢复剧情流（旧 crossing 会话未过期则无缝恢复；
+    // 已过期/被顶掉时 onerror 会反复失败，此时用户可点「离开」回到进入界面）
+    if(PLAYER_STATE.inWorld && PLAYER_STATE.token){
+      playerConnectEvents(PLAYER_STATE.token);
+    }
+    // 已有角色身份：显示世界观状态 + 入世界/剧情流
+    playerRenderWorld(holder);
+  }).catch(function(){
+    holder.textContent = '';
+    holder.appendChild(el('p', {cls:'empty', text:'（无法加载世界状态，请检查世界是否已初始化。）'}));
+  });
+}
 }
 
 function playerProfileForm(done){
@@ -1769,6 +1803,7 @@ function playerArrive(mode){
       }
     }
     toast(PLAYER_STATE.takeover ? '已接管 Bot' : '已进入世界', 'ok');
+    savePlayerState();
     playerConnectEvents(r.token);
     loadPlayer();
   }).catch(showErr);
@@ -2106,6 +2141,7 @@ function playerLeave(){
     PLAYER_STATE.events = [];
     PLAYER_STATE.takeover = false;
     PLAYER_STATE.isAdmin = false;
+    clearPlayerState();
     toast('已离开世界', 'ok');
     loadPlayer();
   }).catch(showErr);
@@ -2153,6 +2189,7 @@ function playerConnectEvents(token){
       PLAYER_STATE.lastTimeLine = '';
       PLAYER_STATE.actBusy = false;
       PLAYER_STATE.takeover = false;
+      clearPlayerState();
       toast(msg.reason || '世界送别了你', 'warn');
       loadPlayer();
     }
