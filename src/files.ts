@@ -73,6 +73,8 @@ export class WorldFiles {
   readonly notesDir: string;
   readonly archiveDir: string;
   readonly galleryDir: string;
+  /** 工具结果溢出（spill）目录：超大结果全文落盘到这，上下文里只留 head/tail 预览 */
+  readonly spillDir: string;
   /** 创世时 World-LLM 生成的浏览器带壳截图外壳（完整 HTML，含 {{screen}} 等占位符） */
   readonly phoneShell: string;
 
@@ -93,6 +95,7 @@ export class WorldFiles {
     this.notesDir = path.join(base, "Notes");
     this.archiveDir = path.join(base, "archive");
     this.galleryDir = path.join(base, "gallery");
+    this.spillDir = path.join(base, "spill");
     this.phoneShell = path.join(base, "phoneShell.html");
   }
 
@@ -101,6 +104,7 @@ export class WorldFiles {
     await fs.mkdir(this.archiveDir, { recursive: true });
     await fs.mkdir(this.galleryDir, { recursive: true });
     await fs.mkdir(this.notesDir, { recursive: true });
+    await fs.mkdir(this.spillDir, { recursive: true });
     if (!(await this.exists(this.botDef))) await fs.writeFile(this.botDef, BOT_DEF_TEMPLATE);
     if (!(await this.exists(this.worldDef))) await fs.writeFile(this.worldDef, WORLD_DEF_TEMPLATE);
     await this.migrateNewsDb();
@@ -414,5 +418,10 @@ export class WorldFiles {
     const tmp = `${file}.tmp`;
     await fs.writeFile(tmp, content);
     await fs.rename(tmp, file);
+  }
+
+  /** spill 目录下某个溢出结果的完整路径（按文件名安全拼接） */
+  spillPath(name: string): string {
+    return path.join(this.spillDir, name);
   }
 }

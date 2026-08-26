@@ -4,6 +4,7 @@ import type { AppManager } from "../apps/manager.js";
 import type { WorldClock } from "../clock.js";
 import { needsMsgIds, type Config } from "../config.js";
 import type { WorldFiles } from "../files.js";
+import { RepeatGuard } from "./repeatGuard.js";
 import { ToolCallParseError } from "../llm/parse.js";
 import type { BotEvent, CompressionResult, EventSource, MediaRef, ParsedToolCall, PhoneStatus, RichText, RichTextPart, ToolCallRecord } from "../types.js";
 import type { WorldAgent } from "../world/agent.js";
@@ -158,6 +159,11 @@ export class BotAgent {
    */
   private lastActBlock: { sig: string; count: number } | null = null;
   /**
+   * 通用防重复工具调用守卫（移植 dsh 的 repeat-tool-reminder）：
+   * 按 (工具名, 规范化参数) 链式计数，连续重复达到阈值时注入递进式提醒（纯 advisory，不拦截）。
+   */
+  private repeatGuard: RepeatGuard;
+  /**
    * 已完成的等待区间（世界 TU，被打断的按实际时长计），用于"等待时长占比过高"的拦截。
    * 少量多次的短等是正常的；要治的是「几乎全部时间都在干等」——所以按时长不按次数。
    */
@@ -217,20 +223,29 @@ export class BotAgent {
     private crossing: BotCrossingApi | null = null,
   ) {
     this.toolDefs = tools ?? BOT_TOOLS;
+    this.repeatGuard = new RepeatGuard({
+      thresholds: config.bot.repeatThresholds ?? [3, 5, 8],
+      include: [],
+      exclude: config.bot.repeatExclude ?? ["rest", "wait"],
+      argumentsPreviewChars: 500,
+    });
     // 原生声明用全量内置工具（稳定，不随界面状态变）；允许集另行按分层控制
     this.backend = createBackend(config.bot, this.layerNames("core"), this.toolDefs);
     this.scheduler = new Scheduler(
       clock,
       (content, ref) => {
+        // 结果溢出治理（spill/prune）：超阈值的结果先裁剪为 head/tail 预览 + 全文落盘，
+        // 再进入上下文——防止超大结果反复占据窗口、加剧退化。
+        const gated = this.spillResult(content, ref);
         // 手动驾驶（管理员代理）工具结果回传：真正执行结果在此交付，回传给发起方
         if (ref) {
           const pending = this.externalToolResults.get(ref);
           if (pending) {
             this.externalToolResults.delete(ref);
-            pending.resolve({ ok: true, text: toPlainText(content) });
+            pending.resolve({ ok: true, text: toPlainText(gated) });
           }
         }
-        this.pushEvent("tool", content, { ref });
+        this.pushEvent("tool", gated, { ref });
       },
       logger,
     );
@@ -758,6 +773,13 @@ export class BotAgent {
   // ---------- 工具派发 ----------
 
   private async dispatch(call: ToolCallRecord): Promise<void> {
+    // 通用防重复守卫（advisory）：观察这次调用，连续重复达到阈值时注入提醒（不拦截，
+    // 决策权在模型）。放在 dispatch 最前，让所有工具——包括下面被目标误写/参数缺失拦截的
+    // denied 调用——都计入链（模型反复撞被拒的调用，正是最该打断的循环）。
+    const repeatNotice = this.repeatGuard.observe(call);
+    if (repeatNotice) {
+      this.pushEvent("system", `（${repeatNotice}）`, { ref: call.id });
+    }
     // 目标参数误写拦截（频道类工具）：Bot 幻觉出 OneBot API 风格的 detail/channel_id
     // 等写法且没给 id 时，绝不静默回退到当前频道（那会把消息发进无关频道）——
     // 拦下并告知正确格式，让它重试。不打捞：打捞会让错误格式被强化
@@ -1612,6 +1634,35 @@ export class BotAgent {
   private dispatchLocal(call: ToolCallRecord, run: () => Promise<string | RichText>): void {
     this.ackStart(call);
     this.scheduler.schedule(call, { executeAt: "now", run });
+  }
+
+  /**
+   * 工具结果溢出治理（spill/prune，对应 dsh 的 tool-result-pruner + spill-policy）：
+   * 纯文本结果超过 spillMinChars 时，裁成「头部 + 省略标记 + 尾部」，全文 fire-and-forget 落盘到
+   * <base>/spill/，模型上下文只保留裁剪预览。落盘失败静默降级为原样返回（不把成功的调用变成失败）。
+   *
+   * 注意：这里只裁剪 **模型可见** 的文本，原始结果仍由 scheduler 的结果语义保留；
+   * 裁剪让前缀缓存从被裁点起失效，但只发生在个别超大结果上，且换来上下文不被垃圾塞满。
+   */
+  private spillResult(content: string | RichText, ref?: string): string | RichText {
+    const threshold = this.config.bot.spillMinChars ?? 4000;
+    if (threshold <= 0) return content;
+    if (typeof content !== "string") return content; // RichText（含附件/分段）不裁剪
+    if (content.length <= threshold) return content;
+    // head/tail 各占约 45%，中间省略标记
+    const headChars = Math.floor(threshold * 0.45);
+    const tailChars = Math.floor(threshold * 0.45);
+    const head = content.slice(0, headChars);
+    const tail = content.slice(content.length - tailChars);
+    const omitted = content.length - headChars - tailChars;
+    const spillFile = this.files.spillPath(ref ? `${ref}.txt` : `result_${Date.now()}.txt`);
+    const marker = `\n\n[... 中间 ${omitted} 字符已省略，完整结果见 ${spillFile} ...]\n\n`;
+    const preview = head + marker + tail;
+    // 落盘（异步、尽力而为）
+    void this.files
+      .atomicWrite(spillFile, content)
+      .catch(() => {/* spill 失败静默：模型仍拿到预览 */});
+    return preview;
   }
 
   /** 记录一段实际发生的等待（从 fromTU 到现在），并顺手清理窗口外的旧区间 */

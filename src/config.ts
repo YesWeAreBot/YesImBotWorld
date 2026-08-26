@@ -35,6 +35,12 @@ export interface BotModelConfig {
   maxWindowChars: number;
   minIntervalMs: number;
   retryDelayMs: number;
+  /** 防重复工具调用守卫：连续重复阈值（升序；首阈值温和提醒、后续详细提醒）。空数组 = 关闭 */
+  repeatThresholds: number[];
+  /** 防重复守卫排除的工具名匹配（* 通配；bookkeeping 工具既不计数也不重置） */
+  repeatExclude: string[];
+  /** 工具结果溢出治理：超此字符数的结果事件裁剪为 head/tail + 省略标记（spill 到磁盘） */
+  spillMinChars: number;
   modalities: ModalitySupport;
   template: TextTemplateConfig;
 }
@@ -417,6 +423,25 @@ export const Config: Schema<Config> = Schema.intersect([
             "云端 API 建议设为 3000 以上避免触发限速；本地模型可设为 0",
         ),
       retryDelayMs: Schema.natural().default(5000).description("生成失败后的重试等待（毫秒）"),
+      repeatThresholds: Schema.array(Schema.natural())
+        .default([3, 5, 8])
+        .description(
+          "防重复工具调用守卫：Bot 用完全相同的参数连续调用同一工具达到这些次数时，各注入一次提醒——" +
+            "第一个阈值是温和提醒（不点名工具），后续阈值是详细提醒（点名工具、连击数与参数）。" +
+            "纯 advisory：从不真正拦截调用，决策权在模型。填 [] 关闭（阈值须为 ≥2 的整数且不重复）",
+        ),
+      repeatExclude: Schema.array(Schema.string())
+        .default([])
+        .description(
+          "防重复守卫排除的工具名匹配（支持 * 通配，如 check_msg / rest / wait）。" +
+            "这些工具既不计数也不重置——作为 bookkeeping 工具穿插在循环里不会洗白循环",
+        ),
+      spillMinChars: Schema.natural()
+        .default(4000)
+        .description(
+          "工具结果溢出治理：单个结果事件超过该字符数时，裁成「头部 + 省略标记 + 尾部」并全文落盘（数据目录 spill/），" +
+            "模型上下文里只保留裁剪预览——防止超大结果（长文、大列表）反复占据上下文窗口、加剧退化。0 表示禁用",
+        ),
       modalities: Schema.object({
         image: Schema.boolean().default(false).description("模型原生支持图片输入"),
         audio: Schema.boolean().default(false).description("模型原生支持音频输入"),
