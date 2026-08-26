@@ -13,6 +13,7 @@ import type {
   ToolCallRecord,
 } from "../types.js";
 import { renderToolsText } from "./tools.js";
+import { canonicalizeArgs } from "./repeatGuard.js";
 
 interface PinnedPersist {
   pinned: PinnedContext;
@@ -419,9 +420,44 @@ export class BotContext {
     return this.renderSystemText("").length + this.renderStreamText().length + attachmentCost;
   }
 
-  /** 供压缩用：序列化当前工作窗口 */
+  /** 供压缩用：序列化当前工作窗口（把连续重复的工具调用折叠成一条汇总，避免千篇一律的历史占满压缩输入） */
   serializeForCompression(): string {
-    return this.renderStreamText();
+    const lines: string[] = [];
+    let i = 0;
+    while (i < this.stream.length) {
+      const entry = this.stream[i]!;
+      if (entry.kind !== "tool_call") {
+        lines.push(BotContext.renderEventLine(entry.event));
+        i++;
+        continue;
+      }
+      // 连续重复折叠：统计后面有多少个「名字 + 规范化参数完全相同」的连续 tool_call
+      const base = entry.call;
+      const baseKey = JSON.stringify([base.name, canonicalizeArgs(base.arguments ?? {})]);
+      let run = 1;
+      let j = i + 1;
+      while (j < this.stream.length) {
+        const next = this.stream[j]!;
+        if (next.kind !== "tool_call") break;
+        const nextKey = JSON.stringify([next.call.name, canonicalizeArgs(next.call.arguments ?? {})]);
+        if (nextKey !== baseKey) break;
+        run++;
+        j++;
+      }
+      if (run === 1) {
+        // 仅一次：原样渲染，不折叠（保留完整调用行）
+        lines.push(BotContext.renderToolCallLine(base));
+      } else {
+        // 连续重复：只渲染第一条，其后折叠成一条纯文本汇总，压缩输入不被重复调用灌满。
+        // 用自然语言而非自造 XML 标签，避免 World-LLM 把折叠标记误当工具输出格式。
+        lines.push(BotContext.renderToolCallLine(base));
+        lines.push(
+          `（注：上面这个调用在意识流里总共出现了 ${run} 次，其中后 ${run - 1} 次是参数完全相同的重复复读、毫无推进，已折叠省略，不必再复述。）`,
+        );
+      }
+      i = j;
+    }
+    return lines.join("\n");
   }
 
   /** 工作窗口中是否存在原生附件（400 熔断的判定条件之一） */
