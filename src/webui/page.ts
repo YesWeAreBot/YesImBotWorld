@@ -1806,21 +1806,58 @@ function playerRefreshActState(){
 }
 
 // 管理员「接管 Bot」时可手动代理的 Bot 工具（核心高频工具 + 可自由输入任意工具名）
+// 管理员工具面板的常用工具：name / signature / 描述 / 参数字段定义
+// 字段定义：[参数名, 中文标签, 类型, 是否必填, 占位提示]
+// 类型：text / area / num / sel（sel 需带第 6 个元素=选项数组）
 var ADMIN_TOOL_LIST = [
-  ['act', 'act(description: string, duration?: number)', '在世界中做一件事（自然语言描述）。'],
-  ['send', 'send(msg: string, id?: string, media?: string[])', '发送消息（id 缺省为当前频道）。'],
-  ['wait', 'wait(n: number)', '等待 n 个 Time Unit。'],
-  ['check_status', 'check_status(target: "self"|"world", full?: boolean)', '查看自身或世界状态。'],
-  ['check_time', 'check_time()', '看一眼现在几点。'],
-  ['check_msg', 'check_msg(n: number)', '刷新消息列表。'],
-  ['select_channel', 'select_channel(id: string)', '点进一个频道。'],
-  ['read_channel', 'read_channel(n: number)', '读当前频道最近消息。'],
-  ['check_gallery', 'check_gallery(category?: string)', '翻看收藏夹。'],
-  ['check_media', 'check_media(n?: number)', '翻看媒体缓存。'],
-  ['open_app', 'open_app(name: string)', '打开手机里的一个应用。'],
-  ['recall', 'recall(keyword?: string, n?: number)', '回忆自己的过往。'],
-  ['react', 'react(id: string, msg_id: string, emoji: string)', '给某条消息贴表情回应。'],
-  ['unsend', 'unsend(id: string, msg_id: string)', '撤回一条已发消息。']
+  ['act', 'act(description, duration?)', '在世界中做一件事（自然语言描述）。', [
+    ['description', '行动描述', 'area', true, '例如：走向吧台，向老板要一杯酒'],
+    ['duration', '耗时（TU，可选）', 'num', false, '']
+  ]],
+  ['send', 'send(msg, id?, media?)', '发送消息（id 缺省为当前频道）。', [
+    ['msg', '消息内容', 'area', true, '要发送的文字'],
+    ['id', '频道 id（可选）', 'text', false, 'platform:channelId，缺省当前频道'],
+    ['media', '媒体编号（可选，逗号分隔）', 'list', false, '如 12,13 或 gallery:xx.png']
+  ]],
+  ['wait', 'wait(n)', '等待 n 个 Time Unit。', [
+    ['n', '等待时长 TU', 'num', true, '例如 15']
+  ]],
+  ['check_status', 'check_status(target, full?)', '查看自身或世界状态。', [
+    ['target', '目标', 'sel', true, '', ['self','world']],
+    ['full', '查看全文', 'bool', false, '']
+  ]],
+  ['check_time', 'check_time()', '看一眼现在几点。', []],
+  ['check_msg', 'check_msg(n?)', '刷新消息列表。', [
+    ['n', '频道数（可选）', 'num', false, '缺省默认']
+  ]],
+  ['select_channel', 'select_channel(id)', '点进一个频道。', [
+    ['id', '频道 id', 'text', true, 'platform:channelId']
+  ]],
+  ['read_channel', 'read_channel(n?)', '读当前频道最近消息。', [
+    ['n', '条数（可选）', 'num', false, '缺省默认']
+  ]],
+  ['check_gallery', 'check_gallery(category?)', '翻看收藏夹。', [
+    ['category', '分类（可选）', 'text', false, '如 meme']
+  ]],
+  ['check_media', 'check_media(n?)', '翻看媒体缓存。', [
+    ['n', '条数（可选）', 'num', false, '缺省默认']
+  ]],
+  ['open_app', 'open_app(name)', '打开手机里的一个应用。', [
+    ['name', '应用名', 'text', true, '如 聊天 / 浏览器 / 电脑']
+  ]],
+  ['recall', 'recall(keyword?, n?)', '回忆自己的过往。', [
+    ['keyword', '关键词（可选）', 'text', false, ''],
+    ['n', '条数（可选）', 'num', false, '']
+  ]],
+  ['react', 'react(id, msg_id, emoji)', '给某条消息贴表情回应。', [
+    ['id', '频道 id', 'text', true, 'platform:channelId'],
+    ['msg_id', '消息 id', 'text', true, '消息编号'],
+    ['emoji', '表情', 'text', true, '如 👍']
+  ]],
+  ['unsend', 'unsend(id, msg_id)', '撤回一条已发消息。', [
+    ['id', '频道 id', 'text', true, 'platform:channelId'],
+    ['msg_id', '消息 id', 'text', true, '消息编号']
+  ]]
 ];
 
 // 管理员「接管 Bot」时的工具调用面板：代理 Bot 全部工具，经 /api/player/tool 真正执行
@@ -1833,23 +1870,51 @@ function adminToolPanel(){
   var customOpt = el('option', {value:'__custom__', text:'自定义工具名…'});
   sel.appendChild(customOpt);
   ADMIN_TOOL_LIST.forEach(function(t){
-    sel.appendChild(el('option', {value:t[0], text: t[1] + ' — ' + t[2]}));
+    sel.appendChild(el('option', {value:t[0], text: t[0] + ' — ' + t[2]}));
   });
+
+  // 参数字段容器（动态按所选工具渲染）
+  var fieldsBox = el('div', {style:'margin:10px 0'});
+  // 高级 JSON（默认隐藏）
+  var advTa = el('textarea', {rows: 4, placeholder:'直接写完整参数 JSON 对象（优先级高于上方字段）', style:'width:100%;font-family:var(--mono);font-size:12px;display:none'});
+  var advToggle = el('button', {cls:'ghost', text:'▸ 高级：直接编辑 JSON', style:'font-size:12px;margin:4px 0 0'});
   var nameInp = el('input', {placeholder:'自定义工具名（如 send_group_notice）', style:'width:100%;margin-top:8px;display:none'});
-  sel.onchange = function(){
-    if(sel.value === '__custom__'){ nameInp.style.display = ''; nameInp.focus(); }
-    else { nameInp.style.display = 'none'; }
-  };
-  var argsTa = el('textarea', {rows: 4, placeholder:'参数（JSON 对象，例如 {"msg":"你好","id":"platform:123"}；act 填 {"description":"..."}）', style:'width:100%;font-family:var(--mono);font-size:12px'});
-  var resultPre = el('pre', {cls:'', style:'max-height:280px;overflow:auto;margin-top:10px;white-space:pre-wrap;word-break:break-word'});
+
+  var resultPre = el('pre', {style:'max-height:280px;overflow:auto;margin-top:10px;white-space:pre-wrap;word-break:break-word;background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:8px'});
   var errLine = el('p', {style:'color:var(--err);font-size:12.5px;min-height:16px'});
   var busy = false;
+
+  function renderFields(){
+    fieldsBox.textContent = '';
+    if(sel.value === '__custom__'){ nameInp.style.display = ''; return; }
+    nameInp.style.display = 'none';
+    var def = null;
+    for(var i=0;i<ADMIN_TOOL_LIST.length;i++){ if(ADMIN_TOOL_LIST[i][0] === sel.value){ def = ADMIN_TOOL_LIST[i]; break; } }
+    if(!def) return;
+    var fields = def[3] || [];
+    if(!fields.length){ fieldsBox.appendChild(el('p', {cls:'empty', text:'该工具无需参数。'})); return; }
+    fields.forEach(function(f){
+      var key = f[0], label = f[1], type = f[2], required = f[3], ph = f[4], opts = f[5];
+      var inp;
+      if(type === 'area') inp = el('textarea', {rows: 2, placeholder: ph || '', style:'width:100%;font-family:var(--mono);font-size:12px'});
+      else if(type === 'num') inp = el('input', {type:'number', placeholder: ph || '', style:'width:100%'});
+      else if(type === 'bool') inp = el('input', {type:'checkbox', style:'width:auto'});
+      else if(type === 'sel'){ inp = el('select', {style:'width:100%'}); (opts||[]).forEach(function(o){ inp.appendChild(el('option', {value:o, text:o})); }); }
+      else inp = el('input', {placeholder: ph || '', style:'width:100%'});
+      inp.setAttribute('data-key', key);
+      inp.setAttribute('data-type', type);
+      fieldsBox.appendChild(el('label', {text: label + (required ? '' : '（可选）'), style:'font-size:12px;color:var(--fg-dim);display:block;margin:8px 0 3px'}));
+      fieldsBox.appendChild(inp);
+    });
+  }
+  sel.onchange = renderFields;
 
   body.appendChild(el('label', {text:'工具', style:'font-size:12px;color:var(--fg-dim)'}));
   body.appendChild(sel);
   body.appendChild(nameInp);
-  body.appendChild(el('label', {text:'参数', style:'font-size:12px;color:var(--fg-dim);display:block;margin:10px 0 4px'}));
-  body.appendChild(argsTa);
+  body.appendChild(fieldsBox);
+  body.appendChild(advToggle);
+  body.appendChild(advTa);
   body.appendChild(errLine);
   var callBtn = el('button', {cls:'primary', text:'调用工具'});
   body.appendChild(el('div', {cls:'toolbar', style:'margin:6px 0 0'}, [callBtn,
@@ -1857,16 +1922,42 @@ function adminToolPanel(){
   ]));
   body.appendChild(resultPre);
 
+  advToggle.onclick = function(){
+    var show = advTa.style.display === 'none';
+    advTa.style.display = show ? '' : 'none';
+    advToggle.textContent = show ? '▾ 收起高级 JSON' : '▸ 高级：直接编辑 JSON';
+  };
+
+  function collectArgs(){
+    // 高级 JSON 优先
+    if(advTa.style.display !== 'none' && advTa.value.trim()){
+      var parsed;
+      try { parsed = JSON.parse(advTa.value); }
+      catch(e){ throw new Error('参数不是合法 JSON：' + e.message); }
+      if(typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('参数必须是 JSON 对象');
+      return parsed;
+    }
+    var args = {};
+    fieldsBox.querySelectorAll('[data-key]').forEach(function(inp){
+      var key = inp.getAttribute('data-key');
+      var type = inp.getAttribute('data-type');
+      if(type === 'bool'){ if(inp.checked) args[key] = true; return; }
+      var v = inp.value.trim();
+      if(!v){ return; } // 空值省略
+      if(type === 'num'){ var n = Number(v); if(Number.isFinite(n)) args[key] = n; else throw new Error('字段 ' + key + ' 必须是数字'); return; }
+      if(type === 'list'){ args[key] = v.split(/[,，]/).map(function(s){ return s.trim(); }).filter(Boolean); return; }
+      args[key] = v;
+    });
+    return args;
+  }
+
   function runTool(){
     if(busy) return;
     var name = sel.value === '__custom__' ? nameInp.value.trim() : sel.value;
     if(!name){ errLine.textContent = '请选择或输入工具名'; return; }
-    var args = {};
-    if(argsTa.value.trim()){
-      try { args = JSON.parse(argsTa.value); }
-      catch(e){ errLine.textContent = '参数不是合法 JSON：' + e.message; return; }
-    }
-    if(typeof args !== 'object' || Array.isArray(args)){ errLine.textContent = '参数必须是 JSON 对象'; return; }
+    var args;
+    try { args = collectArgs(); }
+    catch(e){ errLine.textContent = e.message; return; }
     errLine.textContent = '';
     busy = true;
     callBtn.disabled = true;
