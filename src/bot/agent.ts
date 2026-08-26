@@ -432,8 +432,30 @@ export class BotAgent {
         source: "system",
         content:
           kind === "nap"
-            ? pickMeta(["动静把你从小憩中弄醒了。", "一点动静把你从浅睡里惊醒了。", "你被一阵动静叫醒，睁开了眼。"])
-            : pickMeta(["你的等待被打断了。", "你等的空当被打断了。", "没等到头，你被别的事打断了。"], this.lastGenAt),
+            ? pickMeta([
+                "动静把你从小憩中弄醒了。",
+                "一点动静把你从浅睡里惊醒了。",
+                "你被一阵动静叫醒，睁开了眼。",
+                "外面有了响动，你迷迷糊糊醒了过来。",
+                "你被某个动静从打盹里拽了出来。",
+                "睡意被打断，你重新清醒过来。",
+                "什么东西响了一下，你从浅睡中转醒。",
+                "你迷迷糊糊睁眼，原来是旁边有动静。",
+                "一阵声响惊动了你，小憩到此为止。",
+                "你从半睡半醒中被拉回现实。",
+              ])
+            : pickMeta([
+                "你的等待被打断了。",
+                "你等的空当被打断了。",
+                "没等到头，你被别的事打断了。",
+                "你正等着，却被别的事岔开了。",
+                "等待没能继续，有情况插了进来。",
+                "你还没等到结果，就被打断了。",
+                "正要往下等，事情起了变化。",
+                "等待被搅了，不得不先处理别的。",
+                "你没等完，就被别的动静打断了。",
+                "等待中途出了岔子，停下吧。",
+              ]),
         refToolCallId: callId,
         worldTime: this.clock.now(),
       });
@@ -1694,7 +1716,18 @@ export class BotAgent {
         this.logger.warn("打破死循环：暂时移除反复调用的工具 %s（下次压缩后恢复）", repeat.toolName);
         this.pushEvent(
           "system",
-          `（你一直在反复调用 ${repeat.toolName}，它暂时不再可用了——先做点别的，或想清楚真正要做的事。）`,
+          pickMeta([
+            `（你一直在反复调用 ${repeat.toolName}，它暂时不再可用了——先做点别的，或想清楚真正要做的事。）`,
+            `（${repeat.toolName} 被暂时收走了，因为你反复用它。换个方向吧，做点真正有意义的事。）`,
+            `（你太依赖 ${repeat.toolName} 了，它暂时不可用。冷静一下，想清楚除了它还能做什么。）`,
+            `（反复调用 ${repeat.toolName} 没有意义，它已被暂时移除。转去做别的，或停下来理理思路。）`,
+            `（${repeat.toolName} 暂时从你手边拿走了。你一直在绕它打转，现在必须换一条路。）`,
+            `（这个工具 ${repeat.toolName} 你翻来覆去地用，先收起来。去做点别的，别再纠结它。）`,
+            `（${repeat.toolName} 暂时不能用了——你之前一直盯着它不放。现在试试别的可能。）`,
+            `（你陷在 ${repeat.toolName} 里出不来，它先被移除了。休息一下，想想真正的目标是什么。）`,
+            `（反复用 ${repeat.toolName} 只会原地打转，它暂时不可用。换件事，或者就安静待一会儿。）`,
+            `（${repeat.toolName} 已经暂时失效，因为你太执着于它。放下它，走向下一个选择。）`,
+          ]),
           { ref: call.id },
         );
         return; // 刚移除，不立即再升级 rest
@@ -1783,8 +1816,18 @@ export class BotAgent {
       : `想过一会儿再发，就先 wait 到那个时候再 ${call.name}。`;
     this.pushEvent(
       "system",
-      `（${call.name} 的 duration 是${verb}耗时——真人也就几秒到几十秒，${n} TU 太久了（上限 ${cap} TU）。` +
-        `${later}什么都没有发生，请改正后重试。）`,
+      pickMeta([
+        `（${call.name} 的 duration 是${verb}耗时——真人也就几秒到几十秒，${n} TU 太久了（上限 ${cap} TU）。${later}什么都没有发生，请改正后重试。）`,
+        `（${n} TU 太久了吧？${verb}只是几秒到几十秒的事，上限 ${cap} TU。${later}消息没发，重新设个合理的 duration。）`,
+        `（你给 ${call.name} 设了 ${n} TU，可${verb}根本用不了这么久（顶多 ${cap} TU）。${later}这次没发。）`,
+        `（${n} TU 的${verb}时长不合理，真人${verb}也就几秒到几十秒，上限 ${cap} TU。${later}请重试。）`,
+        `（${call.name} 的 duration 填成 ${n} TU，超了。${verb}最多 ${cap} TU 而已。${later}这条没发出去。）`,
+        `（你设的时长 ${n} TU 太夸张了，${verb}只要几秒到几十秒（上限 ${cap} TU）。${later}重新来。）`,
+        `（${n} TU 远超${verb}该有的长度（上限 ${cap} TU）。${later}消息没有发出。）`,
+        `（这个 duration（${n} TU）不像${verb}，倒像在磨洋工。上限 ${cap} TU。${later}没发。）`,
+        `（${verb}不必 ${n} TU 这么久，顶多 ${cap} TU。${later}这次被拦下，请改正。）`,
+        `（时长 ${n} TU 超出上限 ${cap} TU，${call.name} 没有执行。${later}重新给个合理时长。）`,
+      ]),
       { ref: call.id },
     );
     return true;
@@ -1980,9 +2023,18 @@ export class BotAgent {
     if (longLimit > 0 && msg.length > longLimit && !isTruthy(call.arguments.confirm_long)) {
       this.pushEvent(
         "system",
-        `（这条消息长达 ${msg.length} 字，没有发出。日常聊天中一条消息一般只有十来个字，` +
-          `太长会显得不像真人——建议精简，或拆成几条短消息分开发。` +
-          `如果你确实要一次性发送长内容（如资料、长文），请在参数里加上 confirm_long: true 再发一次。）`,
+        pickMeta([
+          `（这条消息长达 ${msg.length} 字，没有发出。日常聊天中一条消息一般只有十来个字，太长会显得不像真人——建议精简，或拆成几条短消息分开发。如果你确实要一次性发送长内容（如资料、长文），请在参数里加上 confirm_long: true 再发一次。）`,
+          `（${msg.length} 字太长了，没发出去。真人聊天都是短句，这么一大段会穿帮。精简一下或拆成几句；真要发长文就加 confirm_long: true。）`,
+          `（这条有 ${msg.length} 字，被拦下了。一口气甩这么长不像在聊天，拆短一点更像真人。确需整段长文时加 confirm_long: true。）`,
+          `（你这条消息 ${msg.length} 字，超出了日常聊天的分寸，没发出。日常一句也就十来字——拆开说吧；发资料长文才加 confirm_long: true。）`,
+          `（${msg.length} 字，太长了，这次没发。像在念稿而不是聊天。精简成几句，或确需发长文就 confirm_long: true。）`,
+          `（这条消息被截住了：${msg.length} 字，日常聊天不会一次说这么多。拆成短句逐条发；真发长文加 confirm_long: true。）`,
+          `（一条 ${msg.length} 字的长消息，没发。太不像真人在群里聊天了。建议拆开；确需长文才 confirm_long: true。）`,
+          `（这条长文（${msg.length} 字）没有发出。短消息更自然。要么精简、要么拆条；坚持发长文就加 confirm_long: true。）`,
+          `（${msg.length} 字的消息被拦下了。正常人不会一口气打这么多。拆成几条吧；确需整段发，加 confirm_long: true。）`,
+          `（这条消息 ${msg.length} 字，超出常理了。先按住没发。缩短、拆分，或确实要发整段长文就加 confirm_long: true 再试。）`,
+        ]),
         { ref: call.id },
       );
       return;
@@ -2295,8 +2347,14 @@ export class BotAgent {
             "你小憩了一会儿，回过神来。",
             "你打了个盹，慢慢醒转过来。",
             "你眯了一小会儿，重新打起了精神。",
+            "你闭目养神片刻，又清醒了。",
+            "你短暂地歇了一下，慢慢回神。",
+            "你合眼打了个小盹，睡意消散了。",
+            "你歇了歇，精神头又回来了。",
+            "你小睡片刻，重新睁开了眼。",
+            "你打了个短短的盹，缓过来了。",
+            "你眯眼休息了一会儿，恢复了神采。",
           ],
-          n,
         );
         return (
           `${napWake}当前 ${this.clock.timeLine()}` +
@@ -2388,8 +2446,14 @@ export class BotAgent {
         `你休息了一会儿，过去了 ${elapsedTU.toFixed(1)} 个 TU。休息让你的头脑更清明了些，近来的经历沉淀成了记忆。当前 ${this.clock.timeLine()}`,
         `你从休息中转醒，这一觉过去了 ${elapsedTU.toFixed(1)} 个 TU。思绪清爽了不少，之前的经历也慢慢沉淀下来了。当前 ${this.clock.timeLine()}`,
         `休息结束，你回过神来，已经过去了 ${elapsedTU.toFixed(1)} 个 TU。头脑更清醒了，近来的见闻沉淀进了记忆。当前 ${this.clock.timeLine()}`,
+        `你醒了，这一歇过去了 ${elapsedTU.toFixed(1)} 个 TU。之前的疲惫散了不少，记忆也更清楚了。当前 ${this.clock.timeLine()}`,
+        `休息告一段落，${elapsedTU.toFixed(1)} 个 TU 过去了。你觉得自己精神多了，过去的事理得更顺。当前 ${this.clock.timeLine()}`,
+        `你缓缓睁眼，休息了 ${elapsedTU.toFixed(1)} 个 TU。脑海清明，近来的经历已经妥帖地收进了记忆。当前 ${this.clock.timeLine()}`,
+        `这一觉睡了 ${elapsedTU.toFixed(1)} 个 TU，你恢复过来了。心绪沉静，往事的脉络也更清晰。当前 ${this.clock.timeLine()}`,
+        `休息之后，${elapsedTU.toFixed(1)} 个 TU 已经过去。你神清气爽，前段经历沉淀了下来。当前 ${this.clock.timeLine()}`,
+        `你从长眠里醒来，休息了 ${elapsedTU.toFixed(1)} 个 TU。头脑清爽，近期的见闻都归整好了。当前 ${this.clock.timeLine()}`,
+        `休息结束，${elapsedTU.toFixed(1)} 个 TU 一晃而过。你的思路更清楚，记忆也更扎实了。当前 ${this.clock.timeLine()}`,
       ],
-      elapsedTU,
     );
     this.pushEvent(
       "system",
@@ -2540,10 +2604,19 @@ export function sendBusyMessage(pending: ToolCallRecord[]): string | null {
       : first.name === "send_voice"
         ? String(first.arguments.text ?? "").trim()
         : String(first.arguments.file ?? "").trim();
-  return (
-    `（你上一条消息${preview ? `「${truncate(preview, 40)}」` : ""}还在发送中、还没看到结果，` +
-    `这次没有发出。等它的结果回显后再接着说——可以先做点别的，或整理一下接下来想说的话。）`
-  );
+  const what = preview ? `「${truncate(preview, 40)}」` : "";
+  return pickMeta([
+    `（你上一条消息${what}还在发送中、还没看到结果，这次没有发出。等它的结果回显后再接着说——可以先做点别的，或整理一下接下来想说的话。）`,
+    `（你上一条${what}还没发出去，又急着发新的了？先等等，看到上一条的结果再继续，别抢话。）`,
+    `（上一条${what}还在路上，这条先别发。等它尘埃落定，再想下一句。）`,
+    `（你刚才那条${what}还没回显，这一条被拦下了。慢慢来，一句一句说。）`,
+    `（别急，上一条${what}还没发完。等它真正发出、看到结果，再开口说下一步。）`,
+    `（你连着要发两条，可上一条${what}都还没见着影。先等上一条落地。）`,
+    `（上一条${what}仍在发送中，这次没有发出。等回显了你再继续，别自说自话。）`,
+    `（你上一条消息${what}还没看到结果，这条就没发出去。先确认上一条，再接着说。）`,
+    `（前一条${what}还没发出，这条先收住。等看到结果再推进对话。）`,
+    `（上一条${what}仍在途中，这条不急着发。喘口气，等上一条到位。）`,
+  ]);
 }
 
 function clampInt(value: unknown, min: number, max: number, fallback: number): number {
