@@ -53,6 +53,10 @@ export interface RepeatGuardConfig {
   exclude: string[];
   /** 详细提醒里参数预览的字符上限（防止大 payload 无限进入下一次请求） */
   argumentsPreviewChars: number;
+  /** 交替循环检测：窗口内序列以某个短周期重复这么多轮才判定为循环（默认 3） */
+  cycleRepeatMin?: number;
+  /** 交替循环检测的最大周期长度（默认 3，覆盖 act↔wait 两元循环与 act↔wait↔x 三元循环） */
+  cycleMaxPeriod?: number;
 }
 
 /** 温和首阈值提醒（不点名工具与参数） */
@@ -73,6 +77,16 @@ function detailedReminder(toolName: string, count: number, canonicalArguments: s
     `- 参数：${preview}\n` +
     `这些重复调用没有在推进进度。不要再用这组参数调用这个工具；请查看最新一次结果，` +
     `换一个动作、换一组参数，或在证据已足够时结束当前任务。`
+  );
+}
+
+/** 交替循环提醒：点明这是一段周期性反复、没有新结果的循环 */
+function cycleReminder(pattern: string[], periods: number): string {
+  const seq = pattern.join(" → ");
+  return (
+    `检测到你在反复执行同一组动作：${seq}（这一组动作已连续重复了 ${periods} 轮，每轮完全相同）。` +
+    `你陷入了循环——没有任何新结果、没有任何进展。请立即停下这个模式：` +
+    `换一件完全不同的事情做，或者如果手头的事其实已经做完，就明确收尾，不要再重复这一组动作。`
   );
 }
 
@@ -102,6 +116,12 @@ export class RepeatGuard {
   private excludePatterns: RegExp[];
   private argumentsPreviewChars: number;
   private chain: Chain | null = null;
+  /** 交替循环检测：最近被 track 的调用键（归一化）滚动窗口，用于识别周期性反复 */
+  private window: string[] = [];
+  private cycleRepeatMin: number;
+  private cycleMaxPeriod: number;
+  /** 上一次循环提醒时的窗口快照，避免同一个循环每来一次就重复提醒刷屏 */
+  private lastCycleSignature: string | null = null;
 
   constructor(config: RepeatGuardConfig) {
     this.thresholds = validateThresholds(config.thresholds);
@@ -110,6 +130,8 @@ export class RepeatGuard {
     this.includePatterns = config.include.map(wildcardToRegExp);
     this.excludePatterns = config.exclude.map(wildcardToRegExp);
     this.argumentsPreviewChars = config.argumentsPreviewChars;
+    this.cycleRepeatMin = config.cycleRepeatMin ?? 3;
+    this.cycleMaxPeriod = config.cycleMaxPeriod ?? 3;
   }
 
   /** 该工具是否参与链（exclude/include 判定） */
@@ -119,14 +141,22 @@ export class RepeatGuard {
   }
 
   /**
-   * 观察一次工具调用，推进链计数；命中阈值时返回提醒文本，否则返回 null。
+   * 观察一次工具调用，推进链计数与交替循环检测；命中时返回提醒文本，否则返回 null。
    * 被拦截/拒绝（denied）的调用也走这里——模型反复撞被拒的调用，正是最该打断的循环。
    */
   observe(call: ToolCallRecord): string | null {
-    if (this.thresholds.length === 0) return null;
-    if (!this.tracked(call.name)) return null;
     const canonical = canonicalizeArgs(call.arguments ?? {});
     const key = JSON.stringify([call.name, canonical]);
+
+    // —— 交替循环检测（跨工具周期性反复，如 act↔wait）——
+    // 单工具连续计数无效的场景：两个工具交替，每个工具的连续计数都被对方重置。
+    // 窗口记录**所有**工具调用（含 wait/rest 这类"呼吸间隙"），因为交替循环正是由
+    // "动作工具 + 计时工具" 成对反复构成；只有单工具连续计数才用 tracked() 过滤。
+    const cycleNotice = this.pushWindowAndDetectCycle(key);
+    if (cycleNotice) return cycleNotice;
+
+    if (this.thresholds.length === 0) return null;
+    if (!this.tracked(call.name)) return null;
     const count = this.chain !== null && this.chain.key === key ? this.chain.count + 1 : 1;
     this.chain = { key, count };
     if (!this.thresholdSet.has(count)) return null;
@@ -134,8 +164,65 @@ export class RepeatGuard {
     return detailedReminder(call.name, count, canonical, this.argumentsPreviewChars);
   }
 
+  /** 推进滚动窗口，检测短周期反复；命中返回循环提醒，否则 null */
+  private pushWindowAndDetectCycle(key: string): string | null {
+    this.window.push(key);
+    const maxLen = this.cycleMaxPeriod * this.cycleRepeatMin;
+    if (this.window.length > maxLen) this.window = this.window.slice(this.window.length - maxLen);
+    const n = this.window.length;
+    // 尝试周期 p：窗口末尾至少要有 p*cycleRepeatMin 条，且这些条目是「前 p 条」的精确重复
+    for (let p = 1; p <= this.cycleMaxPeriod; p++) {
+      const need = p * this.cycleRepeatMin;
+      if (n < need) continue;
+      // 检查末尾 need 条是否 = 周期 p 的模式重复 cycleRepeatMin 次
+      let ok = true;
+      for (let r = 1; r < this.cycleRepeatMin && ok; r++) {
+        for (let k = 0; k < p; k++) {
+          if (this.window[n - need + r * p + k] !== this.window[n - need + k]) {
+            ok = false;
+            break;
+          }
+        }
+      }
+      if (!ok) continue;
+      // 命中了：取该周期内的键名（去重后按出现顺序）作为提醒里的「那组动作」
+      const pattern = this.window.slice(n - need, n - need + p).map(extractName);
+      // 签名用「旋转归一的周期模式」——act,wait 循环无论从哪个相位截取，
+      // 归一后签名一致，避免滚窗每滑一格就换相位、导致同一循环反复刷屏。
+      const rawPattern = this.window.slice(n - need, n - need + p);
+      const signature = canonicalCycle(rawPattern);
+      if (signature === this.lastCycleSignature) return null; // 同一个循环不重复刷屏
+      this.lastCycleSignature = signature;
+      return cycleReminder(pattern, this.cycleRepeatMin);
+    }
+    return null;
+  }
+
   /** 用户/外部新一轮输入到来时重置链（对应 dsh 的 agent/pre-step 重置） */
   reset(): void {
     this.chain = null;
+    this.window = [];
+    this.lastCycleSignature = null;
   }
+}
+
+/** 从「name + canonical」归一键里抽出工具名 */
+function extractName(key: string): string {
+  try {
+    const arr = JSON.parse(key) as [string, string];
+    return arr[0];
+  } catch {
+    return key;
+  }
+}
+
+/** 把一个周期模式旋转到字典序最小的相位，作为相位无关的循环签名 */
+function canonicalCycle(pattern: string[]): string {
+  if (pattern.length === 0) return "";
+  let best = pattern.join("\u0000");
+  for (let i = 1; i < pattern.length; i++) {
+    const rotated = [...pattern.slice(i), ...pattern.slice(0, i)].join("\u0000");
+    if (rotated < best) best = rotated;
+  }
+  return best;
 }

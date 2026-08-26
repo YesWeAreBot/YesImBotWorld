@@ -229,6 +229,11 @@ export class BotAgent {
       exclude: config.bot.repeatExclude ?? ["rest", "wait"],
       argumentsPreviewChars: 500,
     });
+    this.logger.info(
+      "[repeatGuard] thresholds=%s exclude=%s",
+      JSON.stringify(config.bot.repeatThresholds ?? [3, 5, 8]),
+      JSON.stringify(config.bot.repeatExclude ?? ["rest", "wait"]),
+    );
     // 原生声明用全量内置工具（稳定，不随界面状态变）；允许集另行按分层控制
     this.backend = createBackend(config.bot, this.layerNames("core"), this.toolDefs);
     this.scheduler = new Scheduler(
@@ -1454,7 +1459,7 @@ export class BotAgent {
           this.pushEvent(
             "system",
             `（最近 ${windowTU} TU 里，你有 ${Math.round(waited)} TU（${rate}%）都在干等——这次等待没有开始。${confirmNote}` +
-              `等待不会让生活自己发生：act 做点什么、翻翻手机消息、打开某个应用、写写笔记，都比干等强。` +
+              `你最近大部分时间都在空等，这样不会有任何进展。去看点新东西、找点真正想做的事，或暂时放下手机做点别的实际的事。` +
               `想清楚确实无事可做的话，紧接着再调用一次 wait 并带上 confirm: true。）`,
             { ref: call.id },
           );
@@ -2335,15 +2340,17 @@ export function repeatingActMessage(sig: string, repeatCount: number, callId: st
   );
 }
 
-/** 依据连续重复次数，生成越来越直白的"别重复"提示（空串 = 无需额外加压） */
+/** 依据连续重复次数，生成越来越直白的"别重复"提示（空串 = 无需额外加压）。
+ *  刻意不指向任何具体替代动作（不暗示 wait、不暗示 act），避免与其它拦截互相推诿、
+ *  把模型逼进「act 被拦→去 wait、wait 被拦→去 act」的死循环。 */
 function escalatingRepeatHint(repeatCount: number): string {
   if (repeatCount >= 4) {
-    return `这已经是你连续第 ${repeatCount} 次重复发起同一个动作了——它既不会因此变快，也不会重复执行；请停止重复提交，转去做别的或安心等它结算`;
+    return `这已经是你连续第 ${repeatCount} 次重复发起同一个动作了——它既不会因此变快，也不会重复执行；请停止重复提交同一个动作`;
   }
   if (repeatCount >= 2) {
-    return `这是你第 ${repeatCount} 次重复发起同一动作——不必再重复，也先别急着做别的事`;
+    return `这是你第 ${repeatCount} 次重复发起同一动作——不必再重复，它已经在进行中了`;
   }
-  return "现在不用急着接着做什么，也别自己去叙述这件事的结果，耐心等它的结果送达，然后再考虑下一步";
+  return "它已经在进行中了，结果会自动送达，不用再发起一次";
 }
 
 /** send 系工具（send/send_file/send_voice）的名字集合 */
