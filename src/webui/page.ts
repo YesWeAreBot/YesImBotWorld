@@ -1665,7 +1665,6 @@ function loadPlayer(){
     holder.appendChild(el('p', {cls:'empty', text:'（无法加载世界状态，请检查世界是否已初始化。）'}));
   });
 }
-}
 
 function playerProfileForm(done){
   var nameInp = el('input', {placeholder:'角色名（世界里的身份）', style:'width:100%'});
