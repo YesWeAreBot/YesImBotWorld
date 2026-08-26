@@ -152,6 +152,12 @@ export class BotAgent {
   /** 上一次 act 的描述与调用编号，用于拦截“结果未出就重复做同一件事” */
   private lastAct: { sig: string; callId: string } | null = null;
   /**
+   * 连续重复提交同一 act 的拦截计数：sig 相同则递增，不同或已交付/完成则清零。
+   * 用于拦截提示的递进式加压（第 1 次温和提醒 → 多次后明确警告别再重复），
+   * 让模型在同一个上下文里不再原地打转。
+   */
+  private lastActBlock: { sig: string; count: number } | null = null;
+  /**
    * 已完成的等待区间（世界 TU，被打断的按实际时长计），用于"等待时长占比过高"的拦截。
    * 少量多次的短等是正常的；要治的是「几乎全部时间都在干等」——所以按时长不按次数。
    */
@@ -392,7 +398,10 @@ export class BotAgent {
       if (kind !== "nap" && startedTU !== undefined) this.recordWait(startedTU);
       this.mailbox.push({
         source: "system",
-        content: kind === "nap" ? "动静把你从小憩中弄醒了。" : "你的等待被打断了。",
+        content:
+          kind === "nap"
+            ? pickMeta(["动静把你从小憩中弄醒了。", "一点动静把你从浅睡里惊醒了。", "你被一阵动静叫醒，睁开了眼。"])
+            : pickMeta(["你的等待被打断了。", "你等的空当被打断了。", "没等到头，你被别的事打断了。"], this.lastGenAt),
         refToolCallId: callId,
         worldTime: this.clock.now(),
       });
@@ -1481,9 +1490,13 @@ export class BotAgent {
     // blockingAct：一个人同时只能专注做一件事。上一个动作还没完成时，新的 act 直接拒绝并提示，
     // 不调用 World-LLM 裁定；也不像 repeat 那样给 Bot 留绕过口（专注模式不可无视）。
     if (this.config.bot.blockingAct) {
-      const busy = actBusyMessage(this.scheduler.pendingByName("act"));
-      if (busy) {
-        this.pushEvent("system", busy, { ref: call.id });
+      const pendingActs = this.scheduler.pendingByName("act");
+      if (pendingActs.length) {
+        this.pushEvent(
+          "system",
+          actBusyMessage(pendingActs, this.bumpActBlock(desc))!,
+          { ref: call.id },
+        );
         return;
       }
     }
@@ -1495,15 +1508,16 @@ export class BotAgent {
       this.scheduler.isPending(this.lastAct.callId) &&
       !isTruthy(call.arguments.repeat)
     ) {
+      const n = this.bumpActBlock(sig);
       this.pushEvent(
         "system",
-        `（你已经在做这件事了（${this.lastAct.callId}），它还在进行中，这次没有重复开始——` +
-          `它的结果会自动以事件的形式送到你这里。如果确实要同时再做一遍同样的事，请在参数里加上 repeat: true。）`,
+        repeatingActMessage(sig, n, this.lastAct.callId),
         { ref: call.id },
       );
       return;
     }
     this.lastAct = { sig, callId: call.id };
+    this.lastActBlock = null; // 成功发起（或重置）一个 act，重复计数归零
     this.ackStart(call);
     this.scheduler.schedule(call, {
       executeAt: "now", // 世界立刻开始裁定；结果压到期望完成时刻交付
@@ -1524,6 +1538,20 @@ export class BotAgent {
         return text;
       },
     });
+  }
+
+  /**
+   * 记录并返回「连续重复提交同一 act」的当前次数。
+   * sig 与上一次被拦截的相同则递增，否则从 1 起算；供拦截提示做递进式加压。
+   */
+  private bumpActBlock(sig: string): number {
+    const key = sig.trim();
+    if (this.lastActBlock?.sig === key) {
+      this.lastActBlock = { sig: key, count: this.lastActBlock.count + 1 };
+    } else {
+      this.lastActBlock = { sig: key, count: 1 };
+    }
+    return this.lastActBlock.count;
   }
 
   /** open_app：打开聊天平台 = 看一眼最近消息；打开其他 App = 展开其工具 */
@@ -2079,10 +2107,21 @@ export class BotAgent {
     this.waiting = { callId: call.id, kind: "nap" };
     this.scheduler.schedule(call, {
       executeAt: "expected",
-      run: async () =>
-        `你小憩了一会儿，回过神来。当前 ${this.clock.timeLine()}` +
-        `（这只是打个盹——你的经历还不算多，还没到需要沉淀记忆的程度；` +
-        `等真正疲惫（意识流冗长）时，rest 才会整理思绪、把经历沉淀为记忆。）`,
+      run: async () => {
+        const napWake = pickMeta(
+          [
+            "你小憩了一会儿，回过神来。",
+            "你打了个盹，慢慢醒转过来。",
+            "你眯了一小会儿，重新打起了精神。",
+          ],
+          n,
+        );
+        return (
+          `${napWake}当前 ${this.clock.timeLine()}` +
+          `（这只是打个盹——你的经历还不算多，还没到需要沉淀记忆的程度；` +
+          `等真正疲惫（意识流冗长）时，rest 才会整理思绪、把经历沉淀为记忆。）`
+        );
+      },
     });
   }
 
@@ -2154,10 +2193,19 @@ export class BotAgent {
     const closedNotes: string[] = [];
     if (closedApp || chatWasOpen) closedNotes.push(`「${closedApp ?? "聊天应用"}」已经自动关闭`);
     if (computerWasOn) closedNotes.push("电脑已经自动关机");
+    // 休息结束的"回过神来"寒暄：多套语义等价措辞随机，用 elapsedTU 做种子——既打破"每次同一句"的循环感，
+    // 又不触碰事实部分（过去了多少 TU、当前时间、哪些东西关了）——那些必须原样、准确。
+    const restWake = pickMeta(
+      [
+        `你休息了一会儿，过去了 ${elapsedTU.toFixed(1)} 个 TU。休息让你的头脑更清明了些，近来的经历沉淀成了记忆。当前 ${this.clock.timeLine()}`,
+        `你从休息中转醒，这一觉过去了 ${elapsedTU.toFixed(1)} 个 TU。思绪清爽了不少，之前的经历也慢慢沉淀下来了。当前 ${this.clock.timeLine()}`,
+        `休息结束，你回过神来，已经过去了 ${elapsedTU.toFixed(1)} 个 TU。头脑更清醒了，近来的见闻沉淀进了记忆。当前 ${this.clock.timeLine()}`,
+      ],
+      elapsedTU,
+    );
     this.pushEvent(
       "system",
-      `你休息了一会儿，过去了 ${elapsedTU.toFixed(1)} 个 TU。休息让你的头脑更清明了些，近来的经历沉淀成了记忆。当前 ${this.clock.timeLine()}` +
-        (closedNotes.length ? `（休息前开着的${closedNotes.join("，")}）` : ""),
+      restWake + (closedNotes.length ? `（休息前开着的${closedNotes.join("，")}）` : ""),
       { ref: call?.id },
     );
     this.logger.info("休息结束，耗时 %s 秒，新上下文约 %d 字符", ((Date.now() - startReal) / 1000).toFixed(1), this.context.approxChars());
@@ -2190,19 +2238,61 @@ function toPlainText(content: string | RichText): string {
 }
 
 /**
+ * 从多套**语义等价**的元话语里随机挑一套。
+ * 只用于非事实性的寒暄/告警/提示语——承载事实或世界裁定的返回（状态、时间、act 结果、recall）
+ * 一律不能用它随机，否则会让模型误以为状态在变、产生幻觉或漂移。
+ * 用时间戳等易变内容做随机种子可避免"每次醒来同一套话"的循环感，又保持确定性可复现。
+ */
+function pickMeta(variants: string[], seed?: number): string {
+  if (variants.length <= 1) return variants[0] ?? "";
+  const n = Number.isFinite(seed) ? Math.abs(Math.floor(seed as number)) : Math.floor(Math.random() * 0x7fffffff);
+  return variants[n % variants.length]!;
+}
+
+/**
  * blockingAct 专注模式的拦截提示：存在未完成的 act 时返回提示文本（Bot 不可绕过），否则返回 null。
  * 供 dispatchAct 使用，也便于冒烟测试覆盖。
  * 措辞纯正面、不点名任何工具：负面指令（"不要 act"）反而会强化模型对 act 的倾向，
  * 也不指定 "等" 等具体动作，避免把复读通成另一种路径依赖。
+ *
+ * repeatCount 为连续重复提交同一动作的次数（可选，默认 1）：重复次数越多，提示越明确地
+ * 压下"继续重复"的冲动——递进式加压，避免温和的固定文案在长上下文里被模型无视而原地打转。
  */
-export function actBusyMessage(pendingActs: ToolCallRecord[]): string | null {
+export function actBusyMessage(
+  pendingActs: ToolCallRecord[],
+  repeatCount: number = 1,
+): string | null {
   if (!pendingActs.length) return null;
   const pdesc = String(pendingActs[0]?.arguments.description ?? "").trim();
+  const what = pdesc ? `「${truncate(pdesc, 60)}」` : "上一件事";
+  const escalate = escalatingRepeatHint(repeatCount);
+  return `（你正在做${what}，它还在进行中，结果会自动以事件的形式送到你这里。${escalate}。）`;
+}
+
+/**
+ * 相同动作未出结果就再次提交的拦截提示（非 blockingAct 的"上一件完全相同的事"拦截）。
+ * repeatCount 为连续重复次数，用于递进式加压。
+ */
+export function repeatingActMessage(sig: string, repeatCount: number, callId: string): string {
+  const what = sig ? `「${truncate(sig, 48)}」` : "这件事";
+  const escalate = escalatingRepeatHint(repeatCount);
+  // 只在重复次数还少时提示 repeat 绕过口；一旦连续重复多次，就不再给绕过口（避免模型借此破防）
+  const bypass = repeatCount < 4 ? "确实要同时再做一遍同样的事时，再在参数里加 repeat。" : "";
   return (
-    `（你正在做${pdesc ? `「${truncate(pdesc, 60)}」` : "上一件事"}，它还在进行中，` +
-    `结果会自动以事件的形式送到你这里。现在不用急着接着做什么，也别自己去叙述这件事的结果——` +
-    `耐心等它的结果送达，然后再考虑下一步。）`
+    `（你已经在做${what}了（${callId}），它还在进行中，这次没有重复开始；` +
+    `结果会自动以事件的形式送到你这里。${escalate}。${bypass}）`
   );
+}
+
+/** 依据连续重复次数，生成越来越直白的"别重复"提示（空串 = 无需额外加压） */
+function escalatingRepeatHint(repeatCount: number): string {
+  if (repeatCount >= 4) {
+    return `这已经是你连续第 ${repeatCount} 次重复发起同一个动作了——它既不会因此变快，也不会重复执行；请停止重复提交，转去做别的或安心等它结算`;
+  }
+  if (repeatCount >= 2) {
+    return `这是你第 ${repeatCount} 次重复发起同一动作——不必再重复，也先别急着做别的事`;
+  }
+  return "现在不用急着接着做什么，也别自己去叙述这件事的结果，耐心等它的结果送达，然后再考虑下一步";
 }
 
 /** send 系工具（send/send_file/send_voice）的名字集合 */
