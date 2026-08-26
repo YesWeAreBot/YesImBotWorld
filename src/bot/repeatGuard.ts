@@ -104,9 +104,21 @@ function validateThresholds(values: number[]): number[] {
   return [...values].sort((a, b) => a - b);
 }
 
+/** 观察结果：是否触发提醒 + 被重复的工具名 + 重复程度（供 agent 决定「仅提醒/移除工具/强制 rest」） */
+export interface ObserveResult {
+  /** 提醒文本（命中阈值时才有；未命中但计数仍在累加时为 null） */
+  notice: string | null;
+  /** 本次被判定为重复的工具名 */
+  toolName: string;
+  /** 单工具链的当前连续计数 */
+  count: number;
+  /** 是否是交替循环（而非单工具重复） */
+  cycle: boolean;
+}
+
 /**
  * 一个 Bot 的防重复守卫。每个 BotAgent 持有一个实例；
- * 每观察到一次工具调用调用 observe()，返回「是否该注入提醒 + 提醒文本」。
+ * 每观察到一次工具调用调用 observe()，返回「是否该注入提醒 + 被重复的工具 + 程度」。
  */
 export class RepeatGuard {
   private thresholds: number[];
@@ -141,37 +153,43 @@ export class RepeatGuard {
   }
 
   /**
-   * 观察一次工具调用，推进链计数与交替循环检测；命中时返回提醒文本，否则返回 null。
+   * 观察一次工具调用，推进链计数与交替循环检测；返回结构化结果（被排除的工具返回 null）。
+   * notice 仅在命中提醒阈值/检出循环时为非 null；count 始终反映当前连续计数，
+   * 供调用方（breakLoop）独立判定「达到多高就该移除工具/强制 rest」，不必绑定提醒阈值点。
    * 被拦截/拒绝（denied）的调用也走这里——模型反复撞被拒的调用，正是最该打断的循环。
    */
-  observe(call: ToolCallRecord): string | null {
+  observe(call: ToolCallRecord): ObserveResult | null {
     const canonical = canonicalizeArgs(call.arguments ?? {});
     const key = JSON.stringify([call.name, canonical]);
 
-    // —— 交替循环检测（跨工具周期性反复，如 act↔wait）——
-    // 单工具连续计数无效的场景：两个工具交替，每个工具的连续计数都被对方重置。
-    // 窗口记录**所有**工具调用（含 wait/rest 这类"呼吸间隙"），因为交替循环正是由
-    // "动作工具 + 计时工具" 成对反复构成；只有单工具连续计数才用 tracked() 过滤。
+    // —— 交替循环检测（跨工具周期性反复，如 act↔wait，从周期 p=2 起）——
     const cycleNotice = this.pushWindowAndDetectCycle(key);
-    if (cycleNotice) return cycleNotice;
+    if (cycleNotice) {
+      return { notice: cycleNotice, toolName: call.name, count: 0, cycle: true };
+    }
 
     if (this.thresholds.length === 0) return null;
     if (!this.tracked(call.name)) return null;
     const count = this.chain !== null && this.chain.key === key ? this.chain.count + 1 : 1;
     this.chain = { key, count };
-    if (!this.thresholdSet.has(count)) return null;
-    if (count === this.firstThreshold) return GENTLE_REMINDER;
-    return detailedReminder(call.name, count, canonical, this.argumentsPreviewChars);
+    const notice = !this.thresholdSet.has(count)
+      ? null
+      : count === this.firstThreshold
+        ? GENTLE_REMINDER
+        : detailedReminder(call.name, count, canonical, this.argumentsPreviewChars);
+    return { notice, toolName: call.name, count, cycle: false };
   }
 
-  /** 推进滚动窗口，检测短周期反复；命中返回循环提醒，否则 null */
+  /** 推进滚动窗口，检测「交替循环」；命中返回循环提醒，否则 null。
+   *  只从周期 p=2 起检测——p=1 的「连续相同工具」交给单工具链计数（带参数详细提醒），
+   *  这里专治两个或更多工具交替反复的循环（单工具链识别不了的那种）。 */
   private pushWindowAndDetectCycle(key: string): string | null {
     this.window.push(key);
     const maxLen = this.cycleMaxPeriod * this.cycleRepeatMin;
     if (this.window.length > maxLen) this.window = this.window.slice(this.window.length - maxLen);
     const n = this.window.length;
-    // 尝试周期 p：窗口末尾至少要有 p*cycleRepeatMin 条，且这些条目是「前 p 条」的精确重复
-    for (let p = 1; p <= this.cycleMaxPeriod; p++) {
+    // 尝试周期 p（从 2 起）：窗口末尾至少要有 p*cycleRepeatMin 条，且这些条目是「前 p 条」的精确重复
+    for (let p = 2; p <= this.cycleMaxPeriod; p++) {
       const need = p * this.cycleRepeatMin;
       if (n < need) continue;
       // 检查末尾 need 条是否 = 周期 p 的模式重复 cycleRepeatMin 次
@@ -186,10 +204,13 @@ export class RepeatGuard {
       }
       if (!ok) continue;
       // 命中了：取该周期内的键名（去重后按出现顺序）作为提醒里的「那组动作」
-      const pattern = this.window.slice(n - need, n - need + p).map(extractName);
+      const rawPattern = this.window.slice(n - need, n - need + p);
+      // 要求周期内的键「不完全相同」——若全相同（如 act,act 伪装成周期 2），
+      // 那是连续同工具、归单工具链计数，不是真正的交替循环。
+      if (new Set(rawPattern).size < 2) continue;
+      const pattern = rawPattern.map(extractName);
       // 签名用「旋转归一的周期模式」——act,wait 循环无论从哪个相位截取，
       // 归一后签名一致，避免滚窗每滑一格就换相位、导致同一循环反复刷屏。
-      const rawPattern = this.window.slice(n - need, n - need + p);
       const signature = canonicalCycle(rawPattern);
       if (signature === this.lastCycleSignature) return null; // 同一个循环不重复刷屏
       this.lastCycleSignature = signature;

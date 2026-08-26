@@ -4,7 +4,7 @@ import type { AppManager } from "../apps/manager.js";
 import type { WorldClock } from "../clock.js";
 import { needsMsgIds, type Config } from "../config.js";
 import type { WorldFiles } from "../files.js";
-import { RepeatGuard } from "./repeatGuard.js";
+import { RepeatGuard, type ObserveResult } from "./repeatGuard.js";
 import { ToolCallParseError } from "../llm/parse.js";
 import type { BotEvent, CompressionResult, EventSource, MediaRef, ParsedToolCall, PhoneStatus, RichText, RichTextPart, ToolCallRecord } from "../types.js";
 import type { WorldAgent } from "../world/agent.js";
@@ -164,6 +164,13 @@ export class BotAgent {
    */
   private repeatGuard: RepeatGuard;
   /**
+   * 打破死循环的强制手段（breakLoop）：
+   * - tempBannedTools：被暂时移除的工具（下次压缩后自动恢复）；
+   * - forceRestCount：移除工具后仍在重复的累计次数，达到 breakLoopForceRestAt 时强制 rest。
+   */
+  private tempBannedTools = new Set<string>();
+  private forceRestCount = 0;
+  /**
    * 已完成的等待区间（世界 TU，被打断的按实际时长计），用于"等待时长占比过高"的拦截。
    * 少量多次的短等是正常的；要治的是「几乎全部时间都在干等」——所以按时长不按次数。
    */
@@ -282,7 +289,9 @@ export class BotAgent {
     }
     const appDefs = [...(this.apps?.activeToolDefs() ?? []), ...(this.computer?.activeToolDefs() ?? [])];
     names.push(...appDefs.map((d) => d.name));
-    this.backend.setToolNames(names);
+    // 打破死循环：临时禁用被判定为「反复调用」的工具（下次压缩后自然恢复）
+    const allowed = names.filter((n) => !this.tempBannedTools.has(n));
+    this.backend.setToolNames(allowed);
     this.backend.setToolDefs?.([...this.toolDefs, ...appDefs]);
   }
 
@@ -778,12 +787,13 @@ export class BotAgent {
   // ---------- 工具派发 ----------
 
   private async dispatch(call: ToolCallRecord): Promise<void> {
-    // 通用防重复守卫（advisory）：观察这次调用，连续重复达到阈值时注入提醒（不拦截，
-    // 决策权在模型）。放在 dispatch 最前，让所有工具——包括下面被目标误写/参数缺失拦截的
+    // 通用防重复守卫：观察这次调用，连续重复达到阈值时注入提醒。
+    // 放在 dispatch 最前，让所有工具——包括下面被目标误写/参数缺失拦截的
     // denied 调用——都计入链（模型反复撞被拒的调用，正是最该打断的循环）。
-    const repeatNotice = this.repeatGuard.observe(call);
-    if (repeatNotice) {
-      this.pushEvent("system", `（${repeatNotice}）`, { ref: call.id });
+    // 开启 breakLoop 时，除 advisory 提醒外还会真正干预：先移除被重复的工具，仍重复则强制 rest。
+    const repeat = this.repeatGuard.observe(call);
+    if (repeat) {
+      this.handleRepeat(call, repeat);
     }
     // 目标参数误写拦截（频道类工具）：Bot 幻觉出 OneBot API 风格的 detail/channel_id
     // 等写法且没给 id 时，绝不静默回退到当前频道（那会把消息发进无关频道）——
@@ -1642,6 +1652,51 @@ export class BotAgent {
   }
 
   /**
+   * 处理 repeatGuard 的观察结果：始终保留 advisory 提醒；开启 breakLoop 时进一步真正干预——
+   * 第一阶段移除被重复的工具（tempBannedTools，下次压缩后恢复），移除后仍重复则升级为强制压缩 rest。
+   * 这是对「纯 advisory 压不住持续自主运行的 Bot」的兜底：不依赖模型听从提醒，直接改变它的可用工具集。
+   */
+  private handleRepeat(call: ToolCallRecord, repeat: ObserveResult): void {
+    // advisory 提醒：命中阈值/检出循环时才有（未命中但计数仍在累加时静默）
+    if (repeat.notice) {
+      this.pushEvent("system", `（${repeat.notice}）`, { ref: call.id });
+    }
+
+    if (!this.config.bot.breakLoop) return;
+
+    const removeAt = this.config.bot.breakLoopRemoveToolAt ?? 0;
+    const restAt = this.config.bot.breakLoopForceRestAt ?? 0;
+
+    // 第一阶段：移除被重复的工具。用 repeat.count（连续计数）而非提醒阈值点判定，
+    // 这样 breakLoopRemoveToolAt 可以独立设成任意值（如 6），不依赖 thresholds=[3,5,8]。
+    // 交替循环（cycle）视为立即达到移除阈值——循环本身就是最该打断的形态。
+    if (removeAt > 0) {
+      const shouldRemove = repeat.cycle || repeat.count >= removeAt;
+      if (shouldRemove && !this.tempBannedTools.has(repeat.toolName) && !isBreakLoopSafeTool(repeat.toolName)) {
+        this.tempBannedTools.add(repeat.toolName);
+        this.refreshToolGate();
+        this.logger.warn("打破死循环：暂时移除反复调用的工具 %s（下次压缩后恢复）", repeat.toolName);
+        this.pushEvent(
+          "system",
+          `（你一直在反复调用 ${repeat.toolName}，它暂时不再可用了——先做点别的，或想清楚真正要做的事。）`,
+          { ref: call.id },
+        );
+        return; // 刚移除，不立即再升级 rest
+      }
+    }
+
+    // 第二阶段：工具已移除（或无需移除）仍在重复——累计至阈值后强制压缩 rest，把循环历史清掉。
+    if (restAt > 0) {
+      this.forceRestCount += 1;
+      if (this.forceRestCount >= restAt) {
+        this.forceRestCount = 0;
+        this.logger.warn("打破死循环：重复未缓解，强制执行带压缩的 rest");
+        void this.doRest(null, true);
+      }
+    }
+  }
+
+  /**
    * 工具结果溢出治理（spill/prune，对应 dsh 的 tool-result-pruner + spill-policy）：
    * 纯文本结果超过 spillMinChars 时，裁成「头部 + 省略标记 + 尾部」，全文 fire-and-forget 落盘到
    * <base>/spill/，模型上下文只保留裁剪预览。落盘失败静默降级为原样返回（不把成功的调用变成失败）。
@@ -2236,6 +2291,12 @@ export class BotAgent {
     await this.computer?.close().catch(() => null);
     const chatWasOpen = this.phoneUi.chatOpen;
     this.phoneUi = { chatOpen: false, channelKey: null, channelIsGroup: false, forwardStack: [] };
+    // 压缩后：被打破死循环而暂时移除的工具自然恢复（工具集与置顶列表在压缩时同步）
+    if (this.tempBannedTools.size) {
+      this.logger.info("rest 后恢复被暂时移除的工具：%s", [...this.tempBannedTools].join("、"));
+      this.tempBannedTools.clear();
+      this.forceRestCount = 0;
+    }
     this.refreshToolGate();
 
     // 醒来时刻更新为当前时间（这是 system 段时间唯一的合法更新时机——
@@ -2355,6 +2416,11 @@ function escalatingRepeatHint(repeatCount: number): string {
 
 /** send 系工具（send/send_file/send_voice）的名字集合 */
 const SEND_TOOL_NAMES = ["send", "send_file", "send_voice"];
+
+/** 打破死循环时不该被移除的"安全"工具：计时/书签类，移除它们反而会让模型无处安放、更疯狂 */
+function isBreakLoopSafeTool(name: string): boolean {
+  return name === "wait" || name === "rest" || name === "check_status" || name === "check_time";
+}
 
 /**
  * sendBlocking 阻塞模式：存在未完成（未回显）的 send 系调用时，返回提示文本，否则 null。

@@ -41,6 +41,12 @@ export interface BotModelConfig {
   repeatExclude: string[];
   /** 工具结果溢出治理：超此字符数的结果事件裁剪为 head/tail + 省略标记（spill 到磁盘） */
   spillMinChars: number;
+  /** 打断死循环的强制手段总开关（默认关）：检测到重复/循环时先移除被重复的工具，无效再强制压缩 rest */
+  breakLoop: boolean;
+  /** 连续重复达到多少次就移除被重复的工具（需 breakLoop 开启） */
+  breakLoopRemoveToolAt: number;
+  /** 移除工具后仍在重复，达到多少次就强制执行带压缩的 rest（需 breakLoop 开启） */
+  breakLoopForceRestAt: number;
   modalities: ModalitySupport;
   template: TextTemplateConfig;
 }
@@ -441,6 +447,22 @@ export const Config: Schema<Config> = Schema.intersect([
         .description(
           "工具结果溢出治理：单个结果事件超过该字符数时，裁成「头部 + 省略标记 + 尾部」并全文落盘（数据目录 spill/），" +
             "模型上下文里只保留裁剪预览——防止超大结果（长文、大列表）反复占据上下文窗口、加剧退化。0 表示禁用",
+        ),
+      breakLoop: Schema.boolean()
+        .default(false)
+        .description(
+          "打断死循环的强制手段（默认关闭）：检测到重复调用/交替循环达到阈值时，不再只是提醒，而是真正干预——" +
+            "先暂时移除被反复调用的工具，若仍在重复则强制执行一次带上下文压缩的 rest。移除的工具在下次压缩后自动恢复。",
+        ),
+      breakLoopRemoveToolAt: Schema.natural()
+        .default(6)
+        .description(
+          "连续重复达到这个次数时，暂时移除被反复调用的工具（如 act、send）。需 breakLoop 开启。0 表示永不移除、只强制 rest",
+        ),
+      breakLoopForceRestAt: Schema.natural()
+        .default(12)
+        .description(
+          "移除工具后仍在重复，累计达到这个次数时强制执行一次带压缩的 rest（清掉循环历史）。需 breakLoop 开启。0 表示永不强制 rest",
         ),
       modalities: Schema.object({
         image: Schema.boolean().default(false).description("模型原生支持图片输入"),
