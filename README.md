@@ -102,8 +102,81 @@ flowchart LR
 | `world.status` | 1 | 世界与 Bot 运行状态 |
 | `world.reload` | 3 | 修改定义文件后重载：World-LLM 调整状态，并以世界观内方式告知 Bot |
 | `world.inject <text>` | 3 | 注入一条系统事件（调试用，会唤醒等待中的 Bot） |
+| `world.travel <世界名\|home>` | 3 | 穿越：把 Bot 强制送往指定异世界（填 `home` 送回自己的世界）；不填列出可去世界 |
+| `world.webui` | 1 | 查看运维 WebUI 的访问地址（需已启用 `webui.enabled`） |
 | `world.clearmsg` | 4 | 只清空 Bot 的聊天消息记录（不影响世界状态与定义） |
 | `world.reset` | 4 | 归档并清空全部运行时状态（保留定义文件与固定的小事记） |
+
+## WebUI 访客模式（只读 · 多账号 · 分级授权）
+
+运维 WebUI 除了管理员（凭 `webui.token`）之外，还支持**访客账号**登录——给协作者/玩家一个**只读**视角（玩家档除外，见下文的「入世界」）。账号由管理员在 WebUI 里增删改，存 `<webuiDir>/visitors.json`。
+
+- **多账号 + 密码哈希**：每个账号独立用户名/密码（scrypt 加盐哈希，不存明文）；密码登录后派发**短期会话 token**（内存态，12 小时 TTL，重启失效）；
+- **权限实时生效**：会话只记账号 id，每次请求**实时从账号表刷新** grants/preset——管理员改权限或删账号，访客立即生效（删号即时失效）；
+- **档位（preset）**决定默认可见的数据块集合（也可逐项调整成 `custom`）：
+  - **operator（运维）**：全读（含 debug 原始请求/响应、config、prompts、usage），唯独默认**不看 bot_status**（运维员不看 Bot 人设/现状）；
+  - **viewer（观察者）**：读世界演化产物（world_status/bot_status/news/facts/stream/notes/gallery/media/archive/devices/crossing/overview），**不看** definitions/config/prompts/debug/usage；
+  - **player（玩家）**：只以「角色视角」入世界——看世界剧情（overview/world_status/news），不看 Bot 内心/状态/意识流/定义等内部；
+  - **custom（自定义）**：按 16 个 grants 块开关逐项控制（overview / world_status / bot_status / news / facts / stream / notes / gallery / archive / devices / crossing / definitions / config / prompts / debug / usage）；
+- **只读保证**：访客的写请求一律拒绝（服务端强制，不是靠前端藏按钮），唯独两类例外：
+  - 访客可改**自己的密码**；
+  - `player` 档账号可用 `/api/player/*` 执行自己的**入世界写操作**（arrive / task / leave）。
+
+## 穿越与真人入世界
+
+除了常驻 Bot 自己生活，世界还支持**双向互动**——Bot 穿越去别的世界作客，以及**真人**（或异世界 Bot）进来。
+
+```mermaid
+flowchart LR
+  subgraph host["我方世界（Host）"]
+    HOST["World-LLM<br/>裁定访客行动 / send_event to=访客"]
+    RES["常驻 Bot"]
+  end
+
+  subgraph peer["远方世界（Peer）"]
+    PEER["对方 World-LLM"]
+    PBOT["对方常驻 Bot"]
+  end
+
+  subgraph player["真人玩家"]
+    P1["player 档账号<br/>WebUI 入世界"]
+    P2["管理员<br/>接管 Bot（同名 avatar/puppet）"]
+  end
+
+  RES -- "travel / go_home<br/>（凭邀请码作客）" --> PEER
+  PBOT -- "凭我方邀请码到达" --> HOST
+  P1 -- "cross / avatar / puppet" --> HOST
+  P2 -- "扮演/操纵常驻 Bot" --> RES
+```
+
+### 联机穿越（`crossing.*`，Bot 到异世界作客 / 接待异世界 Bot）
+
+- **去作客**：`crossing.worlds` 填别人分享给你的邀请码 + 地址，Bot 便能用 `travel` 工具主动前往（或 `world.travel` 强制送去）；作客期间它的 act / wait / 看时间都由**对方 World-LLM** 裁定，自己的世界照常存在，`go_home` 返回；
+- **接待访客**：`crossing.serverEnabled` 开启后本世界起一个 HTTP + SSE 服务（`crossing.port`，默认 18112），持有你 `crossing.invites` 邀请码的异世界 Bot 可以凭码到达（`maxVisitors` 限制同时接待数，SSE 断线 180s 自动视为离开）；
+- **安全边界**：网络上只传任务与事件**文本**，**绝不传任何 LLM API 地址/密钥，也不暴露世界文件**——访客能「看到」的一切都经 World-LLM 生成；
+- **访客档案放置**（`crossing.visitorPersonaMode`）：`pinned`（默认）档案常驻系统提示、缓存命中最优；`check` 只放名单、World 用 `check_visitor` 按需查（省窗口，多一轮往返）。
+
+### 真人入世界（`player` 档账号）
+
+真人通过 WebUI 用一个 `player` 档账号登录，填**角色名 + 人设**后**进入世界**，以角色的身份与 Bot、与世界互动（`/api/player/*` 端点）。进入前选定**进入语义**（进入后不可改）：
+
+| 语义 | 说明 |
+|---|---|
+| **cross（穿越）** | 你的角色本不属于这个世界，从外界降临而来——一个外来访客 |
+| **avatar（扮演 / 入替）** | 完全接管世界里已有的某位角色，替它行动、以它的身份生活 |
+| **puppet（操纵）** | 只操纵已有角色的身体，角色仍保有自己的意识（身体可能不听使唤、有内心活动） |
+
+- 玩家提交行动（act）走 crossing 的 **visitorAct** 裁定（最高优先级，绝不被世界积压饿死）；离开时按语义分化处理：**cross** 的访客离开（身影消散/回家），**avatar/puppet** 的角色**归还世界**、由 World-LLM 继续演化后续；
+- **disambiguation**：创世时 World-LLM 从 `Bot_Definition` 判定常驻 Bot 的名字（持久化在 `meta.json`），后续所有世界/访客提示词都用 `{{botName}}` 硬区分「常驻 Bot vs 来访角色」，杜绝把两者混淆；`rename_bot` 工具可在世界观内改名（同步 meta），WebUI 状态页也可直接改；
+- **驱逐**（`expel_visitor` 工具）：世界可让访客"角色死亡/消散/升天"，切断其后续互动；被驱逐的玩家可用**新角色**重新进入。
+
+### 管理员接管 Bot（手动驾驶）
+
+管理员用**与常驻 Bot 同名**的角色进入世界，选择 `avatar`/`puppet`，即可**接管 Bot**：
+
+- **扮演（avatar）**：暂停 Bot 的自主思考，管理员代理它的**全部工具调用**（send / act / check_status / open_app / gallery …），工具面板是结构化表单（非手敲 JSON，另有高级 JSON 兜底）；
+- **操纵（puppet）**：Bot 继续自主运行，管理员额外操控其行动；
+- 进入判断与「接管 Bot」提示不依赖「进出世界一次」，改名为 Bot 同名的瞬间即高亮提示。
 
 ## Bot-LLM 两种持续生成模式
 
@@ -378,8 +451,11 @@ World-LLM 每次被唤起时通过工具调用读写状态：
 | `gallery_move(name, category, description?)` / `gallery_remove(name)` | 整理归类（「未整理」→ 分类，无描述时必须先看图补描述）/ 移出收藏夹 |
 | `open_app(name)` | 打开应用：聊天应用 → 消息列表 + 解锁 chat 层；MCP/内置应用 → 展开其工具 |
 | `close_app()` | 关闭当前打开的应用（其操作失效） |
+| `open_computer()` / `close_computer()` | 打开/关闭 Bot 自己的电脑（与手机平级的另一台设备，Docker 终端/远程桌面，见「Bot 的个人电脑」） |
 | `put_down_phone()` | 把手机放到一边：关闭应用、清除关注，之后通知一律降级为"手机震了一下" |
 | `pick_up_phone()` | 拿起手机：恢复正常通知 |
+| `travel(world)` | 穿越到另一个世界作客（需 `crossing.worlds` 配置了可去世界）：行动由对方 World-LLM 裁定，手机/聊天照常可用，`go_home` 返回 |
+| `go_home()` | 从异世界返回自己的世界 |
 | `cancel(id)` | 取消倒计时中的工具调用 |
 | `recall(keyword?, since?, until?, n?, important?)` | 回忆过往小事记：按关键词 / 按 T（时间单位）范围 / 只回忆重要回忆（固定条目，对 Bot 透明、不暴露「被固定」），是角色扮演不 OOC 的记忆依据 |
 
@@ -693,6 +769,29 @@ plugins:
           # args: []            # stdio 参数（command 里整条写也行）
           # url: ""             # http 端点
           # headers: {}         # http 附加请求头
+    webui: # 运维 WebUI：管理配置/提示词/状态/相册；另有访客账号（只读/分级授权）与玩家入世界入口
+      enabled: true
+      host: 127.0.0.1 # 局域网访问填 0.0.0.0（注意安全）
+      port: 18111
+      token: "" # 访问令牌；留空不鉴权（仅本机用）；设置后页面与 API 都要携带
+    crossing: # 穿越（联机）：Bot 到异世界作客 / 接待异世界 Bot；真人入世界也用它的通道
+      serverEnabled: false # 开放本世界接待异世界访客（持邀请码的 Bot 可到达）
+      host: 0.0.0.0 # 接待服务监听地址（要接待别的机器需 0.0.0.0 或公网/反代）
+      port: 18112 # 穿越服务端口；对方填 http://你的地址:该端口
+      worldName: "" # 你的世界对外名字（访客到达时看到）
+      botName: "" # 你的 Bot 去别人世界作客时用的名字（留空显示「异界来客」）
+      maxVisitors: 3 # 同时接待的异世界访客上限
+      visitorPersonaMode: pinned # pinned=档案常驻系统提示（缓存最优）；check=按需 check_visitor（省窗口）
+      invites: # 发出的邀请码列表（分享给别人，别人的 Bot 凭码到达；可随时吊销）
+        - code: secret-code-1
+          name: 给小明
+          enabled: true
+      worlds: # 可前往的异世界列表（填别人分享的邀请码 + 地址，Bot 用 travel 前往）
+        - name: 阿伟的世界
+          url: http://1.2.3.4:18112
+          inviteCode: 对方分享的邀请码
+          allowVoluntary: true # 允许 Bot 主动前往；关闭则仅能用 world.travel 强制送去
+          note: "" # 世界简介（写进 travel 工具说明，帮 Bot 决定去不去）
 ```
 
 ## 已知限制
