@@ -224,8 +224,8 @@ export interface WorldInvocation {
    */
   noUpdate?: boolean;
   /**
-   * 禁用状态读取工具（check / grep，act 裁定用）：bot_status / world_status 已内嵌进任务，
-   * news / facts 对「裁定一个动作的结果」非必需——移除状态读取，杜绝模型习惯性多查一轮。
+   * 禁用状态/时间读取工具（check / grep / check_time，act 裁定用）：bot_status / world_status
+   * 已内嵌进任务、当前时刻也已内嵌，无需再查——移除这些读取工具，杜绝模型习惯性多查一轮。
    */
   noCheck?: boolean;
   /** 可选的取消信号：状态更新任务用它在中途（两轮 LLM 之间）被终止并丢弃 */
@@ -589,6 +589,8 @@ export class WorldAgent {
     if (world) {
       task += `\n\n<current_world_status>（世界此刻的状态，已直接提供，无需再 check world_status）\n${world}\n</current_world_status>`;
     }
+    // 当前世界时刻也一并内嵌：避免 World 用 check_time 再查一轮。
+    task += `\n\n<current_time>（当前世界时刻：${this.clock.timeLine()}，已直接提供，无需再 check_time）</current_time>`;
     // 有访客在场时携带 visitors：Bot 的行动波及某位访客时，send_event to= 可直接送达对方
     // noUpdate：本次循环只做 send_event（结果叙述）、不写状态文件 → 走只读并发队列（parallel=true），
     // 与「上一个 act 的状态更新（串行写队列）」真正并行；状态记账由 deliver 触发独立任务补上。
@@ -1367,7 +1369,7 @@ export class WorldAgent {
         (invocation.deliver || invocation.visitors?.length || t.function.name !== "send_event") &&
         (invocation.allowTingle || t.function.name !== "set_tingle") &&
         (!invocation.noUpdate || t.function.name !== "update") &&
-        (!invocation.noCheck || (t.function.name !== "check" && t.function.name !== "grep")) &&
+        (!invocation.noCheck || (t.function.name !== "check" && t.function.name !== "grep" && t.function.name !== "check_time")) &&
         (invocation.visitors?.length ||
           (t.function.name !== "update_visitor_status" && t.function.name !== "expel_visitor")) &&
         ((this.visitorPersonaMode === "check" && invocation.visitors?.length) ||

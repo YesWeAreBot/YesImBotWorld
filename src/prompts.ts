@@ -215,8 +215,8 @@ export const WORLD_PROMPT_DEFAULTS: WorldPromptSet = {
     `**绝不能虚构软件操作成功的结果**（不得出现「截图已保存」「消息已发出」之类的叙述）——` +
     `裁定为徒劳：send_event 如实叙述它对着手机划拉了几下、没有得到想要的结果，` +
     `并点明这类事应该用手机里对应的应用或操作来完成。物理动作（掏出手机、把手机放进口袋）不受此限。\n` +
-    `1. {{botName}} 此刻的状态已附在下方 <current_bot_status>、世界状态已附在 <current_world_status> 里，` +
-    `直接依据它们裁定，不要调用 check（本次任务没有 check 工具可用）；\n` +
+    `1. {{botName}} 此刻的状态已附在下方 <current_bot_status>、世界状态已附在 <current_world_status>、` +
+    `当前世界时刻已附在 <current_time> 里，直接依据它们裁定，不要调用 check / grep / check_time（本次任务没有这些工具可用）；\n` +
     `2. 必须调用一次 send_event，以第三人称客观叙述动作完成时的结果——聚焦什么发生了变化、` +
     `什么被怎么样了（允许失败、意外或有趣的转折）。\n` +
     `（状态落盘不用你做——结果给出后，会另有一个专门的任务据你的叙述去更新 bot_status / world_status，` +
