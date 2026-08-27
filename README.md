@@ -13,21 +13,56 @@ YesImBot World：让 Bot 生活在一个由 LLM 独立维护的虚拟世界中�
 
 ## 架构
 
-```
-┌────────────────────────────── Koishi ──────────────────────────────┐
-│  Gateway(中间件): 所有消息入库 ──┐          KoishiMessenger          │
-│  Allow Notification → Event ────┤          (check_msg/send)         │
-└─────────────────────────────────┼────────────────────▲─────────────┘
-                                  ▼                    │
-┌─────────── Bot-LLM (BotAgent) ──────────┐   ┌── World-LLM (WorldAgent) ──┐
-│ 主循环: 排空事件邮箱 → 生成 Tool Call    │   │ 无状态，按需唤起            │
-│         → 追加进流 → 派发执行(不等结果)  │   │ 工具: check / update /      │
-│ 上下文: 置顶区(角色/历史/工具/记忆)      │◄──┤       check_time /          │
-│         + Tool Call 流(只追加)          │事件│       send_event            │
-│ 调度器: duration → 期望完成时刻 → Event │──►│ 维护: World_Status.md       │
-└──────────────────┬──────────────────────┘act│       News.jsonl               │
-                   │                          └──────────▲─────────────────┘
-              WorldClock (TU) ── Tingle 心跳 ────────────┘
+两个 LLM 协同：Bot-LLM **持续**在生活（一个接一个生成工具调用），World-LLM **按需**被唤起（裁定动作、推进世界、补叙等待），两者通过事件流与状态文件解耦。
+
+```mermaid
+flowchart LR
+  subgraph Koishi["Koishi 进程"]
+    GW["Gateway 中间件<br/>所有消息入库 + 通知转事件"]
+    MSG["KoishiMessenger<br/>check_msg / send / 平台操作"]
+  end
+
+  subgraph Bot["Bot-LLM（BotAgent）· 持续推理"]
+    LOOP["主循环<br/>排空事件邮箱 → 生成 Tool Call<br/>→ 追加进流 → 派发执行（不等结果）"]
+    CTX["上下文<br/>置顶区（角色/历史/工具/记忆）<br/>+ Tool Call 流（只追加）"]
+    SCHED["调度器<br/>duration → 期望完成时刻 → 事件交付"]
+    TOOLS["工具分层<br/>core / chat / channel / group / App"]
+  end
+
+  subgraph World["World-LLM（WorldAgent）· 无状态·按需唤起"]
+    ADJ["act 裁定<br/>内嵌状态 → send_event"]
+    BOOK["状态补记<br/>（后台任务）更新状态文件"]
+    TINGLE["Tingle 心跳<br/>推进世界演化"]
+    WAIT["wait / 时间 / 离线补叙"]
+  end
+
+  subgraph FS["状态文件（basePath）"]
+    BS["Bot_Status.md"]
+    WS["World_Status.md"]
+    NEWS["News.jsonl"]
+    FACTS["facts.jsonl"]
+  end
+
+  GW --> MSG
+  MSG -- "消息/通知（事件）" --> LOOP
+  LOOP --> CTX
+  LOOP --> SCHED
+  LOOP --> TOOLS
+  TOOLS -- "act / wait / check_status …" --> ADJ
+
+  ADJ -- "结果事件（send_event）" --> LOOP
+  ADJ -- "触发状态补记" --> BOOK
+  TINGLE --> WS
+  TINGLE --> NEWS
+  BOOK --> BS
+  BOOK --> WS
+  BOOK --> FACTS
+  ADJ -. "只读（状态已内嵌）" .-> BS
+  ADJ -. "只读（状态已内嵌）" .-> WS
+  WAIT --> WS
+
+  WorldClock["WorldClock（TU）"] -- "Tingle 心跳" --> TINGLE
+  WorldClock -- "期望完成时刻" --> SCHED
 ```
 
 ### 数据目录（`basePath`，默认 `data/yesimbot-world`）
@@ -48,6 +83,7 @@ YesImBot World：让 Bot 生活在一个由 LLM 独立维护的虚拟世界中�
 | `meta.json` | 运行时 | 世界元数据（创世时判定：是否现实世界设定） |
 | `phoneShell.html` | World-LLM（创世生成）/ 用户 | 浏览器带壳截图的外壳 HTML（含 `{{screen}}` 等占位符，可在 WebUI「状态 → 手机外壳」页预览与编辑） |
 | `focus.json` | 运行时 | Bot 正在关注的频道（关注期间消息必定完整呈现） |
+| `spill/` | 运行时 | 工具结果溢出治理（`bot.spillMinChars`）裁剪后的全文落盘：`<callId>.txt`；上下文里只留 head/tail 预览，完整结果可在此审计 |
 | `archive/` | 运行时 | 压缩/重置/手动存档的历史快照（每份一个时间戳文件夹，含 `manifest.json`；可在 WebUI「数据」页查看、回档、删除） |
 
 ## 使用步骤
@@ -134,6 +170,92 @@ YesImBot World：让 Bot 生活在一个由 LLM 独立维护的虚拟世界中�
   （防止压缩请求本身超过模型窗口）；压缩失败时降级处理（归档丢弃工作窗口、沿用旧摘要），
   保证上下文一定缩小、不会陷入"压缩失败 → 立即再次强制 rest"的死循环。
 
+## 上下文退化治理（防复读 / 防循环）
+
+长时间自主运行的 LLM 会退化成几种循环：**复读同一个工具调用**、**交替循环**
+（`act ↔ wait` 反复）、**口头禅式重复发言**。插件用「纵深防御」层层拦截（从最温和的提醒到最硬的阻断），
+并把所有提醒文案都做成 **≥10 套字面差异大的变体随机返回**（事实值如次数/工具名/参数原样保留，只随机话术），
+避免固定文案本身在长上下文里被模型无视、成为另一种循环。
+
+```mermaid
+flowchart TD
+  A["检测到重复 / 循环"] --> B{"severity 分级"}
+  B -- "低（连续次数少）" --> C["advisory 提醒<br/>（10 套变体随机）"]
+  B -- "中（连续次数多）" --> D["递进加压提醒<br/>（点名工具 / 连击数 / 参数）"]
+  B -- "高（达到 breakLoopRemoveToolAt）" --> E["暂时移除被重复的工具<br/>（下次压缩后恢复）"]
+  B -- "顽固（达到 breakLoopForceRestAt）" --> F["强制压缩 rest<br/>（清掉循环历史）"]
+  E --> G{"仍在重复?"}
+  G -- "是" --> F
+  G -- "否" --> H["循环解除"]
+  C --> H
+  D --> H
+  F --> H
+```
+
+| 层 | 机制 | 说明 |
+|---|---|---|
+| 单工具复读 | **RepeatGuard**（移植 dsh 的 repeat-tool-reminder） | 按 `(工具名, 规范化参数)` 链式计数，连续相同达阈值（默认 `[3,5,8]`）注入递进提醒：首个阈值温和、后续点名工具+连击数+参数。纯 advisory，从不硬拦 |
+| 交替循环 | **跨工具周期检测** | 滚动窗口识别 `act → wait → act → wait` 这类短周期反复（≥3 轮），点明「你在反复执行同一组动作」 |
+| 口头禅复读 | **近 N 条发言去重**（`messaging.recentRepeatThreshold` / `recentRepeatWindow`） | 同一句话在最近 N 条里重复达到阈值就拦；**判重只按「频道 + 内容 + 图片」，忽略引用/@ 目标**——同一句话引用 A 还是 B 都是同一句 |
+| 同上重复 | **same-act / same-send 拦截** | act 被 `blockingAct` 拦（上一个动作未完成）；send 与 sendBlocking 拦截，各带递进文案 |
+| 压缩折叠 | **serializeForCompression** | 压缩时把「连续完全相同的工具调用」折叠成一条 + 汇总标记，避免复读正文被 World-LLM 当真实经历沉淀进摘要 |
+| 结果裁剪 | **spill / prune**（`bot.spillMinChars`） | 超阈值（默认 4000 字符）的纯文本工具结果裁成「头部 + 省略 + 尾部」，全文落盘 `spill/`，防止超大结果反复占据窗口 |
+| 强力兜底 | **breakLoop**（默认关） | 两段升级：先「暂时移除被重复的工具」（`breakLoopRemoveToolAt`，默认 6 次），无效再「强制压缩 rest」（`breakLoopForceRestAt`，默认 12 次）。移除的工具在下次压缩后自动恢复 |
+
+相关配置（`bot.*`，除标注外）：
+
+| 配置 | 默认 | 说明 |
+|---|---|---|
+| `repeatThresholds` | `[3, 5, 8]` | 单工具连续重复提醒阈值（升序；`[]` 关闭） |
+| `repeatExclude` | `[]` | 排除的工具名匹配（`*` 通配）；bookkeeping 工具既不计数也不重置，不会洗白循环。代码里对 `rest`/`wait` 有默认兜底 |
+| `spillMinChars` | `4000` | 工具结果溢出裁剪阈值（`0` 禁用） |
+| `breakLoop` | `false` | 打破死循环的强制手段总开关 |
+| `breakLoopRemoveToolAt` | `6` | 连续重复达此次数暂时移除该工具 |
+| `breakLoopForceRestAt` | `12` | 移除后仍重复达此次数强制压缩 rest |
+| `messaging.recentRepeatThreshold` | `1` | 近 N 条里同一句出现这么多次就拦（第 2 次拦） |
+| `messaging.recentRepeatWindow` | `20` | 近期重复检测的滑动窗口条数 |
+
+## act 裁决提速（World-LLM 解耦 · 状态内嵌）
+
+World-LLM **没有持续上下文、也不关心前缀缓存**：每次被唤起都是全新对话，状态全靠 `check` 工具按需读文件。
+这带来一个天然的正确结论——把状态**直接内嵌进任务提示词**，既无缓存损失，又省掉工具读取的 LLM 往返。
+
+早期 act 裁决慢的根因：一次 act 要跑「check 状态 → send_event 结果叙述 → update 状态记账」**多轮** LLM 工具循环。
+现在拆成三条正交优化：
+
+```mermaid
+flowchart LR
+  subgraph ACT["act 裁定（只读并行队列）"]
+    A1["内嵌 bot_status / world_status / 当前时刻"] --> A2["只做 send_event<br/>（noUpdate + noCheck）"]
+  end
+
+  subgraph BOOK["状态补记（串行写队列，后台）"]
+    B1["updateStateAfterAct<br/>整体覆盖落盘"] --> B2["可合并 + 过时自弃"]
+  end
+
+  subgraph OTHER["其他写任务（串行写队列）"]
+    T["Tingle / wait / 压缩 / 访客"]
+  end
+
+  A2 -- "结果事件（立即可交付）" --> BOT["Bot"]
+  A2 -- "fire-and-forget 触发补记" --> B1
+  A2 -. "与写队列并行（只读队列）" .-> B1
+  B1 -. "与其他写任务串行" .-> T
+```
+
+| 优化 | 做法 | 收益 |
+|---|---|---|
+| **状态内嵌** | act 裁定时把 `Bot_Status.md`、`World_Status.md`、当前时刻 **全文内嵌**进任务 | 省掉 `check(bot_status)` / `check(world_status)` / `check_time` 三轮读取往返 |
+| **结果与记账解耦** | act 裁定只做 `send_event`（`noUpdate`）；状态落盘交给独立的后台任务 `updateStateAfterAct` | act 裁定的工具循环从 3~6 轮降到 1 轮 |
+| **禁用冗余读取** | `noCheck` 直接从工具列表移除 `check` / `grep` / `check_time`（prompt 写「别查」压不住模型，干脆让它没得查） | 结论性杜绝「习惯性多查一轮」 |
+| **真并发** | act 裁定走**只读并行队列**，与状态补记/Tingle 所在的**串行写队列**彼此独立 | Bot 下一次 act 的裁定与上一次 act 的状态补记、以及 Tingle 心跳**真正同时发请求**（需推理后端支持并发） |
+| **可合并 + 过时自弃** | 连续快速 act 时：前一任务被 `AbortSignal` 中止省 token；并用**单调递增 seq** 在写文件前自检，过时的任务跳过落盘；被中断的**前序事件累积**进最新任务的 prompt 一并补记 | 状态最终收敛到最新裁决，任何一次 act 的结果都不丢失，也不写错误的中间态 |
+
+设计取舍（已知、可接受）：
+
+- **状态短暂滞后**：act 结果立即可交付，但 `Bot_Status.md`/`World_Status.md` 的落盘稍后由后台补记完成——「最终一致」，连续快速 act 时靠「只保留最新一个补记 + 累积前序事件」收敛；
+- **前提是你上一轮配置一样**：`serializeSameEndpoint: false`（同源端点锁关闭）且推理后端支持并发——否则并行只是把排队从客户端挪到服务端，无真实收益。
+
 ## 多模态
 
 消息中的**图片 / 音频 / 视频**会被下载进本地资产库（`basePath/assets/`，sha256 去重——平台的媒体 URL 会过期），消息记录中只存占位符。Bot 感知媒体的方式由配置决定：
@@ -218,6 +340,8 @@ duration 明显超过按字数估算的打字时间时，视为"过会儿再发"
 ### World 内部工具（World-LLM 用）
 
 World-LLM 每次被唤起时通过工具调用读写状态：
+
+> 注意：**act 裁决**已不走这些读取工具——状态与当前时刻被内嵌进任务、`check`/`grep`/`check_time`/`update` 都被 `noCheck`/`noUpdate` 从该任务移除（见上文「act 裁决提速」）。下面的工具全集仍用于 Tingle、wait 补叙、离线补叙、压缩、状态补记等其它任务。
 
 | 工具 | 说明 |
 |---|---|
@@ -432,6 +556,12 @@ plugins:
       maxTokens: 4096 # write/patch 内容较长时避免 JSON 在闭合前被截断
       minIntervalMs: 0
       maxWindowChars: 262144
+      repeatThresholds: [3, 5, 8] # 单工具连续重复提醒阈值（升序；[] 关闭）
+      repeatExclude: []           # 排除的工具名匹配（* 通配）；bookkeeping 工具不计数也不重置
+      spillMinChars: 4000         # 超大工具结果裁剪阈值（0 禁用），全文落盘 spill/
+      breakLoop: false            # 打破死循环的强制手段总开关（先移工具、无效再强制 rest）
+      breakLoopRemoveToolAt: 6    # 连续重复达此次数暂时移除该工具
+      breakLoopForceRestAt: 12    # 移除后仍重复达此次数强制压缩 rest
       modalities: # text 模式下不生效，媒体一律走解释器
         image: false
         audio: false
@@ -484,6 +614,8 @@ plugins:
       offlineHistory: true # 重新上线时用 get_group_msg_history 补拉离线期间错过的群消息（只入库 + 汇总事件，不打扰上下文）
       typingCharsPerSec: 5 # 打字速度（字/现实秒），按消息字数线性估算打字耗时，判定 send 的 duration 语义
       sendDeferFactor: 4 # duration 超过「打字估算 × 该倍数」视为"过会儿再发"：到点询问、三类情况打断
+      recentRepeatThreshold: 1 # 近 N 条里同一句出现这么多次就拦（1 = 第 2 次说同一句就拦；0 关闭）
+      recentRepeatWindow: 20 # 近期重复检测的滑动窗口条数
     platformOps: # 平台扩展操作，每项独立开关（默认全部 false，此处为示例）
       recall: true
       react: true
