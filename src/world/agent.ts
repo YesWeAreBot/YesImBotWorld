@@ -223,6 +223,11 @@ export interface WorldInvocation {
    * 状态记账由独立的、可合并的 updateStateAfterAct 后台任务并行完成。
    */
   noUpdate?: boolean;
+  /**
+   * 禁用状态读取工具（check / grep，act 裁定用）：bot_status / world_status 已内嵌进任务，
+   * news / facts 对「裁定一个动作的结果」非必需——移除状态读取，杜绝模型习惯性多查一轮。
+   */
+  noCheck?: boolean;
   /** 可选的取消信号：状态更新任务用它在中途（两轮 LLM 之间）被终止并丢弃 */
   signal?: AbortSignal;
   /**
@@ -599,6 +604,7 @@ export class WorldAgent {
         botDeliver: emitEvent,
         visitors: this.visitorsProvider?.() ?? [],
         noUpdate: true,
+        noCheck: true,
       },
       true,
     );
@@ -1361,6 +1367,7 @@ export class WorldAgent {
         (invocation.deliver || invocation.visitors?.length || t.function.name !== "send_event") &&
         (invocation.allowTingle || t.function.name !== "set_tingle") &&
         (!invocation.noUpdate || t.function.name !== "update") &&
+        (!invocation.noCheck || (t.function.name !== "check" && t.function.name !== "grep")) &&
         (invocation.visitors?.length ||
           (t.function.name !== "update_visitor_status" && t.function.name !== "expel_visitor")) &&
         ((this.visitorPersonaMode === "check" && invocation.visitors?.length) ||
