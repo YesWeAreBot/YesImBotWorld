@@ -89,9 +89,9 @@ export const BOT_TOOLS: BotToolDef[] = [
     name: "select_channel",
     signature: 'select_channel(id: string)',
     description:
-      '点进消息列表中的一个频道（id 格式为 "platform:channelId"）。进入频道页后才能进行频道内的操作（发消息等，进入时会看到可用操作）。' +
+      '点进消息列表中的一个频道（id 格式为 "platform:channelId"）。进入频道页后能进行频道内的完整操作（发消息、撤回、贴表情等，进入时会看到可用操作）。' +
       "此后的一段时间内你会持续留意这个频道，它的新消息会直接呈现在你眼前（发消息给某频道也有同样效果）。" +
-      "已经在这个频道里时无需再次点进；想刷新/看更多消息用 read_channel。",
+      "对刚来新消息的频道，也可以不进频道页、直接发消息快捷回复。已经在这个频道里时无需再次点进；想刷新/看更多消息用 read_channel。",
   },
   {
     name: "read_channel",
@@ -204,7 +204,8 @@ export const BOT_TOOLS: BotToolDef[] = [
     name: "send",
     signature: 'send(msg: string, id?: string, media?: string[], resend?: boolean, confirm_long?: boolean, insist?: boolean)',
     description:
-      "发送消息。id 缺省为当前所在频道；要发给别的频道就给出完整频道 id（格式 \"platform:channelId\"，来自消息列表，不要用人名代替），相当于先切换过去。" +
+      "发送消息。id 缺省为当前所在频道页；要发给别的频道就给出完整频道 id（格式 \"platform:channelId\"，来自消息列表，不要用人名代替）。" +
+      "没点进任何频道页时（例如刚收到某频道的新消息通知、想快捷回复），带上该频道的 id 即可直接发出，无需先 select_channel。" +
       'media 可附带图片或视频，元素为媒体编号（如 "12"，来自收藏夹或媒体缓存）。' +
       "在 msg 里写 [图片#12] 或 [视频#3] 会把对应媒体嵌在文字中间发出（图文混排，QQ 等平台可能分开显示）——" +
       "注意：msg 里写了标记这张图就会真的发出去，不想发就不要写。" +

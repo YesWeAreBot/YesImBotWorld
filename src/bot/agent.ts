@@ -215,6 +215,13 @@ export class BotAgent {
     /** 正在逐层查看的合并转发聊天记录（view_forward 压栈 / exit_forward 出栈） */
     forwardStack: string[];
   } = { chatOpen: false, channelKey: null, channelIsGroup: false, forwardStack: [] };
+  /**
+   * 最近一次有外部消息动静的频道 key（通知快捷回复的锚点）：
+   * 手机即使没点进任何频道页，只要最近有频道来了新消息，send 系工具就能解锁快捷回复——
+   * 但必须显式带 id（从通知文本里照抄），不做"省略 id 默认发向这里"的 fallback，避免误发到陈旧频道。
+   * 由 noteDeferredChannelActivity 在外部消息入库时写入；只作为解锁快捷回复的判定依据。
+   */
+  private lastNotifyKey = "";
 
   constructor(
     private config: Config,
@@ -288,6 +295,10 @@ export class BotAgent {
       if (this.phoneUi.channelKey) {
         names.push(...this.layerNames("channel"));
         if (this.phoneUi.channelIsGroup) names.push(...this.layerNames("group"));
+      } else if (this.lastNotifyKey) {
+        // 未点进频道页，但有最近通知源（收到过外部消息）→ 允许发送系工具带 id 快捷回复
+        // 其余 channel 工具（unsend/react/poke 等）仍需真正进入频道页。
+        names.push(...SEND_TOOL_NAMES);
       }
     }
     const appDefs = [...(this.apps?.activeToolDefs() ?? []), ...(this.computer?.activeToolDefs() ?? [])];
@@ -306,6 +317,8 @@ export class BotAgent {
   private channelArg(call: ToolCallRecord): string | null {
     const raw = call.arguments.id ?? call.arguments.channel;
     const explicit = raw != null ? String(raw).trim() : "";
+    // 缺省目标：显式 id > 当前频道页。不做"最近通知源"fallback——快捷回复必须显式带 id
+    // （从通知文本里照抄），避免把陈旧的最近消息频道当默认目标误发。
     return explicit || this.phoneUi.channelKey;
   }
 
@@ -1654,7 +1667,8 @@ export class BotAgent {
         const prefix = closed ? `（你关掉了「${closed}」）` : "";
         const unlock = firstOpen
           ? `（聊天应用已打开，新增可用操作（关闭应用后失效）：\n${renderToolsText(this.layerDefs("chat"))}\n` +
-            `要**发消息**（send / send_file / send_voice）得先用 select_channel 点进某个频道——进频道后才解锁这些发送操作。）\n\n`
+            `要**发消息**（send / send_file / send_voice），可以先 select_channel 点进某个频道（进频道后才解锁频道内的完整操作）；` +
+            `没点进频道时，若某频道刚来了新消息、收到它的提醒，也能带上它的 id 直接快捷回复。）\n\n`
           : "";
         return typeof rich === "string"
           ? { text: prefix + unlock + rich }
@@ -1917,6 +1931,9 @@ export class BotAgent {
 
   /** 同频道来了新消息：打断对那个频道的延期发送意图 */
   noteDeferredChannelActivity(key: string): void {
+    // 外部消息动静锚点：无论是否投递通知，只要有别人发来消息，它就是"最近通知源"，
+    // 用于解锁"带 id 快捷回复"（send 系在未 select_channel 时也能显式带 id 发出）。
+    if (key) this.lastNotifyKey = key;
     if (!this.pendingDeferred.length) return;
     const hit = this.pendingDeferred.filter((p) => this.matchesDeferred(p, key));
     for (const pend of hit) {
@@ -2009,7 +2026,7 @@ export class BotAgent {
     const atRaw = call.arguments.at_sender ?? call.arguments.atSender ?? call.arguments.at;
     const atSender = !(atRaw === false || atRaw === "false" || atRaw === 0);
     if (!id) {
-      this.pushEvent("system", "（send 需要频道：先 select_channel 进入频道，或给出 id 参数。）", { ref: call.id });
+      this.pushEvent("system", "（send 现在没有可发的频道：你需要先用 select_channel 点进某个频道，或等某个频道来新消息后带上它的 id 快捷回复。）", { ref: call.id });
       return;
     }
     if (!msg && !media.length) {
@@ -2113,7 +2130,7 @@ export class BotAgent {
     const id = this.channelArg(call) ?? "";
     const file = String(call.arguments.file ?? "");
     if (!id) {
-      this.pushEvent("system", "（send_file 需要频道：先 select_channel 进入频道，或给出 id 参数。）", { ref: call.id });
+      this.pushEvent("system", "（send_file 现在没有可发的频道：你需要先用 select_channel 点进某个频道，或等某个频道来新消息后带上它的 id 快捷回复。）", { ref: call.id });
       return;
     }
     if (!file) {
@@ -2157,7 +2174,7 @@ export class BotAgent {
     const id = this.channelArg(call) ?? "";
     const text = String(call.arguments.text ?? "");
     if (!id) {
-      this.pushEvent("system", "（send_voice 需要频道：先 select_channel 进入频道，或给出 id 参数。）", { ref: call.id });
+      this.pushEvent("system", "（send_voice 现在没有可发的频道：你需要先用 select_channel 点进某个频道，或等某个频道来新消息后带上它的 id 快捷回复。）", { ref: call.id });
       return;
     }
     if (!text) {
