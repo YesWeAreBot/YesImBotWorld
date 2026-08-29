@@ -140,6 +140,10 @@ export interface MessagingConfig {
   recentRepeatThreshold: number;
   /** 近期重复检测的滑动窗口大小（默认 20 条） */
   recentRepeatWindow: number;
+  /** send 系工具成功后是否回显该频道最近若干条消息（默认关闭） */
+  sendEcho: boolean;
+  /** send 回显该频道最近多少条消息（默认 10） */
+  sendEchoRecent: number;
 }
 
 /** 聊天平台扩展操作（收发消息之外的能力），每个接口独立开关，默认全部关闭 */
@@ -1155,6 +1159,18 @@ export const Config: Schema<Config> = Schema.intersect([
         .min(5)
         .default(20)
         .description("近期重复检测的滑动窗口大小：统计最近多少条已发消息里的重复。默认 20 条"),
+      sendEcho: Schema.boolean()
+        .default(false)
+        .description(
+          "send 系工具（send / send_file / send_voice）成功后回显该频道最近若干条消息：让 Bot 看到自己的话「上墙」、以及对方的最新回应，" +
+            "消除「没发出去/发错了」的错觉。默认关闭——回显只剩一句「消息已发送到…」，不附带频道消息列表，" +
+            "避免模型只盯着刚发的这一条而忽略更长上下文；需要时再开启。",
+        ),
+      sendEchoRecent: Schema.natural()
+        .min(1)
+        .max(200)
+        .default(10)
+        .description("send 回显该频道最近多少条消息（默认 10）。仅在 sendEcho 开启时生效；调小可减少上下文占用"),
     }).description("Koishi 消息接入"),
   }),
 ]);

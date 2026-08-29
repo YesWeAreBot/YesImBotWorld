@@ -1998,10 +1998,11 @@ export class BotAgent {
   /**
    * 发送类工具的成功结果后，回显该频道最近 n 条消息（文本），让模型看到自己的
    * 话"上墙"了、以及对方的最新回应——消除"没发出去/发错了"的错觉，抑制重复发送。
-   * 只取文本（不转发附件），保持轻量。
+   * 只取文本（不转发附件），保持轻量。messaging.sendEcho 关闭时只回 out、不带频道列表。
    */
-  private async echoChannelRecent(id: string, out: string, n = 10): Promise<string | RichText> {
-    const recent = await this.messenger.channelMessages(id, n, { intro: "echo" });
+  private async echoChannelRecent(id: string, out: string, n?: number): Promise<string | RichText> {
+    if (this.config.messaging.sendEcho === false) return out;
+    const recent = await this.messenger.channelMessages(id, n ?? this.config.messaging.sendEchoRecent, { intro: "echo" });
     const recentText = recent.text.trim();
     return recentText ? { text: `${out}\n\n${recentText}` } : out;
   }
