@@ -52,7 +52,12 @@ export class ChatBackend implements BotBackend {
   }
 
   setToolNames(names: string[]): void {
-    this.toolNames = names;
+    // 允许集变化：原生声明需重建——native 声明按允许集分层，模型只看到当前真正可用的工具
+    // （否则全量声明会让模型在还没进频道时就"看到" send 并提前调用，被分层允许集拒绝）。
+    if (this.toolNames.join(",") !== names.join(",")) {
+      this.toolNames = names;
+      this.nativeDefs = null;
+    }
   }
 
   setToolDefs(defs: NamedToolDef[]): void {
@@ -61,12 +66,14 @@ export class ChatBackend implements BotBackend {
   }
 
   /**
-   * 原生声明（按 setToolDefs 惰性重建）：声明**全量**工具集，不随允许集（分层解锁）变化——
-   * 请求前缀保持稳定，分层照旧由事件通知、由解析侧的允许集把关。
+   * 原生声明（按 setToolDefs / setToolNames 惰性重建）：只声明**当前允许集**（toolNames）内的工具，
+   * 随频道进出/应用开关变化——模型看不到当前不可用的工具（如未进频道时的 send），
+   * 从根上杜绝"提前看到 send 却调用被拒"的矛盾。tools 声明不进 messages 前缀，分层不影响 prompt cache 命中。
    */
   private currentNativeDefs(): ChatToolDef[] {
     if (!this.nativeDefs) {
-      this.nativeDefs = toNativeToolDefs(this.toolDefs);
+      const allowed = this.toolDefs.filter((d) => this.toolNames.includes(d.name));
+      this.nativeDefs = toNativeToolDefs(allowed);
     }
     return this.nativeDefs;
   }
