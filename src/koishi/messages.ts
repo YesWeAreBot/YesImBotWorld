@@ -10,6 +10,8 @@ export interface KnownChannel {
   key: string;
   platform: string;
   channelId: string;
+  /** 是否为私聊（direct）：来自入站 session.isDirect 的权威标记，可靠于 channelId 字符串猜测 */
+  isDirect: boolean;
   participants: { userId: string; username: string }[];
 }
 
@@ -25,6 +27,11 @@ export interface WorldMessageRow {
   self: boolean;
   /** 平台侧消息 id（用于 unsend / react），可能为空 */
   messageId: string;
+  /**
+   * 是否为私聊（direct）。入站时来自 session.isDirect（平台权威信号）；
+   * 旧数据/历史拉取可能缺失，读取方以 undefined/null 为"未知"，回退 channelId 的 private: 前缀。
+   */
+  isDirect?: boolean;
 }
 
 /**
@@ -46,6 +53,7 @@ export class MessageStore {
         timestamp: "timestamp",
         self: "boolean",
         messageId: { type: "string", length: 255, initial: "" },
+        isDirect: { type: "boolean", nullable: true },
       },
       { autoInc: true, primary: "id" },
     );
@@ -91,8 +99,18 @@ export class MessageStore {
       const key = `${row.platform}:${row.channelId}`;
       let entry = map.get(key);
       if (!entry) {
-        entry = { key, platform: row.platform, channelId: row.channelId, participants: [] };
+        entry = {
+          key,
+          platform: row.platform,
+          channelId: row.channelId,
+          // 权威私聊标记：取该频道任意一条已明确记录的 isDirect（多数为 true 即私聊）
+          // 也回退 channelId 的 private: 前缀（onebot 约定），保证旧数据/纯群历史兼容
+          isDirect: row.isDirect ?? row.channelId.startsWith("private:"),
+          participants: [],
+        };
         map.set(key, entry);
+      } else if (entry.isDirect !== true && row.isDirect === true) {
+        entry.isDirect = true;
       }
       if (!row.self && !entry.participants.some((p) => p.userId === row.userId)) {
         entry.participants.push({ userId: row.userId, username: row.username });

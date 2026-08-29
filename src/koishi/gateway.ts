@@ -136,6 +136,7 @@ export class Gateway {
         timestamp: new Date(),
         self: selfOp,
         messageId,
+        isDirect: session.isDirect,
       });
     }
 
@@ -181,6 +182,7 @@ export class Gateway {
       timestamp: new Date(),
       self: false,
       messageId: "",
+      isDirect: !groupId,
     });
 
     if (this.phone.down) {
@@ -235,6 +237,7 @@ export class Gateway {
       timestamp: new Date(),
       self: false,
       messageId: "",
+      isDirect: false,
     });
 
     if (this.phone.down) {
@@ -325,6 +328,7 @@ export class Gateway {
       timestamp: new Date(),
       self: true,
       messageId: msgId,
+      isDirect: session.isDirect,
     });
     this.callbacks.selfMessage(key, toMarkerText(content), msgId);
   }
@@ -378,6 +382,7 @@ export class Gateway {
       timestamp: new Date(session.timestamp ?? Date.now()),
       self: false,
       messageId: session.messageId ?? "",
+      isDirect: session.isDirect,
     });
 
     const key = `${session.platform}:${session.channelId}`;

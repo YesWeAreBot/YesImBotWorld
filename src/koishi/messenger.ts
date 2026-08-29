@@ -118,7 +118,7 @@ export class KoishiMessenger implements MessengerApi {
     if ("error" in resolved) return resolved;
     return {
       key: `${resolved.platform}:${resolved.channelId}`,
-      isPrivate: resolved.channelId.startsWith("private:"),
+      isPrivate: resolved.isDirect,
     };
   }
 
@@ -443,7 +443,7 @@ export class KoishiMessenger implements MessengerApi {
     // 出站富文本解析：<at …/>、<face …/> 标签（入站渲染的照抄形式）与
     // at 标记/裸 @名字（按频道参与者解析）→ 真正的消息元素，杜绝"字面假 @"。
     // 私聊没有 at：at 一律降级为 @名字 文本，表情照常可用
-    const isGroup = !target.channelId.startsWith("private:");
+    const isGroup = !target.isDirect;
     let participants: { userId: string; username: string }[] | null = null;
     const getParticipants = async (): Promise<{ userId: string; username: string }[]> => {
       if (participants) return participants;
@@ -489,7 +489,7 @@ export class KoishiMessenger implements MessengerApi {
     if (replyTo) {
       elements.push(h("quote", { id: replyTo }));
       stored += `[引用 msg:${replyTo}] `;
-      if (target.channelId.startsWith("private:")) atSender = false;
+      if (target.isDirect) atSender = false;
       if (atSender) {
         const quoted = await this.store.findByMessageId(target.platform, target.channelId, replyTo);
         if (quoted && !quoted.self && quoted.userId) {
@@ -759,7 +759,7 @@ export class KoishiMessenger implements MessengerApi {
     if (target.platform !== "onebot") return "（合并转发目前只支持 QQ（OneBot）平台。）";
     const ids = msgIds.slice(0, 50);
     const messages = ids.map((m) => ({ type: "node", data: { id: toIdValue(m) } }));
-    const isPrivate = target.channelId.startsWith("private:");
+    const isPrivate = target.isDirect;
     const key = `${target.platform}:${target.channelId}`;
     this.ownSends.expect(key);
     let data: Record<string, unknown>;
@@ -969,7 +969,7 @@ export class KoishiMessenger implements MessengerApi {
     const target = await this.resolveBot(id);
     if ("error" in target) return target.error;
     if (target.platform !== "onebot") return "（戳一戳目前只支持 QQ（OneBot）平台。）";
-    const isPrivate = target.channelId.startsWith("private:");
+    const isPrivate = target.isDirect;
     const uid = userId?.trim() || (isPrivate ? target.channelId.slice("private:".length) : "");
     if (!uid) return "（在群里 poke 需要 user_id 参数指明戳谁。）";
     try {
@@ -1757,16 +1757,16 @@ export class KoishiMessenger implements MessengerApi {
 
   private async resolveBot(
     id: string,
-  ): Promise<{ bot: Bot; platform: string; channelId: string } | { error: string }> {
+  ): Promise<{ bot: Bot; platform: string; channelId: string; isDirect: boolean } | { error: string }> {
     const resolved = await this.resolveChannel(id);
     if ("error" in resolved) return resolved;
-    const { platform, channelId } = resolved;
+    const { platform, channelId, isDirect } = resolved;
     const candidates = this.ctx.bots.filter((b) => b.platform === platform);
     if (!candidates.length) return { error: `（消息没发出去：没有接入 ${platform} 平台的账号。）` };
     // 只用在线的实例：断线/重连中的僵尸实例内部未就绪，调用会炸出费解的底层错误
     const bot = candidates.find((b) => b.isActive);
     if (!bot) return { error: `（手机没有信号：${platform} 的连接暂时断开了，消息没发出去。稍等片刻再试。）` };
-    return { bot, platform, channelId };
+    return { bot, platform, channelId, isDirect };
   }
 
   /**
@@ -1781,7 +1781,7 @@ export class KoishiMessenger implements MessengerApi {
    */
   private async resolveChannel(
     id: string,
-  ): Promise<{ platform: string; channelId: string } | { error: string }> {
+  ): Promise<{ platform: string; channelId: string; isDirect: boolean } | { error: string }> {
     const { platform, channelId, error } = parseChannelKey(id);
     let channels: KnownChannel[] = [];
     try {
@@ -1790,8 +1790,9 @@ export class KoishiMessenger implements MessengerApi {
       /* 查询失败时退化为原有行为 */
     }
 
-    if (!error && channels.some((c) => c.platform === platform && c.channelId === channelId)) {
-      return { platform, channelId };
+    if (!error) {
+      const hit = channels.find((c) => c.platform === platform && c.channelId === channelId);
+      if (hit) return { platform, channelId, isDirect: hit.isDirect };
     }
 
     // 模糊匹配：取 id 中的非平台片段作为查询词
@@ -1830,7 +1831,8 @@ export class KoishiMessenger implements MessengerApi {
     }
 
     if (error) return { error };
-    return { platform, channelId };
+    // 存储查不到（新频道/历史数据）：回退 onebot 的 private: 前缀约定
+    return { platform, channelId, isDirect: channelId.startsWith("private:") };
   }
 
   /**
@@ -1892,7 +1894,7 @@ export class KoishiMessenger implements MessengerApi {
   }
 
   private async storeSelf(
-    target: { bot: Bot; platform: string; channelId: string },
+    target: { bot: Bot; platform: string; channelId: string; isDirect: boolean },
     content: string,
     messageId?: string,
   ): Promise<void> {
@@ -1906,6 +1908,7 @@ export class KoishiMessenger implements MessengerApi {
       timestamp: new Date(),
       self: true,
       messageId: messageId ?? "",
+      isDirect: target.isDirect,
     });
   }
 }

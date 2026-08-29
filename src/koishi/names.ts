@@ -35,13 +35,27 @@ export class ChannelNameResolver {
     if (sep <= 0) return key;
     const platform = key.slice(0, sep);
     const channelId = key.slice(sep + 1);
-    if (channelId.startsWith("private:")) {
-      const userId = channelId.slice("private:".length);
+    // 权威私聊标记：优先消息记录里的 isDirect，读不到回退 onebot 的 private: 前缀约定
+    const isDirect = (await this.lookupIsDirect(platform, channelId)) ?? channelId.startsWith("private:");
+    if (isDirect) {
+      const userId = channelId.startsWith("private:") ? channelId.slice("private:".length) : channelId;
       const name = await this.peerName(platform, userId);
       return name && name !== userId ? `与${name}的私聊(${key})` : key;
     }
     const name = await this.groupName(platform, channelId);
     return name && name !== channelId ? `${name}(${key})` : key;
+  }
+
+  /** 从消息记录查该频道的私聊标记（platform:channelId 精确匹配），查不到返回 null */
+  private async lookupIsDirect(platform: string, channelId: string): Promise<boolean | null> {
+    try {
+      const channels = await this.store.knownChannels();
+      const hit = channels.find((c) => c.platform === platform && c.channelId === channelId);
+      if (hit) return hit.isDirect;
+    } catch {
+      /* 查询失败回退 */
+    }
+    return null;
   }
 
   private bot(platform: string) {
