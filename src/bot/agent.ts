@@ -638,6 +638,12 @@ export class BotAgent {
               truncate(err.raw ?? err.message, 1200),
             );
             const nativeMode = this.config.bot.mode === "chat" && this.config.bot.nativeToolCalls;
+            // 「工具此刻不可用 / 未知工具」是可执行的明确原因（分层允许集造成）——必须原样透传给模型，
+            // 让它知道该先 open_app 进聊天应用、select_channel 进频道，而不是吞成"恍惚"后原地重试同一个调用。
+            if (/(此刻不可用|未知工具)/.test(err.message)) {
+              this.pushEvent("system", `（${err.message}）`);
+              continue;
+            }
             const emphasis =
               this.parseFailures >= 3
                 ? nativeMode
@@ -1647,7 +1653,8 @@ export class BotAgent {
         const rich = await this.messenger.recentChannels(10);
         const prefix = closed ? `（你关掉了「${closed}」）` : "";
         const unlock = firstOpen
-          ? `（聊天应用已打开，新增可用操作（关闭应用后失效）：\n${renderToolsText(this.layerDefs("chat"))}）\n\n`
+          ? `（聊天应用已打开，新增可用操作（关闭应用后失效）：\n${renderToolsText(this.layerDefs("chat"))}\n` +
+            `要**发消息**（send / send_file / send_voice）得先用 select_channel 点进某个频道——进频道后才解锁这些发送操作。）\n\n`
           : "";
         return typeof rich === "string"
           ? { text: prefix + unlock + rich }
