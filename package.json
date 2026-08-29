@@ -1,6 +1,6 @@
 {
   "name": "koishi-plugin-yesimbot-world",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "YesImBot World: 让 Bot 生活在由另一个 LLM 维护的独立虚拟世界中，持续生成行动流",
   "type": "module",
   "main": "dist/index.cjs",
