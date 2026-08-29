@@ -40,7 +40,7 @@ export interface MessengerApi {
   /** 宽松解析频道 id，返回规范化 key 与是否私聊（用于进入频道页/自动切频道） */
   resolveKey(id: string): Promise<{ key: string; isPrivate: boolean } | { error: string }>;
   recentChannels(n: number): Promise<RichText>;
-  channelMessages(id: string, n: number): Promise<RichText>;
+  channelMessages(id: string, n: number, opts?: { intro?: "open" | "read" | "echo" }): Promise<RichText>;
   gallery(category?: string): Promise<RichText>;
   checkMedia(n: number, type?: "image" | "audio" | "video"): Promise<string>;
   gallerySave(mediaId: string, category: string, description: string, name?: string): Promise<string>;
@@ -621,7 +621,7 @@ export class BotAgent {
 
         // 上下文满：强制休息（带世界观内的合理解释）
         if (this.context.approxChars() > this.config.bot.maxWindowChars) {
-          await this.doRest(null, true);
+          await this.doRest(null, "overflow");
           continue;
         }
 
@@ -933,7 +933,7 @@ export class BotAgent {
         }
         const key = this.phoneUi.channelKey;
         return this.dispatchLocal(call, async () => {
-          const messages = await this.messenger.channelMessages(key, clampInt(call.arguments.n, 10, 200, 10));
+          const messages = await this.messenger.channelMessages(key, clampInt(call.arguments.n, 10, 200, 10), { intro: "read" });
           const text =
             (typeof messages === "string" ? messages : messages.text) +
             "\n（若觉得还没读全，就把 n 调大一些再调用一次 read_channel 看更早的消息。）";
@@ -1761,7 +1761,7 @@ export class BotAgent {
       if (this.forceRestCount >= restAt) {
         this.forceRestCount = 0;
         this.logger.warn("打破死循环：重复未缓解，强制执行带压缩的 rest");
-        void this.doRest(null, true);
+        void this.doRest(null, "breakLoop");
       }
     }
   }
@@ -2001,7 +2001,7 @@ export class BotAgent {
    * 只取文本（不转发附件），保持轻量。
    */
   private async echoChannelRecent(id: string, out: string, n = 10): Promise<string | RichText> {
-    const recent = await this.messenger.channelMessages(id, n);
+    const recent = await this.messenger.channelMessages(id, n, { intro: "echo" });
     const recentText = recent.text.trim();
     return recentText ? { text: `${out}\n\n${recentText}` } : out;
   }
@@ -2353,7 +2353,7 @@ export class BotAgent {
     if (threshold > 0 && this.context.approxChars() < threshold) {
       return this.dispatchLightRest(call);
     }
-    return this.doRest(call, false);
+    return this.doRest(call, null);
   }
 
   /** 小憩：纯计时暂停（语义同 wait），到点或被动静唤醒 */
@@ -2391,19 +2391,36 @@ export class BotAgent {
 
   /**
    * 休息：由 World-LLM 压缩总结上下文，刷新置顶区，重建（text 模式预热）KV cache。
-   * forced = 上下文满时的强制休息，带世界观内的合理解释。
+   * reason：null = 主动休息；"overflow" = 上下文满的强制休息；"breakLoop" = 打破死循环的强制压缩 rest。
+   * 三者各自带不同的世界观合理解释。
    */
-  private async doRest(call: ToolCallRecord | null, forced: boolean): Promise<void> {
-    if (forced) {
+  private async doRest(call: ToolCallRecord | null, reason: "overflow" | "breakLoop" | null): Promise<void> {
+    if (reason === "overflow") {
       this.pushEvent(
         "system",
         "一阵强烈的疲惫感袭来——你经历了太多事，思绪已经不堪重负，撑不住地闭上了眼睛……",
+      );
+    } else if (reason === "breakLoop") {
+      this.pushEvent(
+        "system",
+        pickMeta([
+          "你突然意识到自己一直在原地打转——同一件事翻来覆去，怎么都绕不出去。你强迫自己停下来，先冷静地沉淀一下再继续。",
+          "回过神来，你发现自己的念头像卡了壳似的一再重复，越转越乱。你按住了这股劲，决定先休息整理，理清头绪再说。",
+          "你猛然发觉自己陷进了一个循环：想做的事、说的话一遍遍重复，却毫无进展。你硬是让自己停下来，歇一歇、重新理顺思路。",
+          "你察觉自己像被绕进了死胡同，反复撞着同一堵墙。你深吸一口气，先退下来歇一歇，把乱掉的思路重新理一理。",
+          "某种烦躁让你意识到：自己这几步一直在来回打转，没有往前走。你强迫自己停下，先静下来沉淀，再重新出发。",
+          "你发现自己像唱片跳了针，同一段反复重播。你按停了它，让自己歇一下，把头脑里打结的地方慢慢解开。",
+          "一阵徒劳感让你警醒——你正一遍遍重复着同样的尝试、同样的话。你及时抽身，停下来休息，准备理清后再接着来。",
+          "你恍然明白自己被困在了原地：使出多少力气都只是在转圈。你停住脚，先坐下来歇一歇，把纷乱的念头收一收。",
+          "像是有什么东西让你机械地重复着之前的动作，你警觉地停了下来，决定先休息，让头脑空一空、重新沉淀。",
+          "你从一阵恍惚中定下神，清醒地看到自己正在原地兜圈子。你不再耗下去，先歇一歇，让思路回到正轨。",
+        ]),
       );
     }
     await this.drainMailbox();
 
     const startReal = Date.now();
-    this.logger.info("开始休息（%s），压缩上下文：%d 条记录，约 %d 字符", forced ? "强制" : "主动", this.context.stream.length, this.context.approxChars());
+    this.logger.info("开始休息（%s），压缩上下文：%d 条记录，约 %d 字符", reason ? reason : "主动", this.context.stream.length, this.context.approxChars());
 
     // 压缩失败绝不能让上下文原样保留：否则强制 rest 会立即再次触发，陷入死循环。
     // World-LLM 不可用时降级：直接归档丢弃工作窗口，沿用旧摘要并注明记忆模糊。

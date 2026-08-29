@@ -136,7 +136,7 @@ export class KoishiMessenger implements MessengerApi {
     return { text: `你翻了翻手机，最近活跃的频道：\n${lines.join("\n")}` };
   }
 
-  async channelMessages(id: string, n: number): Promise<RichText> {
+  async channelMessages(id: string, n: number, opts?: { intro?: "open" | "read" | "echo" }): Promise<RichText> {
     const resolved = await this.resolveChannel(id);
     if ("error" in resolved) return { text: resolved.error };
     const { platform, channelId } = resolved;
@@ -166,8 +166,25 @@ export class KoishiMessenger implements MessengerApi {
       const mute = await this.muteHint({ bot, platform, channelId });
       if (mute) tail += `\n（${mute}，禁言解除前没法在这个群里发消息）`;
     }
+    const intro = opts?.intro === "read"
+      ? pickMeta([
+          `你翻了翻 ${display} 的聊天记录（最近 ${rows.length} 条）`,
+          `你往上划了划 ${display} 的消息（最近 ${rows.length} 条）`,
+          `你看了看 ${display} 最近的聊天内容（共 ${rows.length} 条）`,
+          `你刷了一眼 ${display} 的聊天记录（最近 ${rows.length} 条）`,
+          `你浏览了一下 ${display} 近期的消息（共 ${rows.length} 条）`,
+        ])
+      : opts?.intro === "echo"
+        ? pickMeta([
+          `${display} 这边的动静（最近 ${rows.length} 条）`,
+          `${display} 的最新消息（最近 ${rows.length} 条）`,
+          `${display} 里最近的聊天（最近 ${rows.length} 条）`,
+          `${display} 现在的情况（最近 ${rows.length} 条）`,
+          `${display} 的最新进展（最近 ${rows.length} 条）`,
+        ])
+        : `你打开了 ${display} 的聊天记录（最近 ${rows.length} 条）`;
     return {
-      text: `你打开了 ${display} 的聊天记录（最近 ${rows.length} 条）：\n${lines.join("\n")}${tail}`,
+      text: `${intro}：\n${lines.join("\n")}${tail}`,
       attachments: attachments.length ? attachments : undefined,
     };
   }
@@ -2171,6 +2188,12 @@ function formatSize(bytes: number): string {
 }
 
 const LABEL = { image: "图片", audio: "语音", video: "视频" } as const;
+
+/** 从多变体里随机挑一条（避免"每次同一句"的机械感） */
+function pickMeta(variants: string[], seed?: number): string {
+  const i = seed ?? Math.floor(Math.random() * variants.length);
+  return variants[i % variants.length] ?? variants[0] ?? "";
+}
 
 /** 轻量替换媒体占位符（不触发解释器，用于预览） */
 function stripPlaceholders(text: string): string {
