@@ -1,4 +1,5 @@
 import { promises as fs } from "node:fs";
+import { createRequire } from "node:module";
 import path from "node:path";
 import { Context, Service } from "koishi";
 import { AppManager } from "./apps/manager.js";
@@ -52,8 +53,18 @@ declare module "koishi" {
 }
 
 const DEF_PLACEHOLDER = "（尚未编写）";
-/** WebUI 展示用版本号（与 package.json 保持一致） */
-const WEBUI_VERSION = "0.1.0";
+/** WebUI 展示用版本号：优先从 package.json 读取（版本只维护 package.json 一处），读不到才回退常量 */
+const WEBUI_VERSION = readPackageVersion();
+
+/** 从 package.json 读 version（经 ./package.json 导出 path 解析；失败/非发布场景兜底回退） */
+function readPackageVersion(): string {
+  try {
+    const require = createRequire(import.meta.url);
+    return require("koishi-plugin-yesimbot-world/package.json").version as string;
+  } catch {
+    return "0.2.1";
+  }
+}
 
 export class WorldService extends Service<Config> {
   // puppeteer 可选：未安装时浏览器 App 不提供截图（其余功能照常），安装后无需改动即可用
