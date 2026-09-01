@@ -311,9 +311,9 @@ export class BotAgent {
         names.push(...this.layerNames("channel"));
         if (this.phoneUi.channelIsGroup) names.push(...this.layerNames("group"));
       } else if (this.lastNotifyKey) {
-        // 未点进频道页，但有最近通知源（收到过外部消息）→ 允许发送系工具带 id 快捷回复
+        // 未点进频道页，但有最近通知源（收到过外部消息）→ 允许编辑输入框的工具组带 id 快捷回复
         // 其余 channel 工具（unsend/react/poke 等）仍需真正进入频道页。
-        names.push(...SEND_TOOL_NAMES);
+        names.push(...DRAFT_TOOL_NAMES);
       }
     }
     const appDefs = [...(this.apps?.activeToolDefs() ?? []), ...(this.computer?.activeToolDefs() ?? [])];
@@ -524,7 +524,7 @@ export class BotAgent {
       source: "tool",
       content: `消息已发送到 ${channelKey}${msgTag}。`,
       worldTime: this.clock.now(),
-      asToolCall: { name: "send", arguments: { id: channelKey, msg } },
+      asToolCall: { name: "send_message", arguments: { id: channelKey, msg } },
     });
     this.logger.info("[external-send:simulate] %s %s", channelKey, truncate(msg, 100));
     // 账号自己发出了一条消息：打断对该频道的延期发送意图
@@ -1021,12 +1021,6 @@ export class BotAgent {
         }
         return this.dispatchLocal(call, async () => this.messenger.viewMedia(refs));
       }
-      case "send":
-        return this.dispatchSend(call);
-      case "send_file":
-        return this.dispatchSendFile(call);
-      case "send_voice":
-        return this.dispatchSendVoice(call);
       case "start_message":
         return this.dispatchStartMessage(call);
       case "type_text":
@@ -1690,8 +1684,9 @@ export class BotAgent {
         const prefix = closed ? `（你关掉了「${closed}」）` : "";
         const unlock = firstOpen
           ? `（聊天应用已打开，新增可用操作（关闭应用后失效）：\n${renderToolsText(this.layerDefs("chat"))}\n` +
-            `要**发消息**（send / send_file / send_voice），可以先 select_channel 点进某个频道（进频道后才解锁频道内的完整操作）；` +
-            `没点进频道时，若某频道刚来了新消息、收到它的提醒，也能带上它的 id 直接快捷回复。）\n\n`
+            `要**发消息**，先 select_channel 点进某个频道（进频道后才解锁频道内的完整操作），` +
+            `再用 start_message 开始编辑、type_text 打字、pick_media 选图、send_message 发出；` +
+            `没点进频道时，若某频道刚来了新消息、收到它的提醒，也能 start_message 带上它的 id 直接快捷回复。）\n\n`
           : "";
         return typeof rich === "string"
           ? { text: prefix + unlock + rich }
@@ -1937,7 +1932,7 @@ export class BotAgent {
       pend.timer = undefined;
     }
     this.pendingDeferred = this.pendingDeferred.filter((p) => p !== pend);
-    const toolName = pend.kind === "text" ? "send" : pend.kind === "voice" ? "send_voice" : "send_file";
+    const toolName = "send_message";
     const target = pend.kind === "text" ? `给 ${pend.rawId} 发消息说「${pend.content}」` : pend.kind === "voice" ? `给 ${pend.rawId} 发语音「${pend.content}」` : `给 ${pend.rawId} 发送文件「${pend.content}」`;
     this.pushEvent(
       "system",
@@ -1955,7 +1950,7 @@ export class BotAgent {
   /** 同频道来了新消息：打断对那个频道的延期发送意图 */
   noteDeferredChannelActivity(key: string): void {
     // 外部消息动静锚点：无论是否投递通知，只要有别人发来消息，它就是"最近通知源"，
-    // 用于解锁"带 id 快捷回复"（send 系在未 select_channel 时也能显式带 id 发出）。
+    // 用于解锁"带 id 快捷回复"（输入框编辑工具组在未 select_channel 时也能带 id 使用）。
     if (key) this.lastNotifyKey = key;
     if (!this.pendingDeferred.length) return;
     const hit = this.pendingDeferred.filter((p) => this.matchesDeferred(p, key));
@@ -2213,110 +2208,6 @@ export class BotAgent {
       : "\n（输入框是空的。）";
   }
 
-  private dispatchSend(call: ToolCallRecord): void {
-    // sendBlocking：上一条 send 系消息还没回显前，拒绝新的 send（避免连发相近/不连贯的消息）
-    if (this.config.bot.sendBlocking) {
-      const busy = sendBusyMessage(SEND_TOOL_NAMES.flatMap((n) => this.scheduler.pendingByName(n)));
-      if (busy) {
-        this.pushEvent("system", busy, { ref: call.id });
-        return;
-      }
-    }
-    const id = this.channelArg(call) ?? "";
-    const msg = String(call.arguments.msg ?? "");
-    const mediaRaw = call.arguments.media ?? call.arguments.images;
-    const media = Array.isArray(mediaRaw) ? (mediaRaw as (string | number)[]) : [];
-    const replyRaw = call.arguments.reply_to ?? call.arguments.replyTo ?? call.arguments.quote;
-    // 归一化引用目标：Bot 可能照抄消息记录里的 (msg:xxx) 编号，去掉前缀只留数字 id
-    const replyTo = normalizeMsgId(replyRaw);
-    // 引用回复默认自动 @ 原发送人（模拟 QQ 客户端），Bot 显式给 at_sender: false 时去掉
-    const atRaw = call.arguments.at_sender ?? call.arguments.atSender ?? call.arguments.at;
-    const atSender = !(atRaw === false || atRaw === "false" || atRaw === 0);
-    if (!id) {
-      this.pushEvent("system", "（send 现在没有可发的频道：你需要先用 select_channel 点进某个频道，或等某个频道来新消息后带上它的 id 快捷回复。）", { ref: call.id });
-      return;
-    }
-    if (!msg && !media.length) {
-      // 误写的消息参数名（message/text/content）：点名纠正，不打捞
-      const alias = ["message", "text", "content"].find((k) => call.arguments[k] != null);
-      this.pushEvent(
-        "system",
-        alias
-          ? `（send 的消息参数必须叫 msg，不存在 ${alias} 这种参数。` +
-              `正确格式：send(id?: string, msg: string, …)。什么都没有发生，请改正后重试。）`
-          : "（send 需要 msg（或 media）参数。）",
-        { ref: call.id },
-      );
-      return;
-    }
-    // 超长消息拦截：真人聊天单条消息很短；确需发长文时要求二次确认
-    const longLimit = this.config.messaging.longMessageChars;
-    if (longLimit > 0 && msg.length > longLimit && !isTruthy(call.arguments.confirm_long)) {
-      this.pushEvent(
-        "system",
-        pickMeta([
-          `（这条消息长达 ${msg.length} 字，没有发出。日常聊天中一条消息一般只有十来个字，太长会显得不像真人——建议精简，或拆成几条短消息分开发。如果你确实要一次性发送长内容（如资料、长文），请在参数里加上 confirm_long: true 再发一次。）`,
-          `（${msg.length} 字太长了，没发出去。真人聊天都是短句，这么一大段会穿帮。精简一下或拆成几句；真要发长文就加 confirm_long: true。）`,
-          `（这条有 ${msg.length} 字，被拦下了。一口气甩这么长不像在聊天，拆短一点更像真人。确需整段长文时加 confirm_long: true。）`,
-          `（你这条消息 ${msg.length} 字，超出了日常聊天的分寸，没发出。日常一句也就十来字——拆开说吧；发资料长文才加 confirm_long: true。）`,
-          `（${msg.length} 字，太长了，这次没发。像在念稿而不是聊天。精简成几句，或确需发长文就 confirm_long: true。）`,
-          `（这条消息被截住了：${msg.length} 字，日常聊天不会一次说这么多。拆成短句逐条发；真发长文加 confirm_long: true。）`,
-          `（一条 ${msg.length} 字的长消息，没发。太不像真人在群里聊天了。建议拆开；确需长文才 confirm_long: true。）`,
-          `（这条长文（${msg.length} 字）没有发出。短消息更自然。要么精简、要么拆条；坚持发长文就加 confirm_long: true。）`,
-          `（${msg.length} 字的消息被拦下了。正常人不会一口气打这么多。拆成几条吧；确需整段发，加 confirm_long: true。）`,
-          `（这条消息 ${msg.length} 字，超出常理了。先按住没发。缩短、拆分，或确实要发整段长文就加 confirm_long: true 再试。）`,
-        ]),
-        { ref: call.id },
-      );
-      return;
-    }
-    // duration 明显超过打字时间 → 视为"过会儿再发"，延期后询问而不是自动发出
-    if (this.maybeDeferSend(call, "text", id, msg)) return;
-    if (this.gateSendDuration(call, "打字")) return;
-    // 拦截"近期反复发同一句"（口头禅式复读）：同一签名在最近 N 条里重复达到阈值就拦，
-    // 除非显式声明 resend。用滑动窗口而非只跟上一条比——治"每隔几句又把同一句话说一遍"。
-    // 注意：sig 只按「频道 + 内容 + 图片」判重，显式排除 reply_to / at_sender——
-    // 同一句话无论是否在引用回复别人、是否 @ 了对方，都是同一句，都要拦。
-    const sig = JSON.stringify([id, msg, media.map(String)]);
-    const recentRepeat = this.recentSendSigs.filter((s) => s === sig).length;
-    const repeatThreshold = this.config.messaging.recentRepeatThreshold;
-    if (repeatThreshold > 0 && recentRepeat >= repeatThreshold && !isTruthy(call.arguments.resend)) {
-      this.pushEvent(
-        "system",
-        pickMeta(
-          [
-            `（你最近已经说过「${truncate(msg, 24)}」${recentRepeat} 次了。这句话反复出现，就像一个复读机——这次没有发出。换一种说法，或真的没有新内容就别说。）`,
-            `（又是这句「${truncate(msg, 24)}」？近期你已经发了 ${recentRepeat} 次几乎相同的话。请别变成只会复读的机器，想点新的话说。）`,
-            `（「${truncate(msg, 24)}」这句你最近反复说了 ${recentRepeat} 遍。收一收，说说别的，或沉默也比复读强。）`,
-            `（这句话「${truncate(msg, 24)}」你已经说过 ${recentRepeat} 回了，怎么还在原地说。它没有被发出去——换句新鲜的吧。）`,
-            `（停一下，你又要说「${truncate(msg, 24)}」？这已经是近期第 ${recentRepeat} 次了。重复的话不如不说，想点新东西。）`,
-            `（又是老一套：「${truncate(msg, 24)}」。你已经第 ${recentRepeat} 次想发这句了，忍住，说点不一样的。）`,
-            `（这是你第 ${recentRepeat} 次想说「${truncate(msg, 24)}」了，这句早说过。消息没发，请换个表达，别老重复。）`,
-            `（词穷了吗？「${truncate(msg, 24)}」你最近说过 ${recentRepeat} 次，再说就没意思了。这次不发了，想想别的。）`,
-            `（「${truncate(msg, 24)}」翻来覆去就是它，已经是第 ${recentRepeat} 次。别再借这句话应付了，认真回应眼前的情况。）`,
-            `（这句「${truncate(msg, 24)}」已经讲过 ${recentRepeat} 次，再讲就是嚼别人嚼过的馍。消息被拦下，换措辞。）`,
-          ],
-        ),
-        { ref: call.id },
-      );
-      return;
-    }
-    this.recordSendSig(sig);
-    this.ackStart(call);
-    const insist = isTruthy(call.arguments.insist);
-    this.scheduler.schedule(call, {
-      executeAt: "expected", // 打字完成的那一刻消息才真正发出（此前可 cancel）
-      run: async () => {
-        const target = await this.switchToTarget(id);
-        if ("error" in target) return target.error;
-        const out = await this.messenger.send(target.key, msg, media, replyTo, atSender, insist);
-        // 自己发出了一条消息：打断对该频道的延期发送意图
-        this.noteDeferredSelfSent(target.key);
-        return this.echoChannelRecent(id, out);
-      },
-    });
-  }
-
   /** 记录一条已发出的 send 签名，滑窗维护「最近 N 条」（超窗滑出最老） */
   private recordSendSig(sig: string): void {
     this.recentSendSigs.push(sig);
@@ -2324,121 +2215,6 @@ export class BotAgent {
     if (this.recentSendSigs.length > window) {
       this.recentSendSigs = this.recentSendSigs.slice(this.recentSendSigs.length - window);
     }
-  }
-
-  private dispatchSendFile(call: ToolCallRecord): void {
-    if (this.config.bot.sendBlocking) {
-      const busy = sendBusyMessage(SEND_TOOL_NAMES.flatMap((n) => this.scheduler.pendingByName(n)));
-      if (busy) {
-        this.pushEvent("system", busy, { ref: call.id });
-        return;
-      }
-    }
-    const id = this.channelArg(call) ?? "";
-    const file = String(call.arguments.file ?? "");
-    if (!id) {
-      this.pushEvent("system", "（send_file 现在没有可发的频道：你需要先用 select_channel 点进某个频道，或等某个频道来新消息后带上它的 id 快捷回复。）", { ref: call.id });
-      return;
-    }
-    if (!file) {
-      // 误写的文件参数名：点名纠正，不打捞
-      const alias = ["ref", "media", "path", "filename", "file_id", "name"].find(
-        (k) => call.arguments[k] != null,
-      );
-      this.pushEvent(
-        "system",
-        alias
-          ? `（send_file 的文件参数必须叫 file，不存在 ${alias} 这种参数。` +
-              `正确格式：send_file(file: string, id?: string)。什么都没有发生，请改正后重试。）`
-          : "（send_file 需要 file 参数。）",
-        { ref: call.id },
-      );
-      return;
-    }
-    if (this.maybeDeferSend(call, "file", id, file)) return;
-    if (this.gateSendDuration(call, "挑选并发送文件的")) return;
-    this.ackStart(call);
-    this.scheduler.schedule(call, {
-      executeAt: "expected",
-      run: async () => {
-        const target = await this.switchToTarget(id);
-        if ("error" in target) return target.error;
-        const out = await this.messenger.sendFile(target.key, file);
-        this.noteDeferredSelfSent(target.key);
-        return this.echoChannelRecent(id, out);
-      },
-    });
-  }
-
-  private dispatchSendVoice(call: ToolCallRecord): void {
-    if (this.config.bot.sendBlocking) {
-      const busy = sendBusyMessage(SEND_TOOL_NAMES.flatMap((n) => this.scheduler.pendingByName(n)));
-      if (busy) {
-        this.pushEvent("system", busy, { ref: call.id });
-        return;
-      }
-    }
-    const id = this.channelArg(call) ?? "";
-    const text = String(call.arguments.text ?? "");
-    if (!id) {
-      this.pushEvent("system", "（send_voice 现在没有可发的频道：你需要先用 select_channel 点进某个频道，或等某个频道来新消息后带上它的 id 快捷回复。）", { ref: call.id });
-      return;
-    }
-    if (!text) {
-      // 误写的文本参数名：点名纠正，不打捞
-      const alias = ["msg", "message", "content", "voice"].find((k) => call.arguments[k] != null);
-      this.pushEvent(
-        "system",
-        alias
-          ? `（send_voice 的文本参数必须叫 text，不存在 ${alias} 这种参数。` +
-              `正确格式：send_voice(text: string, id?: string)。什么都没有发生，请改正后重试。）`
-          : "（send_voice 需要 text 参数。）",
-        { ref: call.id },
-      );
-      return;
-    }
-    if (this.maybeDeferSend(call, "voice", id, text)) return;
-    if (this.gateSendDuration(call, "说话")) return;
-    // 近期反复说同一句（同 send 的滑动窗口去重）
-    const vsig = JSON.stringify(["voice", id, text]);
-    const vRepeat = this.recentSendSigs.filter((s) => s === vsig).length;
-    if (
-      this.config.messaging.recentRepeatThreshold > 0 &&
-      vRepeat >= this.config.messaging.recentRepeatThreshold &&
-      !isTruthy(call.arguments.resend)
-    ) {
-      this.pushEvent(
-        "system",
-        pickMeta(
-          [
-            `（这句「${truncate(text, 24)}」你最近已经说过 ${vRepeat} 次了——别反复说同一句话，换点新鲜的。）`,
-            `（又是「${truncate(text, 24)}」，近期第 ${vRepeat} 次了。这句没发出去，别再复读，想点别的话。）`,
-            `（「${truncate(text, 24)}」你翻来覆去说了 ${vRepeat} 遍，说点别的吧，重复的话没人爱听。）`,
-            `（打住，这句「${truncate(text, 24)}」你已经第 ${vRepeat} 次想说了。语音没发，换个说法。）`,
-            `（又是这套「${truncate(text, 24)}」，都说 ${vRepeat} 回了。歇一歇，想想新的内容。）`,
-            `（这句「${truncate(text, 24)}」近期讲过 ${vRepeat} 次，再讲就成复读了。拦住，重新组织语言。）`,
-            `（你又要说「${truncate(text, 24)}」？已经第 ${vRepeat} 次了，句穷了就先别发。）`,
-            `（「${truncate(text, 24)}」又是它，第 ${vRepeat} 回了。这条被拦下，请说点跟刚才不一样的。）`,
-            `（同一句「${truncate(text, 24)}」你已经念了 ${vRepeat} 遍，像卡带的录音。停一下，换台。）`,
-            `（别再「${truncate(text, 24)}」了，这是第 ${vRepeat} 次。语音没发出，想点新鲜的。）`,
-          ],
-        ),
-        { ref: call.id },
-      );
-      return;
-    }
-    this.recordSendSig(vsig);
-    this.ackStart(call);
-    this.scheduler.schedule(call, {
-      executeAt: "expected", // 说完的那一刻语音才发出（此前可 cancel）
-      run: async () => {
-        const target = await this.switchToTarget(id);
-        if ("error" in target) return target.error;
-        const out = await this.messenger.sendVoice(target.key, text);
-        this.noteDeferredSelfSent(target.key);
-        return this.echoChannelRecent(id, out);
-      },
-    });
   }
 
   private dispatchCancel(call: ToolCallRecord): void {
@@ -2833,8 +2609,10 @@ function escalatingRepeatHint(repeatCount: number): string {
   ]);
 }
 
-/** send 系工具（send/send_file/send_voice）的名字集合 */
-const SEND_TOOL_NAMES = ["send", "send_file", "send_voice"];
+/** send 系工具（send_message）的名字集合 */
+const SEND_TOOL_NAMES = ["send_message"];
+/** 输入框编辑工具组（start_message → type_text/pick_media… → send_message） */
+const DRAFT_TOOL_NAMES = ["start_message", "type_text", "backspace", "pick_media", "clear_draft", "send_message"];
 
 /** 打破死循环时不该被移除的"安全"工具：计时/书签类，移除它们反而会让模型无处安放、更疯狂 */
 function isBreakLoopSafeTool(name: string): boolean {
@@ -2842,19 +2620,11 @@ function isBreakLoopSafeTool(name: string): boolean {
 }
 
 /**
- * sendBlocking 阻塞模式：存在未完成（未回显）的 send 系调用时，返回提示文本，否则 null。
- * 供 dispatchSend / dispatchSendFile / dispatchSendVoice 使用。
+ * sendBlocking 阻塞模式：存在未完成（未回显）的 send_message 调用时，返回提示文本，否则 null。
  */
 export function sendBusyMessage(pending: ToolCallRecord[]): string | null {
   if (!pending.length) return null;
-  const first = pending[0]!;
-  const preview =
-    first.name === "send"
-      ? String(first.arguments.msg ?? "").trim()
-      : first.name === "send_voice"
-        ? String(first.arguments.text ?? "").trim()
-        : String(first.arguments.file ?? "").trim();
-  const what = preview ? `「${truncate(preview, 40)}」` : "";
+  const what = "";
   return pickMeta([
     `（你上一条消息${what}还在发送中、还没看到结果，这次没有发出。等它的结果回显后再接着说——可以先做点别的，或整理一下接下来想说的话。）`,
     `（你上一条${what}还没发出去，又急着发新的了？先等等，看到上一条的结果再继续，别抢话。）`,

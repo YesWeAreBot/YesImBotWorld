@@ -26,7 +26,7 @@ const CHAT_LAYER = new Set([
   "user_info", "send_like", "delete_friend", "set_profile", "set_model_show", "ocr_image",
 ]);
 const CHANNEL_LAYER = new Set([
-  "send", "send_file", "send_voice", "unsend", "react", "get_emoji_likes",
+  "unsend", "react", "get_emoji_likes",
   "forward_msgs", "view_forward", "exit_forward", "poke", "channel_notify",
   "read_channel",
   "start_message", "type_text", "backspace", "pick_media", "clear_draft", "send_message",
@@ -212,33 +212,6 @@ export const BOT_TOOLS: BotToolDef[] = [
       "与上一条完全相同的消息会被拦截（防复读），确实要重复发送时加 resend: true。",
   },
   {
-    name: "send",
-    signature: 'send(msg: string, id?: string, media?: string[], resend?: boolean, confirm_long?: boolean, insist?: boolean)',
-    description:
-      "发送消息。id 缺省为当前所在频道页；要发给别的频道就给出完整频道 id（格式 \"platform:channelId\"，来自消息列表，不要用人名代替）。" +
-      "没点进任何频道页时（例如刚收到某频道的新消息通知、想快捷回复），带上该频道的 id 即可直接发出，无需先 select_channel。" +
-      'media 可附带图片或视频，元素为媒体编号（如 "12"，来自收藏夹或媒体缓存）。' +
-      "在 msg 里写 [图片#12] 或 [视频#3] 会把对应媒体嵌在文字中间发出（图文混排，QQ 等平台可能分开显示）——" +
-      "注意：msg 里写了标记这张图就会真的发出去，不想发就不要写。" +
-      "duration 表示打字耗时——按消息长度估计，几到几十 TU。消息会在打字完成时真正发出（发出前可 cancel）。" +
-      "duration 明显超过打字时间时不会自动发出，而是视为你打算过会儿再发：到点后系统会问你到底要不要发（想发再调用一次 send）；" +
-      "期间若目标频道来了新消息、你自己的账号在那边发了消息、或你转去忙别的，这个念头就会被打断。" +
-      "与上一条完全相同的消息会被拦截（防止无意义复读）；确实要重复发送时加 resend: true。" +
-      "像真人一样聊天：单条消息尽量简短（一般十来个字），长内容拆成多条短消息；" +
-      "确需发送整段长文（如资料、文章）时须加 confirm_long: true。" +
-      "连续发了几条对方都没回应时，继续发送会被拦下——确实有必须现在说的话再加 insist: true。" +
-      "消息里的结构标签照抄即可复用：<at id=\"QQ号\"/>、<face id=\"…\"/>、<quote id=\"…\"/> 是别人消息里真实出现过的引用/@/表情。" +
-      "引用回复别人、@ 别人时用「reply_to / at_sender 参数」（见下），不要自己在 msg 里现编这些标签；" +
-      "只有当你就是把别人消息原样转发/复述、其中天然带着这些标签时才照抄，不要在标签基础上再加一次参数。",
-  },
-  {
-    name: "send_file",
-    signature: 'send_file(file: string, id?: string)',
-    description:
-      '以文件形式发送音频、视频或其他文件。file 为媒体编号（如 "7"）或收藏夹文件（如 "gallery:简历.pdf"）；' +
-      "id 缺省为当前频道。图片请直接用 send 的 media 参数发送。",
-  },
-  {
     name: "start_message",
     signature: 'start_message(id?: string, reply_to?: string, at_sender?: boolean)',
     description:
@@ -270,13 +243,6 @@ export const BOT_TOOLS: BotToolDef[] = [
     name: "clear_draft",
     signature: 'clear_draft()',
     description: "清空输入框里还没发出去的全部内容（取消这轮编辑）。",
-  },
-  {
-    name: "send_voice",
-    signature: 'send_voice(text: string, id?: string)',
-    description:
-      "把一段话转成你的声音，以语音消息发出（id 缺省为当前频道）。适合简短口语化的内容。" +
-      "duration 表示说话耗时（几到几十 TU）；明显超过时会视为你打算过会儿再发，到点后询问你是否要发（想发再调用一次 send_voice）。发出前可 cancel。",
   },
   {
     name: "unsend",
@@ -524,8 +490,6 @@ export function availableTools(opts: {
         return (opts.crossingWorlds?.length ?? 0) > 0;
       case "go_home":
         return !!opts.crossingConfigured;
-      case "send_voice":
-        return opts.tts;
       case "channel_notify":
         return !!opts.notifyManaged;
       case "unsend":
@@ -598,25 +562,9 @@ export function availableTools(opts: {
         return true;
     }
   });
-  // 各分支按顺序叠加（同一工具可能命中多条，如 send 同时受 ignoreSendDuration 与 reply 影响）
+  // 各分支按顺序叠加
   return tools.map((t) => {
     let def = t;
-    // 无视 send 系 duration：描述同步改口（与 agent.gateSendDuration 的行为对应）
-    if (opts.ignoreSendDuration && (def.name === "send" || def.name === "send_voice")) {
-      def = {
-        ...def,
-        description:
-          def.name === "send"
-            ? def.description.replace(
-                /duration 表示打字耗时[\s\S]*?这个念头就会被打断。/,
-                "duration 会被忽略，消息立即发出。",
-              )
-            : def.description.replace(
-                /duration 表示说话耗时[\s\S]*?可 cancel。/,
-                "duration 会被忽略，语音立即发出。",
-              ),
-      };
-    }
     // 等待占比拦截：只有开启时才在 wait 描述里说明 confirm 参数
     if (def.name === "wait" && opts.waitConfirm) {
       def = {
@@ -634,23 +582,6 @@ export function availableTools(opts: {
           def.description +
           "开启 blockingAct（同时只能专注做一件事）时：上一个动作还没完成前，新的 act 会被直接拒绝，" +
           "也不能用 repeat 绕过——手头的事照常推进，等它的结果自动送达即可。",
-      };
-    }
-    // 开启引用回复时，send 增加 reply_to / at_sender 参数说明
-    if (def.name === "send" && opts.ops.reply) {
-      def = {
-        ...def,
-        signature: def.signature.replace(
-          "media?: string[]",
-          "media?: string[], reply_to?: string, at_sender?: boolean",
-        ),
-        description:
-          def.description +
-          "引用回复某条消息时用 reply_to 参数，填消息记录里 (msg:xxx) 的**数字编号**（即 xxx 这串数字，不要带 \"msg:\" 前缀，这是唯一方式，不要再在 msg 里另加 <quote>/<at> 标签）。" +
-          "注意：reply_to 填的是**消息编号 (msg:xxx)**，不是图片的媒体编号——要回复某张图时，填它所在那条消息的 (msg:xxx)，绝不能填 [图片#12] 里的 12（那是媒体编号，只用于发图/view_media）。" +
-          "群聊里用 reply_to 引用会像 QQ 一样自动在开头 @ 对方——大多数时候保留即可；" +
-          "如果不想 @（比如只是顺带提到、或不想打扰对方），加 at_sender: false 去掉，就像真人删掉自动加上的 @。" +
-          "要 @ 某人但不想引用它的话，才在 msg 里写 <at id=\"QQ号\"/>（而不要用 reply_to）。",
       };
     }
     // open_app 的描述里列出已安装的应用
