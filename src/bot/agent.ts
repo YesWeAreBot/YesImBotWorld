@@ -6,7 +6,8 @@ import { needsMsgIds, type Config } from "../config.js";
 import type { WorldFiles } from "../files.js";
 import { RepeatGuard, type ObserveResult } from "./repeatGuard.js";
 import { ToolCallParseError } from "../llm/parse.js";
-import type { BotEvent, CompressionResult, EventSource, MediaRef, ParsedToolCall, PhoneStatus, RichText, RichTextPart, ToolCallRecord } from "../types.js";
+import type { BotEvent, CompressionResult, Draft, DraftSegment, EventSource, MediaRef, ParsedToolCall, PhoneStatus, PickFailure, PickResult, RichText, RichTextPart, ToolCallRecord } from "../types.js";
+import { emptyDraft } from "../types.js";
 import type { WorldAgent } from "../world/agent.js";
 import type { NotifyManager } from "../koishi/notify.js";
 import { debug } from "../webui/debug.js";
@@ -47,10 +48,18 @@ export interface MessengerApi {
   galleryMove(name: string, category: string, description?: string): Promise<string>;
   galleryRemove(name: string): Promise<string>;
   viewMedia(refs: string[]): Promise<RichText>;
+  resolveMediaRefs(refs: string[]): Promise<(PickResult | PickFailure)[]>;
   send(
     id: string,
     msg: string,
     media?: (string | number)[],
+    replyTo?: string,
+    atSender?: boolean,
+    insist?: boolean,
+  ): Promise<string>;
+  sendSegments(
+    id: string,
+    segments: DraftSegment[],
     replyTo?: string,
     atSender?: boolean,
     insist?: boolean,
@@ -215,6 +224,12 @@ export class BotAgent {
     /** 正在逐层查看的合并转发聊天记录（view_forward 压栈 / exit_forward 出栈） */
     forwardStack: string[];
   } = { chatOpen: false, channelKey: null, channelIsGroup: false, forwardStack: [] };
+  /**
+   * 待发送输入框：像真人一样先把要发的内容编辑好（打字、选图插入、删改），
+   * 最后再单独「发送」。替代原来一次性生成整条消息的 send——发图必须先选图，
+   * 杜绝「不看图随手写个 [图片#id] 就发出来」的不相关图。
+   */
+  private draft: Draft = emptyDraft();
   /**
    * 最近一次有外部消息动静的频道 key（通知快捷回复的锚点）：
    * 手机即使没点进任何频道页，只要最近有频道来了新消息，send 系工具就能解锁快捷回复——
@@ -1012,6 +1027,18 @@ export class BotAgent {
         return this.dispatchSendFile(call);
       case "send_voice":
         return this.dispatchSendVoice(call);
+      case "start_message":
+        return this.dispatchStartMessage(call);
+      case "type_text":
+        return this.dispatchTypeText(call);
+      case "backspace":
+        return this.dispatchBackspace(call);
+      case "pick_media":
+        return this.dispatchPickMedia(call);
+      case "clear_draft":
+        return this.dispatchClearDraft(call);
+      case "send_message":
+        return this.dispatchSendMessage(call);
       case "put_down_phone":
         return this.dispatchLocal(call, async () => {
           const closedApp = await this.apps?.closeCurrent();
@@ -2003,6 +2030,189 @@ export class BotAgent {
     return recentText ? { text: `${out}\n\n${recentText}` } : out;
   }
 
+  // ---------- 待发送输入框（draft） ----------
+
+  /** 开始编辑一条消息：确定目标频道（及可选的引用回复）。已有未发内容时先确认是否覆盖。 */
+  private dispatchStartMessage(call: ToolCallRecord): void {
+    return this.dispatchLocal(call, async () => {
+      const id = this.channelArg(call);
+      if (!id && !this.draft.channelKey) {
+        return "（start_message 需要 id 参数：先 select_channel 进频道，或给出频道 id 指定要发给谁。）";
+      }
+      if (id) {
+        const resolved = await this.messenger.resolveKey(id);
+        if ("error" in resolved) return resolved.error;
+        this.draft.channelKey = resolved.key;
+      }
+      const replyRaw = call.arguments.reply_to ?? call.arguments.replyTo;
+      this.draft.replyTo = normalizeMsgId(replyRaw);
+      const atRaw = call.arguments.at_sender ?? call.arguments.atSender ?? call.arguments.at;
+      this.draft.atSender = !(atRaw === false || atRaw === "false" || atRaw === 0);
+      this.draft.segments = [];
+      this.draft.cursor = 0;
+      return (
+        `你开始编辑发给 ${this.draft.channelKey} 的消息` +
+        (this.draft.replyTo ? `（引用回复 msg:${this.draft.replyTo}）` : "") +
+        `。输入框还是空的：用 type_text 打字、pick_media 挑图插入，编辑好用 send_message 发出。`
+      );
+    });
+  }
+
+  /** 在光标处输入文字（与相邻文字段合并）。返回输入框当前内容预览。 */
+  private dispatchTypeText(call: ToolCallRecord): void {
+    return this.dispatchLocal(call, async () => {
+      if (!this.draft.channelKey) {
+        return "（还没有开始编辑消息：先 start_message 确定要发给谁。）";
+      }
+      const text = String(call.arguments.text ?? call.arguments.msg ?? "");
+      if (!text) return "（type_text 需要 text 参数。）";
+      this.draft.segments.splice(this.draft.cursor, 0, { kind: "text", text });
+      this.draft.cursor += 1;
+      return this.draftPreview();
+    });
+  }
+
+  /** 从光标前删除内容（默认删一个文字段/媒体段，或按 n 个字符删）。 */
+  private dispatchBackspace(call: ToolCallRecord): void {
+    return this.dispatchLocal(call, async () => {
+      if (!this.draft.channelKey) {
+        return "（还没有开始编辑消息：先 start_message 确定要发给谁。）";
+      }
+      if (this.draft.cursor <= 0) return "（光标已经在最前面，没有可删的内容。）";
+      const seg = this.draft.segments[this.draft.cursor - 1]!;
+      if (seg.kind === "text") {
+        const n = Number(call.arguments.n ?? 1);
+        if (Number.isFinite(n) && n > 0 && n < seg.text.length) {
+          seg.text = seg.text.slice(0, seg.text.length - n);
+        } else {
+          this.draft.segments.splice(this.draft.cursor - 1, 1);
+          this.draft.cursor -= 1;
+        }
+      } else {
+        // 媒体/文件/语音段：整体删除
+        this.draft.segments.splice(this.draft.cursor - 1, 1);
+        this.draft.cursor -= 1;
+      }
+      return this.draftPreview();
+    });
+  }
+
+  /** 挑图并插入输入框：从收藏夹/媒体缓存选定若干张图，插到光标处（必须先看清内容）。 */
+  private dispatchPickMedia(call: ToolCallRecord): void {
+    return this.dispatchLocal(call, async () => {
+      if (!this.draft.channelKey) {
+        return "（还没有开始编辑消息：先 start_message 确定要发给谁。）";
+      }
+      const raw = call.arguments.media ?? call.arguments.media_ids ?? call.arguments.refs;
+      const refs = Array.isArray(raw) ? raw.map((r) => String(r)) : [];
+      if (!refs.length) return "（pick_media 需要 media 参数：要插入的媒体编号或收藏夹文件的列表，如 [\"12\", \"gallery:表情包/xx.png\"]。）";
+      const results = await this.messenger.resolveMediaRefs(refs);
+      const okCount = results.filter((r) => r.ok).length;
+      const inserted: string[] = [];
+      for (const r of results) {
+        if (!r.ok) {
+          this.pushEvent("system", `（${r.refText}：${r.error}）`, { ref: call.id });
+          continue;
+        }
+        this.draft.segments.splice(this.draft.cursor, 0, { kind: "media", ref: r.ref, sticker: r.sticker });
+        this.draft.cursor += 1;
+        inserted.push(`[${r.ref.type === "image" ? "图片" : r.ref.type === "video" ? "视频" : "音频"}#${r.ref.id}]`);
+      }
+      return (
+        (inserted.length
+          ? `你从${this.draft.channelKey}的输入框里插入了 ${inserted.join("、")}。`
+          : "没有插入任何媒体。") +
+        this.draftPreview()
+      );
+    });
+  }
+
+  /** 清空输入框。 */
+  private dispatchClearDraft(call: ToolCallRecord): void {
+    return this.dispatchLocal(call, async () => {
+      this.draft.segments = [];
+      this.draft.cursor = 0;
+      return "（输入框已清空。）";
+    });
+  }
+
+  /** 单独发送：把输入框里的内容真正发出去。复用 send 的拦截逻辑，发送后清空输入框。 */
+  private dispatchSendMessage(call: ToolCallRecord): void {
+    if (this.config.bot.sendBlocking) {
+      const busy = sendBusyMessage(SEND_TOOL_NAMES.flatMap((n) => this.scheduler.pendingByName(n)));
+      if (busy) {
+        this.pushEvent("system", busy, { ref: call.id });
+        return;
+      }
+    }
+    if (!this.draft.channelKey) {
+      this.pushEvent("system", "（还没有要发的消息：先 start_message 确定目标，再 type_text / pick_media 编辑内容，最后 send_message 发送。）", { ref: call.id });
+      return;
+    }
+    if (!this.draft.segments.length) {
+      this.pushEvent("system", "（输入框是空的，没有可发的内容。）", { ref: call.id });
+      return;
+    }
+    const id = this.draft.channelKey;
+    const draftText = draftPlainText(this.draft.segments);
+    const hasMedia = this.draft.segments.some((s) => s.kind === "media");
+    const longLimit = this.config.messaging.longMessageChars;
+    if (longLimit > 0 && draftText.length > longLimit && !isTruthy(call.arguments.confirm_long)) {
+      this.pushEvent(
+        "system",
+        pickMeta([
+          `（这条消息长达 ${draftText.length} 字，没有发出。日常聊天中一条消息一般只有十来个字，太长会显得不像真人——建议用 backspace 精简，或拆成几条分开发。如果你确实要一次性发送长内容（如资料、长文），请在参数里加上 confirm_long: true 再发一次。）`,
+          `（${draftText.length} 字太长了，没发出去。真人聊天都是短句，这么一大段会穿帮。精简一下或拆成几句；真要发长文就加 confirm_long: true。）`,
+          `（这条有 ${draftText.length} 字，被拦下了。一口气甩这么长不像在聊天，拆短一点更像真人。确需整段长文时加 confirm_long: true。）`,
+        ]),
+        { ref: call.id },
+      );
+      return;
+    }
+    if (this.gateSendDuration(call, "打字")) return;
+    // 防复读签名：按「频道 + 文字 + 图片」判重
+    const sig = JSON.stringify([id, draftText, this.draft.segments.filter((s) => s.kind === "media").map((s) => s.kind === "media" ? String(s.ref.id) : "")]);
+    const recentRepeat = this.recentSendSigs.filter((s) => s === sig).length;
+    const repeatThreshold = this.config.messaging.recentRepeatThreshold;
+    if (repeatThreshold > 0 && recentRepeat >= repeatThreshold && !isTruthy(call.arguments.resend)) {
+      this.pushEvent("system", `（你最近已经说过「${truncate(draftText, 24)}」${recentRepeat} 次了。这句没有发出——换一种说法，或真的没有新内容就别说。）`, { ref: call.id });
+      return;
+    }
+    this.recordSendSig(sig);
+    this.ackStart(call);
+    const insist = isTruthy(call.arguments.insist);
+    const replyTo = this.draft.replyTo;
+    const atSender = this.draft.atSender;
+    const segments = this.draft.segments;
+    this.draft.segments = [];
+    this.draft.cursor = 0;
+    this.draft.replyTo = undefined;
+    this.draft.atSender = true;
+    this.scheduler.schedule(call, {
+      executeAt: "expected",
+      run: async () => {
+        const target = await this.switchToTarget(id);
+        if ("error" in target) return target.error;
+        const out = await this.messenger.sendSegments(target.key, segments, replyTo, atSender, insist);
+        this.noteDeferredSelfSent(target.key);
+        return this.echoChannelRecent(id, out);
+      },
+    });
+  }
+
+  /** 输入框当前内容的预览文本（供编辑工具反馈）。 */
+  private draftPreview(): string {
+    const parts = this.draft.segments.map((s) => {
+      if (s.kind === "text") return s.text;
+      if (s.kind === "media") return `\u3010${s.ref.type === "image" ? "图片" : s.ref.type === "video" ? "视频" : "音频"}#${s.ref.id}\u3011`;
+      if (s.kind === "file") return `\u3010文件：${s.label}\u3011`;
+      return `\u3010语音：${s.text}\u3011`;
+    });
+    return parts.length
+      ? `\n（当前输入框内容：${parts.join("")}）`
+      : "\n（输入框是空的。）";
+  }
+
   private dispatchSend(call: ToolCallRecord): void {
     // sendBlocking：上一条 send 系消息还没回显前，拒绝新的 send（避免连发相近/不连贯的消息）
     if (this.config.bot.sendBlocking) {
@@ -2522,6 +2732,11 @@ function truncate(text: string, max: number): string {
 /** RichText / string 统一取纯文本 */
 function toPlainText(content: string | RichText): string {
   return typeof content === "string" ? content : content.text;
+}
+
+/** 提取 draft 的纯文本（用于长文/防复读判断；媒体段不计入文字长度） */
+function draftPlainText(segments: DraftSegment[]): string {
+  return segments.map((s) => (s.kind === "text" ? s.text : s.kind === "voice" ? s.text : "")).join("");
 }
 
 /**
