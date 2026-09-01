@@ -251,7 +251,9 @@ export class KoishiMessenger implements MessengerApi {
 
     const lines: string[] = [];
     const attachments: MediaRef[] = [];
-    for (const name of names.slice(0, 50)) {
+    const parts: RichTextPart[] = [];
+    for (let idx = 0; idx < Math.min(names.length, 50); idx++) {
+      const name = names[idx]!;
       const file = path.join(this.galleryStore.dirOf(cat), name);
       const stat = await fs.stat(file).catch(() => null);
       if (!stat?.isFile()) continue;
@@ -259,40 +261,52 @@ export class KoishiMessenger implements MessengerApi {
       if (type === "image") {
         const id = await this.media.ingest(`file://${file}`, "image");
         if (id === null) {
-          lines.push(`- [图片] ${cat}/${name}（读取失败）`);
+          const row = `- ${cat}/${name}（读取失败）`;
+          lines.push(row);
+          parts.push({ kind: "text", text: row + (idx < Math.min(names.length, 50) - 1 ? "\n" : "") });
           continue;
         }
         const row = await this.media.get(id);
         const meta = row ? await this.galleryStore.findMeta(cat, name, row.sha256) : null;
-        const desc =
-          meta?.description || (row ? ((await this.captioner.describe(row.ref)) ?? "") : "");
-        let attachNote = "";
+        const desc = meta?.description || (row ? ((await this.captioner.describe(row.ref)) ?? "") : "");
+        const head = `- ${cat}/${name}${desc ? `：${truncate(desc, 120)}` : ""}`;
+        // 原生可附且预算内：图就位（parts 里 media 段紧跟这一行文字），不带 [图片#id] 占位、不写「原图见附件」
         if (row && this.renderer.canAttach(row.ref) && attachments.length < this.renderer.maxAttach) {
           attachments.push(row.ref);
-          attachNote = "（原图见附件）";
+          lines.push(head);
+          parts.push({ kind: "text", text: head });
+          parts.push({ kind: "media", ref: row.ref, marker: `[图片#${id}]` });
+        } else {
+          // 不可附：就地给描述（desc 已有，或标注读不出内容）
+          const fallback = desc ? head : `- ${cat}/${name}（没有可用的识图能力，看不清内容）`;
+          lines.push(fallback);
+          parts.push({ kind: "text", text: fallback });
         }
-        lines.push(`- [图片#${id}] ${cat}/${name}${attachNote}${desc ? `：${truncate(desc, 120)}` : ""}`);
       } else if (type === "audio" || type === "video") {
         const id = await this.media.ingest(`file://${file}`, type);
         const label = type === "audio" ? "音频" : "视频";
         const meta = id !== null ? await this.galleryStore.findMeta(cat, name) : null;
-        lines.push(
-          id !== null
-            ? `- [${label}#${id}] ${cat}/${name}（${formatSize(stat.size)}）${meta?.description ? `：${truncate(meta.description, 120)}` : ""}`
-            : `- [${label}] ${cat}/${name}（读取失败）`,
-        );
+        const row = id !== null
+          ? `- ${cat}/${name}（${formatSize(stat.size)}）${meta?.description ? `：${truncate(meta.description, 120)}` : ""}`
+          : `- ${cat}/${name}（读取失败）`;
+        lines.push(row);
+        parts.push({ kind: "text", text: row });
       } else {
-        lines.push(`- [文件] gallery:${cat}/${name}（${formatSize(stat.size)}，可用 send_file 发送）`);
+        const row = `- ${cat}/${name}（${formatSize(stat.size)}）`;
+        lines.push(row);
+        parts.push({ kind: "text", text: row });
       }
+      if (idx < Math.min(names.length, 50) - 1) parts.push({ kind: "text", text: "\n" });
     }
     if (names.length > 50) lines.push(`（还有 ${names.length - 50} 项未显示）`);
     const tail =
       cat === UNSORTED_CATEGORY
         ? "\n（这些是主人放进来还没整理的：先 view_media 看清内容，再用 gallery_move 移到合适的分类并写好描述。）"
-        : "\n（发送用 send 的 media 参数填编号；光看描述拿不准的图，发出前先用 view_media 仔细看一眼。）";
+        : "\n（光看描述拿不准的图，发出前先 view_media 仔细看一眼；挑中后用 pick_media 插入输入框。）";
     return {
       text: `你打开了收藏夹的「${cat}」分类：\n${lines.join("\n")}${tail}`,
       attachments: attachments.length ? attachments : undefined,
+      parts: parts.length ? parts : undefined,
     };
   }
 
@@ -409,14 +423,16 @@ export class KoishiMessenger implements MessengerApi {
 
     const lines: string[] = [];
     const attachments: MediaRef[] = [];
+    const parts: RichTextPart[] = [];
     for (const refText of list) {
       const resolved = await this.resolveMediaRef(String(refText));
       if ("error" in resolved) {
-        lines.push(`- ${refText}：${resolved.error}`);
+        const row = `- ${refText}：${resolved.error}`;
+        lines.push(row);
+        parts.push({ kind: "text", text: row });
         continue;
       }
       const { ref } = resolved;
-      const label = `${LABEL[ref.type]}#${ref.id}`;
       // 收藏夹里已记下的描述（按 sha 反查，用户手动放的文件也能对上）
       const row = await this.media.get(ref.id);
       const meta = row ? await this.galleryStore.findBySha(row.sha256) : null;
@@ -427,18 +443,24 @@ export class KoishiMessenger implements MessengerApi {
 
       if (this.renderer.canAttach(ref) && attachments.length < this.renderer.maxAttach) {
         attachments.push(ref);
-        lines.push(`- [${label}]${savedAt}（原图见附件，仔细看看）${noted ? ` ${noted}` : ""}`);
+        // 原生可看：图就位（media 段紧跟这一行文字），不带 [图片#id] 占位、不写「原图见附件」
+        const head = `- ${savedAt}${noted}`;
+        lines.push(head);
+        parts.push({ kind: "text", text: head });
+        parts.push({ kind: "media", ref, marker: `[${LABEL[ref.type]}#${ref.id}]` });
         continue;
       }
       const detail = await this.captioner.describeDetailed(ref);
-      lines.push(
-        `- [${label}]${savedAt}${detail ? `：${detail}` : "（没有可用的识图能力，看不清内容）"}` +
-          (noted ? `\n  ${noted}` : ""),
-      );
+      const rowText =
+        `- ${savedAt}${detail ? `：${detail}` : "（没有可用的识图能力，看不清内容）"}` +
+        (noted ? `\n  ${noted}` : "");
+      lines.push(rowText);
+      parts.push({ kind: "text", text: rowText });
     }
     return {
       text: `你把这几样东西拿起来仔细看了看：\n${lines.join("\n")}`,
       attachments: attachments.length ? attachments : undefined,
+      parts: parts.length ? parts : undefined,
     };
   }
 
@@ -2052,9 +2074,9 @@ export class KoishiMessenger implements MessengerApi {
       const entry = await this.galleryStore.resolve(galleryName);
       if (!entry) return { error: `（收藏夹里没有 "${galleryName}"，可先用 check_gallery 确认它存在。）` };
       const type = typeByExt(entry.name);
-      if (type === "file") return { error: `（"${entry.name}" 不是媒体文件，请用 send_file 发送）` };
+      if (type === "file") return { error: `（"${entry.name}" 不是图片/语音/视频，不能当作媒体插入。）` };
       if (allowTypes && !allowTypes.includes(type)) {
-        return { error: `（"${entry.name}" 是${LABEL[type]}，不能放进普通消息；请用 send_file${type === "audio" ? " 或 send_voice" : ""} 发送）` };
+        return { error: `（"${entry.name}" 是${LABEL[type]}，不能放进这里。）` };
       }
       const id = await this.media.ingest(`file://${entry.file}`, type);
       if (id === null) return { error: `（读取 "${entry.name}" 失败，可先用 check_gallery 确认它存在。）` };
@@ -2068,7 +2090,7 @@ export class KoishiMessenger implements MessengerApi {
     if (!row) return { error: `（找不到媒体 #${match[1]}，它可能未被收录。）` };
     if (allowTypes && !allowTypes.includes(row.ref.type)) {
       return {
-        error: `（#${row.id} 是${LABEL[row.ref.type]}，不能放进普通消息；请用 send_file${row.ref.type === "audio" ? " 或 send_voice" : ""} 发送。）`,
+        error: `（#${row.id} 是${LABEL[row.ref.type]}，不能放进这里。）`,
       };
     }
     let sticker = false;

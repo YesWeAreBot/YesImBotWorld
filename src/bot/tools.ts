@@ -163,7 +163,7 @@ export const BOT_TOOLS: BotToolDef[] = [
     signature: "check_gallery(category?: string)",
     description:
       "翻看你的收藏夹。收藏夹按分类存放：表情包、meme、截图、照片、未整理。不带参数看总览（各分类的数量），" +
-      "带 category 打开某一类，列出每项的引用编号、文件名和描述（供 send 的 media 参数或 send_file 使用）。" +
+      "带 category 打开某一类，列出每项的内容和描述（挑中后用 pick_media 插入输入框）。" +
       "发图先来这里挑；「未整理」里是主人放进来还没归类的东西，有空时看看（view_media）并用 gallery_move 整理。",
   },
   {

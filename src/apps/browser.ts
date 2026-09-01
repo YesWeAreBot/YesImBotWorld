@@ -359,7 +359,7 @@ export class BrowserApp implements WorldApp {
     if (ctype.startsWith("image/")) {
       const id = await this.media.ingest(res.url || url, "image", undefined, this.cfg.browserProxy);
       return id !== null
-        ? `这个网址是一张图片，已存入你的媒体缓存：[图片#${id}]（可用 send 发送，喜欢可 gallery_save 收藏）。`
+        ? `这个网址是一张图片，已存入你的媒体缓存（图片#${id}，可用 pick_media 插入发送，喜欢可 gallery_save 收藏）。`
         : "（这个网址是一张图片，但下载失败了。）";
     }
     if (ctype && !ctype.includes("html") && !ctype.startsWith("text/")) {
@@ -385,16 +385,17 @@ export class BrowserApp implements WorldApp {
     if (id === null) return `（图片加载失败（${img.url.slice(0, 100)}），点不开。）`;
     const row = await this.media.get(id);
     if (!row) return "（图片加载失败。）";
-    const label = `{图${n}} [图片#${id}]${img.alt ? `（${img.alt}）` : ""}`;
+    const label = `{图${n}} ${img.alt ? `（${img.alt}）` : ""}`;
     if (this.canAttach(row.ref)) {
       return {
-        text: `你点开了 ${label}，原图见附件。（想保存/发送就 save_image 或直接 send 这个编号）`,
+        text: `你点开了 ${label}，图就在下面。（想保存/发送就 save_image 或记住编号 pick_media 插入）`,
         attachments: [row.ref],
+        parts: [{ kind: "text", text: `你点开了 ${label}，图就在下面。` }, { kind: "media", ref: row.ref, marker: `[图片#${id}]` }],
       };
     }
     const detail = await this.captioner.describeDetailed(row.ref);
     return detail
-      ? `你点开了 ${label}，仔细看了看：${detail}\n（想保存/发送就 save_image 或直接 send 这个编号）`
+      ? `你点开了 ${label}，仔细看了看：${detail}\n（想保存/发送就 save_image 或记住编号 pick_media 插入）`
       : `（你点开了 ${label}，但没有可用的识图能力，看不清内容。）`;
   }
 
@@ -407,8 +408,8 @@ export class BrowserApp implements WorldApp {
       if (row && !row.summary) await this.media.setSummary(id, `网页图片：${img.alt}`);
     }
     return (
-      `图片已保存到你的媒体缓存：[图片#${id}]${img.alt ? `（${img.alt}）` : ""}。` +
-      `可以直接用 send 发送；想长期留着就 gallery_save 收藏（记得选分类、写描述）。`
+      `图片已保存到你的媒体缓存：图片#${id}${img.alt ? `（${img.alt}）` : ""}。` +
+      `想发就 pick_media 用这个编号插入；想长期留着就 gallery_save 收藏（记得选分类、写描述）。`
     );
   }
 
@@ -570,8 +571,8 @@ export class BrowserApp implements WorldApp {
       description,
     );
     return (
-      `咔嚓——截图已存进收藏夹 截图/${name}：[图片#${id}]（${description}）。` +
-      `可以直接用 send 发送。`
+      `咔嚓——截图已存进收藏夹 截图/${name}：图片#${id}（${description}）。` +
+      `想发就 pick_media 用这个编号插入。`
     );
   }
 

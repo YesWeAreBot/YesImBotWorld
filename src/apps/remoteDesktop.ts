@@ -140,10 +140,11 @@ export class RemoteDesktopApp implements WorldApp {
     const ref: MediaRef = row.ref;
     return {
       text:
-        `你抬头看了看远程桌面的屏幕（${shot.width}x${shot.height}），画面见附件。` +
+        `你抬头看了看远程桌面的屏幕（${shot.width}x${shot.height}），画面如下。` +
         `看清界面后决定下一步，操作完再 screen 看变化。` +
         HINT,
       attachments: [ref],
+      parts: [{ kind: "text", text: `你抬头看了看远程桌面的屏幕（${shot.width}x${shot.height}），画面如下。` }, { kind: "media", ref, marker: `[图片#${id}]` }, { kind: "text", text: `看清界面后决定下一步，操作完再 screen 看变化。${HINT}` }],
     };
   }
 
