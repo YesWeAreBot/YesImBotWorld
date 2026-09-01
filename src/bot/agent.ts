@@ -607,7 +607,7 @@ export class BotAgent {
   // ---------- 主循环 ----------
 
   private async runLoop(): Promise<void> {
-    this.logger.info("Bot-LLM 开始持续推理（%s 模式）", this.config.bot.mode);
+    this.logger.info("Bot-LLM 开始持续推理");
     while (this.running) {
       try {
         await this.drainMailbox();
@@ -650,7 +650,6 @@ export class BotAgent {
               this.parseFailures,
               truncate(err.raw ?? err.message, 1200),
             );
-            const nativeMode = this.config.bot.mode === "chat" && this.config.bot.nativeToolCalls;
             // 「工具此刻不可用 / 未知工具」是可执行的明确原因（分层允许集造成）——必须原样透传给模型，
             // 让它知道该先 open_app 进聊天应用、select_channel 进频道，而不是吞成"恍惚"后原地重试同一个调用。
             if (/(此刻不可用|未知工具)/.test(err.message)) {
@@ -659,9 +658,7 @@ export class BotAgent {
             }
             const emphasis =
               this.parseFailures >= 3
-                ? nativeMode
-                  ? "不要写正文或解释，先想清楚要调用哪个工具，然后通过工具调用接口调用它。"
-                  : "不要写正文或解释，先想清楚要调用哪个工具，然后只输出那一个 JSON。"
+                ? "不要写正文或解释，先想清楚要调用哪个工具，然后通过工具调用接口调用它。"
                 : "";
             // 关键：不要把原始错误输出（尤其是模型自己拼的 <event>…</event>）回灌进上下文——
             // 那会污染意识流，让模型把它当成真实发生的事件并继续模仿。
@@ -679,7 +676,6 @@ export class BotAgent {
           // - 413：请求体超过服务端上限（base64 附件把请求撑爆了）→ 整体熔断并提示调预算。
           // 处理后立即重试，否则同一附件会让之后每一次请求都失败。
           if (
-            this.config.bot.mode === "chat" &&
             !this.context.attachmentsDisabled &&
             /\((400|413)\)/.test(String(err)) &&
             this.context.hasAttachments()
@@ -2473,9 +2469,6 @@ export class BotAgent {
     // 醒来时刻更新为当前时间（这是 system 段时间唯一的合法更新时机——
     // 压缩后前缀本来就要重建，此时更新不损失缓存）
     this.wakeTimeLine = this.clock.timeLine();
-
-    // 预热 KV cache（text 模式）
-    await this.backend.warmup?.(this.context, this.wakeTimeLine).catch(() => {});
 
     const elapsedTU = (Date.now() - startReal) / 1000 / this.clock.unitRealSeconds;
     const closedNotes: string[] = [];

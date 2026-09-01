@@ -1,5 +1,4 @@
 import { promises as fs } from "node:fs";
-import type { TextTemplateConfig } from "../config.js";
 import type { WorldFiles } from "../files.js";
 import type { ChatMessage, ContentPart } from "../llm/chat.js";
 import type { AttachmentLoadFn } from "../media/parts.js";
@@ -187,8 +186,6 @@ export class BotContext {
   accountsProvider: (() => string) | null = null;
   /** 常驻 Bot 名字提供者（service 注入）：运行时可变（世界演化可改名），渲染时实时取值 */
   botNameProvider: (() => string) | null = null;
-  /** 工具走原生 function calling 声明（service 按 bot.nativeToolCalls 与 mode 注入）：切换行为准则的输出格式段 */
-  nativeToolCalls = false;
   /** wait 工具被移除（service 按 bot.disableWait 注入）：行为准则不再提及等待 */
   waitRemoved = false;
 
@@ -203,7 +200,7 @@ export class BotContext {
       ...(botName ? [`# 你的名字\n你叫「${botName}」——这就是你，别人这样称呼你、@ 你时就是在跟你说话。`] : []),
       c.constitutionHead +
         "\n\n" +
-        (this.nativeToolCalls ? c.outputFormatNative : c.outputFormatJson) +
+        c.outputFormatNative +
         "\n" +
         c.constitution +
         "\n" +
@@ -394,19 +391,6 @@ export class BotContext {
       role: m.role,
       content: m.parts.length === 1 && m.parts[0]!.type === "text" ? m.parts[0]!.text : m.parts,
     }));
-  }
-
-  /** text 模式：单一连续文档，整个 Tool Call 流是一个永不结束的 assistant 段 */
-  toTextPrompt(template: TextTemplateConfig, timeLine: string): string {
-    const streamText = this.renderStreamText();
-    return (
-      template.bos +
-      template.systemPrefix +
-      this.renderSystemText(timeLine) +
-      template.systemSuffix +
-      template.streamPrefix +
-      (streamText ? streamText + "\n" : "")
-    );
   }
 
   /** 近似上下文大小（字符数），用于判断是否需要强制 rest。每个原生附件按 2000 字符计 */

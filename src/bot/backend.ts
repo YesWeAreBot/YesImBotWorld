@@ -1,9 +1,7 @@
 import type { BotModelConfig } from "../config.js";
 import { ChatClient, type ChatResult, type ChatToolDef } from "../llm/chat.js";
-import { buildToolCallGrammar } from "../llm/grammar.js";
 import { withEndpointLock } from "../llm/lock.js";
 import { extractToolCall, ToolCallParseError, validateToolCall } from "../llm/parse.js";
-import { TextClient } from "../llm/text.js";
 import type { ParsedToolCall } from "../types.js";
 import type { BotContext } from "./context.js";
 import { toNativeToolDefs, type NamedToolDef } from "./nativeTools.js";
@@ -12,9 +10,7 @@ import { BOT_TOOL_NAMES } from "./tools.js";
 /** Bot-LLM 后端：给定当前上下文，生成下一个工具调用 */
 export interface BotBackend {
   generate(context: BotContext, timeLine: string, signal?: AbortSignal): Promise<ParsedToolCall>;
-  /** 可选：压缩后预热 KV cache（rest 期间"计算 KVcache"） */
-  warmup?(context: BotContext, timeLine: string): Promise<void>;
-  /** 更新允许的工具名集（App 打开/关闭时动态调整；text 模式会重建 GBNF 语法） */
+  /** 更新允许的工具名集（App 打开/关闭时动态调整） */
   setToolNames(names: string[]): void;
   /** 可选：更新当前可用工具的完整定义（原生 tools 声明需要签名与描述） */
   setToolDefs?(defs: NamedToolDef[]): void;
@@ -129,70 +125,6 @@ export class ChatBackend implements BotBackend {
   }
 }
 
-/**
- * text_completion 模式（llama.cpp）：单一连续 prompt + GBNF 语法约束。
- * 语法保证输出恰好是一个合法工具调用；EOS 在语法完成前被屏蔽。
- */
-export class TextBackend implements BotBackend {
-  private client: TextClient;
-  private grammar: string;
-  private toolNames: string[];
-
-  constructor(
-    private cfg: BotModelConfig,
-    toolNames: string[] = BOT_TOOL_NAMES,
-  ) {
-    this.toolNames = toolNames;
-    this.client = new TextClient({
-      baseURL: cfg.baseURL,
-      apiKey: cfg.apiKey || undefined,
-      model: cfg.model || undefined,
-      temperature: cfg.temperature,
-      maxTokens: cfg.maxTokens,
-      stream: cfg.stream,
-      label: "Bot",
-    });
-    this.grammar = buildToolCallGrammar(toolNames);
-  }
-
-  setToolNames(names: string[]): void {
-    this.toolNames = names;
-    // 语法是逐请求发送的采样约束，重建不影响 KV cache
-    this.grammar = buildToolCallGrammar(names);
-  }
-
-  async generate(context: BotContext, timeLine: string, signal?: AbortSignal): Promise<ParsedToolCall> {
-    const prompt = context.toTextPrompt(this.cfg.template, timeLine);
-    // 端点锁：与 World-LLM 共用同一换载端点时排队执行（不同源时无影响）
-    return withEndpointLock(
-      this.cfg.baseURL,
-      async () => {
-        const content = await this.client.complete(prompt, { grammar: this.grammar, signal });
-        try {
-          return extractToolCall(content, this.toolNames);
-        } catch (err) {
-          if (err instanceof ToolCallParseError && isLikelyTruncated(err)) {
-            const retry = await this.client.complete(prompt, {
-              grammar: this.grammar,
-              signal,
-              nPredict: Math.max(this.cfg.maxTokens, 4096),
-            });
-            return extractToolCall(retry, this.toolNames);
-          }
-          throw err;
-        }
-      },
-      signal,
-    );
-  }
-
-  /** n_predict=0 的请求只做 prompt 评估，用于压缩后重建 llama.cpp 的 KV cache */
-  async warmup(context: BotContext, timeLine: string): Promise<void> {
-    const prompt = context.toTextPrompt(this.cfg.template, timeLine);
-    await withEndpointLock(this.cfg.baseURL, () => this.client.complete(prompt, { nPredict: 0 }));
-  }
-}
-
 function safeParse(raw: string): unknown {
   try {
     return JSON.parse(raw);
@@ -212,5 +144,5 @@ export function createBackend(
   toolNames?: string[],
   toolDefs?: NamedToolDef[],
 ): BotBackend {
-  return cfg.mode === "text" ? new TextBackend(cfg, toolNames) : new ChatBackend(cfg, toolNames, toolDefs);
+  return new ChatBackend(cfg, toolNames, toolDefs);
 }

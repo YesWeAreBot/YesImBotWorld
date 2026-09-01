@@ -1,7 +1,7 @@
 /**
  * LLM Token 用量统计（模块级单例，与 debug.ts 平级）。
  *
- * ChatClient / TextClient 在每次请求完成后调用 record()，持久化到
+ * ChatClient 在每次请求完成后调用 record()，持久化到
  * <webuiDir>/usage.jsonl（JSONL 追加写，崩溃最多丢最后一条），
  * WebUI 服务器据此提供 /api/usage 汇总接口。
  */

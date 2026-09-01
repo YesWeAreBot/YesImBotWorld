@@ -1,12 +1,5 @@
 import { Schema } from "koishi";
 
-export interface TextTemplateConfig {
-  bos: string;
-  systemPrefix: string;
-  systemSuffix: string;
-  streamPrefix: string;
-}
-
 export interface ModalitySupport {
   image: boolean;
   audio: boolean;
@@ -14,7 +7,6 @@ export interface ModalitySupport {
 }
 
 export interface BotModelConfig {
-  mode: "chat" | "text";
   baseURL: string;
   apiKey: string;
   model: string;
@@ -48,7 +40,6 @@ export interface BotModelConfig {
   /** 移除工具后仍在重复，达到多少次就强制执行带压缩的 rest（需 breakLoop 开启） */
   breakLoopForceRestAt: number;
   modalities: ModalitySupport;
-  template: TextTemplateConfig;
 }
 
 export interface CaptionerConfig {
@@ -342,17 +333,11 @@ export const Config: Schema<Config> = Schema.intersect([
 
   Schema.object({
     bot: Schema.object({
-      mode: Schema.union([
-        Schema.const("chat").description("chat_completion 循环（任意 OpenAI 兼容 API）"),
-        Schema.const("text").description("text_completion + GBNF（llama.cpp server 专属，强约束输出）"),
-      ])
-        .default("chat")
-        .description("持续生成的实现方式"),
       baseURL: Schema.string()
         .default("http://127.0.0.1:8080/v1")
-        .description("API 地址。chat 模式填 OpenAI 兼容根路径（含 /v1）；text 模式填 llama.cpp server 根路径"),
+        .description("API 地址（OpenAI 兼容根路径，含 /v1）"),
       apiKey: Schema.string().role("secret").default("").description("API Key（本地部署可留空）"),
-      model: Schema.string().default("").description("模型名（text 模式下 llama.cpp 单模型部署可留空）"),
+      model: Schema.string().default("").description("模型名"),
       temperature: Schema.number().min(0).max(2).default(0.8).description("采样温度"),
       maxTokens: Schema.natural()
         .default(4096)
@@ -477,16 +462,9 @@ export const Config: Schema<Config> = Schema.intersect([
         audio: Schema.boolean().default(false).description("模型原生支持音频输入"),
         video: Schema.boolean().default(false).description("模型原生支持视频输入"),
       }).description(
-        "Bot-LLM 的原生多模态能力（仅 chat 模式生效；text 模式的 /completion 无法输入媒体，一律使用外挂解释器）。" +
-          "原生支持的模态会以 content part 附件注入上下文；未支持的模态回退到外挂解释器。" +
+        "Bot-LLM 的原生多模态能力。原生支持的模态会以 content part 附件注入上下文；未支持的模态回退到外挂解释器。" +
           "GIF 动图按能力路由：支持视频 → 走视频通道；仅支持图像 → 抽帧拼成一张网格图注入；都不支持 → 优先外挂视频解释器",
       ),
-      template: Schema.object({
-        bos: Schema.string().default("").description("BOS 文本（llama.cpp 通常自动加 BOS token，留空即可）"),
-        systemPrefix: Schema.string().default("<|im_start|>system\n").description("system 段前缀"),
-        systemSuffix: Schema.string().default("<|im_end|>\n").description("system 段后缀"),
-        streamPrefix: Schema.string().default("<|im_start|>assistant\n").description("Tool Call 流（持续的 assistant 段）前缀"),
-      }).description("text 模式的提示词模板（按模型的 chat template 调整，默认 ChatML）"),
     }).description("Bot-LLM：持续生成工具调用流的角色模型"),
   }),
 

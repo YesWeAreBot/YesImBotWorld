@@ -140,7 +140,7 @@ export class WorldService extends Service<Config> {
     Object.assign(this.effectiveModalities, config.bot.modalities);
     const isGif = (ref: MediaRef) => ref.type === "image" && ref.mime === "image/gif";
     const nativeSupport = (ref: MediaRef) => {
-      if (config.bot.mode !== "chat" || !nativeSafeMime(ref)) return false;
+      if (!nativeSafeMime(ref)) return false;
       if (isGif(ref)) return this.effectiveModalities.video || this.effectiveModalities.image;
       return this.effectiveModalities[ref.type];
     };
@@ -352,8 +352,6 @@ export class WorldService extends Service<Config> {
     const tools = this.currentTools();
 
     this.botContext = new BotContext(this.files, this.pinnedToolsText(), this.promptStore);
-    // 工具原生声明（仅 chat 模式）：行为准则里的输出格式段随之切换
-    this.botContext.nativeToolCalls = this.config.bot.mode === "chat" && this.config.bot.nativeToolCalls;
     // wait 被移除时，行为准则与时间说明不再提及等待
     this.botContext.waitRemoved = this.config.bot.disableWait;
     // 聊天账号列表：Bot 识别 <at id/>、引用等结构里的"自己"的依据。
@@ -376,30 +374,28 @@ export class WorldService extends Service<Config> {
     // 原生多模态：附件 → content part。
     // 加载时按【当前】模态配置与格式白名单过滤：用户纠正配置后，历史事件里
     // 已不支持的附件（关掉的模态 / GIF 表情等）不再注入请求，避免持续 400。
-    if (this.config.bot.mode === "chat") {
-      // 新会话：有效模态从配置重置（上次会话的运行时降级不跨会话生效）
-      Object.assign(this.effectiveModalities, this.config.bot.modalities);
-      const modalities = this.effectiveModalities;
-      const loader = createAttachmentLoader(this.media, modalities, this.ctx.logger("yesimbot-world"));
-      const allowed = (ref: MediaRef) =>
-        ref.type === "image" && ref.mime === "image/gif"
-          ? modalities.video || modalities.image
-          : modalities[ref.type];
-      this.botContext.attachmentLoader = async (ref) =>
-        allowed(ref) && nativeSafeMime(ref) ? loader(ref) : null;
-      // 运行时降级：服务端 400 拒收 video_url / input_audio 时只关对应模态，
-      // 附件缓存重建（GIF 从 video_url 改为拼帧图的 image_url）
-      this.botContext.degradeModalities = (kinds) => {
-        for (const k of kinds) modalities[k] = false;
-        loader.clearCache();
-      };
-      // 每次请求的附件总预算（数量 + 体积）：历史附件每次请求都会重发，不设预算会撑爆请求体（413）
-      this.botContext.maxAttachmentsPerRequest = this.config.media.maxAttachmentsPerRequest;
-      this.botContext.maxAttachmentBytesPerRequest = Math.max(
-        1,
-        Math.round(this.config.media.maxAttachmentMbPerRequest * 1024 * 1024),
-      );
-    }
+    // 新会话：有效模态从配置重置（上次会话的运行时降级不跨会话生效）
+    Object.assign(this.effectiveModalities, this.config.bot.modalities);
+    const modalities = this.effectiveModalities;
+    const loader = createAttachmentLoader(this.media, modalities, this.ctx.logger("yesimbot-world"));
+    const allowed = (ref: MediaRef) =>
+      ref.type === "image" && ref.mime === "image/gif"
+        ? modalities.video || modalities.image
+        : modalities[ref.type];
+    this.botContext.attachmentLoader = async (ref) =>
+      allowed(ref) && nativeSafeMime(ref) ? loader(ref) : null;
+    // 运行时降级：服务端 400 拒收 video_url / input_audio 时只关对应模态，
+    // 附件缓存重建（GIF 从 video_url 改为拼帧图的 image_url）
+    this.botContext.degradeModalities = (kinds) => {
+      for (const k of kinds) modalities[k] = false;
+      loader.clearCache();
+    };
+    // 每次请求的附件总预算（数量 + 体积）：历史附件每次请求都会重发，不设预算会撑爆请求体（413）
+    this.botContext.maxAttachmentsPerRequest = this.config.media.maxAttachmentsPerRequest;
+    this.botContext.maxAttachmentBytesPerRequest = Math.max(
+      1,
+      Math.round(this.config.media.maxAttachmentMbPerRequest * 1024 * 1024),
+    );
 
     const messenger = new KoishiMessenger(
       this.ctx,
@@ -837,7 +833,7 @@ export class WorldService extends Service<Config> {
     if (this.bot) {
       const s = this.bot.status();
       lines.push(
-        `Bot-LLM：${s.running ? "持续推理中" : "已停止"}（${this.config.bot.mode} 模式）`,
+        `Bot-LLM：${s.running ? "持续推理中" : "已停止"}`,
         `工作窗口：${s.streamLength} 条记录，约 ${s.approxChars} 字符（预算 ${this.config.bot.maxWindowChars}）`,
         `等待中：${s.waiting ?? "否"}；进行中的动作：${s.pendingTasks} 个；World-LLM 队列：${this.world.queueLength} 个`,
       );

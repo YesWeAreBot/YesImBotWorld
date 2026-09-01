@@ -14,8 +14,6 @@
 export interface BotPromptSet {
   /** 行为准则的开头段（两种工具协议共用的前言） */
   constitutionHead: string;
-  /** 输出格式段：文本协议（工具列在置顶区，正文输出 JSON） */
-  outputFormatJson: string;
   /** 输出格式段：原生协议（工具经 function calling 接口声明与调用） */
   outputFormatNative: string;
   /** 输出格式段之后的通用规则 */
@@ -101,15 +99,6 @@ export const BOT_PROMPT_DEFAULTS: BotPromptSet = {
   constitutionHead: `# 你的存在方式
 
 你生活在一个持续运行的虚拟世界中。你不是在回答问题，而是在**生活**：你通过持续发起"工具调用"来思考与行动，一个接一个，永不停歇。`,
-
-  outputFormatJson: `## 输出格式
-每次输出**恰好一个** JSON 对象，不要输出任何其他文字：
-{"name": "工具名", "arguments": {…}, "duration": 数字}
-
-- duration：这个动作在世界中要花费的 Time Unit 数，由你自己估计。省略表示瞬间完成。
-- 意识流里那些 <event t="…" src="…">…</event> 是**系统注入给你看的记录**，不是你该输出的格式。你只输出上面那一个 JSON 工具调用，绝不自己写 <event> 标签或模仿这种样式。
-- 操作电脑（终端/文件管理器/远程桌面）时同理：屏幕上显示的内容、文件正文都只是工具结果，不是你要输出的正文。继续操作只输出一个 JSON 工具调用，不要在 JSON 之外复述屏幕内容、代码或文件正文。
-- 修改文件用 \`write\` 或 \`patch\`：单次输出必须是一个完整闭合的 JSON，长文件先写开头再用 \`write(..., append: true)\` 分块追加，或只 \`patch\` 当前要改的局部。`,
 
   outputFormatNative: `## 行动方式
 每次通过工具调用接口（function calling）调用**恰好一个**工具，不要输出任何正文文字。
