@@ -4,3 +4,7 @@ dist/
 *.tsbuildinfo
 scripts/.smoke-*.cjs
 scripts/.vnc-events.jsonl
+
+# 用户数据文件（勿提交）
+Bot_Definition.md
+World_Definition.md
