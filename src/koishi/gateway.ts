@@ -484,6 +484,7 @@ export class Gateway {
     return {
       text: `你正留意着 ${await this.names.display(key)}，看到新消息——${msgTag}${session.username ?? session.userId}说：${rendered.text}`,
       attachments: rendered.attachments,
+      parts: rendered.parts,
     };
   }
 
@@ -498,6 +499,7 @@ export class Gateway {
         return {
           text: `手机响了一下：收到来自 ${await this.names.display(key)} 的消息，${session.username ?? session.userId}说：${rendered.text}`,
           attachments: rendered.attachments,
+          parts: rendered.parts,
         };
       }
     }

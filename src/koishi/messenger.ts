@@ -15,7 +15,7 @@ import {
 import { MEDIA_PLACEHOLDER, mediaPlaceholder, type MediaRenderer } from "../media/render.js";
 import type { MediaStore } from "../media/store.js";
 import type { TtsClient } from "../media/tts.js";
-import type { MediaRef, MediaType, RichText } from "../types.js";
+import type { MediaRef, MediaType, RichText, RichTextPart } from "../types.js";
 import type { FocusManager } from "./focus.js";
 import { atTag, faceTag, formatBanDuration } from "./gateway.js";
 import { needsMsgIds, type MessagingConfig, type PlatformOpsConfig } from "../config.js";
@@ -148,12 +148,33 @@ export class KoishiMessenger implements MessengerApi {
 
     const attachments: MediaRef[] = [];
     const lines: string[] = [];
-    for (const row of rows) {
+    // 有序图文分段：让每张图的 content part 出现在它所属那条消息文字的正下方，
+    // 而不是全部平铺到整段文字末尾——多图时模型才能把「哪张图」和「哪条 msg」对上，
+    // 避免引用回复（reply_to）张冠李戴。
+    const parts: RichTextPart[] = [];
+    for (let idx = 0; idx < rows.length; idx++) {
+      const row = rows[idx]!;
       const who = row.self ? "你自己" : row.username || row.userId;
       const rendered = await this.renderer.render(row.content);
       if (rendered.attachments) attachments.push(...rendered.attachments);
       const msgTag = this.showMsgId && row.messageId ? ` (msg:${row.messageId})` : "";
-      lines.push(`[${formatTime(row.timestamp)}]${msgTag} ${who}: ${rendered.text}`);
+      const header = `[${formatTime(row.timestamp)}]${msgTag} ${who}: `;
+      lines.push(header + rendered.text);
+      // 行头作为 text 段，随后依序展开该消息的图文交错分段
+      if (rendered.parts?.length) {
+        // 行头直接拼进第一个 text 段（若有），避免图文之间多出一个空段
+        const first = rendered.parts[0]!;
+        if (first.kind === "text") {
+          parts.push({ kind: "text", text: header + first.text });
+          for (const seg of rendered.parts.slice(1)) parts.push(seg);
+        } else {
+          parts.push({ kind: "text", text: header });
+          for (const seg of rendered.parts) parts.push(seg);
+        }
+      } else {
+        parts.push({ kind: "text", text: header + rendered.text });
+      }
+      if (idx < rows.length - 1) parts.push({ kind: "text", text: "\n" });
     }
     // 最后一条是自己发的：显式点破，防止 Bot 把自己的消息当成别人的来"接话"
     let tail = rows[rows.length - 1]?.self
@@ -186,6 +207,7 @@ export class KoishiMessenger implements MessengerApi {
     return {
       text: `${intro}：\n${lines.join("\n")}${tail}`,
       attachments: attachments.length ? attachments : undefined,
+      parts: parts.length ? parts : undefined,
     };
   }
 
