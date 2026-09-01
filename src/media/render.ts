@@ -25,10 +25,11 @@ export function nativeSafeMime(ref: MediaRef): boolean {
 /**
  * 把含媒体占位符的文本渲染为 Bot 可感知的形式：
  *
- * - Bot-LLM 原生支持该模态（chat 模式 + 声明能力）→ 文本保留 `[图片#12]` 标记，
- *   媒体作为附件（content part）注入，受单事件附件数上限约束；
- * - 否则若配置了外挂解释器 → `[图片#12：解释文本]`（解释结果缓存）；
- * - 否则 → `[图片#12（无法查看内容）]`。
+ * - Bot-LLM 原生支持该模态 → 文本**不留占位符**（图片位置由 content part 精确表达），
+ *   parts 里放 media 段；media 段额外带一个「降级描述」，供附件超预算被裁时退化用；
+ * - 否则若配置了外挂解释器 → 就地渲染 `[图片#12：解释文本]`（解释结果缓存）；
+ * - 否则 → 就地渲染 `[图片#12（无法查看内容）]`。
+ * 图片/媒体的**相对位置绝不变动**：文字与媒体按原文顺序交错。
  */
 export class MediaRenderer {
   constructor(
@@ -36,8 +37,6 @@ export class MediaRenderer {
     private captioner: CaptionService,
     private nativeSupport: (ref: MediaRef) => boolean,
     private maxAttachments: number,
-    /** 原生附件的括注文本（如 GIF 拼帧的阅读提示），缺省"（见附件）" */
-    private attachmentNote?: (ref: MediaRef) => string,
   ) {}
 
   /** 该媒体能否作为原生附件注入（供 messenger 在列表/细看场景直接附原图时判断） */
@@ -69,11 +68,11 @@ export class MediaRenderer {
       const type = match[2] as MediaType;
       const seg = await this.renderOneParts(id, type, attachments);
       if (seg.kind === "media") {
-        const marker = `[${TYPE_LABEL[type]}#${id}${seg.note}]`;
-        result += marker;
-        parts.push({ ...seg, marker });
+        // 原生支持：text 字段该位置留空（图片由 content part 表达，不写占位符、不写「见附件」）；
+        // media 段的 marker 已存成「降级描述」，供附件超预算被裁时纯文本退化。
+        parts.push(seg);
       } else {
-        // 走解释器/无法查看：退化成纯文本
+        // 走解释器/无法查看：退化成纯文本（就地，不动位置）
         result += seg.text;
         parts.push(seg);
       }
@@ -89,8 +88,8 @@ export class MediaRenderer {
   }
 
   /**
-   * 渲染单个媒体：原生支持 → 作为 media 段（附 ref）；否则 → 解释器文本 / 无法查看。
-   * 返回 media 段时 note 为该段的括注（如"（见附件）"）。
+   * 渲染单个媒体：原生支持 → 作为 media 段（附 ref，marker = 降级描述）；
+   * 否则 → 解释器文本 / 无法查看。
    */
   private async renderOneParts(
     id: number,
@@ -102,8 +101,12 @@ export class MediaRenderer {
 
     if (this.nativeSupport(row.ref) && attachments.length < this.maxAttachments) {
       attachments.push(row.ref);
-      const note = this.attachmentNote?.(row.ref) ?? "（见附件）";
-      return { kind: "media", ref: row.ref, note, marker: "" };
+      // marker（降级描述）：附件超预算被裁时，退化成「[图片#12：描述]」就地呈现，而不是骗人的「见附件」
+      const caption = await this.captioner.describe(row.ref);
+      const marker = caption
+        ? `[${TYPE_LABEL[type]}#${id}：${caption}]`
+        : `[${TYPE_LABEL[type]}#${id}]`;
+      return { kind: "media", ref: row.ref, marker };
     }
 
     const caption = await this.captioner.describe(row.ref);

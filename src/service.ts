@@ -149,12 +149,6 @@ export class WorldService extends Service<Config> {
       this.captioner,
       nativeSupport,
       config.media.maxAttachmentsPerEvent,
-      (ref) => {
-        if (!isGif(ref)) return "（见附件）";
-        return this.effectiveModalities.video
-          ? "（GIF 动图，见附件）"
-          : "（GIF 动图，附件为其逐帧拼图，按行从左到右为播放顺序）";
-      },
     );
 
     // 关注频道管理：Bot 打开/发消息的频道在一段时间内无视通知策略，消息必定呈现内容
