@@ -42,36 +42,27 @@ export interface MediaRef {
 }
 
 /**
- * 待发送输入框（draft）的一个有序分段。
- * 发送前的内容由这些分段按顺序组成：文字段、已选定的媒体段（图片/视频）、文件段、语音段。
- * 媒体段是**已经选好**的具体媒体（不再用 `[图片#id]` 占位符），保证 Bot 发图必须先选图。
+ * 待填充的图文混排发送缓冲：send 的 msg 里带了 `<img>` 占位符时，不立即发出，
+ * 而是暂存这条消息，等 Bot 用 pick_media 逐个/批量选图填充占位符，填满后自动发送。
+ * 这是给「图文混排」轻量用的缓冲，只存 msg 文本 + 占位符位置 + 已选图，不是完整的光标输入框。
  */
-export type DraftSegment =
-  | { kind: "text"; text: string }
-  | { kind: "media"; ref: MediaRef; sticker: boolean }
-  | { kind: "file"; ref: MediaRef; label: string }
-  | { kind: "voice"; text: string };
-
-/**
- * 待发送输入框状态：像真人的聊天输入框一样，先把要发的内容编辑好（打字、选图插入），
- * 最后再单独"发送"。替代原来一次性生成整条消息的 send。
- */
-export interface Draft {
-  /** 目标频道 key（start_message 时确定）；null 表示尚未开始编辑 */
-  channelKey: string | null;
-  /** 引用回复的目标消息 id（可选，start_message 时给定） */
+export interface PendingImageFill {
+  /** 目标频道 key（send 时确定） */
+  channelKey: string;
+  /** 引用回复目标（可选） */
   replyTo?: string;
-  /** 引用回复时是否自动 @ 原发送人（模拟 QQ 客户端） */
+  /** 引用时是否自动 @ 原发送人 */
   atSender: boolean;
-  /** 有序内容分段（图文交错） */
-  segments: DraftSegment[];
-  /** 光标位置：segments 数组中的插入点索引（0..segments.length）；输入/选图都落在光标处 */
-  cursor: number;
-}
-
-/** 空的 draft（还没开始编辑任何消息） */
-export function emptyDraft(): Draft {
-  return { channelKey: null, atSender: true, segments: [], cursor: 0 };
+  /** 原始 msg 文本（含 `<img>` 占位符） */
+  msg: string;
+  /** `<img>` 占位符数量 */
+  placeholderCount: number;
+  /** 已选定并按占位符顺序填充的媒体（每个元素：媒体引用 + 是否表情包） */
+  filled: { ref: MediaRef; sticker: boolean }[];
+  /** 发送时透传的参数 */
+  insist: boolean;
+  confirmLong: boolean;
+  resend: boolean;
 }
 
 /** 选图解析成功：得到具体媒体引用 + 是否表情包 */

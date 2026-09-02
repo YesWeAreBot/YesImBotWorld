@@ -26,10 +26,9 @@ const CHAT_LAYER = new Set([
   "user_info", "send_like", "delete_friend", "set_profile", "set_model_show", "ocr_image",
 ]);
 const CHANNEL_LAYER = new Set([
-  "unsend", "react", "get_emoji_likes",
+  "send", "pick_media", "unsend", "react", "get_emoji_likes",
   "forward_msgs", "view_forward", "exit_forward", "poke", "channel_notify",
   "read_channel",
-  "start_message", "type_text", "backspace", "pick_media", "clear_draft", "send_message",
 ]);
 const GROUP_LAYER = new Set([
   "group_info", "list_members", "member_info", "group_honor", "group_files",
@@ -202,47 +201,20 @@ export const BOT_TOOLS: BotToolDef[] = [
     description: '把一个文件移出你的收藏夹。name 为 check_gallery 里看到的文件名（可带分类前缀，如 "meme/xx.png"）。',
   },
   {
-    name: "send_message",
-    signature: 'send_message(confirm_long?: boolean, insist?: boolean, resend?: boolean)',
+    name: "send",
+    signature: 'send(msg: string, id?: string, media?: string[], reply_to?: string, at_sender?: boolean, resend?: boolean, confirm_long?: boolean, insist?: boolean)',
     description:
-      "把输入框里编辑好的内容**真正发出去**（像真人点发送键）。发送后输入框清空。" +
-      "发送前需已用 start_message 确定目标、并编辑了内容（type_text / pick_media）。" +
-      "确需一次发送整段长文时加 confirm_long: true；" +
-      "连续发了几条对方都没回应被拦时，确实必须现在说再加 insist: true；" +
-      "与上一条完全相同的消息会被拦截（防复读），确实要重复发送时加 resend: true。",
-  },
-  {
-    name: "start_message",
-    signature: 'start_message(id?: string, reply_to?: string, at_sender?: boolean)',
-    description:
-      "开始编辑一条要发送的消息（打开输入框，此时还没发出任何东西）。id 缺省为当前所在频道页，要发给别的频道就给出完整频道 id；" +
-      "引用回复某条消息时给 reply_to（填消息记录里 (msg:xxx) 的**数字编号**），at_sender 控制是否自动 @ 原发送人（默认 true）。" +
-      "编辑好后用 send_message 真正发出。",
-  },
-  {
-    name: "type_text",
-    signature: 'type_text(text: string)',
-    description:
-      "在输入框当前光标处输入文字（像真人打字）。连续调用会接着往后追加。想在文字之间插内容，先用 backspace 或重新组织。" +
-      "输入框有其他内容时，这些文字会按调用顺序排布。",
-  },
-  {
-    name: "backspace",
-    signature: 'backspace(n?: number)',
-    description:
-      "从输入框光标前删除内容（像真人敲退格键）。n 可选：删除最后 n 个字符（仅对文字段）；不给 n 则删除光标前整个文字/媒体段。",
+      "发送消息。id 缺省为当前所在频道页；要发给别的频道就给出完整频道 id（格式 \"platform:channelId\"）。" +
+      "要发**图文混排**时，在 msg 里要插图的位置写 `<img>` 占位符（几张图写几个 `<img>`）——" +
+      "这样消息不会立刻发出，而是提示你选图；你再用 pick_media 按占位符顺序选出对应张图，选满后消息自动发出。" +
+      "若只是想单纯发文字/在末尾附一张图，也可用 media 参数直接给媒体编号。",
   },
   {
     name: "pick_media",
     signature: 'pick_media(media: string[])',
     description:
-      "从收藏夹/媒体缓存挑图并插入输入框光标处（像真人点图片按钮、勾选插入）。media 为媒体编号或收藏夹文件的列表（如 [\"12\", \"gallery:表情包/xx.png\"]）。" +
-      "发图前务必先用 check_gallery / check_media / view_media 看清内容——光凭编号随手插很容易发出不相关的图。可一次插多张。",
-  },
-  {
-    name: "clear_draft",
-    signature: 'clear_draft()',
-    description: "清空输入框里还没发出去的全部内容（取消这轮编辑）。",
+      "按 msg 里 `<img>` 占位符的顺序选图填充（结合 send 的图文混排用）。media 为媒体编号或收藏夹文件的列表（如 [\"12\", \"gallery:表情包/xx.png\"]）。" +
+      "发图务必先用 check_gallery / check_media / view_media 看清内容——光凭编号随手选很容易发出不相关的图。选了 N 张就填 N 个占位符，填满后那张消息自动发出。",
   },
   {
     name: "unsend",

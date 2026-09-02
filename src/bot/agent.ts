@@ -6,8 +6,7 @@ import { needsMsgIds, type Config } from "../config.js";
 import type { WorldFiles } from "../files.js";
 import { RepeatGuard, type ObserveResult } from "./repeatGuard.js";
 import { ToolCallParseError } from "../llm/parse.js";
-import type { BotEvent, CompressionResult, Draft, DraftSegment, EventSource, MediaRef, ParsedToolCall, PhoneStatus, PickFailure, PickResult, RichText, RichTextPart, ToolCallRecord } from "../types.js";
-import { emptyDraft } from "../types.js";
+import type { BotEvent, CompressionResult, EventSource, MediaRef, ParsedToolCall, PendingImageFill, PhoneStatus, PickFailure, PickResult, RichText, RichTextPart, ToolCallRecord } from "../types.js";
 import type { WorldAgent } from "../world/agent.js";
 import type { NotifyManager } from "../koishi/notify.js";
 import { debug } from "../webui/debug.js";
@@ -57,15 +56,6 @@ export interface MessengerApi {
     atSender?: boolean,
     insist?: boolean,
   ): Promise<string>;
-  sendSegments(
-    id: string,
-    segments: DraftSegment[],
-    replyTo?: string,
-    atSender?: boolean,
-    insist?: boolean,
-  ): Promise<string>;
-  sendFile(id: string, ref: string): Promise<string>;
-  sendVoice(id: string, text: string): Promise<string>;
   putDownPhone(): Promise<string>;
   recall(id: string, msgId: string): Promise<string>;
   react(id: string, msgId: string, emoji: string, remove?: boolean): Promise<string>;
@@ -225,11 +215,10 @@ export class BotAgent {
     forwardStack: string[];
   } = { chatOpen: false, channelKey: null, channelIsGroup: false, forwardStack: [] };
   /**
-   * 待发送输入框：像真人一样先把要发的内容编辑好（打字、选图插入、删改），
-   * 最后再单独「发送」。替代原来一次性生成整条消息的 send——发图必须先选图，
-   * 杜绝「不看图随手写个 [图片#id] 就发出来」的不相关图。
+   * 待填充的图文混排缓冲：send 的 msg 带 `<img>` 占位符时暂存于此，等 pick_media 选图填满后自动发送。
+   * null 表示当前没有待填充的消息。
    */
-  private draft: Draft = emptyDraft();
+  private pendingImageFill: PendingImageFill | null = null;
   /**
    * 最近一次有外部消息动静的频道 key（通知快捷回复的锚点）：
    * 手机即使没点进任何频道页，只要最近有频道来了新消息，send 系工具就能解锁快捷回复——
@@ -311,9 +300,9 @@ export class BotAgent {
         names.push(...this.layerNames("channel"));
         if (this.phoneUi.channelIsGroup) names.push(...this.layerNames("group"));
       } else if (this.lastNotifyKey) {
-        // 未点进频道页，但有最近通知源（收到过外部消息）→ 允许编辑输入框的工具组带 id 快捷回复
+        // 未点进频道页，但有最近通知源（收到过外部消息）→ 允许 send/pick_media 带 id 快捷回复
         // 其余 channel 工具（unsend/react/poke 等）仍需真正进入频道页。
-        names.push(...DRAFT_TOOL_NAMES);
+        names.push("send", "pick_media");
       }
     }
     const appDefs = [...(this.apps?.activeToolDefs() ?? []), ...(this.computer?.activeToolDefs() ?? [])];
@@ -524,7 +513,7 @@ export class BotAgent {
       source: "tool",
       content: `消息已发送到 ${channelKey}${msgTag}。`,
       worldTime: this.clock.now(),
-      asToolCall: { name: "send_message", arguments: { id: channelKey, msg } },
+      asToolCall: { name: "send", arguments: { id: channelKey, msg } },
     });
     this.logger.info("[external-send:simulate] %s %s", channelKey, truncate(msg, 100));
     // 账号自己发出了一条消息：打断对该频道的延期发送意图
@@ -1021,18 +1010,10 @@ export class BotAgent {
         }
         return this.dispatchLocal(call, async () => this.messenger.viewMedia(refs));
       }
-      case "start_message":
-        return this.dispatchStartMessage(call);
-      case "type_text":
-        return this.dispatchTypeText(call);
-      case "backspace":
-        return this.dispatchBackspace(call);
+      case "send":
+        return this.dispatchSend(call);
       case "pick_media":
         return this.dispatchPickMedia(call);
-      case "clear_draft":
-        return this.dispatchClearDraft(call);
-      case "send_message":
-        return this.dispatchSendMessage(call);
       case "put_down_phone":
         return this.dispatchLocal(call, async () => {
           const closedApp = await this.apps?.closeCurrent();
@@ -1684,9 +1665,9 @@ export class BotAgent {
         const prefix = closed ? `（你关掉了「${closed}」）` : "";
         const unlock = firstOpen
           ? `（聊天应用已打开，新增可用操作（关闭应用后失效）：\n${renderToolsText(this.layerDefs("chat"))}\n` +
-            `要**发消息**，先 select_channel 点进某个频道（进频道后才解锁频道内的完整操作），` +
-            `再用 start_message 开始编辑、type_text 打字、pick_media 选图、send_message 发出；` +
-            `没点进频道时，若某频道刚来了新消息、收到它的提醒，也能 start_message 带上它的 id 直接快捷回复。）\n\n`
+            `要**发消息**，先 select_channel 点进某个频道（进频道后才解锁频道内的完整操作），再用 send 发送；` +
+            `想发图文混排，在 msg 里写 <img> 占位符再用 pick_media 选图填充；` +
+            `没点进频道时，若某频道刚来了新消息、收到它的提醒，也能 send 带上它的 id 直接快捷回复。）\n\n`
           : "";
         return typeof rich === "string"
           ? { text: prefix + unlock + rich }
@@ -1932,7 +1913,7 @@ export class BotAgent {
       pend.timer = undefined;
     }
     this.pendingDeferred = this.pendingDeferred.filter((p) => p !== pend);
-    const toolName = "send_message";
+    const toolName = "send";
     const target = pend.kind === "text" ? `给 ${pend.rawId} 发消息说「${pend.content}」` : pend.kind === "voice" ? `给 ${pend.rawId} 发语音「${pend.content}」` : `给 ${pend.rawId} 发送文件「${pend.content}」`;
     this.pushEvent(
       "system",
@@ -2025,114 +2006,16 @@ export class BotAgent {
     return recentText ? { text: `${out}\n\n${recentText}` } : out;
   }
 
-  // ---------- 待发送输入框（draft） ----------
 
-  /** 开始编辑一条消息：确定目标频道（及可选的引用回复）。已有未发内容时先确认是否覆盖。 */
-  private dispatchStartMessage(call: ToolCallRecord): void {
-    return this.dispatchLocal(call, async () => {
-      const id = this.channelArg(call);
-      if (!id && !this.draft.channelKey) {
-        return "（start_message 需要 id 参数：先 select_channel 进频道，或给出频道 id 指定要发给谁。）";
-      }
-      if (id) {
-        const resolved = await this.messenger.resolveKey(id);
-        if ("error" in resolved) return resolved.error;
-        this.draft.channelKey = resolved.key;
-      }
-      const replyRaw = call.arguments.reply_to ?? call.arguments.replyTo;
-      this.draft.replyTo = normalizeMsgId(replyRaw);
-      const atRaw = call.arguments.at_sender ?? call.arguments.atSender ?? call.arguments.at;
-      this.draft.atSender = !(atRaw === false || atRaw === "false" || atRaw === 0);
-      this.draft.segments = [];
-      this.draft.cursor = 0;
-      return (
-        `你开始编辑发给 ${this.draft.channelKey} 的消息` +
-        (this.draft.replyTo ? `（引用回复 msg:${this.draft.replyTo}）` : "") +
-        `。输入框还是空的：用 type_text 打字、pick_media 挑图插入，编辑好用 send_message 发出。`
-      );
-    });
+  // ---------- 发送（图文混排经 <img> 占位符） ----------
+
+  /** msg 里 <img> 占位符的数量（``<img>`` / ``<img/>`` / ``<IMG>`` 都算） */
+  private countImgPlaceholders(msg: string): number {
+    return (msg.match(/<img\s*\/?>/gi) ?? []).length;
   }
 
-  /** 在光标处输入文字（与相邻文字段合并）。返回输入框当前内容预览。 */
-  private dispatchTypeText(call: ToolCallRecord): void {
-    return this.dispatchLocal(call, async () => {
-      if (!this.draft.channelKey) {
-        return "（还没有开始编辑消息：先 start_message 确定要发给谁。）";
-      }
-      const text = String(call.arguments.text ?? call.arguments.msg ?? "");
-      if (!text) return "（type_text 需要 text 参数。）";
-      this.draft.segments.splice(this.draft.cursor, 0, { kind: "text", text });
-      this.draft.cursor += 1;
-      return this.draftPreview();
-    });
-  }
-
-  /** 从光标前删除内容（默认删一个文字段/媒体段，或按 n 个字符删）。 */
-  private dispatchBackspace(call: ToolCallRecord): void {
-    return this.dispatchLocal(call, async () => {
-      if (!this.draft.channelKey) {
-        return "（还没有开始编辑消息：先 start_message 确定要发给谁。）";
-      }
-      if (this.draft.cursor <= 0) return "（光标已经在最前面，没有可删的内容。）";
-      const seg = this.draft.segments[this.draft.cursor - 1]!;
-      if (seg.kind === "text") {
-        const n = Number(call.arguments.n ?? 1);
-        if (Number.isFinite(n) && n > 0 && n < seg.text.length) {
-          seg.text = seg.text.slice(0, seg.text.length - n);
-        } else {
-          this.draft.segments.splice(this.draft.cursor - 1, 1);
-          this.draft.cursor -= 1;
-        }
-      } else {
-        // 媒体/文件/语音段：整体删除
-        this.draft.segments.splice(this.draft.cursor - 1, 1);
-        this.draft.cursor -= 1;
-      }
-      return this.draftPreview();
-    });
-  }
-
-  /** 挑图并插入输入框：从收藏夹/媒体缓存选定若干张图，插到光标处（必须先看清内容）。 */
-  private dispatchPickMedia(call: ToolCallRecord): void {
-    return this.dispatchLocal(call, async () => {
-      if (!this.draft.channelKey) {
-        return "（还没有开始编辑消息：先 start_message 确定要发给谁。）";
-      }
-      const raw = call.arguments.media ?? call.arguments.media_ids ?? call.arguments.refs;
-      const refs = Array.isArray(raw) ? raw.map((r) => String(r)) : [];
-      if (!refs.length) return "（pick_media 需要 media 参数：要插入的媒体编号或收藏夹文件的列表，如 [\"12\", \"gallery:表情包/xx.png\"]。）";
-      const results = await this.messenger.resolveMediaRefs(refs);
-      const okCount = results.filter((r) => r.ok).length;
-      const inserted: string[] = [];
-      for (const r of results) {
-        if (!r.ok) {
-          this.pushEvent("system", `（${r.refText}：${r.error}）`, { ref: call.id });
-          continue;
-        }
-        this.draft.segments.splice(this.draft.cursor, 0, { kind: "media", ref: r.ref, sticker: r.sticker });
-        this.draft.cursor += 1;
-        inserted.push(`[${r.ref.type === "image" ? "图片" : r.ref.type === "video" ? "视频" : "音频"}#${r.ref.id}]`);
-      }
-      return (
-        (inserted.length
-          ? `你从${this.draft.channelKey}的输入框里插入了 ${inserted.join("、")}。`
-          : "没有插入任何媒体。") +
-        this.draftPreview()
-      );
-    });
-  }
-
-  /** 清空输入框。 */
-  private dispatchClearDraft(call: ToolCallRecord): void {
-    return this.dispatchLocal(call, async () => {
-      this.draft.segments = [];
-      this.draft.cursor = 0;
-      return "（输入框已清空。）";
-    });
-  }
-
-  /** 单独发送：把输入框里的内容真正发出去。复用 send 的拦截逻辑，发送后清空输入框。 */
-  private dispatchSendMessage(call: ToolCallRecord): void {
+  private dispatchSend(call: ToolCallRecord): void {
+    // sendBlocking：上一条消息还没回显前，拒绝新的 send（避免连发相近/不连贯的消息）
     if (this.config.bot.sendBlocking) {
       const busy = sendBusyMessage(SEND_TOOL_NAMES.flatMap((n) => this.scheduler.pendingByName(n)));
       if (busy) {
@@ -2140,72 +2023,142 @@ export class BotAgent {
         return;
       }
     }
-    if (!this.draft.channelKey) {
-      this.pushEvent("system", "（还没有要发的消息：先 start_message 确定目标，再 type_text / pick_media 编辑内容，最后 send_message 发送。）", { ref: call.id });
+    const id = this.channelArg(call) ?? "";
+    const msg = String(call.arguments.msg ?? "");
+    const mediaRaw = call.arguments.media ?? call.arguments.images;
+    const media = Array.isArray(mediaRaw) ? (mediaRaw as (string | number)[]) : [];
+    const replyRaw = call.arguments.reply_to ?? call.arguments.replyTo ?? call.arguments.quote;
+    const replyTo = normalizeMsgId(replyRaw);
+    const atRaw = call.arguments.at_sender ?? call.arguments.atSender ?? call.arguments.at;
+    const atSender = !(atRaw === false || atRaw === "false" || atRaw === 0);
+    if (!id) {
+      this.pushEvent("system", "（send 现在没有可发的频道：你需要先用 select_channel 点进某个频道，或等某个频道来新消息后带上它的 id 快捷回复。）", { ref: call.id });
       return;
     }
-    if (!this.draft.segments.length) {
-      this.pushEvent("system", "（输入框是空的，没有可发的内容。）", { ref: call.id });
-      return;
-    }
-    const id = this.draft.channelKey;
-    const draftText = draftPlainText(this.draft.segments);
-    const hasMedia = this.draft.segments.some((s) => s.kind === "media");
-    const longLimit = this.config.messaging.longMessageChars;
-    if (longLimit > 0 && draftText.length > longLimit && !isTruthy(call.arguments.confirm_long)) {
+    if (!msg && !media.length) {
+      const alias = ["message", "text", "content"].find((k) => call.arguments[k] != null);
       this.pushEvent(
         "system",
-        pickMeta([
-          `（这条消息长达 ${draftText.length} 字，没有发出。日常聊天中一条消息一般只有十来个字，太长会显得不像真人——建议用 backspace 精简，或拆成几条分开发。如果你确实要一次性发送长内容（如资料、长文），请在参数里加上 confirm_long: true 再发一次。）`,
-          `（${draftText.length} 字太长了，没发出去。真人聊天都是短句，这么一大段会穿帮。精简一下或拆成几句；真要发长文就加 confirm_long: true。）`,
-          `（这条有 ${draftText.length} 字，被拦下了。一口气甩这么长不像在聊天，拆短一点更像真人。确需整段长文时加 confirm_long: true。）`,
-        ]),
+        alias
+          ? `（send 的消息参数必须叫 msg，不存在 ${alias} 这种参数。正确格式：send(id?: string, msg: string, …)。）`
+          : "（send 需要 msg（或 media）参数。）",
         { ref: call.id },
       );
       return;
     }
+    // 统一走 finishSend：内部先过拦截，再按「有无 <img> 占位符」决定暂存或调度发送
+    this.finishSend(call, id, msg, media, replyTo, atSender);
+  }
+
+  /** 选图填充 <img> 占位符：按占位符顺序逐张填，填满后自动发送。 */
+  private dispatchPickMedia(call: ToolCallRecord): void {
+    return this.dispatchLocal(call, async () => {
+      const pending = this.pendingImageFill;
+      if (!pending) {
+        return "（当前没有待填充的消息：先用 send 在 msg 里写 <img> 占位符，再 pick_media 选图填充。）";
+      }
+      const raw = call.arguments.media ?? call.arguments.media_ids ?? call.arguments.refs;
+      const refs = Array.isArray(raw) ? raw.map((r) => String(r)) : [];
+      if (!refs.length) return "（pick_media 需要 media 参数：要填充的媒体编号或收藏夹文件的列表。）";
+      const results = await this.messenger.resolveMediaRefs(refs);
+      for (const r of results) {
+        if (!r.ok) {
+          this.pushEvent("system", `（${r.refText}：${r.error}）`, { ref: call.id });
+          continue;
+        }
+        if (pending.filled.length < pending.placeholderCount) {
+          pending.filled.push({ ref: r.ref, sticker: r.sticker });
+        }
+      }
+      const remaining = pending.placeholderCount - pending.filled.length;
+      if (remaining > 0) {
+        return `（已填充 ${pending.filled.length} 张，还剩 ${remaining} 个占位符待填充，继续 pick_media 选图。）`;
+      }
+      // 填满：把 msg 里的每个 <img> 替换成 [图片#id]，走正常发送
+      const filled = pending.filled;
+      const msg = pending.msg;
+      this.pendingImageFill = null;
+      let filledMsg = msg;
+      let i = 0;
+      filledMsg = filledMsg.replace(/<img\s*\/?>/gi, () => {
+        const f = filled[i++]!;
+        const label = f.ref.type === "image" ? "图片" : f.ref.type === "video" ? "视频" : "音频";
+        return `[${label}#${f.ref.id}]`;
+      });
+      // 复用原 send 的拦截/发送：直接调 messenger.send（内联 [图片#id] 会被解析成图片）
+      const insist = pending.insist;
+      const replyTo = pending.replyTo;
+      const atSender = pending.atSender;
+      const id = pending.channelKey;
+      const media = filled.map((f) => String(f.ref.id));
+      // 记录防复读签名（fill 后消息按「频道 + 替换后文字 + 已选图」判重）
+      this.recordSendSig(JSON.stringify([id, filledMsg, media]));
+      return await this.deliverSend(id, filledMsg, media, replyTo, atSender, insist);
+    });
+  }
+
+  /** 无占位符时的正常发送（或填满后调用）：走 duration/长文/防复读拦截，然后真正发出。 */
+  private finishSend(call: ToolCallRecord, id: string, msg: string, media: (string | number)[], replyTo: string | undefined, atSender: boolean): void {
+    const longLimit = this.config.messaging.longMessageChars;
+    if (longLimit > 0 && msg.length > longLimit && !isTruthy(call.arguments.confirm_long)) {
+      this.pushEvent(
+        "system",
+        `（这条消息长达 ${msg.length} 字，没有发出。日常聊天中一条消息一般只有十来个字，太长会显得不像真人——精简一下，或确需发长文就加 confirm_long: true。）`,
+        { ref: call.id },
+      );
+      return;
+    }
+    if (this.maybeDeferSend(call, "text", id, msg)) return;
     if (this.gateSendDuration(call, "打字")) return;
-    // 防复读签名：按「频道 + 文字 + 图片」判重
-    const sig = JSON.stringify([id, draftText, this.draft.segments.filter((s) => s.kind === "media").map((s) => s.kind === "media" ? String(s.ref.id) : "")]);
+    const sig = JSON.stringify([id, msg, media.map(String)]);
     const recentRepeat = this.recentSendSigs.filter((s) => s === sig).length;
     const repeatThreshold = this.config.messaging.recentRepeatThreshold;
     if (repeatThreshold > 0 && recentRepeat >= repeatThreshold && !isTruthy(call.arguments.resend)) {
-      this.pushEvent("system", `（你最近已经说过「${truncate(draftText, 24)}」${recentRepeat} 次了。这句没有发出——换一种说法，或真的没有新内容就别说。）`, { ref: call.id });
+      this.pushEvent("system", `（你最近已经说过「${truncate(msg, 24)}」${recentRepeat} 次了。这句没有发出——换一种说法，或真的没有新内容就别说。）`, { ref: call.id });
+      return;
+    }
+    // <img> 占位符：拦截已过，但图还没选，暂存待 pick_media 填充
+    const imgCount = this.countImgPlaceholders(msg);
+    if (imgCount > 0) {
+      this.pendingImageFill = {
+        channelKey: id,
+        replyTo,
+        atSender,
+        msg,
+        placeholderCount: imgCount,
+        filled: [],
+        insist: isTruthy(call.arguments.insist),
+        confirmLong: isTruthy(call.arguments.confirm_long),
+        resend: isTruthy(call.arguments.resend),
+      };
+      this.pushEvent(
+        "system",
+        `（这条消息里有 ${imgCount} 个图片占位符 \`<img>\`，还没有选图，所以没有发出。` +
+          `请先用 check_gallery / check_media / view_media 看清要发的图，` +
+          `再用 pick_media 一次选出 ${imgCount} 张图（按占位符出现的顺序），选满后消息会自动发出。）`,
+        { ref: call.id },
+      );
       return;
     }
     this.recordSendSig(sig);
     this.ackStart(call);
     const insist = isTruthy(call.arguments.insist);
-    const replyTo = this.draft.replyTo;
-    const atSender = this.draft.atSender;
-    const segments = this.draft.segments;
-    this.draft.segments = [];
-    this.draft.cursor = 0;
-    this.draft.replyTo = undefined;
-    this.draft.atSender = true;
     this.scheduler.schedule(call, {
       executeAt: "expected",
       run: async () => {
-        const target = await this.switchToTarget(id);
-        if ("error" in target) return target.error;
-        const out = await this.messenger.sendSegments(target.key, segments, replyTo, atSender, insist);
-        this.noteDeferredSelfSent(target.key);
-        return this.echoChannelRecent(id, out);
+        const out = await this.deliverSend(id, msg, media, replyTo, atSender, insist);
+        return out;
       },
     });
   }
 
-  /** 输入框当前内容的预览文本（供编辑工具反馈）。 */
-  private draftPreview(): string {
-    const parts = this.draft.segments.map((s) => {
-      if (s.kind === "text") return s.text;
-      if (s.kind === "media") return `\u3010${s.ref.type === "image" ? "图片" : s.ref.type === "video" ? "视频" : "音频"}#${s.ref.id}\u3011`;
-      if (s.kind === "file") return `\u3010文件：${s.label}\u3011`;
-      return `\u3010语音：${s.text}\u3011`;
-    });
-    return parts.length
-      ? `\n（当前输入框内容：${parts.join("")}）`
-      : "\n（输入框是空的。）";
+  /** 真正发出：切频道 + messenger.send，打断延期发送意图，回显。 */
+  private async deliverSend(id: string, msg: string, media: (string | number)[], replyTo: string | undefined, atSender: boolean, insist: boolean): Promise<string | RichText> {
+    const target = await this.switchToTarget(id);
+    if ("error" in target) return target.error;
+    const out = await this.messenger.send(target.key, msg, media, replyTo, atSender, insist);
+    this.noteDeferredSelfSent(target.key);
+    return this.echoChannelRecent(id, out);
   }
 
   /** 记录一条已发出的 send 签名，滑窗维护「最近 N 条」（超窗滑出最老） */
@@ -2510,11 +2463,6 @@ function toPlainText(content: string | RichText): string {
   return typeof content === "string" ? content : content.text;
 }
 
-/** 提取 draft 的纯文本（用于长文/防复读判断；媒体段不计入文字长度） */
-function draftPlainText(segments: DraftSegment[]): string {
-  return segments.map((s) => (s.kind === "text" ? s.text : s.kind === "voice" ? s.text : "")).join("");
-}
-
 /**
  * 从多套**语义等价**的元话语里随机挑一套。
  * 只用于非事实性的寒暄/告警/提示语——承载事实或世界裁定的返回（状态、时间、act 结果、recall）
@@ -2609,10 +2557,8 @@ function escalatingRepeatHint(repeatCount: number): string {
   ]);
 }
 
-/** send 系工具（send_message）的名字集合 */
-const SEND_TOOL_NAMES = ["send_message"];
-/** 输入框编辑工具组（start_message → type_text/pick_media… → send_message） */
-const DRAFT_TOOL_NAMES = ["start_message", "type_text", "backspace", "pick_media", "clear_draft", "send_message"];
+/** send 系工具的名字集合（send 发送消息、pick_media 填充 <img> 占位符） */
+const SEND_TOOL_NAMES = ["send", "pick_media"];
 
 /** 打破死循环时不该被移除的"安全"工具：计时/书签类，移除它们反而会让模型无处安放、更疯狂 */
 function isBreakLoopSafeTool(name: string): boolean {
@@ -2620,7 +2566,7 @@ function isBreakLoopSafeTool(name: string): boolean {
 }
 
 /**
- * sendBlocking 阻塞模式：存在未完成（未回显）的 send_message 调用时，返回提示文本，否则 null。
+ * sendBlocking 阻塞模式：存在未完成（未回显）的 send 调用时，返回提示文本，否则 null。
  */
 export function sendBusyMessage(pending: ToolCallRecord[]): string | null {
   if (!pending.length) return null;

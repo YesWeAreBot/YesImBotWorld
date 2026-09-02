@@ -19,7 +19,7 @@ export interface BotModelConfig {
   disableWait: boolean;
   ignoreSendDuration: boolean;
   blockingAct: boolean;
-  /** send_message 的阻塞：上一条还没完成回显前，拒绝新的发送 */
+  /** send 的阻塞：上一条还没完成回显前，拒绝新的发送 */
   sendBlocking: boolean;
   waitRateThreshold: number;
   waitRateWindow: number;
@@ -131,7 +131,7 @@ export interface MessagingConfig {
   recentRepeatThreshold: number;
   /** 近期重复检测的滑动窗口大小（默认 20 条） */
   recentRepeatWindow: number;
-  /** send_message 成功后是否回显该频道最近若干条消息（默认关闭） */
+  /** send 成功后是否回显该频道最近若干条消息（默认关闭） */
   sendEcho: boolean;
   /** send 回显该频道最近多少条消息（默认 10） */
   sendEchoRecent: number;
@@ -376,7 +376,7 @@ export const Config: Schema<Config> = Schema.intersect([
       ignoreSendDuration: Schema.boolean()
         .default(false)
         .description(
-          "无视 send_message 的 duration：消息不再按\"打字耗时\"延迟发出，" +
+          "无视 send 的 duration：消息不再按\"打字耗时\"延迟发出，" +
             "而是立即发送（也不再有超大 duration 的拦截与发出前的 cancel 窗口）。工具描述会同步说明",
         ),
       blockingAct: Schema.boolean()
@@ -389,7 +389,7 @@ export const Config: Schema<Config> = Schema.intersect([
       sendBlocking: Schema.boolean()
         .default(true)
         .description(
-          "send_message 的阻塞（默认开启）：上一条消息还没发出、结果还没回显前，" +
+          "send 的阻塞（默认开启）：上一条消息还没发出、结果还没回显前，" +
             "新的发送会被直接拒绝并提示——避免 Bot 在看不到自己上一条消息的情况下连发意思相近、前后不连贯的消息。" +
             "其他工具调用不受影响。关闭后允许在上一条消息未回显时继续发下一条",
         ),
@@ -1140,7 +1140,7 @@ export const Config: Schema<Config> = Schema.intersect([
       sendEcho: Schema.boolean()
         .default(false)
         .description(
-          "send_message 成功后回显该频道最近若干条消息：让 Bot 看到自己的话「上墙」、以及对方的最新回应，" +
+          "send 成功后回显该频道最近若干条消息：让 Bot 看到自己的话「上墙」、以及对方的最新回应，" +
             "消除「没发出去/发错了」的错觉。默认关闭——回显只剩一句「消息已发送到…」，不附带频道消息列表，" +
             "避免模型只盯着刚发的这一条而忽略更长上下文；需要时再开启。",
         ),
