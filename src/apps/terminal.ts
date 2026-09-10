@@ -91,7 +91,7 @@ export class TerminalApp implements WorldApp {
       `如实输出报错或失败；不要凭空编造这个世界不该有的文件或程序；\n` +
       `3. 只输出终端屏幕上的内容（像普通命令行那样简洁），不要输出任何解释、旁白或代码围栏。`;
     try {
-      return (await this.world.query(task)) + PROMPT_HINT;
+      return (await this.world.executeAppAction("执行虚构电脑命令。只在能根据已建模设备和文件精确结算时执行，否则返回不支持。命令=" + JSON.stringify(command))) + PROMPT_HINT;
     } catch (err) {
       this.logger.warn("虚构终端输出生成失败: %s", err);
       return "（终端好像卡住了，屏幕上什么都没有。）" + PROMPT_HINT;

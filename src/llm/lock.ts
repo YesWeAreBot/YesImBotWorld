@@ -39,6 +39,7 @@ export function withEndpointLock<T>(
   fn: () => Promise<T>,
   signal?: AbortSignal,
 ): Promise<T> {
+  if (signal?.aborted) return Promise.reject(new DOMException("This operation was aborted", "AbortError"));
   if (!lockEnabled) return fn();
   const key = originKey(baseURL);
   const tail = tails.get(key) ?? Promise.resolve();
@@ -57,5 +58,13 @@ export function withEndpointLock<T>(
       () => undefined,
     ),
   );
-  return next;
+  if (!signal) return next;
+  // Abort the caller's wait immediately while retaining its place in the FIFO chain.
+  // The queued run still checks the signal and never invokes fn after cancellation.
+  return new Promise<T>((resolve, reject) => {
+    const abort = () => reject(new DOMException("This operation was aborted", "AbortError"));
+    signal.addEventListener("abort", abort, { once: true });
+    next.then(resolve, reject).finally(() => signal.removeEventListener("abort", abort));
+    if (signal.aborted) abort();
+  });
 }

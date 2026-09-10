@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
 <meta name="color-scheme" content="dark">
 <meta name="theme-color" content="#07090f">
 <title>YesImBot World · 世界观测台</title>
@@ -19,14 +19,20 @@
 }
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
 html,body{height:100%}
+/* 移动端视口高度：优先用动态视口 dvh（iOS 地址栏收起/展开时高度会变），老浏览器回退 vh */
 body{
   margin:0;color:var(--fg);font:14px/1.65 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei","Segoe UI",sans-serif;
+  background:var(--bg);
+}
+/* 背景柔光渐变：用固定定位伪元素实现，避免 background-attachment:fixed 在 iOS 上的兼容问题，
+   同时避免渐变随滚动内容平铺重复拼接 */
+body::before{
+  content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;
   background:
     radial-gradient(1100px 520px at 85% -8%, rgba(138,123,255,.13), transparent 62%),
     radial-gradient(900px 480px at -8% 18%, rgba(110,231,255,.08), transparent 58%),
-    radial-gradient(700px 500px at 50% 115%, rgba(110,231,255,.05), transparent 60%),
-    var(--bg);
-  background-attachment:fixed;
+    radial-gradient(700px 500px at 50% 115%, rgba(110,231,255,.08), transparent 60%);
+  background-repeat:no-repeat;
 }
 a{color:var(--accent);text-decoration:none}
 ::selection{background:rgba(110,231,255,.28)}
@@ -56,9 +62,9 @@ details summary::before{content:"▸";display:inline-block;margin-right:6px;colo
 details[open]>summary::before{transform:rotate(90deg)}
 
 /* ---------- 布局骨架 ---------- */
-#app{display:flex;min-height:100vh}
+#app{display:flex;min-height:100vh;min-height:100dvh}
 #sidebar{
-  width:228px;flex:none;position:sticky;top:0;height:100vh;display:flex;flex-direction:column;z-index:40;
+  width:228px;flex:none;position:sticky;top:0;height:100vh;height:100dvh;display:flex;flex-direction:column;z-index:40;
   background:rgba(9,12,19,.72);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);
   border-right:1px solid var(--line);
 }
@@ -376,7 +382,46 @@ details.adv>.body{padding:4px 14px 12px}
 var NL = String.fromCharCode(10);
 var VERSION = '?';
 var TOKEN = localStorage.getItem('wui_token') || '';
+// 访问者模式：'admin'（webui.token）或 'visitor'（访客账号）
+var MODE = localStorage.getItem('wui_mode') === 'visitor' ? 'visitor' : 'admin';
+var VISITOR_TOKEN = localStorage.getItem('wui_visitor_token') || '';
+var VISITOR_GRANTS = []; // 当前访客会话可见的数据块集合
+try { VISITOR_GRANTS = JSON.parse(localStorage.getItem('wui_visitor_grants') || '[]'); } catch(e) { VISITOR_GRANTS = []; }
+var VISITOR_PRESET = localStorage.getItem('wui_visitor_preset') || '';
+var VISITOR_PLAYER_PROFILE = null; // { name, persona }
+try { VISITOR_PLAYER_PROFILE = JSON.parse(localStorage.getItem('wui_player_profile') || 'null'); } catch(e) { VISITOR_PLAYER_PROFILE = null; }
+// 管理员的玩家角色档案（独立 key，避免与访客串）：管理员无账号档案，仅存本地
+var ADMIN_PLAYER_PROFILE = null; // { name, persona, mode }
+try { ADMIN_PLAYER_PROFILE = JSON.parse(localStorage.getItem('wui_admin_player_profile') || 'null'); } catch(e) { ADMIN_PLAYER_PROFILE = null; }
+// 常驻 Bot 名字（来自 /api/state meta.botName；管理员同名判定 / 工具面板用）
+var RESIDENT_BOT_NAME = '';
+var PLAYER_STATE = { token: '', worldName: '', inWorld: false, events: [], actBusy: false, lastTimeLine: '', mode: '', isAdmin: false, takeover: false, botName: '' };
+// 刷新后恢复「是否已入世界」的关键状态（token 用于重连 SSE，避免刷新后误当全新进入、与 crossing 里的旧会话冲突）
+function savePlayerState(){
+  var keep = { token: PLAYER_STATE.token, worldName: PLAYER_STATE.worldName, inWorld: PLAYER_STATE.inWorld, mode: PLAYER_STATE.mode, isAdmin: PLAYER_STATE.isAdmin, takeover: PLAYER_STATE.takeover, botName: PLAYER_STATE.botName };
+  localStorage.setItem('wui_player_state', JSON.stringify(keep));
+}
+function loadPlayerState(){
+  try {
+    var d = JSON.parse(localStorage.getItem('wui_player_state') || 'null');
+    if(d && typeof d === 'object'){
+      if(d.token) PLAYER_STATE.token = d.token;
+      if(typeof d.worldName === 'string') PLAYER_STATE.worldName = d.worldName;
+      if(d.inWorld) PLAYER_STATE.inWorld = true;
+      if(d.mode) PLAYER_STATE.mode = d.mode;
+      if(d.isAdmin) PLAYER_STATE.isAdmin = true;
+      if(d.takeover) PLAYER_STATE.takeover = true;
+      if(d.botName) PLAYER_STATE.botName = d.botName;
+      if(PLAYER_STATE.botName) RESIDENT_BOT_NAME = PLAYER_STATE.botName;
+    }
+  } catch(e) { /* ignore */ }
+}
+function clearPlayerState(){
+  localStorage.removeItem('wui_player_state');
+}
 var activeView = 'overview';
+var playerNewsAsc = false; // 世界观剧情「最近事件」排序：false=倒序(最新在上,默认) true=正序
+var worldStatusCache = null; // 最近一次 /api/state 结果，供 news 排序切换时免重复拉取
 // SSE 断线续传锚点：跨页面加载持久化，避免每次无缓存刷新都从 0 重放整段调试历史
 var lastEventId = Number(localStorage.getItem('wui_last_id') || 0);
 var evtSource = null;
@@ -403,6 +448,8 @@ function el(tag, attrs, children){
     else if(k === 'cls') n.className = attrs[k];
     else if(k === 'text') n.textContent = attrs[k];
     else if(k.indexOf('on') === 0) n.addEventListener(k.slice(2), attrs[k]);
+    // 布尔属性：用真实布尔赋值而非 setAttribute（HTML 里 checked/disabled/readonly 存在即真，值无所谓）
+    else if(k === 'checked' || k === 'disabled' || k === 'readonly' || k === 'selected' || k === 'multiple') n[k] = !!attrs[k];
     else n.setAttribute(k, attrs[k]);
   }
   if(children){
@@ -437,7 +484,10 @@ var ICONS = {
   sliders: svgIcon('<path d="M4 8h10M18 8h2M4 16h4M12 16h8"/><circle cx="16" cy="8" r="2"/><circle cx="10" cy="16" r="2"/>'),
   menu: svgIcon('<path d="M4 7h16M4 12h16M4 17h16"/>'),
   phone: svgIcon('<rect x="7" y="2.5" width="10" height="19" rx="2.5"/><path d="M11 18.5h2"/>'),
-  portal: svgIcon('<circle cx="12" cy="12" r="9"/><path d="M3.5 12h17"/><path d="M12 3a13.5 13.5 0 0 1 0 18"/><path d="M12 3a13.5 13.5 0 0 0 0 18"/>')
+  portal: svgIcon('<circle cx="12" cy="12" r="9"/><path d="M3.5 12h17"/><path d="M12 3a13.5 13.5 0 0 1 0 18"/><path d="M12 3a13.5 13.5 0 0 0 0 18"/>'),
+  door: svgIcon('<path d="M5 21V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v16"/><path d="M13 21v-7a2 2 0 0 1 2-2h1.5"/><circle cx="16" cy="10.5" r="0.8"/>'),
+  logout: svgIcon('<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="M15 8l4 4-4 4"/><path d="M19 12H9"/>'),
+  users: svgIcon('<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/>')
 };
 function icon(name){ return ICONS[name] || ''; }
 function copyText(text, hint){
@@ -472,27 +522,99 @@ function hideModal(){ $('#modal').classList.remove('show'); }
 $('#modal-x').onclick = hideModal;
 $('#modal').onclick = function(e){ if(e.target === this) hideModal(); };
 function promptToken(){
-  return new Promise(function(resolve){
-    var inp = el('input', {type:'password', placeholder:'webui.token', style:'width:100%'});
-    var body = el('div', null, [
-      el('p', {text:'服务器设置了访问令牌（webui.token），请输入以继续。', style:'color:var(--fg-dim);font-size:13px'}),
-      inp,
+  return promptAuth();
+}
+// 登录：管理员令牌（webui.token）或访客账号（用户名+密码）
+// 采用单例：登录弹窗已显示期间，后续 401 复用同一个 Promise，不重复弹窗、不清空已填表单
+var authPromise = null;
+function promptAuth(){
+  if(authPromise) return authPromise;
+  authPromise = new Promise(function(resolve){
+    var finish = function(v){ authPromise = null; hideModal(); resolve(v); };
+    var mode = 'admin'; // 'admin' | 'visitor'
+    var usernameInput = el('input', {placeholder:'用户名', style:'width:100%;margin:0 0 8px'});
+    var pwdInput = el('input', {type:'password', placeholder:'密码', style:'width:100%'});
+    var tokenInput = el('input', {type:'password', placeholder:'webui.token', style:'width:100%'});
+    var errLine = el('p', {style:'color:var(--err);font-size:12.5px;min-height:16px'});
+    var adminSec = el('div', null, [
+      el('p', {text:'服务器设置了访问令牌（webui.token），请输入以继续。', style:'color:var(--fg-dim);font-size:13px;margin:0 0 8px'}),
+      tokenInput
+    ]);
+    var visitorSec = el('div', null, [
+      el('p', {text:'访客只读访问：输入管理员分配的用户名与密码。', style:'color:var(--fg-dim);font-size:13px;margin:0 0 8px'}),
+      usernameInput, pwdInput
+    ]);
+    var tabs = el('div', {cls:'toolbar', style:'margin:0 0 10px'}, [
+      el('button', {cls: mode==='admin'?'primary':'', text:'管理员', onclick:function(){ setMode('admin'); }}),
+      el('button', {cls: mode==='visitor'?'primary':'', text:'访客', onclick:function(){ setMode('visitor'); }})
+    ]);
+    var body = el('div', null, [tabs, adminSec, visitorSec, errLine,
       el('div', {cls:'toolbar'}, [
-        el('button', {text:'取消', onclick:function(){ hideModal(); resolve(null); }}),
-        el('button', {cls:'primary', text:'确定', onclick:function(){ confirmToken(); }})
+        el('button', {text:'取消', onclick:function(){ finish(null); }}),
+        el('button', {cls:'primary', text:'登录', onclick:function(){ doLogin(); }})
       ])
     ]);
-    function confirmToken(){
-      TOKEN = inp.value.trim();
-      localStorage.setItem('wui_token', TOKEN);
-      hideModal();
-      connectSSE(); // 令牌更新后重建 SSE 连接（否则一直 401 重试）
-      resolve(TOKEN);
+    function setMode(m){
+      mode = m;
+      tabs.childNodes[0].className = m==='admin'?'primary':'';
+      tabs.childNodes[1].className = m==='visitor'?'primary':'';
+      adminSec.style.display = m==='admin' ? '' : 'none';
+      visitorSec.style.display = m==='visitor' ? '' : 'none';
+      errLine.textContent = '';
+      if(m==='admin') setTimeout(function(){ tokenInput.focus(); }, 20);
+      else setTimeout(function(){ usernameInput.focus(); }, 20);
     }
-    showModal('需要访问令牌', body);
-    setTimeout(function(){ inp.focus(); }, 50);
-    inp.onkeydown = function(e){ if(e.key === 'Enter') confirmToken(); };
+    function doLogin(){
+      errLine.textContent = '';
+      if(mode === 'admin'){
+        setAdmin(tokenInput.value.trim());
+      } else {
+        fetch('/api/login', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({username: usernameInput.value.trim(), password: pwdInput.value})})
+          .then(function(res){ return res.json().then(function(d){ return {ok:res.ok, d:d}; }); })
+          .then(function(r){
+            if(!r.ok){ errLine.textContent = r.d.error || '登录失败'; return; }
+            setVisitor(r.d.token, r.d.grants || [], r.d.preset, r.d.playerProfile || null);
+          })
+          .catch(function(e){ errLine.textContent = String(e && e.message || e); });
+      }
+    }
+    function setAdmin(t){
+      TOKEN = t;
+      MODE = 'admin';
+      VISITOR_TOKEN = '';
+      localStorage.setItem('wui_token', TOKEN);
+      localStorage.setItem('wui_mode', 'admin');
+      localStorage.removeItem('wui_visitor_token');
+      localStorage.removeItem('wui_visitor_grants');
+      localStorage.removeItem('wui_visitor_preset');
+      localStorage.removeItem('wui_player_profile');
+      connectSSE();
+      finish(t);
+    }
+    function setVisitor(tok, grants, preset, playerProfile){
+      VISITOR_TOKEN = tok;
+      VISITOR_GRANTS = grants;
+      VISITOR_PRESET = preset || '';
+      VISITOR_PLAYER_PROFILE = playerProfile || null;
+      MODE = 'visitor';
+      TOKEN = '';
+      localStorage.setItem('wui_mode', 'visitor');
+      localStorage.setItem('wui_visitor_token', tok);
+      localStorage.setItem('wui_visitor_grants', JSON.stringify(grants));
+      localStorage.setItem('wui_visitor_preset', preset || '');
+      localStorage.setItem('wui_player_profile', JSON.stringify(playerProfile || null));
+      localStorage.removeItem('wui_token');
+      buildNav();
+      connectSSE();
+      finish(tok);
+    }
+    showModal('需要登录', body);
+    setMode('admin');
+    tokenInput.onkeydown = function(e){ if(e.key === 'Enter') doLogin(); };
+    usernameInput.onkeydown = function(e){ if(e.key === 'Enter') doLogin(); };
+    pwdInput.onkeydown = function(e){ if(e.key === 'Enter') doLogin(); };
   });
+  return authPromise;
 }
 function showImage(title, url){
   var img = el('img', {src:url, cls:'full'});
@@ -503,7 +625,19 @@ function showImage(title, url){
 // ---------- API ----------
 function api(method, path, body, retried){
   var opts = {method:method, headers:{}};
-  if(TOKEN) opts.headers['Authorization'] = 'Bearer ' + TOKEN;
+  if(MODE === 'visitor'){
+    // 访客只读：写请求直接拒绝，不发请求（安全兜底，即便某个写按钮漏隐藏也不会真正落盘）。
+    // 例外：玩家档（player）允许自己的入世界写操作（/api/player/*）；
+    //       所有访客允许改自己的密码（/api/account/password）
+    var isPlayerOp = VISITOR_PRESET === 'player' && String(path).indexOf('/api/player') === 0;
+    var isPasswordOp = String(path) === '/api/account/password';
+    if(method !== 'GET' && !isPlayerOp && !isPasswordOp){
+      return Promise.reject(new Error('访客模式为只读，无法执行此操作'));
+    }
+    if(VISITOR_TOKEN) opts.headers['x-visitor-token'] = VISITOR_TOKEN;
+  } else if(TOKEN){
+    opts.headers['Authorization'] = 'Bearer ' + TOKEN;
+  }
   if(body !== undefined){
     if(body instanceof FormData){ opts.body = body; }
     else if(typeof Blob !== 'undefined' && body instanceof Blob){ opts.headers['Content-Type'] = body.type || 'application/octet-stream'; opts.body = body; }
@@ -511,11 +645,15 @@ function api(method, path, body, retried){
     else { opts.headers['Content-Type'] = 'application/json'; opts.body = JSON.stringify(body); }
   }
   return fetch(path, opts).then(function(res){
-    if(res.status === 401 && !retried){
-      return promptToken().then(function(t){
+    if((res.status === 401) && !retried){
+      return promptAuth().then(function(t){
         if(t == null) throw new Error('未授权');
         return api(method, path, body, true);
       });
+    }
+    if(res.status === 403 && !retried){
+      // 访客越权访问（无读权限）：提示后不再重试，避免死循环
+      throw new Error('无权访问');
     }
     return res.json().then(function(data){
       if(!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
@@ -524,16 +662,21 @@ function api(method, path, body, retried){
   });
 }
 
-// 给 img src 之类无法携带 Authorization 头的 URL 附上令牌参数
+// 给 img src 之类无法携带 Authorization 头的 URL 附上凭证参数
 function withToken(url){
-  if(!TOKEN) return url;
-  return url + (url.indexOf('?') >= 0 ? '&' : '?') + 'token=' + encodeURIComponent(TOKEN);
+  var sep = url.indexOf('?') >= 0 ? '&' : '?';
+  if(MODE === 'visitor'){
+    return VISITOR_TOKEN ? url + sep + 'visitor=' + encodeURIComponent(VISITOR_TOKEN) : url;
+  }
+  return TOKEN ? url + sep + 'token=' + encodeURIComponent(TOKEN) : url;
 }
 
 // ---------- SSE ----------
 function connectSSE(){
   if(evtSource) evtSource.close();
-  var url = '/api/events?since=' + lastEventId + (TOKEN ? '&token=' + encodeURIComponent(TOKEN) : '');
+  var url = '/api/events?since=' + lastEventId;
+  if(MODE === 'visitor'){ if(VISITOR_TOKEN) url += '&visitor=' + encodeURIComponent(VISITOR_TOKEN); }
+  else if(TOKEN){ url += '&token=' + encodeURIComponent(TOKEN); }
   evtSource = new EventSource(url);
   evtSource.onopen = function(){ $('#sse-dot').className = 'on'; };
   evtSource.onerror = function(){ $('#sse-dot').className = 'off'; };
@@ -612,33 +755,133 @@ function seedLive(){
 }
 
 // ---------- 导航 ----------
+// 第 4 项（可选）：访客可见所需的数据块（多个任一满足）；缺省则仅 admin 可见
 var NAV = [
   {group:'观测'},
-  ['overview','总览','gauge'],
-  ['devices','设备','monitor'],
-  ['debug','调试','activity'],
-  ['usage','用量','chart'],
+  ['overview','总览','gauge',['overview']],
+  ['devices','设备','monitor',['devices']],
+  ['debug','调试','activity',['debug']],
+  ['usage','用量','chart',['usage']],
   {group:'世界'},
-  ['state','状态','file'],
-  ['crossing','穿越','portal'],
-  ['prompts','提示词','edit'],
-  ['gallery','相册','image'],
-  ['media','媒体','film'],
-  ['data','数据','folder'],
+  ['state','状态','file',['world_status','bot_status','news','facts']],
+  ['crossing','穿越','portal',['crossing']],
+  ['player','入世界','door',['__player__']],
+  ['prompts','提示词','edit',['prompts']],
+  ['gallery','相册','image',['gallery']],
+  ['media','媒体','film',['gallery']],
+  ['data','数据','folder',['notes','archive']],
   {group:'系统'},
-  ['config','配置','sliders'],
+  ['visitors','访客','users',['config']],
+  ['config','配置','sliders',['config']],
 ];
+function visitorCanSee(grants){
+  if(MODE !== 'visitor') return true;
+  if(!grants || !grants.length) return false;
+  // 特殊：玩家入世界入口仅 player 档可见
+  if(grants.indexOf('__player__') >= 0) return VISITOR_PRESET === 'player';
+  return grants.some(function(g){ return VISITOR_GRANTS.indexOf(g) >= 0; });
+}
+function isVisitor(){ return MODE === 'visitor'; }
+// 从后端同步当前访客会话的最新 grants（管理员改权限后实时生效）；会话失效则退回登录
+function syncVisitorGrants(){
+  if(MODE !== 'visitor' || !VISITOR_TOKEN) return Promise.resolve();
+  return fetch('/api/visitors/me', {headers:{'x-visitor-token': VISITOR_TOKEN}}).then(function(res){
+    if(res.status === 401){
+      // 会话失效（账号被删/过期）：清凭证并重新登录
+      logoutVisitor();
+      return promptAuth();
+    }
+    return res.json().then(function(d){
+      if(!res.ok) throw new Error(d.error || 'HTTP ' + res.status);
+      VISITOR_GRANTS = d.grants || [];
+      VISITOR_PRESET = d.preset || '';
+      localStorage.setItem('wui_visitor_grants', JSON.stringify(VISITOR_GRANTS));
+      localStorage.setItem('wui_visitor_preset', VISITOR_PRESET);
+      buildNav();
+      return d;
+    });
+  }).catch(function(){ /* 网络失败等：保留旧 grants，不打断 */ });
+}
+function logoutVisitor(){
+  MODE = 'admin';
+  VISITOR_TOKEN = '';
+  VISITOR_GRANTS = [];
+  VISITOR_PRESET = '';
+  VISITOR_PLAYER_PROFILE = null;
+  localStorage.removeItem('wui_mode');
+  localStorage.removeItem('wui_visitor_token');
+  localStorage.removeItem('wui_visitor_grants');
+  localStorage.removeItem('wui_visitor_preset');
+  localStorage.removeItem('wui_player_profile');
+  document.body.classList.remove('visitor-readonly');
+  buildNav();
+  switchView('overview');
+}
+// 访客自助改密码：弹窗填旧密码 + 新密码
+function openChangePassword(){
+  var oldInp = el('input', {type:'password', placeholder:'当前密码', style:'width:100%'});
+  var newInp = el('input', {type:'password', placeholder:'新密码', style:'width:100%'});
+  var err = el('p', {style:'color:var(--err);font-size:12.5px;min-height:16px'});
+  showModal('修改密码', el('div', null, [
+    el('label', {text:'当前密码'}), oldInp,
+    el('label', {text:'新密码'}), newInp,
+    err,
+    el('div', {cls:'toolbar', style:'margin:8px 0 0'}, [
+      el('button', {text:'取消', onclick:hideModal}),
+      el('button', {cls:'primary', text:'保存', onclick:function(){
+        var oldP = oldInp.value;
+        var newP = newInp.value;
+        if(!oldP){ err.textContent = '请输入当前密码'; return; }
+        if(!newP){ err.textContent = '请输入新密码'; return; }
+        api('POST', '/api/account/password', {oldPassword: oldP, newPassword: newP}).then(function(){
+          hideModal();
+          toast('密码已修改', 'ok');
+        }).catch(function(e){ err.textContent = e.message || e; });
+      }})
+    ])
+  ]));
+  setTimeout(function(){ oldInp.focus(); }, 20);
+}
 function buildNav(){
   var nav = $('#nav');
   nav.textContent = '';
-  NAV.forEach(function(it){
-    if(it.group){ nav.appendChild(el('div', {cls:'nav-group', text: it.group})); return; }
+  var i = 0;
+  while(i < NAV.length){
+    // 注意：必须用 let（块级作用域），否则 onclick 闭包都捕获同一个循环变量，全部跳到最后一个导航项
+    let it = NAV[i];
+    if(it.group){
+      // 该分组下若没有任何访客可见项，则连分组标签一起隐藏
+      var groupName = it.group;
+      var hasVisible = false;
+      for(var j = i + 1; j < NAV.length && !NAV[j].group; j++){
+        if(visitorCanSee(NAV[j][3])){ hasVisible = true; break; }
+      }
+      if(hasVisible) nav.appendChild(el('div', {cls:'nav-group', text: groupName}));
+      i++;
+      continue;
+    }
+    if(!visitorCanSee(it[3])){ i++; continue; }
     var a = el('a', {cls: it[0]===activeView?'active':''});
     a.appendChild(el('span', {cls:'ico', html: icon(it[2])}));
     a.appendChild(el('span', {text: it[1]}));
     a.onclick = function(){ switchView(it[0]); closeDrawer(); };
     nav.appendChild(a);
-  });
+    i++;
+  }
+  // 访客专属操作：改密码 / 退出登录
+  if(MODE === 'visitor'){
+    nav.appendChild(el('div', {cls:'nav-group', text:'账号'}));
+    var cp = el('a', {cls:'nav-action'});
+    cp.appendChild(el('span', {cls:'ico', html: icon('sliders')}));
+    cp.appendChild(el('span', {text:'修改密码'}));
+    cp.onclick = function(){ openChangePassword(); closeDrawer(); };
+    nav.appendChild(cp);
+    var lo = el('a', {cls:'nav-action'});
+    lo.appendChild(el('span', {cls:'ico', html: icon('logout')}));
+    lo.appendChild(el('span', {text:'退出登录'}));
+    lo.onclick = function(){ logoutVisitor(); closeDrawer(); };
+    nav.appendChild(lo);
+  }
 }
 function clearViewTimers(){
   viewTimers.forEach(function(t){ clearInterval(t); });
@@ -650,6 +893,7 @@ function switchView(name){
   activeView = name;
   if(location.hash !== '#' + name) history.replaceState(null, '', '#' + name);
   clearViewTimers();
+  if(MODE === 'visitor') syncVisitorGrants();
   buildNav();
   // 切换视图时轻微淡入；同视图刷新不动画
   if(changed){
@@ -669,6 +913,8 @@ function switchView(name){
   else if(name === 'gallery') loadGallery();
   else if(name === 'media') loadMedia();
   else if(name === 'data') refreshData();
+  else if(name === 'visitors') loadVisitors();
+  else if(name === 'player') loadPlayer();
   else $('#main').textContent = '';
 }
 $('#btn-refresh').onclick = function(){ switchView(activeView); };
@@ -732,7 +978,7 @@ function renderOverview(o){
       el('div', null, [worldStatePill(o)]),
       el('div', {cls:'hero-clock', id:'ov-clock', text: clockText}),
       el('div', {cls:'hero-sub', id:'ov-sub', text: heroSub(o)}),
-      el('div', {cls:'hero-actions'}, [
+      isVisitor() ? null : el('div', {cls:'hero-actions'}, [
         el('button', {cls:'primary', text:'创世', title:'world.init：由 World-LLM 依据定义生成初始状态', onclick: function(){ worldAction('init', true); }}),
         el('button', {text:'开始', onclick: function(){ worldAction('start'); }}),
         el('button', {text:'暂停', onclick: function(){ worldAction('stop'); }}),
@@ -817,7 +1063,7 @@ function overviewCards(o){
     card('World-LLM 队列', String(o.worldQueue)),
     card('手机', o.phoneDown ? '放在一边（通知震动）' : '在手边'),
     card('电脑', o.computerOn ? o.computerOn : '未开机'),
-    card('关注频道', o.focusChannels.length ? o.focusChannels.join('、') : '无', 'small')
+    card('关注频道', (o.focusChannels || []).length ? o.focusChannels.join('、') : '无', 'small')
   ];
   if(o.crossing && (o.crossing.location || (o.crossing.worlds && o.crossing.worlds.length))){
     cards.push(card('所在世界', o.crossing.location ? '异世界「' + o.crossing.location + '」' : '自己的世界', o.crossing.location ? '' : 'small'));
@@ -827,13 +1073,14 @@ function overviewCards(o){
     cards.push(card('异世界访客', vs.length ? vs.map(function(v){ return v.name; }).join('、') : '无', vs.length ? '' : 'small'));
   }
   if(o.appOpen) cards.push(card('手机应用', o.appOpen));
-  o.galleryCounts.forEach(function(g){ cards.push(card('相册 · ' + g.category, String(g.count))); });
+  (o.galleryCounts || []).forEach(function(g){ cards.push(card('相册 · ' + g.category, String(g.count))); });
   return cards;
 }
 function newsSection(o){
   var body = el('div', {cls:'body'});
-  if(o.news.length){
-    o.news.forEach(function(n){
+  var news = o.news || [];
+  if(news.length){
+    news.forEach(function(n){
       body.appendChild(el('div', {cls:'news-item'}, [
         el('span', {cls:'clock', text:'[' + n.clock + ']'}),
         el('span', {text: ' ' + n.content, style:'font-size:12.5px'})
@@ -1155,16 +1402,18 @@ function computerPanel(d){
   if(c.on) head.appendChild(el('span', {cls:'mode-badge on', text: c.on + ' 打开中', style:'margin-left:auto'}));
   if(c.mode === 'off'){
     body.appendChild(el('p', {cls:'empty', text:'电脑未启用。开启后 Bot 会拥有一台自己的电脑：Docker 容器（终端/文件）或远程桌面（看屏幕、动鼠标键盘）。'}));
-    body.appendChild(el('button', {text:'前往配置开启', onclick:function(){ gotoCfg('apps'); }}));
+    if(!isVisitor()) body.appendChild(el('button', {text:'前往配置开启', onclick:function(){ gotoCfg('apps'); }}));
   } else if(c.mode === 'docker'){
     body.appendChild(dockerStatus(c.docker));
-    body.appendChild(el('div', {cls:'toolbar'}, [
-      el('button', {cls:'primary', text:'开机', onclick:function(){ computerAction('start'); }}),
-      el('button', {text:'关机', onclick:function(){ if(confirm('关闭 Bot 的电脑？容器数据保留，Bot 的终端会暂时不可用。')) computerAction('stop'); }}),
-      el('button', {text:'重启', onclick:function(){ if(confirm('重启 Bot 的电脑容器？')) computerAction('restart'); }}),
-    ]));
-    body.appendChild(el('div', {cls:'crumb', text:'终端控制台（运维用途，命令在容器内执行）'}));
-    body.appendChild(termBox());
+    if(!isVisitor()){
+      body.appendChild(el('div', {cls:'toolbar'}, [
+        el('button', {cls:'primary', text:'开机', onclick:function(){ computerAction('start'); }}),
+        el('button', {text:'关机', onclick:function(){ if(confirm('关闭 Bot 的电脑？容器数据保留，Bot 的终端会暂时不可用。')) computerAction('stop'); }}),
+        el('button', {text:'重启', onclick:function(){ if(confirm('重启 Bot 的电脑容器？')) computerAction('restart'); }}),
+      ]));
+      body.appendChild(el('div', {cls:'crumb', text:'终端控制台（运维用途，命令在容器内执行）'}));
+      body.appendChild(termBox());
+    }
   } else {
     body.appendChild(remotePanel(c));
   }
@@ -1269,9 +1518,7 @@ function pollScreen(){
   if(activeView !== 'devices' || !devicesCache || devicesCache.computer.mode !== 'remote_desktop') return;
   if(screenBusy) return;
   screenBusy = true;
-  var headers = {};
-  if(TOKEN) headers['Authorization'] = 'Bearer ' + TOKEN;
-  fetch('/api/computer/screen?w=1280&t=' + Date.now(), {headers: headers}).then(function(res){
+  fetch(withToken('/api/computer/screen?w=1280&t=' + Date.now())).then(function(res){
     if(!res.ok) return res.json().then(function(d){ throw new Error((d && d.error) || ('HTTP ' + res.status)); });
     return res.blob();
   }).then(function(blob){
@@ -1361,10 +1608,798 @@ var PLAT_DANGER = ['deleteFriend','groupKick','groupLeave','groupBan','groupWhol
 function cfgGroupKey(g){
   return g.children && g.children.length === 1 && g.children[0].type === 'object' ? g.children[0].key : 'root';
 }
+
+// ---------- 玩家入世界（真人角色扮演） ----------
+// 当前玩家的角色档案（管理员用本地 ADMIN_PLAYER_PROFILE，访客用 VISITOR_PLAYER_PROFILE）
+function getPlayerProfile(){
+  return MODE === 'visitor' ? VISITOR_PLAYER_PROFILE : ADMIN_PLAYER_PROFILE;
+}
+function setPlayerProfile(p){
+  if(MODE === 'visitor'){
+    VISITOR_PLAYER_PROFILE = p;
+    if(p) localStorage.setItem('wui_player_profile', JSON.stringify(p));
+    else localStorage.removeItem('wui_player_profile');
+  } else {
+    ADMIN_PLAYER_PROFILE = p;
+    if(p) localStorage.setItem('wui_admin_player_profile', JSON.stringify(p));
+    else localStorage.removeItem('wui_admin_player_profile');
+  }
+}
+// 管理员角色名是否与常驻 Bot 同名（尚未选进入语义前即可判定「可接管」）
+function isAdminSameName(){
+  return MODE !== 'visitor' && !!RESIDENT_BOT_NAME && !!getPlayerProfile()
+    && getPlayerProfile().name === RESIDENT_BOT_NAME;
+}
+// 管理员是否处于「接管 Bot」模式（角色名 === 常驻 Bot 名，且为扮演/操纵）
+function isAdminTakeover(){
+  return isAdminSameName()
+    && (getPlayerProfile().mode === 'avatar' || getPlayerProfile().mode === 'puppet');
+}
+function loadPlayer(){
+  // 刷新恢复：先从 localStorage 恢复「已入世界」状态（token 用于重连 SSE，避免误当全新进入）
+  loadPlayerState();
+  var main = $('#main');
+  main.textContent = '';
+  main.appendChild(viewHead('入世界', '以你的角色身份进入这个虚拟世界，通过行动与世界互动。'));
+  var holder = el('div', {text:'加载中…', cls:'empty'});
+  main.appendChild(holder);
+  // 先拉取常驻 Bot 名字（管理员同名判定 / 接管 Bot 用），拿到后再渲染——否则首次进入时 RESIDENT_BOT_NAME 还是空，
+  // 导致「接管 Bot」提示 / 工具面板不出现。
+  api('GET', '/api/state').then(function(r){
+    RESIDENT_BOT_NAME = (r.meta && r.meta.botName ? String(r.meta.botName).trim() : '');
+    holder.textContent = '';
+    // 首次：无角色身份 → 先填角色
+    if(!getPlayerProfile() || !getPlayerProfile().name){
+      holder.appendChild(playerProfileForm(function(){
+        loadPlayer();
+      }));
+      return;
+    }
+    // 刷新后已入世界：重连 SSE 恢复剧情流（旧 crossing 会话未过期则无缝恢复；
+    // 已过期/被顶掉时 onerror 会反复失败，此时用户可点「离开」回到进入界面）
+    if(PLAYER_STATE.inWorld && PLAYER_STATE.token){
+      playerConnectEvents(PLAYER_STATE.token);
+    }
+    // 已有角色身份：显示世界观状态 + 入世界/剧情流
+    playerRenderWorld(holder);
+  }).catch(function(){
+    holder.textContent = '';
+    holder.appendChild(el('p', {cls:'empty', text:'（无法加载世界状态，请检查世界是否已初始化。）'}));
+  });
+}
+
+function playerProfileForm(done){
+  var nameInp = el('input', {placeholder:'角色名（世界里的身份）', style:'width:100%'});
+  var personaTa = el('textarea', {rows: 6, placeholder:'角色人设：你是谁、什么性格、什么来历……（世界会根据它来让 NPC/Bot 认识你）', style:'width:100%'});
+  var cur = getPlayerProfile();
+  if(cur){
+    nameInp.value = cur.name || '';
+    personaTa.value = cur.persona || '';
+  }
+  var err = el('p', {style:'color:var(--err);font-size:12.5px;min-height:16px'});
+  // 管理员同名提示：填常驻 Bot 名即可进入「接管 Bot」模式（随输入实时更新，名字命中即高亮提醒）
+  var botHint = null;
+  function refreshBotHint(){
+    if(!botHint) return;
+    var name = nameInp.value.trim();
+    var hit = MODE !== 'visitor' && RESIDENT_BOT_NAME && name === RESIDENT_BOT_NAME;
+    if(hit){
+      botHint.style.color = 'var(--warn)';
+      botHint.innerHTML = '✔ 角色名与常驻 Bot「' + esc(RESIDENT_BOT_NAME) + '」相同：保存后进入世界时选「扮演/操纵」即可<b>接管该 Bot</b>（代理其全部工具调用）。';
+    } else {
+      botHint.style.color = 'var(--fg-dim)';
+      botHint.innerHTML = '常驻 Bot 名为「' + esc(RESIDENT_BOT_NAME) + '」。用它作角色名并选择「扮演/操纵」即可接管该 Bot（代理其全部工具调用）。';
+    }
+  }
+  if(MODE !== 'visitor' && RESIDENT_BOT_NAME){
+    botHint = el('p', {style:'color:var(--fg-dim);font-size:12px;margin:6px 0 0'});
+  }
+  var saveProfile = function(){
+    var name = nameInp.value.trim();
+    if(!name){ err.textContent = '角色名不能为空'; return; }
+    var profile = {name: name, persona: personaTa.value.trim()};
+    if(MODE === 'visitor'){
+      // 访客：持久化到账号（服务端校验同名）
+      api('PUT', '/api/player/profile', profile).then(function(){
+        setPlayerProfile(profile);
+        toast('角色身份已保存', 'ok');
+        done();
+      }).catch(function(e){ err.textContent = e.message || e; });
+    } else {
+      // 管理员：仅存本地（管理员同名是「接管 Bot」，不校验）
+      setPlayerProfile(profile);
+      toast('角色身份已保存', 'ok');
+      done();
+    }
+  };
+  nameInp.onkeydown = function(e){ if(e.key === 'Enter'){ saveProfile(); } };
+  nameInp.oninput = refreshBotHint;
+  refreshBotHint();
+  var form = el('div', {cls:'section'}, [
+    el('h3', {text:'你的角色身份'}),
+    el('div', {cls:'body'}, [
+      el('label', {text:'角色名'}), nameInp,
+      el('label', {text:'人设'}), personaTa,
+      botHint,
+      err,
+      el('div', {cls:'toolbar', style:'margin-top:10px'}, [
+        el('button', {cls:'primary', text:'保存角色', onclick:saveProfile})
+      ])
+    ])
+  ]);
+  return form;
+}
+
+function playerRenderWorld(holder){
+  // 世界运行状态 + 入世界/剧情
+  var profile = getPlayerProfile();
+  holder.textContent = '';
+  // 顶部：角色身份 + 入世界状态（未入世界时可重新编辑身份，创建新角色）
+  var head = el('div', {cls:'section'});
+  var headTitle = el('h3', {html:'角色 <span class="hint">' + esc(profile.name) + '</span>'});
+  head.appendChild(headTitle);
+  if(!PLAYER_STATE.inWorld){
+    headTitle.appendChild(el('button', {cls:'ghost', text:'重新编辑角色', style:'margin-left:8px', onclick:function(){
+      // 重新编辑角色身份（创建新角色 / 换人设），编辑后回到入世界界面
+      holder.textContent = '';
+      holder.appendChild(playerProfileForm(function(){
+        loadPlayer();
+      }));
+    }}));
+  }
+  head.appendChild(el('div', {cls:'body'}, [
+    el('div', {id:'player-status', style:'padding:10px;background:var(--panel);border:1px solid var(--line);border-radius:8px'})
+  ]));
+  holder.appendChild(head);
+  playerRenderStatus($('#player-status'));
+
+  if(!PLAYER_STATE.inWorld){
+    // 未入世界：显示「进入世界」+ 进入语义选择（仅进入前可选，进入后锁定）
+    var canTakeover = isAdminSameName();
+    var curMode = canTakeover && (profile.mode === 'avatar' || profile.mode === 'puppet') ? profile.mode : 'cross';
+    var modeOpts = [
+      ['cross', '穿越', '你的角色本不属于这个世界，从外界降临而来。'],
+      ['avatar', '接管常驻 Bot', '仅管理员与常驻 Bot 同名时可用：暂停自主行动，通过工具代理控制。NPC 入替尚未开放。'],
+      ['puppet', '共同操控常驻 Bot', '仅管理员与常驻 Bot 同名时可用：保留 Bot 自主行动，同时通过工具代理控制。']
+    ];
+    var modeRadios = modeOpts.map(function(o){
+      return el('label', {cls:'mode-opt', style:'display:block;padding:8px 10px;margin:6px 0;border:1px solid var(--line);border-radius:8px;cursor:pointer'}, [
+        el('input', {type:'radio', name:'player-mode', value:o[0], checked: o[0]===curMode, disabled:o[0] !== 'cross' && !canTakeover, onchange:function(){ curMode = o[0]; }}),
+        el('span', {text: ' ' + o[1], style:'font-weight:600;font-size:13px'}),
+        el('div', {text: o[2], style:'font-size:12px;color:var(--fg-dim);margin:2px 0 0 22px'})
+      ]);
+    });
+    // 管理员 + 同名：进入语义里扮演/操纵即「接管 Bot」的说明（改名后立即提示，不依赖进入语义）
+    var takeoverHint = null;
+    if(isAdminSameName()){
+      takeoverHint = el('p', {style:'color:var(--warn);font-size:12.5px', html:
+        '你的角色名与常驻 Bot「' + esc(RESIDENT_BOT_NAME) + '」相同。选择上方「扮演（入替）」或「操纵」进入，即可<b>接管该 Bot</b>：扮演会暂停它的自主思考、由你代理其全部工具调用；操纵则让它继续自主运行、你额外操控其行动。'});
+    }
+    var enterBar = el('div', {cls:'section'}, [
+      el('h3', {text:'进入世界'}),
+      el('div', {cls:'body'}, [
+        el('p', {text:'当前支持独立角色穿越。已有 NPC 的扮演/操纵需要实体控制权绑定，暂未开放；管理员同名接管常驻 Bot 仍可用。', style:'color:var(--fg-dim);font-size:13px'}),
+        takeoverHint,
+        el('div', {}, modeRadios),
+        el('button', {cls:'primary', text:'进入世界', onclick:function(){ playerArrive(curMode); }})
+      ])
+    ]);
+    holder.appendChild(enterBar);
+  } else {
+    holder.appendChild(playerWorldPanel());
+    // 管理员接管 Bot：附上「工具调用面板」（代理 Bot 全部工具）
+    if(isAdminTakeover()) holder.appendChild(adminToolPanel());
+  }
+  // 世界剧情（世界状态+新闻，只读）
+  holder.appendChild(playerWorldStatus());
+}
+
+function playerArrive(mode){
+  mode = (mode === 'avatar' || mode === 'puppet') ? mode : 'cross';
+  var profile = getPlayerProfile();
+  // 管理员：角色身份随请求体传入（无账号档案）；访客沿用服务端档案
+  var body = MODE === 'visitor' ? {mode: mode} : {name: profile.name, persona: profile.persona || '', mode: mode};
+  api('POST', '/api/player/arrive', body).then(function(r){
+    PLAYER_STATE.token = r.token;
+    PLAYER_STATE.worldName = r.worldName || '';
+    PLAYER_STATE.inWorld = true;
+    PLAYER_STATE.mode = r.mode || mode;
+    PLAYER_STATE.isAdmin = MODE !== 'visitor';
+    PLAYER_STATE.botName = r.botName || RESIDENT_BOT_NAME || '';
+    if(PLAYER_STATE.botName) RESIDENT_BOT_NAME = PLAYER_STATE.botName;
+    PLAYER_STATE.takeover = PLAYER_STATE.isAdmin && !!PLAYER_STATE.botName && profile.name === PLAYER_STATE.botName;
+    PLAYER_STATE.events = [];
+    // 持久化进入语义：下次进入默认沿用
+    if(profile){
+      profile.mode = mode;
+      setPlayerProfile(profile);
+      if(MODE === 'visitor'){
+        api('PUT', '/api/player/profile', { name: profile.name, persona: profile.persona || '', mode: mode }).catch(function(){});
+      }
+    }
+    toast(PLAYER_STATE.takeover ? '已接管 Bot' : '已进入世界', 'ok');
+    savePlayerState();
+    playerConnectEvents(r.token);
+    loadPlayer();
+  }).catch(showErr);
+}
+
+function playerWorldPanel(){
+  var box = el('div', {cls:'section'});
+  box.appendChild(el('h3', {html:'世界互动 <span class="hint">' + esc(PLAYER_STATE.worldName || '') + '</span>'}));
+  var body = el('div', {cls:'body'});
+  // 剧情流
+  var feed = el('div', {id:'player-feed', style:'max-height:360px;overflow:auto;border:1px solid var(--line);border-radius:8px;padding:10px;margin-bottom:12px'});
+  body.appendChild(feed);
+  playerRenderFeed(feed);
+  // act 提交
+  var actInp = el('textarea', {rows: 3, placeholder:'描述你的角色想做什么（例如：走向吧台，向老板要一杯酒）', style:'width:100%'});
+  var err = el('p', {style:'color:var(--err);font-size:12.5px;min-height:16px'});
+  body.appendChild(el('div', {cls:'toolbar', style:'margin:8px 0 0'}, [actInp]));
+  var actBtn = el('button', {cls:'primary', text:'行动', onclick:function(){ playerSubmitAct(actInp, err, feed, actBtn); }});
+  body.appendChild(el('div', {cls:'toolbar', style:'margin:4px 0 0'}, [
+    el('span', {id:'player-act-state', style:'color:var(--fg-dark);font-size:12px', text: PLAYER_STATE.actBusy ? '等待世界裁定中…' : ''}),
+    el('span', {cls:'spacer'}),
+    actBtn,
+    el('button', {cls:'ghost', text:'离开世界', onclick:function(){ playerLeave(); }})
+  ]));
+  box.appendChild(body);
+  return box;
+}
+
+function playerRefreshActState(){
+  var st = $('#player-act-state');
+  if(st) st.textContent = PLAYER_STATE.actBusy ? '等待世界裁定中…' : '';
+  var btns = $('#main').querySelectorAll('button');
+  // 行动按钮禁用状态跟随 actBusy（宽泛匹配：不影响其它按钮，仅文字为「行动」者）
+  btns.forEach(function(b){ if(b.textContent === '行动'){ b.disabled = !!PLAYER_STATE.actBusy; } });
+}
+
+// 管理员「接管 Bot」时可手动代理的 Bot 工具（核心高频工具 + 可自由输入任意工具名）
+// 管理员工具面板的常用工具：name / signature / 描述 / 参数字段定义
+// 字段定义：[参数名, 中文标签, 类型, 是否必填, 占位提示]
+// 类型：text / area / num / sel（sel 需带第 6 个元素=选项数组）
+var ADMIN_TOOL_LIST = [
+  ['act', 'act(description, duration?)', '在世界中做一件事（自然语言描述）。', [
+    ['description', '行动描述', 'area', true, '例如：走向吧台，向老板要一杯酒'],
+    ['duration', '耗时（TU，可选）', 'num', false, '']
+  ]],
+  ['send', 'send(msg, id?, media?)', '发送消息（id 缺省为当前频道）。', [
+    ['msg', '消息内容', 'area', true, '要发送的文字'],
+    ['id', '频道 id（可选）', 'text', false, 'platform:channelId，缺省当前频道'],
+    ['media', '媒体编号（可选，逗号分隔）', 'list', false, '如 12,13 或 gallery:xx.png']
+  ]],
+  ['wait', 'wait(n)', '等待 n 个 Time Unit。', [
+    ['n', '等待时长 TU', 'num', true, '例如 15']
+  ]],
+  ['check_status', 'check_status(target, full?)', '查看自身或世界状态。', [
+    ['target', '目标', 'sel', true, '', ['self','world']],
+    ['full', '查看全文', 'bool', false, '']
+  ]],
+  ['check_time', 'check_time()', '看一眼现在几点。', []],
+  ['check_msg', 'check_msg(n?)', '刷新消息列表。', [
+    ['n', '频道数（可选）', 'num', false, '缺省默认']
+  ]],
+  ['select_channel', 'select_channel(id)', '点进一个频道。', [
+    ['id', '频道 id', 'text', true, 'platform:channelId']
+  ]],
+  ['read_channel', 'read_channel(n?)', '读当前频道最近消息。', [
+    ['n', '条数（可选）', 'num', false, '缺省默认']
+  ]],
+  ['check_gallery', 'check_gallery(category?)', '翻看收藏夹。', [
+    ['category', '分类（可选）', 'text', false, '如 meme']
+  ]],
+  ['check_media', 'check_media(n?)', '翻看媒体缓存。', [
+    ['n', '条数（可选）', 'num', false, '缺省默认']
+  ]],
+  ['open_app', 'open_app(name)', '打开手机里的一个应用。', [
+    ['name', '应用名', 'text', true, '如 聊天 / 浏览器 / 电脑']
+  ]],
+  ['recall', 'recall(keyword?, n?)', '回忆自己的过往。', [
+    ['keyword', '关键词（可选）', 'text', false, ''],
+    ['n', '条数（可选）', 'num', false, '']
+  ]],
+  ['react', 'react(id, msg_id, emoji)', '给某条消息贴表情回应。', [
+    ['id', '频道 id', 'text', true, 'platform:channelId'],
+    ['msg_id', '消息 id', 'text', true, '消息编号'],
+    ['emoji', '表情', 'text', true, '如 👍']
+  ]],
+  ['unsend', 'unsend(id, msg_id)', '撤回一条已发消息。', [
+    ['id', '频道 id', 'text', true, 'platform:channelId'],
+    ['msg_id', '消息 id', 'text', true, '消息编号']
+  ]]
+];
+
+// 管理员「接管 Bot」时的工具调用面板：代理 Bot 全部工具，经 /api/player/tool 真正执行
+function adminToolPanel(){
+  var box = el('div', {cls:'section'});
+  box.appendChild(el('h3', {html:'工具调用面板 <span class="hint">手动驾驶常驻 Bot「' + esc(RESIDENT_BOT_NAME || '') + '」</span>'}));
+  var body = el('div', {cls:'body'});
+
+  var sel = el('select', {style:'width:100%'});
+  var customOpt = el('option', {value:'__custom__', text:'自定义工具名…'});
+  sel.appendChild(customOpt);
+  ADMIN_TOOL_LIST.forEach(function(t){
+    sel.appendChild(el('option', {value:t[0], text: t[0] + ' — ' + t[2]}));
+  });
+
+  // 参数字段容器（动态按所选工具渲染）
+  var fieldsBox = el('div', {style:'margin:10px 0'});
+  // 高级 JSON（默认隐藏）
+  var advTa = el('textarea', {rows: 4, placeholder:'直接写完整参数 JSON 对象（优先级高于上方字段）', style:'width:100%;font-family:var(--mono);font-size:12px;display:none'});
+  var advToggle = el('button', {cls:'ghost', text:'▸ 高级：直接编辑 JSON', style:'font-size:12px;margin:4px 0 0'});
+  var nameInp = el('input', {placeholder:'自定义工具名（如 send_group_notice）', style:'width:100%;margin-top:8px;display:none'});
+
+  var resultPre = el('pre', {style:'max-height:280px;overflow:auto;margin-top:10px;white-space:pre-wrap;word-break:break-word;background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:8px'});
+  var errLine = el('p', {style:'color:var(--err);font-size:12.5px;min-height:16px'});
+  var busy = false;
+
+  function renderFields(){
+    fieldsBox.textContent = '';
+    if(sel.value === '__custom__'){ nameInp.style.display = ''; return; }
+    nameInp.style.display = 'none';
+    var def = null;
+    for(var i=0;i<ADMIN_TOOL_LIST.length;i++){ if(ADMIN_TOOL_LIST[i][0] === sel.value){ def = ADMIN_TOOL_LIST[i]; break; } }
+    if(!def) return;
+    var fields = def[3] || [];
+    if(!fields.length){ fieldsBox.appendChild(el('p', {cls:'empty', text:'该工具无需参数。'})); return; }
+    fields.forEach(function(f){
+      var key = f[0], label = f[1], type = f[2], required = f[3], ph = f[4], opts = f[5];
+      var inp;
+      if(type === 'area') inp = el('textarea', {rows: 2, placeholder: ph || '', style:'width:100%;font-family:var(--mono);font-size:12px'});
+      else if(type === 'num') inp = el('input', {type:'number', placeholder: ph || '', style:'width:100%'});
+      else if(type === 'bool') inp = el('input', {type:'checkbox', style:'width:auto'});
+      else if(type === 'sel'){ inp = el('select', {style:'width:100%'}); (opts||[]).forEach(function(o){ inp.appendChild(el('option', {value:o, text:o})); }); }
+      else inp = el('input', {placeholder: ph || '', style:'width:100%'});
+      inp.setAttribute('data-key', key);
+      inp.setAttribute('data-type', type);
+      fieldsBox.appendChild(el('label', {text: label + (required ? '' : '（可选）'), style:'font-size:12px;color:var(--fg-dim);display:block;margin:8px 0 3px'}));
+      fieldsBox.appendChild(inp);
+    });
+  }
+  sel.onchange = renderFields;
+
+  body.appendChild(el('label', {text:'工具', style:'font-size:12px;color:var(--fg-dim)'}));
+  body.appendChild(sel);
+  body.appendChild(nameInp);
+  body.appendChild(fieldsBox);
+  body.appendChild(advToggle);
+  body.appendChild(advTa);
+  body.appendChild(errLine);
+  var callBtn = el('button', {cls:'primary', text:'调用工具'});
+  body.appendChild(el('div', {cls:'toolbar', style:'margin:6px 0 0'}, [callBtn,
+    el('button', {cls:'ghost', text:'清空结果', onclick:function(){ resultPre.textContent = ''; }})
+  ]));
+  body.appendChild(resultPre);
+
+  advToggle.onclick = function(){
+    var show = advTa.style.display === 'none';
+    advTa.style.display = show ? '' : 'none';
+    advToggle.textContent = show ? '▾ 收起高级 JSON' : '▸ 高级：直接编辑 JSON';
+  };
+
+  function collectArgs(){
+    // 高级 JSON 优先
+    if(advTa.style.display !== 'none' && advTa.value.trim()){
+      var parsed;
+      try { parsed = JSON.parse(advTa.value); }
+      catch(e){ throw new Error('参数不是合法 JSON：' + e.message); }
+      if(typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('参数必须是 JSON 对象');
+      return parsed;
+    }
+    var args = {};
+    fieldsBox.querySelectorAll('[data-key]').forEach(function(inp){
+      var key = inp.getAttribute('data-key');
+      var type = inp.getAttribute('data-type');
+      if(type === 'bool'){ if(inp.checked) args[key] = true; return; }
+      var v = inp.value.trim();
+      if(!v){ return; } // 空值省略
+      if(type === 'num'){ var n = Number(v); if(Number.isFinite(n)) args[key] = n; else throw new Error('字段 ' + key + ' 必须是数字'); return; }
+      if(type === 'list'){ args[key] = v.split(/[,，]/).map(function(s){ return s.trim(); }).filter(Boolean); return; }
+      args[key] = v;
+    });
+    return args;
+  }
+
+  function runTool(){
+    if(busy) return;
+    var name = sel.value === '__custom__' ? nameInp.value.trim() : sel.value;
+    if(!name){ errLine.textContent = '请选择或输入工具名'; return; }
+    var args;
+    try { args = collectArgs(); }
+    catch(e){ errLine.textContent = e.message; return; }
+    errLine.textContent = '';
+    busy = true;
+    callBtn.disabled = true;
+    resultPre.textContent = '（正在调用 ' + name + ' …）';
+    api('POST', '/api/player/tool', {name: name, arguments: args}).then(function(r){
+      busy = false;
+      callBtn.disabled = false;
+      resultPre.textContent = (r.ok ? '' : '⚠ 拒绝/失败\n') + (r.text || '（无返回内容）');
+    }).catch(function(e){
+      busy = false;
+      callBtn.disabled = false;
+      errLine.textContent = e.message || e;
+      resultPre.textContent = '';
+    });
+  }
+  callBtn.onclick = runTool;
+  nameInp.onkeydown = function(e){ if(e.key === 'Enter') runTool(); };
+  box.appendChild(body);
+  return box;
+}
+
+// 解析玩家状态档案（World 生成的 markdown）为若干「节」：{label, body}
+function parsePlayerStatus(text){
+  if(!text) return [];
+  var lines = String(text).split('\n');
+  var sections = [];
+  var cur = null; // {label, lines:[]}
+  function flush(){
+    if(cur && cur.lines.join('\n').trim()){
+      sections.push({ label: cur.label, body: cur.lines.join('\n').trim() });
+    }
+    cur = null;
+  }
+  lines.forEach(function(line){
+    var m = line.match(/^#{1,4}\s+(.+?)\s*#*\s*$/);   // 「## 标题」或「# 标题」
+    if(m){
+      flush();
+      cur = { label: m[1].trim(), lines: [] };
+    } else if(cur){
+      cur.lines.push(line);
+    } else {
+      // 没有 heading 的开头自由文本：归入「档案」
+      cur = { label: '档案', lines: [] };
+      cur.lines.push(line);
+    }
+  });
+  flush();
+  return sections;
+}
+
+// 渲染玩家的角色状态（World 维护的 persona：身份 + 状态），按 markdown 分节结构化展示
+function playerRenderStatus(sec){
+  sec.textContent = '';
+  var profile = getPlayerProfile();
+  if(!profile || !profile.persona){
+    sec.appendChild(el('p', {text:'以「' + (profile && profile.name ? profile.name : '你的角色') + '」的身份进入世界，用行动推动剧情。', style:'color:var(--fg-dim);font-size:13px'}));
+    return;
+  }
+  var sections = parsePlayerStatus(profile.persona);
+  if(!sections.length){
+    sec.appendChild(el('div', {style:'font-size:12.5px;white-space:pre-wrap', html: esc(profile.persona)}));
+    return;
+  }
+  sections.forEach(function(s, i){
+    var block = el('div', {style: i ? 'margin-top:8px' : ''});
+    block.appendChild(el('div', {style:'font-size:11.5px;font-weight:600;color:var(--info);margin-bottom:2px', text: s.label}));
+    // 列表项：每行一条，键值美观化；否则整段保留
+    var body = el('div', {style:'font-size:12.5px;white-space:pre-wrap;line-height:1.55', html: esc(s.body)});
+    block.appendChild(body);
+    sec.appendChild(block);
+  });
+}
+
+function playerRefreshStatus(){
+  var sec = $('#player-status');
+  if(sec) playerRenderStatus(sec);
+}
+
+// 事件流渲染：始终正序（时间先后），玩家行动与世界剧情交替显示并带世界观时间戳
+function playerRenderFeed(feed){
+  feed.textContent = '';
+  var list = PLAYER_STATE.events.slice();
+  if(!list.length){
+    feed.appendChild(el('p', {cls:'empty', text:'（还没有剧情——行动后世界会告诉你发生了什么）'}));
+    return;
+  }
+  list.forEach(function(ev){
+    var t = el('div', {style:'font-size:11px;color:var(--fg-dim);margin-bottom:2px', text: ev.timeLine ? '◷ ' + ev.timeLine : ''});
+    var row;
+    if(ev.type === 'player'){
+      // 玩家行动：右侧气泡，带角色名标签
+      row = el('div', {style:'text-align:right;padding:4px 0 6px'}, [
+        el('div', {style:'display:inline-block;max-width:86%;text-align:left'}, [
+          el('div', {style:'font-size:11px;color:var(--fg-dim);margin-bottom:2px;text-align:right', text: ev.name ? ev.name : '你'}),
+          el('div', {style:'padding:6px 10px;border-radius:10px 10px 2px 10px;background:var(--info);color:#fff;font-size:12.5px;white-space:pre-wrap', html: esc(ev.content)})
+        ])
+      ]);
+    } else {
+      // 世界剧情：左侧气泡 + 【世界】标签
+      row = el('div', {style:'padding:4px 0 6px'}, [
+        el('div', {style:'display:inline-block;max-width:86%;padding:6px 10px;border-radius:10px 10px 10px 2px;background:var(--panel);border:1px solid var(--line);font-size:12.5px;white-space:pre-wrap', html: '<span style="color:var(--warn)">【世界】</span> ' + esc(ev.content)})
+      ]);
+    }
+    feed.appendChild(el('div', {style:'padding:4px 0;border-bottom:1px solid var(--line)'}, [t, row]));
+  });
+  // 正序：滚动到底部（最新）
+  feed.scrollTop = feed.scrollHeight;
+}
+
+function playerSubmitAct(actInp, err, feed, actBtn){
+  var desc = actInp.value.trim();
+  if(!desc){ err.textContent = '请描述你的角色想做什么'; return; }
+  if(PLAYER_STATE.actBusy){ err.textContent = '上一个行动还在裁定中'; return; }
+  err.textContent = '';
+  // 尊重 duration：提交后等待，结果异步推送
+  PLAYER_STATE.actBusy = true;
+  actInp.value = '';
+  // 立马上屏：玩家行动与世界剧情交替呈现
+  var prof = getPlayerProfile();
+  PLAYER_STATE.events.push({type:'player', name: prof && prof.name, content: desc, timeLine: PLAYER_STATE.lastTimeLine || ''});
+  playerRefreshFeed();
+  playerRefreshActState();
+  var taskId = 'p_' + Date.now() + '_' + Math.floor(Math.random()*1e6);
+  // 管理员接管 Bot：act 走 Bot 通道（服务端路由到 adjudicateAct），否则走 crossing visitorAct
+  var body = {token: PLAYER_STATE.token, taskId: taskId, kind: 'act', payload: {desc: desc}};
+  if(MODE !== 'visitor' && PLAYER_STATE.takeover) body.actorName = prof && prof.name;
+  api('POST', '/api/player/task', body).then(function(r){
+    // 已受理，等待 SSE 的 task_result（管理员接管 Bot 时 act 结果由正文 r.text 返回，不再有 SSE task_result）
+    if(MODE !== 'visitor' && PLAYER_STATE.takeover && r && r.text){
+      PLAYER_STATE.events.push({type:'world', content: r.text, timeLine: PLAYER_STATE.lastTimeLine || ''});
+      playerRefreshFeed();
+      PLAYER_STATE.actBusy = false;
+      playerRefreshActState();
+    }
+  }).catch(function(e){
+    PLAYER_STATE.actBusy = false;
+    playerRefreshActState();
+    err.textContent = e.message || e;
+  });
+}
+
+function playerLeave(){
+  api('POST', '/api/player/leave', {token: PLAYER_STATE.token}).then(function(){
+    PLAYER_STATE.inWorld = false;
+    PLAYER_STATE.token = '';
+    PLAYER_STATE.events = [];
+    PLAYER_STATE.takeover = false;
+    PLAYER_STATE.isAdmin = false;
+    clearPlayerState();
+    toast('已离开世界', 'ok');
+    loadPlayer();
+  }).catch(showErr);
+}
+
+function playerConnectEvents(token){
+  // 注意：EventSource 无法带 header，需用 URL 参数携带两层 token：
+  // - visitor=访客会话 token / token=管理员 webui.token（webui /api/player/* 鉴权）
+  // - ctoken=crossing session token（转发到 crossing /events）
+  var authQuery = MODE === 'visitor'
+    ? 'visitor=' + encodeURIComponent(VISITOR_TOKEN)
+    : 'token=' + encodeURIComponent(TOKEN);
+  var es = new EventSource('/api/player/events?' + authQuery + '&ctoken=' + encodeURIComponent(token));
+  es.onmessage = function(ev){
+    var msg;
+    try { msg = JSON.parse(ev.data); } catch(e){ return; }
+    if(msg.type === 'hello'){
+      // 记录初始世界观时间戳（后续本地事件用它作近似时间戳）
+      if(msg.timeLine) PLAYER_STATE.lastTimeLine = msg.timeLine;
+    } else if(msg.type === 'event' && msg.content){
+      // 世界推送的剧情事件（带世界观时间戳）；更新时间锚点
+      if(msg.timeLine) PLAYER_STATE.lastTimeLine = msg.timeLine;
+      PLAYER_STATE.events.push({type:'world', content: msg.content, timeLine: msg.timeLine || PLAYER_STATE.lastTimeLine || ''});
+      playerRefreshFeed();
+    } else if(msg.type === 'task_result'){
+      // act 完成：解「等待裁定」锁。剧情已通过 event 实时推送，这里不重复聚合内容
+      PLAYER_STATE.actBusy = false;
+      if(!msg.ok) toast('行动裁定失败', 'err');
+      // 刷新「等待中」提示（actBusy 已变 false，重渲染面板）
+      playerRefreshActState();
+    } else if(msg.type === 'status_update' && msg.content){
+      // World 更新了玩家的状态档案（整体覆盖：身份 + 状态）。本地更新并持久化（仅访客账号；管理员存本地）
+      var prof = getPlayerProfile();
+      var _m = prof && prof.mode;
+      setPlayerProfile({ name: prof.name, persona: msg.content, mode: _m });
+      if(MODE === 'visitor' && prof){
+        api('PUT', '/api/player/profile', { name: prof.name, persona: msg.content, mode: _m }).catch(function(){});
+      }
+      playerRefreshStatus();
+    } else if(msg.type === 'farewell'){
+      PLAYER_STATE.inWorld = false;
+      PLAYER_STATE.token = '';
+      PLAYER_STATE.mode = '';
+      PLAYER_STATE.events = [];
+      PLAYER_STATE.lastTimeLine = '';
+      PLAYER_STATE.actBusy = false;
+      PLAYER_STATE.takeover = false;
+      clearPlayerState();
+      toast(msg.reason || '世界送别了你', 'warn');
+      loadPlayer();
+    }
+  };
+  es.onopen = function(){ console.log('[player] SSE 已连接'); };
+  es.onerror = function(){
+    // EventSource 自动重连；首次失败提示（便于排查）
+    console.warn('[player] SSE 连接出错，将自动重连');
+  };
+}
+
+function playerRefreshFeed(){
+  var feed = $('#player-feed');
+  if(feed) playerRenderFeed(feed);
+}
+
+// 渲染「世界观剧情」内容（世界状态 + 最近事件）；news 切换排序时复用，避免整块重建
+function playerRenderWorldStatus(holder, r){
+  holder.textContent = '';
+  // 世界状态 + 新闻（player 可见的数据块）
+  if(r.worldStatus) holder.appendChild(el('div', {cls:'body', html:'<div style="white-space:pre-wrap;font-size:12.5px">' + esc(r.worldStatus) + '</div>'}));
+  if(r.news && r.news.length){
+    // 标题 + 排序切换按钮（默认倒序：最新事件在上）
+    var toolbar = el('div', {cls:'toolbar', style:'margin:8px 0 6px'}, [
+      el('h4', {text:'最近事件', style:'margin:0'}),
+      el('span', {cls:'spacer'}),
+      el('button', {cls:'ghost', text: playerNewsAsc ? '改为最新在上 ▲' : '改为最早在上 ▼', onclick:function(){
+        playerNewsAsc = !playerNewsAsc;
+        playerRenderWorldStatus(holder, worldStatusCache);
+      }})
+    ]);
+    holder.appendChild(toolbar);
+    var newsList = r.news.slice();
+    // 按世界时刻 t 排序：倒序(默认)或正序；无 t 字段时保持原顺序（文件仍为追加序）
+    newsList.sort(function(a, b){
+      var ta = Number(a && a.t), tb = Number(b && b.t);
+      if(!isFinite(ta) || !isFinite(tb)) return 0;
+      return playerNewsAsc ? ta - tb : tb - ta;
+    });
+    newsList.forEach(function(n){
+      holder.appendChild(el('div', {cls:'news-item'}, [
+        el('span', {cls:'clock', text:'[' + n.clock + ']'}),
+        el('span', {text: ' ' + n.content, style:'font-size:12.5px'})
+      ]));
+    });
+  }
+  if(!r.worldStatus && (!r.news || !r.news.length)){
+    holder.appendChild(el('p', {cls:'empty', text:'（暂无世界剧情）'}));
+  }
+}
+
+function playerWorldStatus(){
+  var sec = el('div', {cls:'section'});
+  sec.appendChild(el('h3', {text:'世界观剧情（只读）'}));
+  var body = el('div', {cls:'body'});
+  var holder = el('div', {text:'加载中…', cls:'empty'});
+  body.appendChild(holder);
+  sec.appendChild(body);
+  api('GET', '/api/state').then(function(r){
+    worldStatusCache = r;
+    playerRenderWorldStatus(holder, r);
+  }).catch(showErr);
+  return sec;
+}
+
+// ---------- 访客账号管理 ----------
+var GRANT_LABELS = [
+  ['overview','总览'], ['world_status','世界状态'], ['bot_status','Bot 状态'], ['news','新闻'], ['facts','小事记'],
+  ['stream','意识流'], ['notes','笔记'], ['gallery','相册/媒体'], ['archive','归档'], ['devices','设备'],
+  ['crossing','穿越'], ['definitions','定义文件'], ['config','配置'], ['prompts','提示词'], ['debug','调试(原始请求)'], ['usage','用量']
+];
+var PRESET_LABELS = { operator:'运维员', viewer:'观众', player:'玩家', custom:'自定义' };
+function loadVisitors(){
+  var main = $('#main');
+  main.textContent = '';
+  main.appendChild(viewHead('访客账号', '创建只读访客账号，分别控制各自可浏览的数据。运维员可看全部（含调试原始请求）但不含 Bot 状态；观众看世界演化产物（含 Bot 状态），屏蔽定义/配置/调试。'));
+  var holder = el('div', {text:'加载中…', cls:'empty'});
+  main.appendChild(holder);
+  api('GET', '/api/visitors').then(function(r){
+    holder.textContent = '';
+    renderVisitors(holder, r.visitors || []);
+  }).catch(showErr);
+}
+function renderVisitors(holder, visitors){
+  holder.textContent = '';
+  // 新增账号
+  var addBtn = el('button', {cls:'primary', text:'新增访客账号', onclick:function(){
+    openVisitorEditor(null, visitors, function(){ loadVisitors(); });
+  }});
+  holder.appendChild(addBtn);
+  if(!visitors.length){
+    holder.appendChild(el('p', {cls:'empty', text:'还没有访客账号。点上方按钮创建。'}));
+    return;
+  }
+  visitors.forEach(function(v){
+    var row = el('div', {cls:'fld', style:'display:flex;align-items:center;gap:10px;padding:8px 0;border-top:1px solid var(--line)'}, [
+      el('div', {style:'flex:1'}, [
+        el('div', {text:v.username || '(未命名)'}),
+        el('div', {style:'font-size:11.5px;color:var(--fg-dark)'}, [
+          el('span', {text: PRESET_LABELS[v.preset] + ' · 创建于 ' + fmtTime(v.createdAt)})
+        ])
+      ]),
+      el('button', {text:'编辑', onclick:function(){ openVisitorEditor(v, visitors, function(){ loadVisitors(); }); }}),
+      el('button', {text:'删除', onclick:function(){
+        if(!confirm('确定删除访客「' + v.username + '」？')) return;
+        api('DELETE', '/api/visitors', {id:v.id}).then(function(){ toast('已删除', 'ok'); loadVisitors(); }).catch(showErr);
+      }})
+    ]);
+    holder.appendChild(row);
+  });
+}
+function openVisitorEditor(acct, all, done){
+  var isNew = !acct;
+  var username = el('input', {placeholder:'用户名', style:'width:100%'});
+  var pwd = el('input', {type:'password', placeholder: isNew ? '密码' : '留空则不修改密码', style:'width:100%'});
+  var presetSel = el('select', {style:'width:100%'});
+  ['operator','viewer','player','custom'].forEach(function(p){
+    presetSel.appendChild(el('option', {value:p, text:PRESET_LABELS[p]}));
+  });
+  // 预设档的可见块（与后端 PRESET_GRANTS 一致）：选择档位时作为「起点」填入勾选
+  var PRESET_GRANTS = {
+    operator: ['overview','world_status','news','facts','stream','notes','gallery','archive','devices','crossing','definitions','config','prompts','debug','usage'],
+    viewer: ['overview','world_status','bot_status','news','facts','stream','notes','gallery','archive','devices','crossing'],
+    player: ['overview','world_status','news']
+  };
+  var grantsBox = el('div', {style:'max-height:260px;overflow:auto;border:1px solid var(--line);border-radius:6px;padding:8px'});
+  // 勾选状态：唯一来源。初始按账号已存 grants（custom）或预设档范围播种
+  var grantChecks = {};
+
+  function applyPreset(preset){
+    GRANT_LABELS.forEach(function(x){ grantChecks[x[0]] = (PRESET_GRANTS[preset] || []).indexOf(x[0]) >= 0; });
+  }
+  // 初始状态：仅当账号是「自定义」档且存有 grants 时，按 grants 播种；否则按档位预设播种
+  var seedPreset;
+  if(acct && acct.preset === 'custom' && acct.grants && Object.keys(acct.grants).length){
+    GRANT_LABELS.forEach(function(x){ grantChecks[x[0]] = !!acct.grants[x[0]]; });
+    seedPreset = 'custom';
+  } else {
+    seedPreset = (isNew ? 'viewer' : (acct ? acct.preset : 'viewer')) || 'viewer';
+    if(seedPreset === 'custom') seedPreset = 'viewer'; // custom 无 grants 时以 viewer 为起点
+    applyPreset(seedPreset);
+  }
+  presetSel.value = seedPreset;
+  if(acct) username.value = acct.username || '';
+
+  function renderGrants(){
+    grantsBox.textContent = '';
+    GRANT_LABELS.forEach(function(x){
+      var cb = el('input', {type:'checkbox', checked: !!grantChecks[x[0]]});
+      cb.onchange = function(){
+        grantChecks[x[0]] = cb.checked;
+        // 手动调整 → 档位自动转「自定义」
+        presetSel.value = 'custom';
+      };
+      grantsBox.appendChild(el('label', {style:'display:flex;gap:6px;align-items:center;font-size:12.5px'}, [
+        cb,
+        el('span', {text:x[1]})
+      ]));
+    });
+  }
+  renderGrants();
+  presetSel.onchange = function(){
+    var p = presetSel.value;
+    if(p !== 'custom'){
+      // 选预设档 → 用预设范围作为起点覆盖勾选
+      applyPreset(p);
+      renderGrants();
+    }
+    // 选「自定义」：保留当前勾选，不做任何覆盖
+  };
+  var tip = el('p', {cls:'hint', text:'选「运维员」或「观众」会套用对应预设范围作起点；之后手动勾选/取消任意项，档位会变为「自定义」。', style:'font-size:11.5px;color:var(--fg-dark);margin:6px 0 0'});
+  var body = el('div', null, [
+    el('label', {text:'用户名'}), username,
+    el('label', {text: isNew ? '密码' : '新密码（留空不修改）'}), pwd,
+    el('label', {text:'档位'}), presetSel,
+    el('label', {text:'可浏览的数据块'}), grantsBox, tip,
+    el('div', {cls:'toolbar', style:'margin-top:10px'}, [
+      el('button', {text:'取消', onclick:hideModal}),
+      el('button', {cls:'primary', text:'保存', onclick:function(){
+        var preset = presetSel.value;
+        var payload = {id: acct ? acct.id : undefined, username: username.value.trim(), preset: preset};
+        if(pwd.value) payload.password = pwd.value;
+        if(preset === 'custom') payload.grants = grantChecks;
+        var req = acct ? {method:'PUT', path:'/api/visitors'} : {method:'POST', path:'/api/visitors'};
+        api(req.method, req.path, payload).then(function(){ toast('已保存', 'ok'); hideModal(); done(); }).catch(showErr);
+      }})
+    ])
+  ]);
+  showModal(isNew ? '新增访客账号' : '编辑访客账号', body);
+}
+
 function loadConfig(){
   var main = $('#main');
   main.textContent = '';
-  main.appendChild(viewHead('配置', '按重要程度分层：常用项直接展开，高级项收起。保存后写入配置文件并重启插件作用域（世界自动恢复运行）。'));
+  main.appendChild(viewHead('配置', isVisitor() ? '只读模式：可浏览配置，无法修改。' : '按重要程度分层：常用项直接展开，高级项收起。保存后写入配置文件并重启插件作用域（世界自动恢复运行）。'));
   var holder = el('div', {text:'加载中…', cls:'empty'});
   main.appendChild(holder);
   api('GET', '/api/config').then(function(r){
@@ -1376,6 +2411,11 @@ function loadConfig(){
     holder.textContent = '';
     holder.appendChild(renderConfigShell());
     renderCfgBody(); // 外壳已挂载，此时 #cfg-body 可被全局查询到
+    // 访客只读：整个配置容器禁止交互（不逐个禁用字段/按钮，用 pointer-events 兜底）
+    if(isVisitor()){
+      var cfgBody = $('#cfg-body');
+      if(cfgBody){ cfgBody.style.pointerEvents = 'none'; cfgBody.style.opacity = '0.85'; }
+    }
   }).catch(showErr);
 }
 function renderConfigShell(){
@@ -1534,6 +2574,10 @@ function updateSaveBar(bar){
   bar = bar || $('#cfg-savebar');
   if(!bar) return;
   bar.textContent = '';
+  if(isVisitor()){
+    bar.appendChild(el('span', {style:'font-size:12.5px;color:var(--fg-dark)', text:'只读模式 · 配置不可修改'}));
+    return;
+  }
   bar.appendChild(el('span', {id:'cfg-dirty-dot', cls:'dirty-dot', style: cfgDirty ? '' : 'visibility:hidden'}));
   bar.appendChild(el('span', {style:'font-size:12.5px;color:var(--fg-dim)', text: cfgDirty ? '有未保存的修改' : '已保存的状态'}));
   bar.appendChild(el('span', {cls:'spacer'}));
@@ -1790,7 +2834,7 @@ function saveConfig(){
 function loadPrompts(){
   var main = $('#main');
   main.textContent = '';
-  main.appendChild(viewHead('提示词', '改写内置提示词（Bot 行为准则 / World 任务模板），保存后立即生效。带 {{变量}} 的是占位符，会被实际内容替换。'));
+  main.appendChild(viewHead('提示词', isVisitor() ? '只读模式：可浏览提示词，无法修改。' : '改写内置提示词（Bot 行为准则 / World 任务模板），保存后立即生效。带 {{变量}} 的是占位符，会被实际内容替换。'));
   var holder = el('div', {text:'加载中…', cls:'empty'});
   main.appendChild(holder);
   api('GET', '/api/prompts').then(function(r){
@@ -1799,10 +2843,12 @@ function loadPrompts(){
     holder.textContent = '';
     holder.appendChild(promptGroup('Bot-LLM · 行为准则', r.defaults.bot, r.overrides.bot, 'bot'));
     holder.appendChild(promptGroup('World-LLM · 系统提示与任务模板', r.defaults.world, r.overrides.world, 'world'));
-    holder.appendChild(el('div', {cls:'toolbar'}, [
-      el('button', {cls:'primary', text:'保存', onclick: savePrompts}),
-      el('span', {style:'color:var(--fg-dark);font-size:12px', text:'仅保存与默认不同的项'})
-    ]));
+    if(!isVisitor()){
+      holder.appendChild(el('div', {cls:'toolbar'}, [
+        el('button', {cls:'primary', text:'保存', onclick: savePrompts}),
+        el('span', {style:'color:var(--fg-dark);font-size:12px', text:'仅保存与默认不同的项'})
+      ]));
+    }
   }).catch(showErr);
 }
 function promptGroup(title, defaults, current, prefix){
@@ -1815,6 +2861,7 @@ function promptGroup(title, defaults, current, prefix){
     var ctl = el('div', {cls:'ctl'});
     var ta = el('textarea', {rows: Math.min(24, String(defaults[key]).split(NL).length + 2)});
     ta.value = current[key] !== undefined ? current[key] : defaults[key];
+    if(isVisitor()) ta.readOnly = true;
     var overBadge = el('span', {style:'font-size:11px'});
     function paint(){
       var overridden = ta.value !== defaults[key];
@@ -1824,7 +2871,7 @@ function promptGroup(title, defaults, current, prefix){
     ta.oninput = paint;
     paint();
     ctl.appendChild(ta);
-    ctl.appendChild(el('div', {cls:'toolbar', style:'margin:4px 0 0'}, [
+    ctl.appendChild(el('div', {cls:'toolbar', style:'margin:4px 0 0'}, isVisitor() ? [overBadge, el('span', {cls:'spacer'})] : [
       overBadge,
       el('span', {cls:'spacer'}),
       el('button', {text:'恢复默认', style:'font-size:11px;padding:2px 8px', onclick:function(){ ta.value = defaults[key]; paint(); }})
@@ -1894,7 +2941,7 @@ function collectOverrides(section, defaults, prefix, out){
 function loadState(){
   var main = $('#main');
   main.textContent = '';
-  main.appendChild(viewHead('状态', '直接读写世界状态：Bot_Status 由 Bot 维护、World_Status 与 News 由 World-LLM 维护——你改的内容会进入它们的视野。'));
+  main.appendChild(viewHead('状态', '查看世界状态、角色成长与事件。Bot / World 状态文本由结构化世界生成，作为只读视图展示。'));
   var holder = el('div', {text:'加载中…', cls:'empty'});
   main.appendChild(holder);
   api('GET', '/api/state').then(function(r){
@@ -1905,42 +2952,84 @@ function loadState(){
 }
 function renderStateEditor(s){
   var frag = document.createDocumentFragment();
-  var tabs = el('div', {cls:'tabs'}, [
-    el('button', {cls:'active', text:'Bot_Status.md', onclick:function(){ setTab(this, 'bot'); }}),
-    el('button', {text:'World_Status.md', onclick:function(){ setTab(this, 'world'); }}),
-    el('button', {text:'世界新闻 News.jsonl', onclick:function(){ setTab(this, 'news'); }}),
-    el('button', {text:'Bot 小事记 facts', onclick:function(){ setTab(this, 'facts'); }}),
-    el('button', {text:'Bot_Definition.md', onclick:function(){ setTab(this, 'botdef'); }}),
-    el('button', {text:'World_Definition.md', onclick:function(){ setTab(this, 'worlddef'); }}),
-    el('button', {text:'手机外壳', onclick:function(){ setTab(this, 'shell'); }})
-  ]);
-  frag.appendChild(tabs);
+  // 每个标签页：id / 标题 / 对应数据块（访客无该块 grant 则整页隐藏）/ 渲染器
   var panes = el('div');
-  panes.appendChild(statePane('bot', 'Bot 状态', s.botStatus, '/api/state/bot-status'));
-  panes.appendChild(statePane('world', '世界状态', s.worldStatus, '/api/state/world-status'));
-  panes.appendChild(jsonlPane('世界新闻', 'World-LLM 记录的世界大事记（JSONL）', s.news, '/api/state/news', '新增一条世界事件…'));
-  panes.appendChild(jsonlPane('Bot 小事记', 'Bot 的私人小事（facts.jsonl）——Bot 用 recall 回忆的私人记忆。可固定条目：固定后既不会被重置/创世删除，也会成为 Bot 心中「刻骨铭心的重要回忆」，是它角色扮演时的关键人设与历史依据（避免 OOC）', s.facts || [], '/api/state/facts', '新增一条 Bot 小事…', {sortable: true, pinnable: true}));
-  panes.appendChild(statePane('botdef', 'Bot 角色定义', s.botDef, '/api/definitions/bot'));
-  panes.appendChild(statePane('worlddef', '世界定义', s.worldDef, '/api/definitions/world'));
-  panes.appendChild(phoneShellPane(s.phoneShell || '', s.meta || {}));
+  var tabDefs = [
+    { id:'structured', label:'世界结构', adminOnly:true, build:function(){ return structuredPane('structured', '结构化世界', '/api/world/state', 'state'); } },
+    { id:'growth', label:'角色成长', grant:'notes', build:function(){ return structuredPane('growth', '角色成长记录', '/api/bot/growth', 'growth'); } },
+    { id:'bot', label:'Bot_Status.md', grant:'bot_status', build:function(){ return statePane('bot', 'Bot 状态', s.botStatus, '/api/state/bot-status'); } },
+    { id:'world', label:'World_Status.md', grant:'world_status', build:function(){ return statePane('world', '世界状态', s.worldStatus, '/api/state/world-status'); } },
+    { id:'news', label:'世界新闻 News.jsonl', grant:'news', build:function(){ return jsonlPane('世界新闻', 'World-LLM 记录的世界大事记（JSONL）', s.news, '/api/state/news', '新增一条世界事件…'); } },
+    { id:'facts', label:'Bot 小事记 facts', grant:'facts', build:function(){ return jsonlPane('Bot 小事记', 'Bot 的私人小事（facts.jsonl）——Bot 用 recall 回忆的私人记忆。可固定条目：固定后既不会被重置/创世删除，也会成为 Bot 心中「刻骨铭心的重要回忆」，是它角色扮演时的关键人设与历史依据（避免 OOC）', s.facts || [], '/api/state/facts', '新增一条 Bot 小事…', {sortable: true, pinnable: true}); } },
+    { id:'botdef', label:'Bot_Definition.md', grant:'definitions', build:function(){ return statePane('botdef', 'Bot 角色定义', s.botDef, '/api/definitions/bot'); } },
+    { id:'worlddef', label:'World_Definition.md', grant:'definitions', build:function(){ return statePane('worlddef', '世界定义', s.worldDef, '/api/definitions/world'); } },
+    { id:'shell', label:'手机外壳', grant:'world_status', build:function(){ return phoneShellPane(s.phoneShell || '', s.meta || {}); } }
+  ];
+  // 过滤：访客只保留有 grant 的标签页
+  var visible = tabDefs.filter(function(t){
+    if(MODE !== 'visitor') return true;
+    if(t.adminOnly) return false;
+    return VISITOR_GRANTS.indexOf(t.grant) >= 0;
+  });
+  var tabs = el('div', {cls:'tabs'});
+  visible.forEach(function(t, i){
+    tabs.appendChild(el('button', {cls: i===0?'active':'', text: t.label, onclick:function(){ setTab(this, t.id); }}));
+    panes.appendChild(t.build());
+  });
+  frag.appendChild(tabs);
   frag.appendChild(panes);
-  if(s.meta && Object.keys(s.meta).length){
-    frag.appendChild(el('div', {cls:'section'}, [el('h3', {text:'元数据 meta.json'}), el('div', {cls:'body'}, [el('pre', {text: JSON.stringify(s.meta, null, 2)})])]));
+  if(s.meta && Object.keys(s.meta).length && (MODE !== 'visitor' || VISITOR_GRANTS.indexOf('world_status') >= 0)){
+    var metaSec = el('div', {cls:'section'}, [el('h3', {text:'元数据 meta.json'})]);
+    var metaBody = el('div', {cls:'body'});
+    // 常驻 Bot 名字：管理员可编辑（写 meta.json，立即生效）；访客只读
+    var curName = (s.meta.botName || '').toString();
+    if(MODE !== 'visitor'){
+      var nameInp = el('input', {placeholder:'常驻 Bot 名字（留空 = 从定义判定）', value: curName, style:'width:100%'});
+      var nameMsg = el('p', {style:'color:var(--fg-dim);font-size:12px;margin:4px 0 0', text:'常驻 Bot 的名字：供 Bot 自己的提示词与访客接待时区分「常驻 Bot vs 访客」用。留空则下次启动/重载定义时从 Bot_Definition 重新判定。'});
+      metaBody.appendChild(el('label', {text:'Bot 名字'}));
+      metaBody.appendChild(nameInp);
+      metaBody.appendChild(nameMsg);
+      metaBody.appendChild(el('div', {cls:'toolbar', style:'margin:6px 0 10px'}, [
+        el('button', {cls:'primary', text:'保存名字', onclick:function(){
+          api('PUT', '/api/state/bot-name', {name: nameInp.value.trim()}).then(function(){
+            toast('Bot 名字已保存', 'ok');
+            loadState();
+          }).catch(showErr);
+        }})
+      ]));
+    }
+    metaBody.appendChild(el('pre', {text: JSON.stringify(s.meta, null, 2)}));
+    metaSec.appendChild(metaBody);
+    frag.appendChild(metaSec);
   }
-  panes.querySelectorAll('[data-pane]').forEach(function(p){ p.classList.toggle('hidden', p.getAttribute('data-pane') !== 'bot'); });
+  // 默认显示第一个可见标签页
+  var firstId = visible.length ? visible[0].id : null;
+  panes.querySelectorAll('[data-pane]').forEach(function(p){ p.classList.toggle('hidden', p.getAttribute('data-pane') !== firstId); });
   return frag;
+}
+function structuredPane(id, title, url, field){
+  var sec = el('div', {cls:'section', 'data-pane':id});
+  var value = el('pre', {text:'加载中…', style:'white-space:pre-wrap;overflow-wrap:anywhere'});
+  sec.appendChild(el('h3', {text:title}));
+  sec.appendChild(el('div', {cls:'body'}, [value]));
+  api('GET', url).then(function(r){ value.textContent = JSON.stringify(r[field] == null ? {} : r[field], null, 2); })
+    .catch(function(err){ value.textContent = err.message || '加载失败'; });
+  return sec;
 }
 function statePane(id, title, content, url){
   var sec = el('div', {cls:'section', 'data-pane': id});
   var ta = el('textarea', {rows: 16});
   ta.value = content;
-  sec.appendChild(el('h3', {html: esc(title) + ' <span class="hint">整体覆盖，保存后实时生效</span>'}));
-  sec.appendChild(el('div', {cls:'body'}, [
-    ta,
-    el('div', {cls:'toolbar'}, [el('button', {cls:'primary', text:'保存', onclick:function(){
+  var projection = id === 'bot' || id === 'world';
+  if(isVisitor() || projection) ta.readOnly = true;
+  sec.appendChild(el('h3', {html: esc(title) + ' <span class="hint">' + (projection ? '只读状态视图' : isVisitor() ? '只读' : '整体覆盖，保存后实时生效') + '</span>'}));
+  var body = el('div', {cls:'body'}, [ta]);
+  if(!isVisitor() && !projection){
+    body.appendChild(el('div', {cls:'toolbar'}, [el('button', {cls:'primary', text:'保存', onclick:function(){
       api('PUT', url, {content: ta.value}).then(function(){ toast(title + ' 已保存', 'ok'); }).catch(showErr);
-    }})])
-  ]));
+    }})]));
+  }
+  sec.appendChild(body);
   return sec;
 }
 function phoneShellPane(shellHtml, meta){
@@ -1948,7 +3037,7 @@ function phoneShellPane(shellHtml, meta){
   sec.appendChild(el('h3', {html:'手机外壳 <span class="hint">浏览器带壳截图的外壳 HTML（含 {{screen}} 等占位符），下方为预览；源码标签页可编辑</span>'}));
   var body = el('div', {cls:'body'});
   // 预览 iframe：用样本值替换占位符，展示外壳布局效果
-  var preview = el('iframe', {style:'width:100%;height:560px;border:1px solid var(--line);border-radius:10px;background:#fff'});
+  var preview = el('iframe', {sandbox:'', referrerpolicy:'no-referrer', style:'width:100%;height:560px;border:1px solid var(--line);border-radius:10px;background:#fff'});
   function renderPreview(){
     var html = shellHtml || '';
     if(!html.trim()){
@@ -1964,12 +3053,15 @@ function phoneShellPane(shellHtml, meta){
       .replace(/\{\{\s*time\s*\}\}/g, '12:34')
       .replace(/\{\{\s*width\s*\}\}/g, String(w))
       .replace(/\{\{\s*height\s*\}\}/g, String(h));
-    preview.srcdoc = sample;
+    // 外壳来自模型：禁脚本、导航、表单和外部资源，只允许内嵌样式/图像。
+    var policy = "default-src 'none'; script-src 'none'; style-src 'unsafe-inline'; img-src data: blob:; font-src data:; base-uri 'none'; form-action 'none'";
+    preview.srcdoc = '<meta http-equiv="Content-Security-Policy" content="' + policy + '">' + sample;
   }
   // 源码编辑（textarea）+ 保存
   var ta = el('textarea', {rows:16, style:'width:100%;font-family:var(--mono);font-size:12px;margin-top:8px'});
   ta.value = shellHtml || '';
-  body.appendChild(el('div', {cls:'toolbar', style:'margin-bottom:8px'}, [
+  if(isVisitor()) ta.readOnly = true;
+  body.appendChild(el('div', {cls:'toolbar', style:'margin-bottom:8px'}, isVisitor() ? [] : [
     el('button', {text:'刷新预览', onclick:function(){ shellHtml = ta.value; renderPreview(); }}),
     el('span', {cls:'spacer'}),
     el('button', {cls:'primary', text:'保存外壳', onclick:function(){
@@ -2011,6 +3103,7 @@ function jsonlPane(title, hint, items, urlBase, placeholder, opts){
       var it = el('div', {cls:'news-item'});
       var ta = el('textarea', {rows: 2});
       ta.value = n.content;
+      if(isVisitor()) ta.readOnly = true;
       it.appendChild(el('span', {cls:'clock', text:'[' + n.clock + ']  T=' + Number(n.t).toFixed(1)}));
       if(n.pinned){
         it.appendChild(el('span', {cls:'tag', style:'margin-left:6px;color:var(--warn);border-color:rgba(251,191,36,.45)', text:'已固定'}));
@@ -2035,21 +3128,23 @@ function jsonlPane(title, hint, items, urlBase, placeholder, opts){
         it.appendChild(detBtn);
         it.appendChild(detBox);
       }
-      it.appendChild(el('div', {cls:'toolbar', style:'margin:4px 0 0'}, [
-        el('button', {text:'保存修改', onclick:function(){
-          api('PUT', urlBase, {index:i, content: ta.value}).then(function(){ items[i].content = ta.value; toast('已保存', 'ok'); }).catch(showErr);
-        }}),
-        el('button', {cls:'danger', text:'删除', onclick:function(){
-          if(!confirm('删除这条？')) return;
-          api('DELETE', urlBase + '?index=' + i).then(function(){ items.splice(i,1); render(); }).catch(showErr);
-        }}),
-        opts.pinnable ? el('div', {style:'display:flex;align-items:center;gap:6px;flex-wrap:wrap'}, [
-          el('button', {cls: n.pinned ? 'primary' : '', title: n.pinned ? '取消固定：这条将不再作为「重要回忆」特别保留，重置/创世时可能被清除' : '固定这条：它将成为 Bot 心中的重要回忆（用 recall 时更该记得、角色扮演不 OOC 的依据），且重置/创世后仍然保留', text: n.pinned ? '取消固定' : '固定', onclick:function(){
-            api('POST', urlBase + '/pin', {index: i, pinned: !n.pinned}).then(function(){ n.pinned = !n.pinned; toast(n.pinned ? '已固定（成为重要回忆，重置/创世后保留）' : '已取消固定', 'ok'); render(); }).catch(showErr);
+      if(!isVisitor()){
+        it.appendChild(el('div', {cls:'toolbar', style:'margin:4px 0 0'}, [
+          el('button', {text:'保存修改', onclick:function(){
+            api('PUT', urlBase, {index:i, content: ta.value}).then(function(){ items[i].content = ta.value; toast('已保存', 'ok'); }).catch(showErr);
           }}),
-          el('span', {style:'font-size:11.5px;color:var(--fg-dim)', text: n.pinned ? '重要回忆 · 重置保留' : '固定=Bot 的重要回忆，重置/创世也保留'})
-        ]) : null
-      ]));
+          el('button', {cls:'danger', text:'删除', onclick:function(){
+            if(!confirm('删除这条？')) return;
+            api('DELETE', urlBase + '?index=' + i).then(function(){ items.splice(i,1); render(); }).catch(showErr);
+          }}),
+          opts.pinnable ? el('div', {style:'display:flex;align-items:center;gap:6px;flex-wrap:wrap'}, [
+            el('button', {cls: n.pinned ? 'primary' : '', title: n.pinned ? '取消固定：这条将不再作为「重要回忆」特别保留，重置/创世时可能被清除' : '固定这条：它将成为 Bot 心中的重要回忆（用 recall 时更该记得、角色扮演不 OOC 的依据），且重置/创世后仍然保留', text: n.pinned ? '取消固定' : '固定', onclick:function(){
+              api('POST', urlBase + '/pin', {index: i, pinned: !n.pinned}).then(function(){ n.pinned = !n.pinned; toast(n.pinned ? '已固定（成为重要回忆，重置/创世后保留）' : '已取消固定', 'ok'); render(); }).catch(showErr);
+            }}),
+            el('span', {style:'font-size:11.5px;color:var(--fg-dim)', text: n.pinned ? '重要回忆 · 重置保留' : '固定=Bot 的重要回忆，重置/创世也保留'})
+          ]) : null
+        ]));
+      }
       list.appendChild(it);
     });
   }
@@ -2064,13 +3159,16 @@ function jsonlPane(title, hint, items, urlBase, placeholder, opts){
     }});
     addBar.appendChild(orderBtn);
   }
-  addBar.appendChild(addInp);
-  addBar.appendChild(el('button', {cls:'primary', text:'追加', onclick:function(){
-    var v = addInp.value.trim();
-    if(!v) return;
-    api('POST', urlBase, {content: v}).then(function(){ addInp.value=''; loadState(); }).catch(showErr);
-  }}));
-  body.appendChild(addBar);
+  // 访客只读：不渲染「追加」输入与按钮（排序切换仍保留）
+  if(!isVisitor()){
+    addBar.appendChild(addInp);
+    addBar.appendChild(el('button', {cls:'primary', text:'追加', onclick:function(){
+      var v = addInp.value.trim();
+      if(!v) return;
+      api('POST', urlBase, {content: v}).then(function(){ addInp.value=''; loadState(); }).catch(showErr);
+    }}));
+  }
+  if(addBar.children.length) body.appendChild(addBar);
   body.appendChild(list);
   sec.appendChild(body);
   return sec;
@@ -2146,7 +3244,7 @@ function renderCrossing(c){
   }
   if(!worlds.length){
     goBody.appendChild(el('p', {cls:'empty', text:'还没有配置任何可去的世界。拿到别人分享的邀请码后，在配置 crossing.worlds 里添加：世界名、对方服务地址（http://主机:端口）、邀请码。'}));
-    goBody.appendChild(el('button', {text:'前往配置', onclick:function(){ gotoCfg('crossing'); }}));
+    if(!isVisitor()) goBody.appendChild(el('button', {text:'前往配置', onclick:function(){ gotoCfg('crossing'); }}));
   } else {
     worlds.forEach(function(w){
       var flags = [];
@@ -2162,14 +3260,14 @@ function renderCrossing(c){
         el('span', {cls:'v'}, [
           c.location === w.name
             ? el('span', {text:'Bot 在这里', style:'color:var(--ok);font-size:12px'})
-            : (function(){
+            : (isVisitor() ? el('span', {text: canGo ? '可前往' : flags.join('，') || '不可前往', style:'color:var(--fg-dark);font-size:12px'}) : (function(){
                 var attrs = {text:'送往', onclick:function(){
                   if(!confirm('把 Bot 强制送往「' + w.name + '」？')) return;
                   crossingTravel(w.name, '穿越');
                 }};
                 if(!canGo) attrs.disabled = 'disabled';
                 return el('button', attrs);
-              })()
+              })())
         ])
       ]));
     });
@@ -2183,7 +3281,7 @@ function renderCrossing(c){
   var hostBody = el('div', {cls:'body'});
   if(!(c.server && c.server.enabled)){
     hostBody.appendChild(el('p', {cls:'empty', text:'接待服务未开启。开启 crossing.serverEnabled 后，你的世界会开放给持有邀请码的访客（来访 Bot 的行动由你的 World-LLM 裁定）。'}));
-    hostBody.appendChild(el('button', {text:'前往配置开启', onclick:function(){ gotoCfg('crossing'); }}));
+    if(!isVisitor()) hostBody.appendChild(el('button', {text:'前往配置开启', onclick:function(){ gotoCfg('crossing'); }}));
   } else {
     hostBody.appendChild(el('div', {cls:'kv'}, [
       el('span', {cls:'k', text:'服务状态'}),
@@ -2284,7 +3382,16 @@ function loadDebug(){
     if(sub === 'stream') renderStreamTab();
     else renderDebugList();
   }
-  var toolbar = el('div', {cls:'toolbar'}, [
+  var toolbar = el('div', {cls:'toolbar'}, isVisitor() ? [
+    el('label', {html:'<input type="checkbox" id="dbg-auto"' + (debugAutoScroll?' checked':'') + '> 自动滚动', style:'font-size:12px;color:var(--fg-dim)'}),
+    el('button', {id:'dbg-order', text: debugOrder === 'desc' ? '倒序' : '正序', title:'切换列表排序（倒序=最新在前）', onclick:function(){
+      debugOrder = debugOrder === 'desc' ? 'asc' : 'desc';
+      $('#dbg-order').textContent = debugOrder === 'desc' ? '倒序' : '正序';
+      renderDebugList();
+    }}),
+    el('span', {cls:'spacer'}),
+    el('span', {id:'dbg-count', text:'', style:'color:var(--fg-dark);font-size:12px'})
+  ] : [
     el('button', {text:'清空', onclick:function(){
       debugEntries = [];
       debugOpenIds = {};
@@ -2526,12 +3633,13 @@ function renderUsage(){
     segBtn('全部', usageFilter==='total', function(){ usageFilter='total'; usageFilterLabel=''; usageEntryFilter=null; syncSeg(this); renderUsageDetail(); }),
     segBtn('按标签', usageFilter==='label', function(){ usageFilter='label'; usageFilterLabel=''; usageEntryFilter=null; syncSeg(this); renderUsageDetail(); }),
     segBtn('按模型', usageFilter==='model', function(){ usageFilter='model'; usageFilterLabel=''; usageEntryFilter=null; syncSeg(this); renderUsageDetail(); }),
-    el('span', {cls:'spacer'}),
+    el('span', {cls:'spacer'})
+  ].concat(isVisitor() ? [] : [
     el('button', {text:'清空全部', cls:'danger', onclick:function(){
       if(!confirm('确定清空全部用量记录？此操作不可恢复。')) return;
       api('DELETE', '/api/usage').then(function(){ refreshUsage(); }).catch(showErr);
     }})
-  ]);
+  ]));
   wrap.appendChild(bar);
   wrap.appendChild(el('div', {id:'usage-detail'}));
   setTimeout(renderUsageDetail, 0);
@@ -2757,7 +3865,7 @@ function renderGallery(){
   frag.appendChild(tabs);
   frag2.appendChild(renderGalleryGrid());
   frag.appendChild(frag2);
-  frag.appendChild(uploadBar());
+  if(!isVisitor()) frag.appendChild(uploadBar());
   return frag;
 }
 function renderGalleryGrid(){
@@ -2777,32 +3885,34 @@ function renderGalleryGrid(){
     }
     card.appendChild(el('div', {cls:'m', text: e.name + ' · ' + fmtBytes(e.size)}));
     card.appendChild(el('div', {cls:'d', text: e.description || '（无描述）'}));
-    var actions = el('div', {cls:'a'});
-    var sel = el('select');
-    ['表情包','meme','截图','照片','未整理'].forEach(function(c){
-      if(c === e.category) return;
-      sel.appendChild(el('option', {value:c, text:'移到 ' + c}));
-    });
-    if(sel.options.length){
-      sel.onchange = function(){
-        var target = sel.value;
-        if(!target) return;
-        api('POST', '/api/gallery/move', {category:e.category, name:e.name, targetCategory:target}).then(function(){
-          toast('已移动到 ' + target, 'ok'); loadGallery();
-        }).catch(showErr);
-      };
-      actions.appendChild(sel);
+    if(!isVisitor()){
+      var actions = el('div', {cls:'a'});
+      var sel = el('select');
+      ['表情包','meme','截图','照片','未整理'].forEach(function(c){
+        if(c === e.category) return;
+        sel.appendChild(el('option', {value:c, text:'移到 ' + c}));
+      });
+      if(sel.options.length){
+        sel.onchange = function(){
+          var target = sel.value;
+          if(!target) return;
+          api('POST', '/api/gallery/move', {category:e.category, name:e.name, targetCategory:target}).then(function(){
+            toast('已移动到 ' + target, 'ok'); loadGallery();
+          }).catch(showErr);
+        };
+        actions.appendChild(sel);
+      }
+      actions.appendChild(el('button', {text:'描述', onclick:function(){
+        var d = prompt('写入描述（Bot 挑图依据：内容、梗/情绪、适合场合）：', e.description || '');
+        if(d == null) return;
+        api('POST', '/api/gallery/description', {category:e.category, name:e.name, description:d}).then(function(){ toast('已保存', 'ok'); loadGallery(); }).catch(showErr);
+      }}));
+      actions.appendChild(el('button', {cls:'danger', text:'删除', onclick:function(){
+        if(!confirm('删除 ' + e.name + ' ？')) return;
+        api('POST', '/api/gallery/remove', {category:e.category, name:e.name}).then(function(){ toast('已删除', 'ok'); loadGallery(); }).catch(showErr);
+      }}));
+      card.appendChild(actions);
     }
-    actions.appendChild(el('button', {text:'描述', onclick:function(){
-      var d = prompt('写入描述（Bot 挑图依据：内容、梗/情绪、适合场合）：', e.description || '');
-      if(d == null) return;
-      api('POST', '/api/gallery/description', {category:e.category, name:e.name, description:d}).then(function(){ toast('已保存', 'ok'); loadGallery(); }).catch(showErr);
-    }}));
-    actions.appendChild(el('button', {cls:'danger', text:'删除', onclick:function(){
-      if(!confirm('删除 ' + e.name + ' ？')) return;
-      api('POST', '/api/gallery/remove', {category:e.category, name:e.name}).then(function(){ toast('已删除', 'ok'); loadGallery(); }).catch(showErr);
-    }}));
-    card.appendChild(actions);
     list.appendChild(card);
   });
   if(!items.length) list.appendChild(el('p', {cls:'empty', text:'（这个分类还是空的）'}));
@@ -2873,6 +3983,7 @@ function refreshData(){
   var main = $('#main');
   main.textContent = '';
   main.appendChild(viewHead('数据文件与记事本', '查看/编辑世界数据目录里的运行时 JSON 文件与 Bot 的记事本（Notes/），以及压缩归档。'));
+  main.appendChild(structuredPane('growth-notes', '角色成长记录', '/api/bot/growth', 'growth'));
   var holder = el('div', {text:'加载中…', cls:'empty'});
   main.appendChild(holder);
   api('GET', '/api/data').then(function(r){
@@ -2897,25 +4008,27 @@ function refreshData(){
     var nlist = el('div');
     api('GET', '/api/notes').then(function(nr){
       (nr.notes || []).forEach(function(n){
-        nlist.appendChild(el('div', {cls:'kv'}, [
-          el('span', {cls:'k', text: n.title}),
-          el('span', {cls:'v'}, [
-            el('button', {text:'打开', style:'padding:2px 9px;font-size:11.5px', onclick:function(){ openNote(n.title); }}),
-            el('button', {cls:'danger', text:'删除', style:'margin-left:6px;padding:2px 9px;font-size:11.5px', onclick:function(){
-              if(!confirm('删除笔记「' + n.title + '」？')) return;
-              api('DELETE', '/api/notes?name=' + encodeURIComponent(n.title)).then(function(){ toast('已删除', 'ok'); refreshData(); }).catch(showErr);
-            }})
-          ])
-        ]));
+        var vnode = el('span', {cls:'v'}, [
+          el('button', {text:'打开', style:'padding:2px 9px;font-size:11.5px', onclick:function(){ openNote(n.title); }})
+        ]);
+        if(!isVisitor()){
+          vnode.appendChild(el('button', {cls:'danger', text:'删除', style:'margin-left:6px;padding:2px 9px;font-size:11.5px', onclick:function(){
+            if(!confirm('删除笔记「' + n.title + '」？')) return;
+            api('DELETE', '/api/notes?name=' + encodeURIComponent(n.title)).then(function(){ toast('已删除', 'ok'); refreshData(); }).catch(showErr);
+          }}));
+        }
+        nlist.appendChild(el('div', {cls:'kv'}, [el('span', {cls:'k', text: n.title}), vnode]));
       });
       if(!nr.notes || !nr.notes.length) nlist.appendChild(el('p', {cls:'empty', text:'（记事本是空的）'}));
     }).catch(function(){});
     nbody.appendChild(nlist);
-    nbody.appendChild(el('div', {cls:'toolbar'}, [el('button', {text:'新建笔记…', onclick:function(){
-      var name = prompt('笔记标题（将创建为 Notes/<标题>.md）：');
-      if(!name) return;
-      openNote(name);
-    }})]));
+    if(!isVisitor()){
+      nbody.appendChild(el('div', {cls:'toolbar'}, [el('button', {text:'新建笔记…', onclick:function(){
+        var name = prompt('笔记标题（将创建为 Notes/<标题>.md）：');
+        if(!name) return;
+        openNote(name);
+      }})]));
+    }
     notesSec.appendChild(nbody);
     holder.appendChild(notesSec);
 
@@ -2925,8 +4038,10 @@ function refreshData(){
 function renderArchiveSection(holder, archive){
   var aSec = el('div', {cls:'section'});
   var head = el('h3', {html:'归档 archive/ <span class="hint">压缩、重置与手动存档的历史快照</span>'});
-  head.appendChild(el('span', {style:'flex:1'}));
-  head.appendChild(el('button', {text:'手动存档…', title:'把当前全部世界状态复制成一份新快照', style:'padding:2px 10px;font-size:12px', onclick: manualArchive}));
+  if(!isVisitor()){
+    head.appendChild(el('span', {style:'flex:1'}));
+    head.appendChild(el('button', {text:'手动存档…', title:'把当前全部世界状态复制成一份新快照', style:'padding:2px 10px;font-size:12px', onclick: manualArchive}));
+  }
   aSec.appendChild(head);
   var ab = el('div', {cls:'body'});
   var snaps = archive.snapshots || [];
@@ -2936,15 +4051,18 @@ function renderArchiveSection(holder, archive){
   }
   snaps.forEach(function(s){
     var item = el('div', {cls:'list-item'});
-    item.appendChild(el('div', {cls:'row'}, [
+    var rowBtns = [
       el('span', {text: (s.label ? '「' + s.label + '」 · ' : '') + s.name, style:'flex:1;min-width:0;font-family:var(--mono);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap', title: s.name}),
-      el('span', {text: new Date(s.mtime).toLocaleString(), style:'color:var(--fg-dark);font-size:11px'}),
-      el('button', {cls:'primary', text:'回档', title:'用这份快照覆盖当前状态（回档前会自动存档当前状态）', style:'padding:2px 10px;font-size:11.5px', onclick:function(){ restoreArchive(s.name); }}),
-      el('button', {cls:'danger', text:'删除', style:'padding:2px 10px;font-size:11.5px', onclick:function(){
+      el('span', {text: new Date(s.mtime).toLocaleString(), style:'color:var(--fg-dark);font-size:11px'})
+    ];
+    if(!isVisitor()){
+      rowBtns.push(el('button', {cls:'primary', text:'回档', title:'用这份快照覆盖当前状态（回档前会自动存档当前状态）', style:'padding:2px 10px;font-size:11.5px', onclick:function(){ restoreArchive(s.name); }}));
+      rowBtns.push(el('button', {cls:'danger', text:'删除', style:'padding:2px 10px;font-size:11.5px', onclick:function(){
         if(!confirm('删除归档「' + s.name + '」？不可恢复。')) return;
         api('POST', '/api/archive/delete', {name: s.name}).then(function(){ toast('已删除', 'ok'); refreshData(); }).catch(showErr);
-      }})
-    ]));
+      }}));
+    }
+    item.appendChild(el('div', {cls:'row'}, rowBtns));
     var frow = el('div', {style:'margin-top:6px;display:flex;gap:6px;flex-wrap:wrap'});
     s.files.forEach(function(f){
       frow.appendChild(el('button', {text: f.name + (f.size ? ' · ' + fmtBytes(f.size) : ''), title:'查看内容', style:'padding:2px 9px;font-size:11px', onclick:function(){
@@ -3009,7 +4127,8 @@ function openDataFile(name){
   api('GET', '/api/data/file?name=' + encodeURIComponent(name)).then(function(r){
     var ta = el('textarea', {rows: 20});
     ta.value = r.content;
-    showModal(name, el('div', null, [
+    if(isVisitor()) ta.readOnly = true;
+    showModal(name, el('div', null, isVisitor() ? [ta] : [
       ta,
       el('div', {cls:'toolbar', style:'margin:8px 0 0'}, [
         el('button', {cls:'primary', text:'保存', onclick:function(){
@@ -3025,7 +4144,8 @@ function openNote(title){
     var note = (r.notes || []).filter(function(n){ return n.title === title; })[0];
     var ta = el('textarea', {rows: 22});
     ta.value = note ? note.content : '';
-    showModal('笔记：' + title, el('div', null, [
+    if(isVisitor()) ta.readOnly = true;
+    showModal('笔记：' + title, el('div', null, isVisitor() ? [ta] : [
       ta,
       el('div', {cls:'toolbar', style:'margin:8px 0 0'}, [
         el('button', {cls:'primary', text:'保存', onclick:function(){
@@ -3055,21 +4175,35 @@ function setPath(obj, arr, val){
 
 // ---------- 启动 ----------
 (function(){
+  // 访客只读：给 body 打标记，用于 CSS 隐藏写相关元素
+  if(MODE === 'visitor') document.body.classList.add('visitor-readonly');
   var h = (location.hash || '').slice(1);
   for(var i=0;i<NAV.length;i++){
-    if(NAV[i][0] === h){ activeView = h; break; }
+    if(NAV[i][0] === h && (NAV[i][3] === undefined || visitorCanSee(NAV[i][3]))){ activeView = h; break; }
   }
 })();
 buildNav();
+// 访客若当前视图不可见，回落到第一个可见视图
+(function(){
+  var cur = null;
+  for(var i=0;i<NAV.length;i++){ if(NAV[i][0] === activeView){ cur = NAV[i]; break; } }
+  if(cur && !visitorCanSee(cur[3])){
+    for(var j=0;j<NAV.length;j++){
+      if(!NAV[j].group && visitorCanSee(NAV[j][3])){ activeView = NAV[j][0]; break; }
+    }
+  }
+})();
 switchView(activeView);
 if(activeView !== 'overview') refreshOverview(false);
 connectSSE();
 setInterval(function(){ refreshOverview(false); }, 8000);
+// 访客：定期同步会话 grants（管理员改权限后实时生效）；被删则退回登录
+if(MODE === 'visitor') setInterval(function(){ syncVisitorGrants(); }, 15000);
 window.addEventListener('hashchange', function(){
   var h = (location.hash || '').slice(1);
   if(h === activeView) return;
   for(var i=0;i<NAV.length;i++){
-    if(NAV[i][0] === h){ switchView(h); return; }
+    if(NAV[i][0] === h && visitorCanSee(NAV[i][3])){ switchView(h); return; }
   }
 });
 // 页面隐藏时挂起 SSE 之外的高频轮询由各视图自查 activeView；此处兜底：

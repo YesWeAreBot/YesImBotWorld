@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+import type { WorldKernel } from "./world/kernel.js";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import type { NewsEntry } from "./types.js";
@@ -57,6 +59,11 @@ const WORLD_DEF_TEMPLATE = `# 世界定义
  * ```
  */
 export class WorldFiles {
+  private kernel?: WorldKernel;
+  bindKernel(kernel: WorldKernel): void { this.kernel = kernel; }
+  readonly worldJournal: string;
+  readonly growthJournal: string;
+  readonly contextCommit: string;
   readonly botDef: string;
   readonly worldDef: string;
   readonly botStatus: string;
@@ -79,6 +86,9 @@ export class WorldFiles {
   readonly phoneShell: string;
 
   constructor(readonly base: string) {
+    this.worldJournal = path.join(base, "world-transactions.jsonl");
+    this.growthJournal = path.join(base, "growth.jsonl");
+    this.contextCommit = path.join(base, "context-commit.json");
     this.botDef = path.join(base, "Bot_Definition.md");
     this.worldDef = path.join(base, "World_Definition.md");
     this.botStatus = path.join(base, "Bot_Status.md");
@@ -149,7 +159,7 @@ export class WorldFiles {
   }
 
   async isInitialized(): Promise<boolean> {
-    return (await this.exists(this.botStatus)) && (await this.exists(this.worldStatus));
+    return !!this.kernel?.snapshot().entities.bot || (await this.readText(this.worldJournal)).trim().length > 0 || ((await this.exists(this.botStatus)) && (await this.exists(this.worldStatus)));
   }
 
   async readText(file: string): Promise<string> {
@@ -161,10 +171,13 @@ export class WorldFiles {
   }
 
   async readBotStatus(): Promise<string> {
+    const state = this.kernel?.snapshot(), actor = state?.entities.bot;
+    if (actor) return JSON.stringify({ name: actor.name, location: actor.location ? state?.entities[actor.location]?.name : null, attributes: Object.fromEntries(Object.entries(actor.attributes).filter(([, attr]) => attr.visibility !== "hidden").map(([key, attr]) => [key, attr.value])) }, null, 2);
     return this.readText(this.botStatus);
   }
 
   async writeBotStatus(content: string): Promise<void> {
+    if (this.kernel?.snapshot().entities.bot || await this.exists(this.worldJournal)) throw new Error("状态已由结构化世界管理，不能覆写旧 Markdown；请通过动作改变世界。");
     await this.atomicWrite(this.botStatus, content);
   }
 
@@ -176,11 +189,19 @@ export class WorldFiles {
     await this.atomicWrite(this.worldDef, content);
   }
 
-  async readWorldStatus(): Promise<string> {
+  async readWorldStatus(publicOnly = false): Promise<string> {
+    if (this.kernel?.snapshot().entities.bot) {
+      if (publicOnly) {
+        const view = await this.kernel.peek("bot", { publicOnly: true });
+        return JSON.stringify({ entities: view.entities }, null, 2);
+      }
+      return JSON.stringify(this.kernel.snapshot(), null, 2);
+    }
     return this.readText(this.worldStatus);
   }
 
   async writeWorldStatus(content: string): Promise<void> {
+    if (this.kernel?.snapshot().entities.bot || await this.exists(this.worldJournal)) throw new Error("世界已由结构化事务管理，不能覆写旧 Markdown。");
     await this.atomicWrite(this.worldStatus, content);
   }
 
@@ -314,6 +335,9 @@ export class WorldFiles {
     const dir = await this.makeArchiveDir(label);
     const saved: string[] = [];
     for (const file of [
+      this.worldJournal,
+      this.growthJournal,
+      this.contextCommit,
       this.botStatus,
       this.worldStatus,
       this.news,
@@ -340,7 +364,11 @@ export class WorldFiles {
 
   /** 用一份归档快照覆盖当前运行时状态（调用方负责先自动存档/停世界） */
   async restoreFrom(snapDir: string): Promise<void> {
+    await this.atomicWrite(path.join(this.base, "bot-receipts-epoch"), randomUUID());
     for (const file of [
+      this.worldJournal,
+      this.growthJournal,
+      this.contextCommit,
       this.botStatus,
       this.worldStatus,
       this.news,
@@ -354,12 +382,14 @@ export class WorldFiles {
     ]) {
       const src = path.join(snapDir, path.basename(file));
       if (await this.exists(src)) await fs.copyFile(src, file);
+      else await fs.rm(file, { force: true });
     }
+    await this.kernel?.reload();
     const notesSrc = path.join(snapDir, "Notes");
+    await fs.rm(this.notesDir, { recursive: true, force: true });
     if (await this.exists(notesSrc)) {
-      await fs.rm(this.notesDir, { recursive: true, force: true });
       await fs.cp(notesSrc, this.notesDir, { recursive: true });
-    }
+    } else await fs.mkdir(this.notesDir, { recursive: true });
   }
 
   /** 创建新的归档快照文件夹（时间戳 + 备注标签，重名时自动加序号） */
@@ -389,10 +419,14 @@ export class WorldFiles {
 
   /** 重置全部运行时状态（保留用户定义文件与固定的小事记），旧状态归档 */
   async reset(): Promise<void> {
+    await this.atomicWrite(path.join(this.base, "bot-receipts-epoch"), randomUUID());
     // 固定的小事记跨越"这辈子"保留：先归档全部旧状态，再只把固定条目留回 facts.jsonl
     const pinnedFacts = await this.readPinnedFacts();
     await this.snapshot("重置");
     for (const file of [
+      this.worldJournal,
+      this.growthJournal,
+      this.contextCommit,
       this.botStatus,
       this.worldStatus,
       this.news,
@@ -411,13 +445,16 @@ export class WorldFiles {
     if (await this.exists(this.notesDir)) {
       await fs.rm(this.notesDir, { recursive: true, force: true });
     }
+    await this.kernel?.reload();
     if (pinnedFacts.length) await this.writeFacts(pinnedFacts);
   }
 
   async atomicWrite(file: string, content: string): Promise<void> {
-    const tmp = `${file}.tmp`;
-    await fs.writeFile(tmp, content);
-    await fs.rename(tmp, file);
+    const tmp = `${file}.${randomUUID()}.tmp`;
+    try {
+      await fs.writeFile(tmp, content, { flag: "wx" });
+      await fs.rename(tmp, file);
+    } finally { await fs.rm(tmp, { force: true }); }
   }
 
   /** spill 目录下某个溢出结果的完整路径（按文件名安全拼接） */

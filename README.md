@@ -5,7 +5,9 @@ YesImBot World：让 Bot 生活在一个由 LLM 独立维护的虚拟世界中�
 两个 LLM 同时运行：
 
 - **Bot-LLM**：持续推理的 Agent，一个接一个地生成工具调用（Tool Call），像文字版 VLA——它不是在"回复消息"，而是在世界中**生活**：行动、等待、休息、翻手机、聊天。
-- **World-LLM**：世界模拟引擎。无持续上下文，按需被唤起：裁定 Bot 行动的结果、响应等待到期、响应 Tingle（世界心跳）推进世界演化，并维护 `World_Status.md`、`News.jsonl`（世界重大事件）与 `facts.jsonl`（Bot 的小事记）。它只模拟 Bot 所处的虚拟世界——聊天平台属于外部真实系统，World-LLM 被明确禁止虚构平台内的事件（消息、好友申请等只能来自 Koishi）。
+- **World-LLM**：按需提出结构化世界事务，裁定行动和 NPC 演化。确定性的世界内核负责校验、持久提交及角色可见性。聊天和真实设备继续以实际平台回执为准。
+
+结构化版本的协议、升级方式及边界见 [架构说明](docs/structured-world.md)。
 
 ## 提醒
 
@@ -13,56 +15,21 @@ YesImBot World：让 Bot 生活在一个由 LLM 独立维护的虚拟世界中�
 
 ## 架构
 
-两个 LLM 协同：Bot-LLM **持续**在生活（一个接一个生成工具调用），World-LLM **按需**被唤起（裁定动作、推进世界、补叙等待），两者通过事件流与状态文件解耦。
+Bot 通过 `observe` 感知世界，通过 `act` 提交意图；角色收到的结果来自已经提交的状态。World 无权改写 Bot 的人格、记忆或代替 Bot 决定台词。
 
 ```mermaid
 flowchart LR
-  subgraph Koishi["Koishi 进程"]
-    GW["Gateway 中间件<br/>所有消息入库 + 通知转事件"]
-    MSG["KoishiMessenger<br/>check_msg / send / 平台操作"]
-  end
-
-  subgraph Bot["Bot-LLM（BotAgent）· 持续推理"]
-    LOOP["主循环<br/>排空事件邮箱 → 生成 Tool Call<br/>→ 追加进流 → 派发执行（不等结果）"]
-    CTX["上下文<br/>置顶区（角色/历史/工具/记忆）<br/>+ Tool Call 流（只追加）"]
-    SCHED["调度器<br/>duration → 期望完成时刻 → 事件交付"]
-    TOOLS["工具分层<br/>core / chat / channel / group / App"]
-  end
-
-  subgraph World["World-LLM（WorldAgent）· 无状态·按需唤起"]
-    ADJ["act 裁定<br/>内嵌状态 → send_event"]
-    BOOK["状态补记<br/>（后台任务）更新状态文件"]
-    TINGLE["Tingle 心跳<br/>推进世界演化"]
-    WAIT["wait / 时间 / 离线补叙"]
-  end
-
-  subgraph FS["状态文件（basePath）"]
-    BS["Bot_Status.md"]
-    WS["World_Status.md"]
-    NEWS["News.jsonl"]
-    FACTS["facts.jsonl"]
-  end
-
-  GW --> MSG
-  MSG -- "消息/通知（事件）" --> LOOP
-  LOOP --> CTX
-  LOOP --> SCHED
-  LOOP --> TOOLS
-  TOOLS -- "act / wait / check_status …" --> ADJ
-
-  ADJ -- "结果事件（send_event）" --> LOOP
-  ADJ -- "触发状态补记" --> BOOK
-  TINGLE --> WS
-  TINGLE --> NEWS
-  BOOK --> BS
-  BOOK --> WS
-  BOOK --> FACTS
-  ADJ -. "只读（状态已内嵌）" .-> BS
-  ADJ -. "只读（状态已内嵌）" .-> WS
-  WAIT --> WS
-
-  WorldClock["WorldClock（TU）"] -- "Tingle 心跳" --> TINGLE
-  WorldClock -- "期望完成时刻" --> SCHED
+  B[Bot Agent] -->|observe| O[角色感知投影]
+  O --> B
+  B -->|act| A[动作调度与取消]
+  A --> W[World 模型提出事务]
+  W --> K[世界内核验证并提交]
+  K --> J[追加事务日志]
+  J --> O
+  T[世界时间 / NPC] --> W
+  O --> G[成长证据账本]
+  B -->|reflect / recall_growth| G
+  P[聊天 / 设备实际回执] --> B
 ```
 
 ### 数据目录（`basePath`，默认 `data/yesimbot-world`）
@@ -71,10 +38,12 @@ flowchart LR
 |---|---|---|
 | `Bot_Definition.md` | **用户** | Bot 角色定义（创世输入；原文以「最初的设定」置顶注入，见下文上下文规则） |
 | `World_Definition.md` | **用户** | 世界定义（创世输入，World-LLM 的最高准则） |
-| `Bot_Status.md` | Bot-LLM（经压缩流程） | Bot 当前状态，作为角色设定置顶注入 |
-| `World_Status.md` | World-LLM | 世界当前状态 |
-| `News.jsonl` | World-LLM | **世界**重大事件列表（JSONL，一行一个事件）。世界中心——只有影响世界走向的大事记这里 |
-| `facts.jsonl` | World-LLM | **Bot** 的小事记（JSONL，一行一件）。Bot 中心——Bot 的私人小事（习惯、偏好、日常）记这里，Bot 用 `recall` 回忆。可在 WebUI 固定条目（`pinned: true`），固定条目在重置世界/重新创世后保留 |
+| `Bot_Status.md` / `World_Status.md` | 旧版迁移资料 | 不再作为状态写入接口 |
+| `world-transactions.jsonl` | 世界内核 | 权威事务及观察日志，支持校验、去重、恢复 |
+| `growth.jsonl` | 角色成长账本 | 角色感知证据、关系、承诺、偏好及修订链 |
+| `context-commit.json` | 上下文提交恢复 | 压缩切换过程中出现，完成后清除 |
+| `News.jsonl` | 历史资料 | 保留原新闻；真实 RSS 在新闻应用中带来源和发布时间显示 |
+| `facts.jsonl` | 历史资料 / 用户 | 保留旧小事记与固定条目；不自动升级为角色成长证据 |
 | `gallery/` | **用户 + Bot** | 收藏夹，按分类子目录存放：`表情包/`、`meme/`、`截图/`、`照片/`、`未整理/`。用户手动投放的文件放进 `未整理/`（或直接丢根目录，会被自动清扫进去），Bot 有空时会看图、写描述、归类 |
 | `assets/` | 运行时 | 媒体资产库（收到/发出的图片、音频、视频，sha256 去重） |
 | `stream.jsonl` | 运行时 | Bot 工作窗口（Tool Call 流）持久化 |
@@ -90,7 +59,7 @@ flowchart LR
 
 1. 配置插件（两个模型的 API 地址）并启用；
 2. 编辑 `Bot_Definition.md` 与 `World_Definition.md`（首次启用后自动生成模板）；
-3. 执行指令 `world.init` —— World-LLM 创世，生成 `Bot_Status.md` / `World_Status.md` / `News.jsonl`；
+3. 执行指令 `world.init` —— World-LLM 提出初始实体，内核验证后生成 `world-transactions.jsonl`；
 4. 执行 `world.start` —— 世界时钟开始流动，Bot-LLM 进入持续推理。
 
 ### 指令
@@ -129,7 +98,7 @@ flowchart LR
 ```mermaid
 flowchart LR
   subgraph host["我方世界（Host）"]
-    HOST["World-LLM<br/>裁定访客行动 / send_event to=访客"]
+    HOST["World-LLM<br/>事务裁定 / 角色观测"]
     RES["常驻 Bot"]
   end
 
@@ -145,7 +114,7 @@ flowchart LR
 
   RES -- "travel / go_home<br/>（凭邀请码作客）" --> PEER
   PBOT -- "凭我方邀请码到达" --> HOST
-  P1 -- "cross / avatar / puppet" --> HOST
+  P1 -- "cross" --> HOST
   P2 -- "扮演/操纵常驻 Bot" --> RES
 ```
 
@@ -153,22 +122,14 @@ flowchart LR
 
 - **去作客**：`crossing.worlds` 填别人分享给你的邀请码 + 地址，Bot 便能用 `travel` 工具主动前往（或 `world.travel` 强制送去）；作客期间它的 act / wait / 看时间都由**对方 World-LLM** 裁定，自己的世界照常存在，`go_home` 返回；
 - **接待访客**：`crossing.serverEnabled` 开启后本世界起一个 HTTP + SSE 服务（`crossing.port`，默认 18112），持有你 `crossing.invites` 邀请码的异世界 Bot 可以凭码到达（`maxVisitors` 限制同时接待数，SSE 断线 180s 自动视为离开）；
-- **安全边界**：网络上只传任务与事件**文本**，**绝不传任何 LLM API 地址/密钥，也不暴露世界文件**——访客能「看到」的一切都经 World-LLM 生成；
-- **访客档案放置**（`crossing.visitorPersonaMode`）：`pinned`（默认）档案常驻系统提示、缓存命中最优；`check` 只放名单、World 用 `check_visitor` 按需查（省窗口，多一轮往返）。
+- **安全边界**：网络上只传任务与事件**文本**，**绝不传任何 LLM API 地址/密钥，也不暴露世界文件**——访客观测由内核按其角色身份与可见性过滤；
+- **访客档案**作为角色创作资料传递，不把其中的物品、位置或能力直接当作宿主世界的事实。旧 `visitorPersonaMode` 仅保留配置兼容。
 
 ### 真人入世界（`player` 档账号）
 
-真人通过 WebUI 用一个 `player` 档账号登录，填**角色名 + 人设**后**进入世界**，以角色的身份与 Bot、与世界互动（`/api/player/*` 端点）。进入前选定**进入语义**（进入后不可改）：
+真人通过 WebUI 的 `player` 账号登录，以 `cross` 方式创建独立访客角色。任务按会话 ID 绑定，不能通过同名冒用他人；到达完成后才接受动作，按世界秒换算时长，离开会取消未提交任务并清理角色。
 
-| 语义 | 说明 |
-|---|---|
-| **cross（穿越）** | 你的角色本不属于这个世界，从外界降临而来——一个外来访客 |
-| **avatar（扮演 / 入替）** | 完全接管世界里已有的某位角色，替它行动、以它的身份生活 |
-| **puppet（操纵）** | 只操纵已有角色的身体，角色仍保有自己的意识（身体可能不听使唤、有内心活动） |
-
-- 玩家提交行动（act）走 crossing 的 **visitorAct** 裁定（最高优先级，绝不被世界积压饿死）；离开时按语义分化处理：**cross** 的访客离开（身影消散/回家），**avatar/puppet** 的角色**归还世界**、由 World-LLM 继续演化后续；
-- **disambiguation**：创世时 World-LLM 从 `Bot_Definition` 判定常驻 Bot 的名字（持久化在 `meta.json`），后续所有世界/访客提示词都用 `{{botName}}` 硬区分「常驻 Bot vs 来访角色」，杜绝把两者混淆；`rename_bot` 工具可在世界观内改名（同步 meta），WebUI 状态页也可直接改；
-- **驱逐**（`expel_visitor` 工具）：世界可让访客"角色死亡/消散/升天"，切断其后续互动；被驱逐的玩家可用**新角色**重新进入。
+普通 NPC 的 avatar/puppet 接管暂不开放，需要进一步实现明确的实体选择和控制权移交。管理员接管常驻 Bot 保留为下面的独立功能，不创建同名副本。
 
 ### 管理员接管 Bot（手动驾驶）
 
@@ -216,32 +177,20 @@ flowchart LR
 - 每个工具调用由 Bot-LLM 自己估计 `duration`（耗时），期望完成时刻 = 生成时刻 + duration；
 - **生成与执行解耦**：生成完一个工具调用不等待结果、立即想下一步；结果在世界到达期望完成时刻时以 Event 注入（若届时结果未就绪，则就绪后立即注入）。模型快 → 角色行动连贯；模型慢 → 角色发呆愣神——推理速度本身塑造性格；
 - `send` 在期望完成时刻（打字完成）才真正发出，此前可 `cancel`（撤回还没发出去的话）；
-- **Tingle**：每 `tingleEveryUnits` 个 TU 触发一次 World-LLM，推进世界演化并追加 News（只有 Bot 能感知的事才打扰它）。
-  配置 `clock.tingleMode = auto` 时可改为由 World 动态决定间隔：每次心跳会向 World-LLM 提供当前历法、时刻与
-  TU 换算关系，它用 `set_tingle` 工具自行决定下一次间隔（限制在 `tingleMinUnits ~ tingleMaxUnits` 内），
-  平淡无事的日子拉长、事多的时段加密；
+- **Tingle**：按配置间隔请求 World 结算自然过程与 NPC 行为。只有经过内核提交后才能进入角色观测；自动间隔配置当前沿用基准间隔。
 - `send` 的 `duration` 语义判定：系统按消息字数线性估算打字耗时（`messaging.typingCharsPerSec`），
   duration 未超过「估算 × `sendDeferFactor`」时当作打字时间照常发送；明显超过时视为「过会儿再发」的意图——
   不会自动发出，到点后系统会询问 Bot 到底要不要发（想发再调用一次 send）；延期期间若目标频道来了新消息、
   自己的账号在那边发了消息（其他插件 / 主人顶号）、或 Bot 把注意力转去了别处，这个念头会被打断并以事件告知。
 
-## 上下文规则（缓存友好 + 拟人）
+## 上下文规则
 
-- 除压缩外**禁止修改上下文**，一切变更以 Event 形式**追加**：配置变更导致工具集变化时，
-  差异（新增工具的完整用法、失效工具名单）以 Event 告知并即刻生效，**置顶的工具列表保持不变**
-  （保护前缀缓存），直到下次 rest 压缩时才同步；用户改设定通过 `world.reload` 以世界观内方式告知；
-- **Bot_Definition.md 原文置顶**：作为系统提示最开头的「最初的你」（Bot 的最初样子，永远不变），
-  与 Bot_Status.md 的「你是谁」（自我认知，随压缩演化）分离。它只在**创世（world.init）**与
-  **上下文压缩（rest）**时从定义文件刷新；其余时候用户对定义的改动一律以 Event（`world.reload`）
-  传入——前缀保持逐字稳定，KV cache 不被中途改动破坏；
-- 事件注入只发生在两次生成之间（当前工具调用生成完毕后统一应用）；每个调度类调用派发时立即注入
-  一条"已开始执行"的确认事件——Bot 永远不会面对"没有任何反应"的信息真空，从源头消除因看不到
-  结果而重复调用的问题，且不引入任何等待延迟；
-- 上下文超过 `maxWindowChars` 时强制触发 `rest()`，Bot 收到的解释是"你感到疲惫不堪"——符合世界观；
-- `rest()` 由 World-LLM 执行压缩：合并历史摘要、更新记忆摘要、按需演化 `Bot_Status.md`（这是角色设定唯一的合法修改渠道），醒来后被告知过去了几个 TU；
-- 压缩有两道安全阀：送入 World-LLM 的意识流超过 `world.compressMaxInputChars` 时只保留最近部分
-  （防止压缩请求本身超过模型窗口）；压缩失败时降级处理（归档丢弃工作窗口、沿用旧摘要），
-  保证上下文一定缩小、不会陷入"压缩失败 → 立即再次强制 rest"的死循环。
+- 角色定义来自用户的 `Bot_Definition.md`；身体和环境来自角色可见的观测；成长单独保存在证据账本中。
+- 事件在模型生成之间追加。工具接受、执行、提交与结果交付分别处理，失败不会伪装成成功。
+- 上下文达到阈值时只请求压缩，不制造疲劳、强迫角色入睡或改写状态。
+- 压缩与生成互斥；按快照清理已经成功总结的前缀，保留期间新到的事件。失败保留原流；跨文件切换可从提交记录恢复。
+- `rest` 是角色主动选择的可唤醒等待。停止服务可以立刻中断，不等待睡眠时长。
+- `reflect` 引用已经实际感知的事件；重复来源不会累计为新经历，反证与修订保留历史。
 
 ## 上下文退化治理（防复读 / 防循环）
 
@@ -256,7 +205,7 @@ flowchart TD
   B -- "低（连续次数少）" --> C["advisory 提醒<br/>（10 套变体随机）"]
   B -- "中（连续次数多）" --> D["递进加压提醒<br/>（点名工具 / 连击数 / 参数）"]
   B -- "高（达到 breakLoopRemoveToolAt）" --> E["暂时移除被重复的工具<br/>（下次压缩后恢复）"]
-  B -- "顽固（达到 breakLoopForceRestAt）" --> F["强制压缩 rest<br/>（清掉循环历史）"]
+  B -- "顽固（达到 breakLoopForceRestAt）" --> F["请求记忆压缩<br/>（清掉循环历史）"]
   E --> G{"仍在重复?"}
   G -- "是" --> F
   G -- "否" --> H["循环解除"]
@@ -273,7 +222,7 @@ flowchart TD
 | 同上重复 | **same-act / same-send 拦截** | act 被 `blockingAct` 拦（上一个动作未完成）；send 与 sendBlocking 拦截，各带递进文案 |
 | 压缩折叠 | **serializeForCompression** | 压缩时把「连续完全相同的工具调用」折叠成一条 + 汇总标记，避免复读正文被 World-LLM 当真实经历沉淀进摘要 |
 | 结果裁剪 | **spill / prune**（`bot.spillMinChars`） | 超阈值（默认 4000 字符）的纯文本工具结果裁成「头部 + 省略 + 尾部」，全文落盘 `spill/`，防止超大结果反复占据窗口 |
-| 强力兜底 | **breakLoop**（默认关） | 两段升级：先「暂时移除被重复的工具」（`breakLoopRemoveToolAt`，默认 6 次），无效再「强制压缩 rest」（`breakLoopForceRestAt`，默认 12 次）。移除的工具在下次压缩后自动恢复 |
+| 强力兜底 | **breakLoop**（默认关） | 两段升级：先「暂时移除被重复的工具」（`breakLoopRemoveToolAt`，默认 6 次），无效再「请求记忆压缩」（`breakLoopForceRestAt`，默认 12 次）。移除的工具在下次压缩后自动恢复 |
 
 相关配置（`bot.*`，除标注外）：
 
@@ -284,50 +233,15 @@ flowchart TD
 | `spillMinChars` | `4000` | 工具结果溢出裁剪阈值（`0` 禁用） |
 | `breakLoop` | `false` | 打破死循环的强制手段总开关 |
 | `breakLoopRemoveToolAt` | `6` | 连续重复达此次数暂时移除该工具 |
-| `breakLoopForceRestAt` | `12` | 移除后仍重复达此次数强制压缩 rest |
+| `breakLoopForceRestAt` | `12` | 移除后仍重复达此次数请求记忆压缩 |
 | `messaging.recentRepeatThreshold` | `1` | 近 N 条里同一句出现这么多次就拦（第 2 次拦） |
 | `messaging.recentRepeatWindow` | `20` | 近期重复检测的滑动窗口条数 |
 
-## act 裁决提速（World-LLM 解耦 · 状态内嵌）
+## 动作提交
 
-World-LLM **没有持续上下文、也不关心前缀缓存**：每次被唤起都是全新对话，状态全靠 `check` 工具按需读文件。
-这带来一个天然的正确结论——把状态**直接内嵌进任务提示词**，既无缓存损失，又省掉工具读取的 LLM 往返。
+`act` 先登记 pending，达到预期完成时刻后才基于最新世界裁定；变更与动作完成标记一起提交，然后投递角色观测。目标版本已变化会导致失败，不能继续使用过时状态。重复请求使用幂等标识，取消仅在最终提交前有效。
 
-早期 act 裁决慢的根因：一次 act 要跑「check 状态 → send_event 结果叙述 → update 状态记账」**多轮** LLM 工具循环。
-现在拆成三条正交优化：
-
-```mermaid
-flowchart LR
-  subgraph ACT["act 裁定（只读并行队列）"]
-    A1["内嵌 bot_status / world_status / 当前时刻"] --> A2["只做 send_event<br/>（noUpdate + noCheck）"]
-  end
-
-  subgraph BOOK["状态补记（串行写队列，后台）"]
-    B1["updateStateAfterAct<br/>整体覆盖落盘"] --> B2["可合并 + 过时自弃"]
-  end
-
-  subgraph OTHER["其他写任务（串行写队列）"]
-    T["Tingle / wait / 压缩 / 访客"]
-  end
-
-  A2 -- "结果事件（立即可交付）" --> BOT["Bot"]
-  A2 -- "fire-and-forget 触发补记" --> B1
-  A2 -. "与写队列并行（只读队列）" .-> B1
-  B1 -. "与其他写任务串行" .-> T
-```
-
-| 优化 | 做法 | 收益 |
-|---|---|---|
-| **状态内嵌** | act 裁定时把 `Bot_Status.md`、`World_Status.md`、当前时刻 **全文内嵌**进任务 | 省掉 `check(bot_status)` / `check(world_status)` / `check_time` 三轮读取往返 |
-| **结果与记账解耦** | act 裁定只做 `send_event`（`noUpdate`）；状态落盘交给独立的后台任务 `updateStateAfterAct` | act 裁定的工具循环从 3~6 轮降到 1 轮 |
-| **禁用冗余读取** | `noCheck` 直接从工具列表移除 `check` / `grep` / `check_time`（prompt 写「别查」压不住模型，干脆让它没得查） | 结论性杜绝「习惯性多查一轮」 |
-| **真并发** | act 裁定走**只读并行队列**，与状态补记/Tingle 所在的**串行写队列**彼此独立 | Bot 下一次 act 的裁定与上一次 act 的状态补记、以及 Tingle 心跳**真正同时发请求**（需推理后端支持并发） |
-| **可合并 + 过时自弃** | 连续快速 act 时：前一任务被 `AbortSignal` 中止省 token；并用**单调递增 seq** 在写文件前自检，过时的任务跳过落盘；被中断的**前序事件累积**进最新任务的 prompt 一并补记 | 状态最终收敛到最新裁决，任何一次 act 的结果都不丢失，也不写错误的中间态 |
-
-设计取舍（已知、可接受）：
-
-- **状态短暂滞后**：act 结果立即可交付，但 `Bot_Status.md`/`World_Status.md` 的落盘稍后由后台补记完成——「最终一致」，连续快速 act 时靠「只保留最新一个补记 + 累积前序事件」收敛；
-- **前提是你上一轮配置一样**：`serializeSameEndpoint: false`（同源端点锁关闭）且推理后端支持并发——否则并行只是把排队从客户端挪到服务端，无真实收益。
+旧的「先 send_event、再后台补记 Markdown」路径已经移除。这个选择增加了到期后的裁定延迟，同时让状态与结果保持一致。`observe` 独立于动作，可查询当前场景或已经观察到的实体句柄；`check_status` 是它的兼容入口，不再提供全知状态。
 
 ## 多模态
 
@@ -410,20 +324,9 @@ duration 明显超过按字数估算的打字时间时，视为"过会儿再发"
 改写为 `[某某 撤回了一条消息]` 标记（Bot 已看过的上下文不动——它自然记得内容，只是知道"这条被收回
 去了"）；Bot 正关注该频道时会追加一条事件告知。Bot 自己撤回消息只改记录，不另行打扰。
 
-### World 内部工具（World-LLM 用）
+### World 内部工具
 
-World-LLM 每次被唤起时通过工具调用读写状态：
-
-> 注意：**act 裁决**已不走这些读取工具——状态与当前时刻被内嵌进任务、`check`/`grep`/`check_time`/`update` 都被 `noCheck`/`noUpdate` 从该任务移除（见上文「act 裁决提速」）。下面的工具全集仍用于 Tingle、wait 补叙、离线补叙、压缩、状态补记等其它任务。
-
-| 工具 | 说明 |
-|---|---|
-| `check(target, n?)` | 读取状态文件：`bot_status` / `world_status` / `news`（世界大事）/ `facts`（Bot 小事） |
-| `grep(target, keyword, n?)` | 按关键词检索文件中的关键部分，只返回命中的行/条目（避免整文件读取占用上下文） |
-| `update(target, content)` | 维护状态文件：`news` 追加世界大事、`facts` 追加 Bot 小事（世界中心与 Bot 中心严格区分） |
-| `send_event(content)` | 向 Bot 的意识流投递事件（它唯一能感知到你的方式） |
-| `check_time()` | 查询世界时钟当前时刻 |
-| `set_tingle(units)` | 仅 Tingle 任务：动态决定下一次心跳间隔（auto 模式） |
+World 模型只调用 `propose_world` 提出一笔事务。操作包括创建实体、更新属性、移动、NPC 发言；内核验证引用、位置、所有权、版本与受控角色权限。模型没有任意文件写入或任意事件投递工具。只读呈现器没有任何工具能力。
 
 ## Bot 可用工具
 
@@ -441,9 +344,11 @@ World-LLM 每次被唤起时通过工具调用读写状态：
 | 工具 | 说明 |
 |---|---|
 | `wait(n)` | 等待 n 个 TU（计时器准时唤醒）；现实等待达 `waitNarrateMinRealSeconds` 时由 World-LLM 提前生成期间见闻随唤醒送达 |
-| `act(description)` | 在世界中做事，World-LLM 裁定结果 |
-| `rest(duration?)` | 休息：压缩上下文 + 预热 KV cache，醒来获知流逝的 TU（打开的应用自动关闭） |
-| `check_status(target)` | 查看自身（`self`）或世界（`world`，含近期 News） |
+| `act(description, target?, observationId?, speech?)` | 提出行动及可选的逐字台词，世界内核提交后返回结果 |
+| `rest(duration?)` | 角色主动休息，可被事件打断；记忆维护独立处理 |
+| `observe(target?, modality?)` | 获取角色当前可感知的结构化观测 |
+| `check_status(target)` | 兼容的自我 / 场景观察入口 |
+| `reflect(...)` / `recall_growth(...)` | 基于实际证据整理 / 检索关系、承诺和偏好 |
 | `check_time()` | 看一眼现在几点（世界裁定能否得知） |
 | `check_gallery(category?)` / `check_media(n?, type?)` | 浏览收藏夹（分类总览 / 打开某一类）/ 只读翻看媒体缓存 |
 | `view_media(media[])` | 发图前细看：原生识图附原图，否则解释器详述 |
@@ -457,7 +362,7 @@ World-LLM 每次被唤起时通过工具调用读写状态：
 | `travel(world)` | 穿越到另一个世界作客（需 `crossing.worlds` 配置了可去世界）：行动由对方 World-LLM 裁定，手机/聊天照常可用，`go_home` 返回 |
 | `go_home()` | 从异世界返回自己的世界 |
 | `cancel(id)` | 取消倒计时中的工具调用 |
-| `recall(keyword?, since?, until?, n?, important?)` | 回忆过往小事记：按关键词 / 按 T（时间单位）范围 / 只回忆重要回忆（固定条目，对 Bot 透明、不暴露「被固定」），是角色扮演不 OOC 的记忆依据 |
+| `recall(keyword?, since?, until?, n?, important?)` | 回忆过往小事记：按关键词 / 按 T（时间单位）范围 / 只回忆重要回忆（固定条目，对 Bot 透明、不暴露「被固定」），属于未验证的旧资料；结构化成长使用 reflect / recall_growth |
 
 ### chat / channel / group 层（节选）
 
@@ -529,7 +434,7 @@ World-LLM 每次被唤起时通过工具调用读写状态：
   - 打开聊天应用（名字可配置，默认 `QQ`，也认 `聊天`/`chat`/`koishi` 等别名）= 看一眼最近消息（等效 `check_msg(10)`）；
   - 打开其他应用 = 连接对应 MCP Server / 内置应用，其工具（名字、参数签名、说明）以事件展开，
     即刻可像普通工具一样调用（动态加入允许列表与 GBNF 语法，工具名与常驻工具冲突时加 `应用名.` 前缀）；
-- **一次只能打开一个 App**：打开新的自动关掉上一个；`close_app()` 主动关闭；`rest` 睡醒后自动关闭；
+- **一次只能打开一个 App**：打开新的自动关掉上一个；`close_app()` 主动关闭；
 - MCP 客户端为零依赖极简实现（`initialize` / `tools/list` / `tools/call`），
   传输支持 **stdio**（本地子进程）与 **Streamable HTTP**（含 SSE 响应）；
 - **内置天气应用**（`apps.weatherEnabled`，默认开启）：`query_weather(city?)`——
@@ -635,9 +540,9 @@ plugins:
       repeatThresholds: [3, 5, 8] # 单工具连续重复提醒阈值（升序；[] 关闭）
       repeatExclude: []           # 排除的工具名匹配（* 通配）；bookkeeping 工具不计数也不重置
       spillMinChars: 4000         # 超大工具结果裁剪阈值（0 禁用），全文落盘 spill/
-      breakLoop: false            # 打破死循环的强制手段总开关（先移工具、无效再强制 rest）
+      breakLoop: false            # 打破死循环的强制手段总开关（先移工具、无效再请求记忆压缩）
       breakLoopRemoveToolAt: 6    # 连续重复达此次数暂时移除该工具
-      breakLoopForceRestAt: 12    # 移除后仍重复达此次数强制压缩 rest
+      breakLoopForceRestAt: 12    # 移除后仍重复达此次数请求记忆压缩
       modalities: # text 模式下不生效，媒体一律走解释器
         image: false
         audio: false
@@ -808,3 +713,6 @@ plugins:
 - 终端与资源管理器只在 `apps.computer.mode` 选了 docker 且世界性质为现实世界时才真正执行命令；
   即使如此，Bot 的操作范围也被限定在这台 Docker 电脑里（默认不映射主机目录、断网、`mounts`/`extraArgs`
   显式控制权限与资源），不会触碰运行 Koishi 的主机。
+## 离线回归测试
+
+运行 `npm run check` 与 `npm test`。测试仅使用临时目录和桩，不连接当前世界、真实模型、聊天平台或 Docker；`npm run build` 生成发布产物。

@@ -13,6 +13,9 @@ import { debug } from "../webui/debug.js";
 import { createBackend, type BotBackend } from "./backend.js";
 import type { BotContext } from "./context.js";
 import { Scheduler } from "./scheduler.js";
+import { GrowthLedger, type GrowthKind, type ReflectionRelation } from "./growth.js";
+import { ReceiptInbox } from "./receipts.js";
+import type { WorldObservation } from "../world/state.js";
 import { typingSlackTU } from "./typing.js";
 import { BOT_TOOLS, renderToolsText, toolLayer, type BotToolDef } from "./tools.js";
 
@@ -94,6 +97,7 @@ export interface MessengerApi {
 }
 
 interface MailboxItem {
+  originEventIds?: string[];
   source: EventSource;
   content: string;
   attachments?: MediaRef[];
@@ -134,6 +138,14 @@ interface PendingDeferred {
 export class BotAgent {
   private backend: BotBackend;
   readonly scheduler: Scheduler;
+  readonly growth: GrowthLedger;
+  private readonly receipts: ReceiptInbox;
+  private retired = false;
+  private receiptsPending = false;
+  private draining: Promise<void> | null = null;
+  private compressionRequested: "overflow" | "breakLoop" | "rest" | null = null;
+  private compressionPromise: Promise<void> | null = null;
+  private generationAbort: AbortController | null = null;
   private mailbox: MailboxItem[] = [];
   private running = false;
   private loopPromise: Promise<void> | null = null;
@@ -141,10 +153,6 @@ export class BotAgent {
   private waiting: { callId: string; kind?: "wait" | "nap"; startedTU?: number } | null = null;
   private wakeFn: (() => void) | null = null;
   private lastGenAt = 0;
-  /** check_status 增量返回：上次查看时的状态文件快照（target → 全文） */
-  private lastStatus = new Map<string, string>();
-  /** check_status(world) 已看过的最新一条 News 的世界时刻 */
-  private lastNewsT: number | null = null;
   /**
    * 近期已发消息的签名滑动窗口（频道+内容+图片），用于拦截"近期反复说同一句"——
    * 不只是相邻两条，而是同一句话在最近 N 条里重复出现就拦（治"口头禅式复读"）。
@@ -244,6 +252,8 @@ export class BotAgent {
     private crossing: BotCrossingApi | null = null,
   ) {
     this.toolDefs = tools ?? BOT_TOOLS;
+    this.growth = new GrowthLedger(files.base);
+    this.receipts = new ReceiptInbox(files.base);
     this.repeatGuard = new RepeatGuard({
       thresholds: config.bot.repeatThresholds ?? [3, 5, 8],
       include: [],
@@ -260,6 +270,14 @@ export class BotAgent {
     this.scheduler = new Scheduler(
       clock,
       (content, ref) => {
+        if (this.retired) {
+          if (ref) {
+            this.externalToolResults.get(ref)?.resolve({ ok: true, text: toPlainText(content) });
+            this.externalToolResults.delete(ref);
+          }
+          void this.receipts.save(content, this.clock.now(), ref).catch(error => this.logger.error("停止后的工具回执保存失败：%s", error));
+          return;
+        }
         // 结果溢出治理（spill/prune）：超阈值的结果先裁剪为 head/tail 预览 + 全文落盘，
         // 再进入上下文——防止超大结果反复占据窗口、加剧退化。
         const gated = this.spillResult(content, ref);
@@ -368,17 +386,24 @@ export class BotAgent {
   // ---------- 生命周期 ----------
 
   start(): void {
-    if (this.running) return;
+    if (this.running || this.loopPromise) return;
     this.running = true;
+    this.retired = false;
+    this.receipts.activate(() => { this.receiptsPending = true; this.wakeFn?.(); });
     this.wakeTimeLine = this.clock.timeLine();
     this.abort = new AbortController();
     this.loopPromise = this.runLoop().catch((err) => {
+      this.running = false;
+      this.retired = true;
+      this.receipts.deactivate();
       this.logger.error("Bot-LLM 主循环异常退出: %s", err);
     });
   }
 
   async stop(): Promise<void> {
-    if (!this.running) return;
+    this.retired = true;
+    this.receipts.deactivate();
+    if (!this.running && !this.loopPromise) { this.scheduler.stopAll(); await this.receipts.settled(); return; }
     this.running = false;
     this.abort?.abort();
     this.scheduler.stopAll();
@@ -386,7 +411,15 @@ export class BotAgent {
     this.waiting = null;
     this.wakeFn?.();
     await this.loopPromise;
+    await this.drainMailbox();
+    await this.context.settled();
+    await this.receipts.settled();
     this.loopPromise = null;
+    for (const [id, pending] of this.externalToolResults) {
+      if (this.scheduler.isPending(id)) continue;
+      pending.resolve({ ok: false, text: "（Bot 已停止，此调用未继续执行。）" });
+      this.externalToolResults.delete(id);
+    }
   }
 
   status(): {
@@ -425,7 +458,7 @@ export class BotAgent {
   pushEvent(
     source: EventSource,
     content: string | RichText,
-    opts: { ref?: string; wake?: boolean } = {},
+    opts: { ref?: string; wake?: boolean; originEventIds?: string[] } = {},
   ): void {
     const rich: RichText = typeof content === "string" ? { text: content } : content;
     // 手动驾驶（管理员代理）结果回传：捕获被校验拒绝时的 system 提示（source=system 且 ref 命中）。
@@ -480,6 +513,7 @@ export class BotAgent {
 
     this.mailbox.push({
       source,
+      originEventIds: opts.originEventIds ?? rich.originEventIds ?? (source === "world" ? observationOrigins(rich.text) : undefined),
       content: rich.text,
       attachments: rich.attachments?.length ? rich.attachments : undefined,
       parts: rich.parts,
@@ -530,6 +564,7 @@ export class BotAgent {
   setManualPaused(paused: boolean): void {
     if (this.manualPaused === paused) return;
     this.manualPaused = paused;
+    if (paused) this.generationAbort?.abort();
     this.logger.info("Bot-LLM 手动驾驶%s", paused ? "接管（暂停自主生成）" : "交还（恢复自主生成）");
     // 交还/唤醒时若 runLoop 正停在暂停等待，立即唤醒推进
     if (!paused) this.wakeFn?.();
@@ -596,6 +631,10 @@ export class BotAgent {
       this.externalToolResults.set(call.id, { resolve, systemText: null });
     });
 
+    if (!this.running) {
+      this.externalToolResults.delete(call.id);
+      return { ok: false, text: "（Bot 已停止，此调用没有开始。）" };
+    }
     await this.dispatch(call);
 
     // 校验拒绝（未进入调度）：dispatch 已同步经 pushEvent(system) 推送了拒绝原因（ref=call.id），
@@ -619,13 +658,16 @@ export class BotAgent {
         // 手动驾驶（管理员扮演接管）：暂停自主生成，仅负责排空邮箱 + 处理外部注入的工具/事件。
         // 短睡后回到循环顶部重排邮箱，保证注入的事件及时进入上下文。
         if (this.manualPaused) {
-          await sleep(250);
+          await sleep(250, this.abort?.signal);
           continue;
         }
 
-        // 上下文满：强制休息（带世界观内的合理解释）
-        if (this.context.approxChars() > this.config.bot.maxWindowChars) {
-          await this.doRest(null, "overflow");
+        // Maintenance is independent of the character's sleep, physical condition, and device state.
+        if (this.context.stream.length && this.context.approxChars() > this.config.bot.maxWindowChars) this.compressionRequested ??= "overflow";
+        if (this.compressionRequested) {
+          const reason = this.compressionRequested;
+          this.compressionRequested = null;
+          await this.doRest(null, reason === "rest" ? null : reason);
           continue;
         }
 
@@ -640,13 +682,17 @@ export class BotAgent {
         // throttle 睡眠期间（含上一个即时工具的执行窗口）可能有新事件到达：
         // 生成前再次排空，避免 Bot 看不到"就差一步"的结果而误以为调用无效、重复调用
         await this.drainMailbox();
+        if (!this.running || this.manualPaused || this.waiting || this.compressionRequested) continue;
 
         let parsed: ParsedToolCall;
         try {
-          parsed = await this.backend.generate(this.context, this.wakeTimeLine, this.abort!.signal);
+          this.generationAbort = new AbortController();
+          const signal = AbortSignal.any([this.abort!.signal, this.generationAbort.signal]);
+          parsed = await this.backend.generate(this.context, this.wakeTimeLine, signal);
           this.parseFailures = 0;
         } catch (err) {
           if (!this.running) break;
+          if (this.manualPaused) continue;
           if (err instanceof ToolCallParseError) {
             this.parseFailures++;
             this.logger.warn(
@@ -714,10 +760,11 @@ export class BotAgent {
             continue;
           }
           this.logger.warn("Bot-LLM 生成失败，%dms 后重试: %s", this.config.bot.retryDelayMs, err);
-          await sleep(this.config.bot.retryDelayMs);
+          await sleep(this.config.bot.retryDelayMs, this.abort?.signal);
           continue;
         }
 
+        if (!this.running || this.manualPaused) continue;
         const call = this.finalize(parsed);
         await this.context.appendToolCall(call);
         debug.emit("bot.tool", `${call.id} ${call.name}`, {
@@ -735,17 +782,32 @@ export class BotAgent {
           truncate(JSON.stringify(call.arguments), 100),
           call.duration ? ` +${call.duration}TU` : "",
         );
+        if (!this.running || this.manualPaused) continue;
         await this.dispatch(call);
       } catch (err) {
         if (!this.running) break;
         this.logger.error("Bot-LLM 循环出错: %s", err);
-        await sleep(this.config.bot.retryDelayMs);
+        await sleep(this.config.bot.retryDelayMs, this.abort?.signal);
       }
     }
     this.logger.info("Bot-LLM 停止推理");
   }
 
   private async drainMailbox(): Promise<void> {
+    if (this.draining) return this.draining;
+    this.draining = this.drainMailboxUnlocked().finally(() => { this.draining = null; });
+    return this.draining;
+  }
+
+  private async drainMailboxUnlocked(): Promise<void> {
+    await this.receipts.ready();
+    this.receiptsPending = false;
+    if (this.running) await this.receipts.drain(async (event) => {
+      // If a process died after append but before removing the inbox file, replay the same ID once.
+      if (!this.context.stream.some(entry => entry.kind === "event" && entry.event.id === event.id)) await this.context.appendEvent(event);
+      await this.growth.perceive(event, event.originEventIds ?? [event.id]);
+      debug.emit("bot.event", `[tool receipt] ${event.id}`, { ...event, recovered: true });
+    });
     if (!this.mailbox.length) return;
     const items = this.mailbox.splice(0);
     for (const item of items) {
@@ -771,6 +833,7 @@ export class BotAgent {
       }
       const event: BotEvent = {
         id: this.context.nextEventId(),
+        originEventIds: item.originEventIds,
         source: item.source,
         content: item.content,
         worldTime: item.worldTime,
@@ -780,6 +843,17 @@ export class BotAgent {
         statusEcho: item.statusEcho,
       };
       await this.context.appendEvent(event);
+      const originCall = event.refToolCallId
+        ? this.context.stream.find((entry) => entry.kind === "tool_call" && entry.call.id === event.refToolCallId)
+        : undefined;
+      const derived = originCall?.kind === "tool_call" && ["reflect", "recall_growth", "recall"].includes(originCall.call.name);
+      await this.growth.perceive(event, derived ? [] : event.originEventIds ?? [event.id]).catch((err) => {
+        this.logger.warn("感知证据保存失败（原始上下文仍保留）：%s", err);
+      });
+      if (event.source === "koishi" || event.source === "world") {
+        this.repeatGuard.reset();
+        this.forceRestCount = 0;
+      }
       const resultLabel = event.refToolCallId
         ? `[${event.source} ← ${event.refToolCallId}] ${event.id}`
         : `[${event.source}] ${event.id}`;
@@ -795,17 +869,17 @@ export class BotAgent {
   }
 
   private async sleepUntilWoken(): Promise<void> {
-    if (!this.waiting || !this.running) return;
+    if (!this.waiting || !this.running || this.receiptsPending) return;
     await new Promise<void>((resolve) => {
       this.wakeFn = resolve;
-      if (!this.waiting || !this.running) resolve();
+      if (!this.waiting || !this.running || this.receiptsPending) resolve();
     });
     this.wakeFn = null;
   }
 
   private async throttle(): Promise<void> {
     const wait = this.lastGenAt + this.config.bot.minIntervalMs - Date.now();
-    if (wait > 0) await sleep(wait);
+    if (wait > 0) await sleep(wait, this.abort?.signal);
     this.lastGenAt = Date.now();
   }
 
@@ -836,9 +910,7 @@ export class BotAgent {
     // denied 调用——都计入链（模型反复撞被拒的调用，正是最该打断的循环）。
     // 开启 breakLoop 时，除 advisory 提醒外还会真正干预：先移除被重复的工具，仍重复则强制 rest。
     const repeat = this.repeatGuard.observe(call);
-    if (repeat) {
-      this.handleRepeat(call, repeat);
-    }
+    if (repeat && this.handleRepeat(call, repeat)) return;
     // 目标参数误写拦截（频道类工具）：Bot 幻觉出 OneBot API 风格的 detail/channel_id
     // 等写法且没给 id 时，绝不静默回退到当前频道（那会把消息发进无关频道）——
     // 拦下并告知正确格式，让它重试。不打捞：打捞会让错误格式被强化
@@ -862,12 +934,38 @@ export class BotAgent {
         return this.dispatchRest(call);
       case "check_status":
         return this.dispatchLocal(call, async () => this.readStatus(call));
+      case "observe":
+        return this.dispatchLocal(call, async () => this.observe(call));
+      case "reflect":
+        return this.dispatchLocal(call, async () => {
+          const a = call.arguments;
+          const result = await this.growth.reflect({
+            kind: a.kind as GrowthKind, subject: a.subject as string, statement: a.statement as string,
+            evidenceIds: Array.isArray(a.event_ids) ? a.event_ids as string[] : [],
+            relation: a.relation as ReflectionRelation | undefined,
+            claimId: typeof a.claim_id === "string" ? a.claim_id : undefined,
+          }, this.clock.now());
+          return { text: JSON.stringify(result), originEventIds: [] };
+        });
+      case "recall_growth":
+        return this.dispatchLocal(call, async () => ({
+          text: JSON.stringify(await this.growth.recall({
+            kind: call.arguments.kind as GrowthKind | undefined,
+            subject: typeof call.arguments.subject === "string" ? call.arguments.subject : undefined,
+            keyword: typeof call.arguments.keyword === "string" ? call.arguments.keyword : undefined,
+            claimId: typeof call.arguments.claim_id === "string" ? call.arguments.claim_id : undefined,
+            n: clampInt(call.arguments.n, 1, 50, 10),
+          })), originEventIds: [],
+        }));
       case "check_time":
-        // 由世界裁定能否得知时间（允许失败）；World-LLM 不可用时退化为直接报时，保证工具可靠
+        // Clock readings are observations; failures must not reveal a global clock.
         return this.dispatchLocal(call, async () => {
           const parts: string[] = [];
           await this.world.resolveCheckTime((content) => parts.push(content));
-          return parts.length ? parts.join("\n") : `你看了看时间——当前 ${this.clock.timeLine()}`;
+          return {
+            text: parts.length ? parts.join("\n") : "（目前没有观察到可确认的时间信息。）",
+            originEventIds: [...new Set(parts.flatMap((part) => observationOrigins(part) ?? []))],
+          };
         });
       case "travel":
         return this.dispatchLocal(call, async () => {
@@ -1534,45 +1632,20 @@ export class BotAgent {
     }
     this.waiting = { callId: call.id, startedTU: this.clock.now() };
 
-    // 长等待：提前 lead 启动 World-LLM 补叙（结果收集到 parts，不直接推事件）
-    const realMs = this.clock.realMsUntil(call.expectedAt);
+    // Observations are now kernel reads, not predictive narration. Read only after the wait actually ends:
+    // an early read would consume another actor's speech even when this wait is interrupted.
     const narrateMinMs = this.config.world.waitNarrateMinRealSeconds * 1000;
-    let summary: { parts: string[]; done: boolean; promise: Promise<void> } | null = null;
-    if (narrateMinMs > 0 && realMs >= narrateMinMs) {
-      const lead = Math.min(30_000, realMs / 2);
-      const timer = setTimeout(() => {
-        if (!this.running || !this.scheduler.isPending(call.id)) return;
-        const s: { parts: string[]; done: boolean; promise: Promise<void> } = {
-          parts: [],
-          done: false,
-          promise: Promise.resolve(),
-        };
-        s.promise = this.world
-          .resolveWait(call, (content) => s.parts.push(content))
-          .then(() => void (s.done = true))
-          .catch(() => void (s.done = true));
-        summary = s;
-      }, Math.max(0, realMs - lead));
-      timer.unref?.();
-    }
-
+    const shouldObserve = narrateMinMs > 0 && this.clock.realMsUntil(call.expectedAt) >= narrateMinMs;
     this.scheduler.schedule(call, {
       executeAt: "expected",
       run: async () => {
-        // 自然到点的等待：整段计入等待占比（提前打断的在 pushEvent 的唤醒路径里记录）
         this.recordWait(call.issuedAt);
-        const timeNote = `等待结束了。当前 ${this.clock.timeLine()}`;
-        const s = summary;
-        if (!s) return timeNote; // 短等待 / 未启用补叙
-        if (s.done) {
-          return s.parts.length ? `${s.parts.join("\n")}\n${timeNote}` : timeNote;
+        if (shouldObserve) {
+          void this.world.resolveWait(call, (content) => this.pushEvent("world", content)).catch((err) => {
+            this.logger.warn("等待后的观测失败：%s", err);
+          });
         }
-        // 补叙尚未生成完：准时唤醒，见闻随后作为世界事件补送
-        void s.promise.then(() => {
-          if (!this.running || !s.parts.length) return;
-          for (const p of s.parts) this.pushEvent("world", p);
-        });
-        return timeNote;
+        return { text: "等待结束了。", originEventIds: [] };
       },
     });
   }
@@ -1612,22 +1685,21 @@ export class BotAgent {
     this.lastActBlock = null; // 成功发起（或重置）一个 act，重复计数归零
     this.ackStart(call);
     this.scheduler.schedule(call, {
-      executeAt: "now", // 世界立刻开始裁定；结果压到期望完成时刻交付
+      executeAt: "now",
+      cancellation: "cooperative",
       run: async (task) => {
         const parts: string[] = [];
-        await this.world.adjudicateAct(call, (content) => parts.push(content));
+        const ok = await this.world.adjudicateAct(call, (content) => parts.push(content), task.signal, task.beginCommit);
         if (task.cancelled()) return null;
-        const text = parts.length
-          ? parts.join("\n")
-          : `（${desc || "刚才的动作"}完成了。）`;
-        // 状态回显：读 World 裁定后已更新的 Bot_Status.md 全文，随本次 act 结果一起注入。
-        // 先把上一处的完整回显退化为轻提示（历史里永远只有最新一处是完整状态），再附上本次的。
-        const status = (await this.files.readBotStatus()).trim();
-        if (status) {
-          await this.context.downgradeLastStatusEcho();
-          return { text, statusEcho: status };
-        }
-        return text;
+        const adjudicatedFailure = parts.some((part) => {
+          try { return JSON.parse(part)?.action?.status === "failed"; } catch { return false; }
+        });
+        if (!ok && !adjudicatedFailure) throw new Error("世界未能裁定此动作，结果尚未确认");
+        if (!parts.length) throw new Error("世界未返回可感知的动作结果，不能认定动作成功");
+        // A world snapshot is not a perception. Only return the adjudicator's actor-filtered receipt.
+        const text = parts.join("\n");
+        const origins = parts.flatMap((part) => observationOrigins(part) ?? []);
+        return { text, originEventIds: [...new Set(origins)] };
       },
     });
   }
@@ -1714,13 +1786,17 @@ export class BotAgent {
    * 第一阶段移除被重复的工具（tempBannedTools，下次压缩后恢复），移除后仍重复则升级为强制压缩 rest。
    * 这是对「纯 advisory 压不住持续自主运行的 Bot」的兜底：不依赖模型听从提醒，直接改变它的可用工具集。
    */
-  private handleRepeat(call: ToolCallRecord, repeat: ObserveResult): void {
+  private handleRepeat(call: ToolCallRecord, repeat: ObserveResult): boolean {
     // advisory 提醒：命中阈值/检出循环时才有（未命中但计数仍在累加时静默）
     if (repeat.notice) {
       this.pushEvent("system", `（${repeat.notice}）`, { ref: call.id });
     }
 
-    if (!this.config.bot.breakLoop) return;
+    if (!this.config.bot.breakLoop) return false;
+    if (!repeat.cycle && repeat.count < 2) {
+      this.forceRestCount = 0;
+      return false;
+    }
 
     const removeAt = this.config.bot.breakLoopRemoveToolAt ?? 0;
     const restAt = this.config.bot.breakLoopForceRestAt ?? 0;
@@ -1750,7 +1826,7 @@ export class BotAgent {
           ]),
           { ref: call.id },
         );
-        return; // 刚移除，不立即再升级 rest
+        return true; // The banned call must not execute after the gate changes.
       }
     }
 
@@ -1760,9 +1836,11 @@ export class BotAgent {
       if (this.forceRestCount >= restAt) {
         this.forceRestCount = 0;
         this.logger.warn("打破死循环：重复未缓解，强制执行带压缩的 rest");
-        void this.doRest(null, "breakLoop");
+        this.compressionRequested = "breakLoop";
+        return true;
       }
     }
+    return false;
   }
 
   /**
@@ -2174,13 +2252,19 @@ export class BotAgent {
     const target = String(call.arguments.id ?? call.arguments.toolcall_id ?? "");
     const result = this.scheduler.cancel(target);
     // 撤回成功后，重发相同内容是合理操作，不应再被重复拦截——清空近期发送窗口
-    if (result === "cancelled") this.recentSendSigs = [];
+    if (result === "cancelled") {
+      this.recentSendSigs = [];
+      if (this.waiting?.callId === target) {
+        this.waiting = null;
+        this.wakeFn?.();
+      }
+    }
     const text =
       result === "cancelled"
         ? `你及时停下了 ${target}。`
         : result === "not_found"
           ? `（找不到进行中的 ${target}，它可能已经完成了。）`
-          : `（来不及了，${target} 已经完成。）`;
+          : `（${target} 已开始提交，不能保证撤销；它的真实结果仍会送达。）`;
     this.pushEvent("system", text, { ref: call.id });
   }
 
@@ -2219,77 +2303,36 @@ export class BotAgent {
 
     const keywordLabel = keyword ? `与「${keyword}」相关` : "";
     return (
-      `你静下心来，回想起了这些往事${keywordLabel}：\n` +
+      `旧资料${keywordLabel}（历史世界作者记录，未经本次感知核实，不能作为新的成长证据）：\n` +
       facts.map((e) => `- [T=${e.t.toFixed(1)} ${e.clock}] ${e.content}`).join("\n") +
       `\n（每条开头是它的 T 时刻：想按时间往前或往后继续回忆，就把 recall 的 since / until 填成对应的 T 数值。）`
     );
   }
 
-  /**
-   * check_status：默认只返回自上次查看以来的变化（状态文件很少变，反复全文返回会撑爆上下文）。
-   * full: true 时返回全文；首次查看（本次运行内没有基准快照）也返回全文。
-   */
-  private async readStatus(call: ToolCallRecord): Promise<string> {
-    const target = String(call.arguments.target ?? "self") === "world" ? "world" : "self";
-    const full = isTruthy(call.arguments.full);
-
-    const status = target === "world" ? await this.files.readWorldStatus() : await this.files.readBotStatus();
-    const prev = this.lastStatus.get(target);
-    this.lastStatus.set(target, status);
-
-    // 世界状态附带 News：增量模式只显示上次没看过的
-    let newsText = "";
-    let hasNewNews = false;
-    if (target === "world") {
-      const news = await this.files.readNews(5);
-      const fresh =
-        full || prev === undefined || this.lastNewsT === null
-          ? news
-          : news.filter((e) => e.t > this.lastNewsT!);
-      hasNewNews = !full && prev !== undefined && fresh.length > 0;
-      if (news.length) this.lastNewsT = Math.max(...news.map((e) => e.t));
-      if (fresh.length) {
-        const label = hasNewNews ? "新发生的事" : "最近发生的事";
-        newsText = `\n\n${label}：\n` + fresh.map((e) => `- [${e.clock}] ${e.content}`).join("\n");
-      }
-    }
-
-    // 全文模式（显式要求，或首次查看没有基准）
-    if (full || prev === undefined) {
-      return target === "world"
-        ? `你环顾四周，感知这个世界的状态——\n${status.trim() || "（未知）"}${newsText}`
-        : `你审视自己的状态——\n${status.trim() || "（未知）"}\n\n当前 ${this.clock.timeLine()}`;
-    }
-
-    // 增量模式：只返回与上次查看相比的变化
-    const diff = diffLines(prev, status);
-    const noChange = diff === null && !hasNewNews;
-    if (noChange) {
-      return target === "world"
-        ? `你环顾四周——世界和你上次查看时没有任何变化，也没有新的事件。` +
-            `（状态不会频繁变化，不必反复 check_status；需要重看全文可加 full: true` +
-            `${this.config.bot.disableWait ? "" : "，或者用 wait 等世界自己发生变化"}。）`
-        : `你审视了一下自己——和上次查看时没什么两样。当前 ${this.clock.timeLine()}\n` +
-            `（状态不会频繁变化，不必反复 check_status；需要重看全文可加 full: true。）`;
-    }
-    const diffText = diff !== null ? `\n（+ 新增/变化，- 不再如此）\n${diff}` : "（状态本身没有变化）";
-    return target === "world"
-      ? `你环顾四周，注意到与上次查看相比的变化——${diffText}${newsText}`
-      : `你审视自己的状态，注意到与上次查看相比的变化——${diffText}\n\n当前 ${this.clock.timeLine()}`;
+  /** Observation is the only entry to physical/world state. */
+  private async observe(call: ToolCallRecord): Promise<RichText> {
+    const self = call.arguments.target === "self";
+    const target = !self && typeof call.arguments.target === "string" ? call.arguments.target : undefined;
+    const modality = self ? "self" : typeof call.arguments.modality === "string" ? call.arguments.modality : undefined;
+    const observation: WorldObservation = await this.world.observe("bot", { target, modality });
+    return { text: JSON.stringify(observation), originEventIds: observation.sourceEventIds };
   }
 
-  // ---------- rest：上下文压缩 ----------
+  private async readStatus(call: ToolCallRecord): Promise<RichText> {
+    // Compatibility alias: neither world nor self may bypass the observation projection.
+    return this.observe({ ...call, arguments: {
+      ...call.arguments, target: undefined, modality: call.arguments.target === "world" ? undefined : "self",
+    } });
+  }
 
-  /**
-   * rest 的分流：上下文达到 restCompressMinChars 时才真正总结沉淀（doRest，不可打断）；
-   * 还不够"疲惫"时只是小憩——像 wait 一样可被消息唤醒打断，不压缩、不清空上下文。
-   */
-  private dispatchRest(call: ToolCallRecord): void | Promise<void> {
+  // ---------- rest 与独立记忆整理 ----------
+
+  /** 角色休息与记忆维护分别调度；通知始终可以打断角色休息。 */
+  private dispatchRest(call: ToolCallRecord): void {
     const threshold = this.config.bot.restCompressMinChars;
-    if (threshold > 0 && this.context.approxChars() < threshold) {
-      return this.dispatchLightRest(call);
-    }
-    return this.doRest(call, null);
+    if (threshold <= 0 || this.context.approxChars() >= threshold) this.compressionRequested = "rest";
+    // Actual rest is always an interruptible timer; context maintenance never imposes sleep.
+    this.dispatchLightRest(call);
   }
 
   /** 小憩：纯计时暂停（语义同 wait），到点或被动静唤醒 */
@@ -2316,130 +2359,78 @@ export class BotAgent {
             "你眯眼休息了一会儿，恢复了神采。",
           ],
         );
-        return (
-          `${napWake}当前 ${this.clock.timeLine()}` +
-          `（这只是打个盹——你的经历还不算多，还没到需要沉淀记忆的程度；` +
-          `等真正疲惫（意识流冗长）时，rest 才会整理思绪、把经历沉淀为记忆。）`
-        );
+        return { text: napWake, originEventIds: [] };
       },
     });
   }
 
-  /**
-   * 休息：由 World-LLM 压缩总结上下文，刷新置顶区，重建（text 模式预热）KV cache。
-   * reason：null = 主动休息；"overflow" = 上下文满的强制休息；"breakLoop" = 打破死循环的强制压缩 rest。
-   * 三者各自带不同的世界观合理解释。
-   */
-  private async doRest(call: ToolCallRecord | null, reason: "overflow" | "breakLoop" | null): Promise<void> {
-    if (reason === "overflow") {
-      this.pushEvent(
-        "system",
-        "一阵强烈的疲惫感袭来——你经历了太多事，思绪已经不堪重负，撑不住地闭上了眼睛……",
-      );
-    } else if (reason === "breakLoop") {
-      this.pushEvent(
-        "system",
-        pickMeta([
-          "你突然意识到自己一直在原地打转——同一件事翻来覆去，怎么都绕不出去。你强迫自己停下来，先冷静地沉淀一下再继续。",
-          "回过神来，你发现自己的念头像卡了壳似的一再重复，越转越乱。你按住了这股劲，决定先休息整理，理清头绪再说。",
-          "你猛然发觉自己陷进了一个循环：想做的事、说的话一遍遍重复，却毫无进展。你硬是让自己停下来，歇一歇、重新理顺思路。",
-          "你察觉自己像被绕进了死胡同，反复撞着同一堵墙。你深吸一口气，先退下来歇一歇，把乱掉的思路重新理一理。",
-          "某种烦躁让你意识到：自己这几步一直在来回打转，没有往前走。你强迫自己停下，先静下来沉淀，再重新出发。",
-          "你发现自己像唱片跳了针，同一段反复重播。你按停了它，让自己歇一下，把头脑里打结的地方慢慢解开。",
-          "一阵徒劳感让你警醒——你正一遍遍重复着同样的尝试、同样的话。你及时抽身，停下来休息，准备理清后再接着来。",
-          "你恍然明白自己被困在了原地：使出多少力气都只是在转圈。你停住脚，先坐下来歇一歇，把纷乱的念头收一收。",
-          "像是有什么东西让你机械地重复着之前的动作，你警觉地停了下来，决定先休息，让头脑空一空、重新沉淀。",
-          "你从一阵恍惚中定下神，清醒地看到自己正在原地兜圈子。你不再耗下去，先歇一歇，让思路回到正轨。",
-        ]),
-      );
-    }
+  /** Memory maintenance runs only at a generation boundary; it does not alter the body or devices. */
+  private async doRest(_call: ToolCallRecord | null, reason: "overflow" | "breakLoop" | null): Promise<void> {
+    if (this.compressionPromise) return this.compressionPromise;
+    this.compressionPromise = this.compactContext(reason).finally(() => { this.compressionPromise = null; });
+    return this.compressionPromise;
+  }
+
+  private async compactContext(reason: "overflow" | "breakLoop" | null): Promise<void> {
     await this.drainMailbox();
-
-    const startReal = Date.now();
-    this.logger.info("开始休息（%s），压缩上下文：%d 条记录，约 %d 字符", reason ? reason : "主动", this.context.stream.length, this.context.approxChars());
-
-    // 压缩失败绝不能让上下文原样保留：否则强制 rest 会立即再次触发，陷入死循环。
-    // World-LLM 不可用时降级：直接归档丢弃工作窗口，沿用旧摘要并注明记忆模糊。
+    const snapshot = await this.context.compressionSnapshot();
+    if (!snapshot.entries.length) return;
+    this.logger.info("整理记忆（%s）：%d 条记录", reason ?? "rest", snapshot.entries.length);
     let result: CompressionResult;
     try {
-      result = await this.world.compress({
-        persona: this.context.pinned.persona,
+      result = await abortable(this.world.compress({
+        persona: this.context.pinned.botDefinition,
         historySummary: this.context.pinned.historySummary,
         memoryDigest: this.context.pinned.memoryDigest,
-        streamText: this.context.serializeForCompression(),
+        streamText: snapshot.text,
         timeLine: this.clock.timeLine(),
-      });
+      }), this.abort?.signal);
     } catch (err) {
-      this.logger.warn("上下文压缩失败，降级处理（丢弃工作窗口，沿用旧摘要）: %s", err);
-      const note = "（注：最近一段经历未能沉淀为记忆，这部分显得有些模糊。）";
-      const oldSummary = this.context.pinned.historySummary;
-      result = {
-        historySummary: oldSummary.includes(note) ? oldSummary : `${oldSummary}\n${note}`.slice(0, 4000),
-        memoryDigest: this.context.pinned.memoryDigest,
-      };
-    }
-    if (result.botStatus) await this.files.writeBotStatus(result.botStatus);
-    await this.context.applyCompression(result, this.clock.now());
-
-    // 若 Bot 指定了休息时长，且压缩很快完成，则继续睡满（现实时间流逝 = 世界时间流逝）
-    const desired = call ? Number(call.arguments.duration ?? call.duration ?? 0) : 0;
-    const compressTU = (Date.now() - startReal) / 1000 / this.clock.unitRealSeconds;
-    if (Number.isFinite(desired) && desired > compressTU) {
-      const remainMs = (desired - compressTU) * this.clock.unitRealSeconds * 1000;
-      await sleep(Math.min(remainMs, 6 * 3600 * 1000));
+      if (!this.running) return;
+      this.logger.warn("记忆整理失败，保留原始经历：%s", err);
+      await sleep(this.config.bot.retryDelayMs, this.abort?.signal);
+      return;
     }
     if (!this.running) return;
-
-    // 休息时手机里开着的应用（聊天界面/MCP）自动关闭，醒来后需重新打开；
-    // 电脑也一并关机（与手机平级，但不打断"手机放下"状态——那是 Bot 自己的选择）
-    const closedApp = await this.apps?.closeCurrent().catch(() => null);
-    const computerWasOn = this.computer?.isOpen ?? false;
-    await this.computer?.close().catch(() => null);
-    const chatWasOpen = this.phoneUi.chatOpen;
-    this.phoneUi = { chatOpen: false, channelKey: null, channelIsGroup: false, forwardStack: [] };
-    // 压缩后：被打破死循环而暂时移除的工具自然恢复（工具集与置顶列表在压缩时同步）
-    if (this.tempBannedTools.size) {
-      this.logger.info("rest 后恢复被暂时移除的工具：%s", [...this.tempBannedTools].join("、"));
-      this.tempBannedTools.clear();
-      this.forceRestCount = 0;
-    }
+    // Ignore any legacy BOT_STATUS output: the memory writer cannot mutate objective world state.
+    await this.context.applyCompression(result, this.clock.now(), snapshot);
+    this.repeatGuard.reset();
+    this.forceRestCount = 0;
+    this.tempBannedTools.clear();
     this.refreshToolGate();
-
-    // 醒来时刻更新为当前时间（这是 system 段时间唯一的合法更新时机——
-    // 压缩后前缀本来就要重建，此时更新不损失缓存）
     this.wakeTimeLine = this.clock.timeLine();
-
-    const elapsedTU = (Date.now() - startReal) / 1000 / this.clock.unitRealSeconds;
-    const closedNotes: string[] = [];
-    if (closedApp || chatWasOpen) closedNotes.push(`「${closedApp ?? "聊天应用"}」已经自动关闭`);
-    if (computerWasOn) closedNotes.push("电脑已经自动关机");
-    // 休息结束的"回过神来"寒暄：多套语义等价措辞随机，用 elapsedTU 做种子——既打破"每次同一句"的循环感，
-    // 又不触碰事实部分（过去了多少 TU、当前时间、哪些东西关了）——那些必须原样、准确。
-    const restWake = pickMeta(
-      [
-        `你休息了一会儿，过去了 ${elapsedTU.toFixed(1)} 个 TU。休息让你的头脑更清明了些，近来的经历沉淀成了记忆。当前 ${this.clock.timeLine()}`,
-        `你从休息中转醒，这一觉过去了 ${elapsedTU.toFixed(1)} 个 TU。思绪清爽了不少，之前的经历也慢慢沉淀下来了。当前 ${this.clock.timeLine()}`,
-        `休息结束，你回过神来，已经过去了 ${elapsedTU.toFixed(1)} 个 TU。头脑更清醒了，近来的见闻沉淀进了记忆。当前 ${this.clock.timeLine()}`,
-        `你醒了，这一歇过去了 ${elapsedTU.toFixed(1)} 个 TU。之前的疲惫散了不少，记忆也更清楚了。当前 ${this.clock.timeLine()}`,
-        `休息告一段落，${elapsedTU.toFixed(1)} 个 TU 过去了。你觉得自己精神多了，过去的事理得更顺。当前 ${this.clock.timeLine()}`,
-        `你缓缓睁眼，休息了 ${elapsedTU.toFixed(1)} 个 TU。脑海清明，近来的经历已经妥帖地收进了记忆。当前 ${this.clock.timeLine()}`,
-        `这一觉睡了 ${elapsedTU.toFixed(1)} 个 TU，你恢复过来了。心绪沉静，往事的脉络也更清晰。当前 ${this.clock.timeLine()}`,
-        `休息之后，${elapsedTU.toFixed(1)} 个 TU 已经过去。你神清气爽，前段经历沉淀了下来。当前 ${this.clock.timeLine()}`,
-        `你从长眠里醒来，休息了 ${elapsedTU.toFixed(1)} 个 TU。头脑清爽，近期的见闻都归整好了。当前 ${this.clock.timeLine()}`,
-        `休息结束，${elapsedTU.toFixed(1)} 个 TU 一晃而过。你的思路更清楚，记忆也更扎实了。当前 ${this.clock.timeLine()}`,
-      ],
-    );
-    this.pushEvent(
-      "system",
-      restWake + (closedNotes.length ? `（休息前开着的${closedNotes.join("，")}）` : ""),
-      { ref: call?.id },
-    );
-    this.logger.info("休息结束，耗时 %s 秒，新上下文约 %d 字符", ((Date.now() - startReal) / 1000).toFixed(1), this.context.approxChars());
   }
+
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+/** Parse provenance only from a typed actor observation delivered by the world boundary. */
+function observationOrigins(text: string): string[] | undefined {
+  try {
+    const parsed = JSON.parse(text) as Partial<WorldObservation> & { observation?: Partial<WorldObservation> };
+    const data = parsed.observation ?? parsed;
+    // A remote actor uses visitor:<session>, bound by the authenticated WorldAgent connection.
+    if (typeof data.actorId !== "string" || !data.actorId || typeof data.observationId !== "string" || !Array.isArray(data.sourceEventIds)) return undefined;
+    return [...new Set(data.sourceEventIds.filter((id): id is string => typeof id === "string" && !!id))];
+  } catch { return undefined; }
+}
+
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.resolve();
+  return new Promise((resolve) => {
+    const finish = () => { clearTimeout(timer); signal?.removeEventListener("abort", finish); resolve(); };
+    const timer = setTimeout(finish, Math.min(Math.max(0, ms), 2_147_483_647));
+    signal?.addEventListener("abort", finish, { once: true });
+  });
+}
+
+function abortable<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(signal.reason);
+  return new Promise((resolve, reject) => {
+    const abort = () => reject(signal.reason);
+    signal.addEventListener("abort", abort, { once: true });
+    promise.then(resolve, reject).finally(() => signal.removeEventListener("abort", abort));
+  });
 }
 
 /**

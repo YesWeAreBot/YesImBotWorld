@@ -211,9 +211,9 @@ export class BotComputer {
         await execDocker(docker, ["start", name], { timeoutMs: 30000 }).catch(() => {});
         const after = await execDocker(docker, ["inspect", "-f", "{{.State.Running}}", name], { timeoutMs: 10000 });
         if (after.code === 0 && after.stdout.trim() === "true") return;
-        // 容器存在但起不来（比如旧版本创建、主进程一启动就退出）：删掉重造
-        this.logger.warn("电脑（%s）无法启动，删除重建", name);
-        await execDocker(docker, ["rm", "-f", name], { timeoutMs: 30000 }).catch(() => {});
+        // 可写层里可能保存了 Bot 的文件，也可能是用户指定复用的容器。
+        // 启动失败不能成为删除数据的理由；保留容器供诊断或显式恢复。
+        throw new Error(`已有电脑容器 ${name} 无法启动，已保留容器和文件，请检查其启动日志后重试。`);
       } else {
         return;
       }
@@ -248,7 +248,7 @@ export class BotComputer {
         "-e", `YBT_WORKDIR=${this.cfg.docker.workdir}`,
         ...(uidArg ? ["-e", `YBT_UID=${uidArg}`] : []),
         "--workdir", this.cfg.docker.workdir,
-        ...(mounts.length ? ["-v", ...mounts] : []),
+        ...mounts.flatMap((mount) => ["-v", mount]),
         ...this.cfg.docker.extraArgs,
         image,
         "sh", "-c", keepAliveScript,
@@ -259,7 +259,10 @@ export class BotComputer {
       throw new Error(`创建电脑失败：${clip(create.stderr, 500)}`);
     }
     selfManaged = { name };
-    await execDocker(docker, ["start", name], { timeoutMs: 30000 });
+    const started = await execDocker(docker, ["start", name], { timeoutMs: 30000 });
+    if (started.code !== 0) {
+      throw new Error(`新建电脑容器 ${name} 启动失败，已保留容器：${clip(started.stderr, 300)}`);
+    }
   }
 }
 

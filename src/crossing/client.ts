@@ -15,6 +15,7 @@ import type { CrossingWorldConfig } from "../config.js";
 import { forEachStreamLine, llmFetch } from "../llm/http.js";
 import type { ToolCallRecord } from "../types.js";
 import type { RemoteWorldLink } from "../world/agent.js";
+import type { WorldObservation } from "../world/state.js";
 import { CROSSING_LIMITS, type CrossingSseMsg, type CrossingTaskKind, type CrossingTaskPayload } from "./protocol.js";
 
 /** 等待主世界任务结果的上限（主世界的 World-LLM 可能排队/推理很久） */
@@ -28,13 +29,16 @@ const RECONNECT_BASE_MS = 2000;
 interface PendingTask {
   resolve: (r: { ok: boolean; content: string }) => void;
   timer: NodeJS.Timeout;
+  cleanup?: () => void;
 }
 
 export interface CrossingClientHooks {
   /** 主世界推来的事件（进 Bot 意识流） */
   onEvent: (content: string) => void;
-  /** 主世界的 World-LLM 更新了 Bot 的状态文件（写回本地 Bot_Status.md） */
+  /** @deprecated 外部状态现在仅通过 onEvent 作为体验描述传递，不允许覆盖本地人设。 */
   onStatusUpdate?: (content: string) => void;
+  /** 本地 1 TU 对应的世界秒数；跨世界行动统一换算为世界秒。 */
+  unitWorldSeconds?: () => number;
   /** 连接不可恢复地丢失（重试耗尽 / 被送别）——上层应把 Bot 弹回自己的世界 */
   onLost: (reason: string) => void;
   logger: Logger;
@@ -46,6 +50,7 @@ export class CrossingClient implements RemoteWorldLink {
   private pending = new Map<string, PendingTask>();
   private sseAbort: AbortController | null = null;
   private _worldName: string;
+  private hostUnitWorldSeconds: number | null = null;
 
   constructor(
     private target: CrossingWorldConfig,
@@ -64,7 +69,7 @@ export class CrossingClient implements RemoteWorldLink {
     return this.target.url
       .trim()
       .replace(/\/+$/, "")
-      .replace(/\/crossing(?:\/(?:arrive|events|task|leave|ping))?$/, "");
+      .replace(/\/crossing(?:\/(?:arrive|events|task|cancel|leave|ping))?$/, "");
   }
 
   // ---------- 生命周期 ----------
@@ -79,6 +84,8 @@ export class CrossingClient implements RemoteWorldLink {
       throw new Error(String(r.error ?? "对方世界拒绝了到达请求"));
     }
     this.token = r.token;
+    const hostUnit = Number(r.unitWorldSeconds);
+    this.hostUnitWorldSeconds = Number.isFinite(hostUnit) && hostUnit > 0 ? hostUnit : null;
     if (typeof r.worldName === "string" && r.worldName.trim()) this._worldName = r.worldName.trim();
     this.active = true;
     void this.eventLoop();
@@ -100,14 +107,34 @@ export class CrossingClient implements RemoteWorldLink {
 
   // ---------- RemoteWorldLink（本地 WorldAgent 转发到这里） ----------
 
-  async adjudicateAct(call: ToolCallRecord, deliver: (content: string) => void): Promise<boolean> {
+  async adjudicateAct(call: ToolCallRecord, deliver: (content: string) => void, signal?: AbortSignal, beforeCommit?: () => boolean): Promise<boolean> {
     const desc = String(call.arguments.description ?? call.arguments.str ?? JSON.stringify(call.arguments));
-    return this.runTask("act", { desc, duration: call.duration ?? 0 }, deliver);
+    const localDuration = call.duration ?? 0;
+    const durationWorldSeconds = localDuration * (this.hooks.unitWorldSeconds?.() ?? 1);
+    return this.runTask("act", {
+      desc, durationWorldSeconds,
+      duration: this.hostUnitWorldSeconds ? durationWorldSeconds / this.hostUnitWorldSeconds : localDuration,
+      ...(typeof call.arguments.speech === "string" ? { speech: call.arguments.speech } : {}),
+      ...(typeof call.arguments.target === "string" ? { target: call.arguments.target } : {}),
+      ...(typeof call.arguments.observationId === "string" ? { observationId: call.arguments.observationId } : {}),
+    }, deliver, { taskId: call.id, signal, beforeCommit });
   }
 
   async resolveWait(call: ToolCallRecord, deliver: (content: string) => void): Promise<boolean> {
     const n = Number(call.arguments.n ?? call.duration ?? 0);
-    return this.runTask("wait", { n }, deliver);
+    const waitWorldSeconds = n * (this.hooks.unitWorldSeconds?.() ?? 1);
+    return this.runTask("wait", { waitWorldSeconds, n: this.hostUnitWorldSeconds ? waitWorldSeconds / this.hostUnitWorldSeconds : n }, deliver, { taskId: call.id });
+  }
+
+  async observe(args: { target?: string; modality?: string } = {}): Promise<WorldObservation> {
+    let text = "";
+    const ok = await this.runTask("observe", args, (content) => { text = content; });
+    if (!ok) throw new Error(text || "远方世界不支持结构化观测");
+    const observation = JSON.parse(text) as WorldObservation;
+    if (!observation || typeof observation.observationId !== "string" || typeof observation.actorId !== "string" || !Array.isArray(observation.entities)) {
+      throw new Error("远方世界返回了无效的结构化观测");
+    }
+    return observation;
   }
 
   async resolveCheckTime(deliver: (content: string) => void): Promise<boolean> {
@@ -125,30 +152,59 @@ export class CrossingClient implements RemoteWorldLink {
     kind: CrossingTaskKind,
     payload: CrossingTaskPayload,
     deliver: (content: string) => void,
+    options: { taskId?: string; signal?: AbortSignal; beforeCommit?: () => boolean } = {},
   ): Promise<boolean> {
-    if (!this.active) return false;
-    const taskId = crypto.randomUUID();
+    if (!this.active || options.signal?.aborted) return false;
+    const taskId = options.taskId ?? crypto.randomUUID();
+    if (this.pending.has(taskId)) throw new Error("同一远程任务正在等待结果，请勿重复提交");
+    const token = this.token;
+    let sent = false;
+    const cancel = () => {
+      if (!sent) return;
+      // 不提前宣称撤销成功：请求主世界取消，最终以 task_result 为准。
+      void this.post("/crossing/cancel", { token, taskId }).catch(() => {});
+    };
+    options.signal?.addEventListener("abort", cancel, { once: true });
     const resultP = new Promise<{ ok: boolean; content: string }>((resolve) => {
       const timer = setTimeout(() => {
+        options.signal?.removeEventListener("abort", cancel);
+        cancel();
         this.pending.delete(taskId);
-        resolve({ ok: false, content: "" });
+        resolve({ ok: false, content: "等待主世界结果超时，已请求取消尚未提交的行动；最终结果未知，请观察确认，勿自动重发。" });
       }, TASK_TIMEOUT_MS);
-      this.pending.set(taskId, { resolve, timer });
+      this.pending.set(taskId, { resolve, timer, cleanup: () => options.signal?.removeEventListener("abort", cancel) });
     });
     try {
-      const r = await this.post("/crossing/task", { token: this.token, taskId, kind, payload });
+      // 请求一旦发出就可能在远端提交；本地调度器必须从这里开始返回 too_late。
+      if (options.signal?.aborted || options.beforeCommit?.() === false) {
+        const p = this.pending.get(taskId)!;
+        clearTimeout(p.timer); p.cleanup?.(); this.pending.delete(taskId); p.resolve({ ok: false, content: "" });
+        return false;
+      }
+      sent = true;
+      const r = await this.post("/crossing/task", { token, taskId, kind, payload });
       if (!r.ok) throw new Error(String(r.error ?? "任务被拒绝"));
     } catch (err) {
       const p = this.pending.get(taskId);
+      // SSE 回执可能先于丢失的 HTTP 确认到达；保留已经明确的结果。
+      if (!p) {
+        const known = await resultP;
+        if (known.content.trim()) deliver(known.content);
+        return known.ok;
+      }
       if (p) {
         clearTimeout(p.timer);
+        p.cleanup?.();
         this.pending.delete(taskId);
+        p.resolve({ ok: false, content: "" });
       }
+      cancel();
       this.hooks.logger.warn("[穿越] 任务提交失败（%s）: %s", kind, err);
+      deliver("远程任务未获得确认，可能已被主世界接收；已请求取消未提交的行动，结果需观察确认，不会自动重放。" );
       return false;
     }
     const result = await resultP;
-    if (result.ok && result.content.trim()) deliver(result.content);
+    if (result.content.trim()) deliver(result.content);
     return result.ok;
   }
 
@@ -178,20 +234,8 @@ export class CrossingClient implements RemoteWorldLink {
           } catch {
             return;
           }
-          if (msg.type === "event") {
-            if (msg.content?.trim()) this.hooks.onEvent(msg.content);
-          } else if (msg.type === "status_update") {
-            if (msg.content?.trim()) this.hooks.onStatusUpdate?.(msg.content);
-          } else if (msg.type === "task_result") {
-            const p = this.pending.get(msg.taskId);
-            if (p) {
-              clearTimeout(p.timer);
-              this.pending.delete(msg.taskId);
-              p.resolve({ ok: !!msg.ok, content: String(msg.content ?? "") });
-            }
-          } else if (msg.type === "farewell") {
-            farewell = msg.reason || "主世界送别了你";
-          }
+          const reason = this.receiveMessage(msg);
+          if (reason) farewell = reason;
         });
         if (farewell) {
           this.lost(farewell);
@@ -215,6 +259,25 @@ export class CrossingClient implements RemoteWorldLink {
     }
   }
 
+  private receiveMessage(msg: CrossingSseMsg): string | null {
+    if (msg.type === "event") {
+      if (msg.content?.trim()) this.hooks.onEvent(msg.content);
+    } else if (msg.type === "status_update") {
+      if (msg.content?.trim()) this.hooks.onEvent(`你在「${this.worldName}」经历的状态变化：${msg.content}`);
+    } else if (msg.type === "task_result") {
+      const p = this.pending.get(msg.taskId);
+      if (p) {
+        clearTimeout(p.timer);
+        p.cleanup?.();
+        this.pending.delete(msg.taskId);
+        p.resolve({ ok: !!msg.ok, content: String(msg.content ?? "") });
+      }
+    } else if (msg.type === "farewell") {
+      return msg.reason || "主世界送别了你";
+    }
+    return null;
+  }
+
   private lost(reason: string): void {
     if (!this.active) return;
     this.active = false;
@@ -225,10 +288,10 @@ export class CrossingClient implements RemoteWorldLink {
   private failAllPending(reason: string): void {
     for (const [, p] of this.pending) {
       clearTimeout(p.timer);
-      p.resolve({ ok: false, content: "" });
+      p.cleanup?.();
+      p.resolve({ ok: false, content: `${reason}；已发出的远程行动可能仍有结果，不会自动重放。` });
     }
     this.pending.clear();
-    void reason;
   }
 
   // ---------- HTTP ----------

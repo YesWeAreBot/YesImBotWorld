@@ -1,4 +1,5 @@
 import type { Context } from "koishi";
+import { channelKey } from "./channels.js";
 
 declare module "koishi" {
   interface Tables {
@@ -10,6 +11,7 @@ export interface KnownChannel {
   key: string;
   platform: string;
   channelId: string;
+  selfId?: string;
   /** 是否为私聊（direct）：来自入站 session.isDirect 的权威标记，可靠于 channelId 字符串猜测 */
   isDirect: boolean;
   participants: { userId: string; username: string }[];
@@ -19,6 +21,8 @@ export interface WorldMessageRow {
   id: number;
   platform: string;
   channelId: string;
+  /** 接收/发送该消息的 Bot 账号；旧记录为空，仅在单账号部署中兼容归属。 */
+  selfId?: string;
   guildId: string;
   userId: string;
   username: string;
@@ -46,6 +50,7 @@ export class MessageStore {
         id: "unsigned",
         platform: "string(64)",
         channelId: "string(255)",
+        selfId: { type: "string", length: 255, initial: "" },
         guildId: "string(255)",
         userId: "string(255)",
         username: "string(255)",
@@ -63,6 +68,23 @@ export class MessageStore {
     await this.ctx.database.create("yesimbot_world_message", row);
   }
 
+  private accountId(row: WorldMessageRow): string | undefined {
+    if (row.selfId) return row.selfId;
+    const accounts = [...new Set(this.ctx.bots.filter((b) => b.platform === row.platform).map((b) => b.selfId))];
+    return accounts.length === 1 ? accounts[0] : undefined;
+  }
+
+  private accountFilter(platform: string, selfId?: string) {
+    const accounts = [...new Set(this.ctx.bots.filter((b) => b.platform === platform).map((b) => b.selfId))];
+    if (selfId) {
+      return accounts.length === 1 && accounts[0] === selfId
+        ? { selfId: { $in: [selfId, ""] } }
+        : { selfId };
+    }
+    // 不知道接收账号的旧记录不与多账号的新记录合并。
+    return accounts.length > 1 ? { selfId: "" } : {};
+  }
+
   /** 清空全部消息记录（world.clearmsg / 创世时调用） */
   async clear(): Promise<void> {
     await this.ctx.database.remove("yesimbot_world_message", {});
@@ -77,7 +99,7 @@ export class MessageStore {
     );
     const seen = new Map<string, WorldMessageRow>();
     for (const row of rows) {
-      const key = `${row.platform}:${row.channelId}`;
+      const key = channelKey(row.platform, row.channelId, this.accountId(row));
       if (!seen.has(key)) seen.set(key, row);
       if (seen.size >= n) break;
     }
@@ -96,13 +118,15 @@ export class MessageStore {
     );
     const map = new Map<string, KnownChannel>();
     for (const row of rows) {
-      const key = `${row.platform}:${row.channelId}`;
+      const selfId = this.accountId(row);
+      const key = channelKey(row.platform, row.channelId, selfId);
       let entry = map.get(key);
       if (!entry) {
         entry = {
           key,
           platform: row.platform,
           channelId: row.channelId,
+          selfId,
           // 权威私聊标记：取该频道任意一条已明确记录的 isDirect（多数为 true 即私聊）
           // 也回退 channelId 的 private: 前缀（onebot 约定），保证旧数据/纯群历史兼容
           isDirect: row.isDirect ?? row.channelId.startsWith("private:"),
@@ -124,11 +148,12 @@ export class MessageStore {
     platform: string,
     channelId: string,
     messageId: string,
+    selfId?: string,
   ): Promise<WorldMessageRow | null> {
     if (!messageId) return null;
     const rows = await this.ctx.database.get(
       "yesimbot_world_message",
-      { platform, channelId, messageId },
+      { platform, channelId, messageId, ...this.accountFilter(platform, selfId) },
       { limit: 1 },
     );
     return rows[0] ?? null;
@@ -155,10 +180,10 @@ export class MessageStore {
   }
 
   /** 某频道最近 n 条消息（时间正序返回） */
-  async channelMessages(platform: string, channelId: string, n: number): Promise<WorldMessageRow[]> {
+  async channelMessages(platform: string, channelId: string, n: number, selfId?: string): Promise<WorldMessageRow[]> {
     const rows = await this.ctx.database.get(
       "yesimbot_world_message",
-      { platform, channelId },
+      { platform, channelId, ...this.accountFilter(platform, selfId) },
       { sort: { timestamp: "desc" }, limit: n },
     );
     return rows.reverse();

@@ -15,25 +15,39 @@
 export type PlayerMode = "cross" | "avatar" | "puppet";
 
 /** 访客提交给主世界的任务类型 */
-export type CrossingTaskKind = "act" | "wait" | "checkTime" | "query";
+export type CrossingTaskKind = "act" | "wait" | "checkTime" | "query" | "observe";
 
 export interface CrossingTaskPayload {
   /** act：动作描述 */
   desc?: string;
-  /** act：动作时长（TU） */
+  /** act：标准跨世界时长，单位世界秒。 */
+  durationWorldSeconds?: number;
+  /** wait：标准跨世界时长，单位世界秒。 */
+  waitWorldSeconds?: number;
+  /** 旧客户端兼容：动作时长，按主世界 TU 解释。 */
   duration?: number;
-  /** wait：等待时长（TU） */
+  /** 旧客户端兼容：等待时长，按主世界 TU 解释。 */
   n?: number;
   /** query：世界查询任务文本 */
   task?: string;
+  /** observe：只能引用该访客自身已有的观测句柄。 */
+  target?: string;
+  modality?: string;
+  speech?: string;
+  observationId?: string;
+}
+
+export interface CrossingTimeUnits {
+  unitWorldSeconds: number;
+  unitRealSeconds: number;
 }
 
 /** SSE 推送给访客的消息 */
 export type CrossingSseMsg =
-  | { type: "hello"; worldName: string; timeLine: string }
+  | ({ type: "hello"; worldName: string; timeLine: string; visitorId?: string } & Partial<CrossingTimeUnits>)
   | { type: "event"; content: string; timeLine?: string }
   | { type: "task_result"; taskId: string; ok: boolean; content: string }
-  /** 主世界的 World-LLM 更新了访客的状态文件（写回访客世界的 Bot_Status.md） */
+  /** 主世界对访客的状态描述，只作为体验事件；不可覆盖访客自己的持久人设。 */
   | { type: "status_update"; content: string }
   | { type: "farewell"; reason: string };
 

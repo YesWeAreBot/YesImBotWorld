@@ -28,6 +28,9 @@ export const DEFAULT_NEWS_FEEDS: string[] = [
 export interface RealNewsItem {
   title: string;
   link?: string;
+  source?: string;
+  publishedAt?: string;
+  retrievedAt?: string;
 }
 
 export interface RealNewsSource {
@@ -53,7 +56,7 @@ export async function fetchAllHeadlines(source: RealNewsSource, n = 20): Promise
   const out: RealNewsItem[] = [];
   for (const feed of feeds) {
     try {
-      const items = await fetchFeed(feed);
+      const items = await fetchFeed(feed, source.proxy);
       for (const it of items) {
         if (out.length >= n) break;
         out.push(it);
@@ -81,7 +84,7 @@ export async function searchHeadlines(
   const out: RealNewsItem[] = [];
   for (const feed of feeds) {
     try {
-      for (const it of await fetchFeed(feed)) {
+      for (const it of await fetchFeed(feed, source.proxy)) {
         const haystack = `${it.title} ${it.link ?? ""}`.toLowerCase();
         if (haystack.includes(kw)) {
           out.push(it);
@@ -96,15 +99,17 @@ export async function searchHeadlines(
 }
 
 /** 抓取单个 RSS 源，返回清洗后的 {title, link} 列表 */
-async function fetchFeed(url: string): Promise<RealNewsItem[]> {
+async function fetchFeed(url: string, proxy = ""): Promise<RealNewsItem[]> {
   const res = await fetchWithProxy(url, {
     headers: { "user-agent": USER_AGENT, accept: "application/rss+xml,application/xml,text/xml,*/*" },
     redirect: "follow",
+    proxy,
     signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
   });
   if (!res.ok) throw new Error(`RSS 源返回 HTTP ${res.status}`);
   const xml = await res.text();
-  return parseRssItems(xml);
+  const retrievedAt = new Date().toISOString();
+  return parseRssItems(xml).map(item => ({ ...item, source: url, retrievedAt }));
 }
 
 /**
@@ -132,18 +137,22 @@ export async function fetchArticleText(url: string, proxy = ""): Promise<string>
 }
 
 /** 极简 RSS/Atom XML 解析：抽 <item>（RSS）或 <entry>（Atom）的 title/link（够用即可，不引入 XML 依赖） */
-function parseRssItems(xml: string): RealNewsItem[] {
+export function parseRssItems(xml: string): RealNewsItem[] {
   const out: RealNewsItem[] = [];
   // RSS 2.0
   let re = /<item>([\s\S]*?)<\/item>/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(xml)) !== null) {
-    out.push({ title: cleanHtml(tagContent(m[1]!, "title")), link: attrOrTagContent(m[1]!, "link") });
+    const date = tagContent(m[1]!, "pubDate") || tagContent(m[1]!, "published") || tagContent(m[1]!, "updated");
+    const millis = Date.parse(date);
+    out.push({ title: cleanHtml(tagContent(m[1]!, "title")), link: attrOrTagContent(m[1]!, "link"), ...(Number.isFinite(millis) ? { publishedAt: new Date(millis).toISOString() } : {}) });
   }
   // Atom
   re = /<entry>([\s\S]*?)<\/entry>/g;
   while ((m = re.exec(xml)) !== null) {
-    out.push({ title: cleanHtml(tagContent(m[1]!, "title")), link: attrOrTagContent(m[1]!, "link") });
+    const date = tagContent(m[1]!, "pubDate") || tagContent(m[1]!, "published") || tagContent(m[1]!, "updated");
+    const millis = Date.parse(date);
+    out.push({ title: cleanHtml(tagContent(m[1]!, "title")), link: attrOrTagContent(m[1]!, "link"), ...(Number.isFinite(millis) ? { publishedAt: new Date(millis).toISOString() } : {}) });
   }
   return out;
 }

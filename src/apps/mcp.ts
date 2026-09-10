@@ -10,6 +10,9 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import type { Logger } from "koishi";
 import type { McpServerConfig } from "../config.js";
 import type { AppRawTool, WorldApp } from "./app.js";
+import type { MediaStore } from "../media/store.js";
+import { mediaPlaceholder, type MediaRenderer } from "../media/render.js";
+import type { RichText } from "../types.js";
 
 const PROTOCOL_VERSION = "2025-03-26";
 const CONNECT_TIMEOUT_MS = 20_000;
@@ -239,6 +242,7 @@ export class McpApp implements WorldApp {
   constructor(
     private cfg: McpServerConfig,
     private logger: Logger,
+    private mediaPipeline?: { media: MediaStore; renderer: MediaRenderer },
   ) {}
 
   get id(): string {
@@ -320,7 +324,7 @@ export class McpApp implements WorldApp {
     return { tools };
   }
 
-  async call(tool: string, args: Record<string, unknown>): Promise<string> {
+  async call(tool: string, args: Record<string, unknown>): Promise<string | RichText> {
     const transport = await this.connect();
     const result = (await transport.request(
       "tools/call",
@@ -328,16 +332,29 @@ export class McpApp implements WorldApp {
       CALL_TIMEOUT_MS,
     )) as Record<string, unknown>;
     const content = Array.isArray(result?.content) ? (result.content as Record<string, unknown>[]) : [];
-    const parts = content.map((c) => {
-      if (c.type === "text") return String(c.text ?? "");
-      if (c.type === "image") return "[图片（此应用返回的图片暂无法查看）]";
-      if (c.type === "audio") return "[音频（此应用返回的音频暂无法收听）]";
-      if (c.type === "resource" || c.type === "resource_link") return `[资源 ${String((c.resource as Record<string, unknown>)?.uri ?? c.uri ?? "")}]`;
-      return `[${String(c.type ?? "?")}]`;
-    });
+    const parts: string[] = [];
+    for (const c of content) {
+      if (c.type === "text") { parts.push(String(c.text ?? "")); continue; }
+      if (c.type === "image" || c.type === "audio") {
+        const label = c.type === "image" ? "图片" : "音频";
+        const mime = typeof c.mimeType === "string" ? c.mimeType : "";
+        const data = typeof c.data === "string" ? c.data : "";
+        // 只摄取 MCP 内联媒体，绝不把外部资源 URI 当成本地路径读取。
+        if (this.mediaPipeline && mime.startsWith(`${c.type}/`) && /^[\w.+-]+\/[\w.+-]+$/.test(mime) && data) {
+          const id = await this.mediaPipeline.media.ingest(`data:${mime};base64,${data}`, c.type, mime);
+          parts.push(id === null ? `[${label}（读取失败或超过媒体限制）]` : mediaPlaceholder(id, c.type));
+        } else {
+          parts.push(`[${label}（媒体数据缺失或媒体管道未配置）]`);
+        }
+        continue;
+      }
+      if (c.type === "resource" || c.type === "resource_link") {
+        parts.push(`[资源 ${String((c.resource as Record<string, unknown>)?.uri ?? c.uri ?? "")}]`);
+      } else parts.push(`[${String(c.type ?? "?")}]`);
+    }
     const text = parts.join("\n").trim() || "（应用没有返回内容）";
     if (result?.isError) throw new Error(text);
-    return text;
+    return this.mediaPipeline ? this.mediaPipeline.renderer.render(text) : text;
   }
 
   async close(): Promise<void> {

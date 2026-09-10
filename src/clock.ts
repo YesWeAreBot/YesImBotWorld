@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import { type CalendarSpec, formatDateMs, formatWorldTime, gregorian } from "./calendar.js";
 import type { ClockConfigData } from "./config.js";
@@ -126,9 +127,11 @@ export class WorldClock {
 
   private async save(): Promise<void> {
     // 原子写入：避免进程在写入途中被杀导致 clock.json 损坏（那会让世界时间归零）
-    const tmp = `${this.file}.tmp`;
-    await fs.writeFile(tmp, JSON.stringify(this.state));
-    await fs.rename(tmp, this.file);
+    const tmp = `${this.file}.${randomUUID()}.tmp`;
+    try {
+      await fs.writeFile(tmp, JSON.stringify(this.state), { flag: "wx" });
+      await fs.rename(tmp, this.file);
+    } finally { await fs.rm(tmp, { force: true }); }
   }
 
   /** 运行中周期性落盘：崩溃时离线起点最多比实际提前一个检查点间隔 */

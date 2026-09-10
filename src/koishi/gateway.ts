@@ -1,4 +1,5 @@
 import { h, type Context, type Session } from "koishi";
+import { channelKey } from "./channels.js";
 import { needsMsgIds, type MessagingConfig, type PlatformOpsConfig } from "../config.js";
 import type { MediaRenderer } from "../media/render.js";
 import { MEDIA_PLACEHOLDER, mediaPlaceholder } from "../media/render.js";
@@ -105,14 +106,14 @@ export class Gateway {
     const messageId = session.messageId ? String(session.messageId) : "";
     if (!channelId || !messageId) return;
     const platform = session.platform ?? "unknown";
-    const key = `${platform}:${channelId}`;
+    const key = channelKey(platform, channelId, session.selfId ?? session.bot?.selfId);
     const selfId = String(session.selfId ?? session.bot?.selfId ?? "");
     // OneBot 群撤回：user_id 是消息发送者、operator_id 是执行撤回的人（可能是管理员）；私聊撤回没有 operator
     const senderId = String(session.userId ?? "");
     const operatorId =
       String((session as unknown as { operatorId?: string }).operatorId ?? "") || senderId;
 
-    const row = await this.store.findByMessageId(platform, channelId, messageId);
+    const row = await this.store.findByMessageId(platform, channelId, messageId, selfId);
     const selfOp = !!selfId && operatorId === selfId;
     const selfSender = !!selfId && senderId === selfId;
     const samePerson = !!operatorId && operatorId === senderId;
@@ -127,6 +128,7 @@ export class Gateway {
     } else {
       // 记录里找不到原消息（发出时插件不在线 / 记录被清空过）：撤回本身也是频道里的动态，补记一条
       await this.store.store({
+        selfId: session.selfId ?? session.bot?.selfId ?? "",
         platform,
         channelId,
         guildId: session.guildId ?? "",
@@ -168,11 +170,12 @@ export class Gateway {
     const platform = session.platform ?? "onebot";
     const groupId = raw.group_id != null ? String(raw.group_id) : "";
     const channelId = groupId || `private:${pokerId}`;
-    const key = `${platform}:${channelId}`;
+    const key = channelKey(platform, channelId, session.selfId ?? session.bot?.selfId);
     const who = await this.lookupUsername(platform, channelId, pokerId);
 
     // 入库：打开频道时能看到这条互动
     await this.store.store({
+      selfId: session.selfId ?? session.bot?.selfId ?? "",
       platform,
       channelId,
       guildId: groupId,
@@ -214,7 +217,7 @@ export class Gateway {
     const platform = session.platform ?? "onebot";
     const groupId = String(raw.group_id ?? session.guildId ?? "");
     if (!groupId) return;
-    const key = `${platform}:${groupId}`;
+    const key = channelKey(platform, groupId, session.selfId ?? session.bot?.selfId);
     const lift = String(raw.sub_type ?? "") === "lift_ban" || Number(raw.duration ?? 0) <= 0;
     const operatorId = String(raw.operator_id ?? "");
     const who = operatorId ? await this.lookupUsername(platform, groupId, operatorId) : "管理员";
@@ -222,6 +225,7 @@ export class Gateway {
 
     // 入库：翻聊天记录时也能看到这条动态
     await this.store.store({
+      selfId: session.selfId ?? session.bot?.selfId ?? "",
       platform,
       channelId: groupId,
       guildId: groupId,
@@ -289,7 +293,7 @@ export class Gateway {
     const who = req.username && req.username !== req.userId ? `${req.username}（${req.userId}）` : req.userId;
     const note = req.comment ? `，附言：「${req.comment}」` : "";
     const hint = `（请求编号 ${req.id}，可用 handle_request 同意或拒绝）`;
-    const guild = req.guildId ? await this.names.display(`${req.platform}:${req.guildId}`) : req.guildId;
+    const guild = req.guildId ? await this.names.display(channelKey(req.platform, req.guildId, req.selfId)) : req.guildId;
     const text =
       kind === "friend"
         ? `手机弹出提示：${req.platform} 上 ${who} 请求添加你为好友${note}。${hint}`
@@ -302,7 +306,7 @@ export class Gateway {
   /** before-send：Bot 账号即将发出一条消息。区分本插件发送与外部发送 */
   private async handleSelfSent(session: Session): Promise<void> {
     if (!session.channelId) return;
-    const key = `${session.platform}:${session.channelId}`;
+    const key = channelKey(session.platform ?? "unknown", session.channelId ?? "unknown", session.selfId ?? session.bot?.selfId);
     // 本插件（messenger）发出的：已由 storeSelf 入库并有工具调用结果，跳过
     if (this.ownSends.consume(key)) return;
 
@@ -319,6 +323,7 @@ export class Gateway {
     const msgId = await this.waitMessageId(session, 3000);
 
     await this.store.store({
+      selfId: session.selfId ?? session.bot?.selfId ?? "",
       platform: session.platform ?? "unknown",
       channelId: session.channelId,
       guildId: session.guildId ?? "",
@@ -373,6 +378,7 @@ export class Gateway {
     }
 
     await this.store.store({
+      selfId: session.selfId ?? session.bot?.selfId ?? "",
       platform: session.platform ?? "unknown",
       channelId: session.channelId ?? "unknown",
       guildId: session.guildId ?? "",
@@ -385,7 +391,7 @@ export class Gateway {
       isDirect: session.isDirect,
     });
 
-    const key = `${session.platform}:${session.channelId}`;
+    const key = channelKey(session.platform ?? "unknown", session.channelId ?? "unknown", session.selfId ?? session.bot?.selfId);
     // 频道有新动静：先让系统侧（延期发送意图等）知情，再走通知策略
     this.callbacks.channelActivity(key);
     // Bot 正在关注的频道：无视通知策略与频道列表，必定呈现完整内容并唤醒

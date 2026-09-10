@@ -14,6 +14,18 @@ import type {
 import { renderToolsText } from "./tools.js";
 import { canonicalizeArgs } from "./repeatGuard.js";
 
+export interface CompressionSnapshot {
+  entries: StreamEntry[];
+  text: string;
+}
+
+interface CompressionCommit {
+  pinned: PinnedContext;
+  counters: { tool: number; event: number };
+  previousStream: StreamEntry[];
+  stream: StreamEntry[];
+}
+
 interface PinnedPersist {
   pinned: PinnedContext;
   counters: { tool: number; event: number };
@@ -66,6 +78,19 @@ export class BotContext {
   private attachAnchor = { pos: 0, skip: 0 };
   private counters = { tool: 0, event: 0 };
   private toolsText: string;
+  private mutationTail: Promise<void> = Promise.resolve();
+  private needsRecovery = true;
+
+  private mutate<T>(run: () => Promise<T>): Promise<T> {
+    const next = this.mutationTail.then(async () => {
+      if (this.needsRecovery) await this.recoverCompressionUnlocked();
+      return run();
+    });
+    this.mutationTail = next.then(() => {}, () => {});
+    return next;
+  }
+
+  async settled(): Promise<void> { await this.mutationTail; }
 
   constructor(
     private files: WorldFiles,
@@ -84,6 +109,10 @@ export class BotContext {
   // ---------- 持久化 ----------
 
   async load(): Promise<void> {
+    return this.mutate(() => this.loadUnlocked());
+  }
+
+  private async loadUnlocked(): Promise<void> {
     try {
       const raw = JSON.parse(await fs.readFile(this.files.pinned, "utf8")) as PinnedPersist;
       this.pinned = raw.pinned;
@@ -92,22 +121,32 @@ export class BotContext {
       // 与当前实际可用工具的差异由 service 层通过 toolsChangeNotice() 以 Event 形式告知 Bot，
       // 置顶列表在下次 rest 压缩（applyCompression）时才同步为当前列表。
     } catch {
-      this.pinned.persona = await this.files.readBotStatus();
+      this.pinned.persona = (await this.files.readDefinitions()).botDef;
     }
     // 迁移/兜底：置顶区缺少「最初设定」（旧版 pinned.json 或没有 pinned.json 的旧世界），
     // 首次从定义文件补入并持久化；此后这部分只在创世与压缩（applyCompression）时刷新，
     // 其余时候用户的改动以 Event 告知，保持前缀稳定（保护 KV cache）。
     if (!this.pinned.botDefinition?.trim()) {
       this.pinned.botDefinition = (await this.files.readDefinitions()).botDef;
-      await this.persistPinned();
+      await this.persistPinnedUnlocked();
     }
+    // Identity is owner-authored; world snapshots are observations, never a system persona.
+    this.pinned.persona = this.pinned.botDefinition;
     this.stream = [];
     this.attachAnchor = { pos: 0, skip: 0 };
     const raw = await this.files.readText(this.files.stream);
     for (const line of raw.split("\n")) {
       if (!line.trim()) continue;
       try {
-        this.stream.push(JSON.parse(line) as StreamEntry);
+        const entry = JSON.parse(line) as StreamEntry;
+        this.stream.push(entry);
+        // A crash between the append and counter save must not reuse an event ID.
+        const id = entry.kind === "tool_call" ? entry.call.id : entry.event.id;
+        const n = Number(id.split("_").at(-1));
+        if (Number.isSafeInteger(n)) {
+          const counter = entry.kind === "tool_call" ? "tool" : "event";
+          this.counters[counter] = Math.max(this.counters[counter], n);
+        }
       } catch {
         /* 跳过损坏行 */
       }
@@ -115,13 +154,17 @@ export class BotContext {
   }
 
   async persistPinned(): Promise<void> {
+    return this.mutate(() => this.persistPinnedUnlocked());
+  }
+
+  private async persistPinnedUnlocked(): Promise<void> {
     const data: PinnedPersist = { pinned: this.pinned, counters: this.counters };
     await this.files.atomicWrite(this.files.pinned, JSON.stringify(data, null, 2));
   }
 
   private async appendEntry(entry: StreamEntry): Promise<void> {
-    this.stream.push(entry);
     await fs.appendFile(this.files.stream, JSON.stringify(entry) + "\n");
+    this.stream.push(entry);
   }
 
   // ---------- 追加 ----------
@@ -135,13 +178,17 @@ export class BotContext {
   }
 
   async appendToolCall(call: ToolCallRecord): Promise<void> {
-    await this.appendEntry({ kind: "tool_call", call });
-    await this.persistPinned(); // 保存计数器
+    await this.mutate(async () => {
+      await this.appendEntry({ kind: "tool_call", call });
+      await this.persistPinnedUnlocked();
+    });
   }
 
   async appendEvent(event: BotEvent): Promise<void> {
-    await this.appendEntry({ kind: "event", event });
-    await this.persistPinned();
+    await this.mutate(async () => {
+      await this.appendEntry({ kind: "event", event });
+      await this.persistPinnedUnlocked();
+    });
   }
 
   /**
@@ -156,6 +203,10 @@ export class BotContext {
    * 内存中的 stream 同步修改，保证本次与后续渲染一致。
    */
   async downgradeLastStatusEcho(): Promise<void> {
+    return this.mutate(() => this.downgradeLastStatusEchoUnlocked());
+  }
+
+  private async downgradeLastStatusEchoUnlocked(): Promise<void> {
     let idx = -1;
     for (let i = this.stream.length - 1; i >= 0; i--) {
       const entry = this.stream[i]!;
@@ -237,7 +288,7 @@ export class BotContext {
   static renderEventLine(event: BotEvent): string {
     const ref = event.refToolCallId ? ` ref="${event.refToolCallId}"` : "";
     const echo = event.statusEcho ? `\n\n（你此刻的状态：\n${event.statusEcho}\n）` : "";
-    return `<event t="${event.worldTime.toFixed(1)}" src="${event.source}"${ref}>${event.content}${echo}</event>`;
+    return `<event id="${event.id}" t="${event.worldTime.toFixed(1)}" src="${event.source}"${ref}>${event.content}${echo}</event>`;
   }
 
   /**
@@ -252,7 +303,7 @@ export class BotContext {
     allowed: Set<number>,
   ): Promise<ContentPart[]> {
     const refAttr = event.refToolCallId ? ` ref="${event.refToolCallId}"` : "";
-    const open = `<event t="${event.worldTime.toFixed(1)}" src="${event.source}"${refAttr}>`;
+    const open = `<event id="${event.id}" t="${event.worldTime.toFixed(1)}" src="${event.source}"${refAttr}>`;
     const echo = event.statusEcho ? `\n\n（你此刻的状态：\n${event.statusEcho}\n）` : "";
     const close = `</event>`;
 
@@ -319,14 +370,16 @@ export class BotContext {
    * 预算从最新的事件往前分配，更早的附件退化为纯文字标记。
    */
   async toChatMessages(timeLine: string): Promise<ChatMessage[]> {
+    await this.settled();
+    const entries = structuredClone(this.stream);
     const loader = this.attachmentLoader && !this.attachmentsDisabled ? this.attachmentLoader : null;
     const allowed = new Set<number>();
     this.lastAttachmentPartTypes = new Set();
     if (loader) {
       // 1. 收集锚点之后的候选附件（单个超预算的永久跳过——决策稳定，不影响前缀）
       const cands: { pos: number; skip: number; ref: MediaRef; size: number }[] = [];
-      for (let i = this.attachAnchor.pos; i < this.stream.length; i++) {
-        const entry = this.stream[i]!;
+      for (let i = this.attachAnchor.pos; i < entries.length; i++) {
+        const entry = entries[i]!;
         if (entry.kind !== "event" || !entry.event.attachments?.length) continue;
         const from = i === this.attachAnchor.pos ? this.attachAnchor.skip : 0;
         for (let k = from; k < entry.event.attachments.length; k++) {
@@ -355,7 +408,7 @@ export class BotContext {
         const first = kept[0];
         this.attachAnchor = first
           ? { pos: first.pos, skip: first.skip }
-          : { pos: this.stream.length, skip: 0 };
+          : { pos: entries.length, skip: 0 };
         for (const c of kept) allowed.add(c.ref.id);
       } else {
         for (const c of cands) allowed.add(c.ref.id);
@@ -365,7 +418,7 @@ export class BotContext {
     const built: { role: ChatMessage["role"]; parts: ContentPart[] }[] = [
       { role: "system", parts: [{ type: "text", text: this.renderSystemText(timeLine) }] },
     ];
-    for (const entry of this.stream) {
+    for (const entry of entries) {
       const role = entry.kind === "tool_call" ? "assistant" : "user";
       let parts: ContentPart[];
       if (entry.kind === "tool_call") {
@@ -405,11 +458,11 @@ export class BotContext {
   }
 
   /** 供压缩用：序列化当前工作窗口（把连续重复的工具调用折叠成一条汇总，避免千篇一律的历史占满压缩输入） */
-  serializeForCompression(): string {
+  serializeForCompression(entries: StreamEntry[] = this.stream): string {
     const lines: string[] = [];
     let i = 0;
-    while (i < this.stream.length) {
-      const entry = this.stream[i]!;
+    while (i < entries.length) {
+      const entry = entries[i]!;
       if (entry.kind !== "tool_call") {
         lines.push(BotContext.renderEventLine(entry.event));
         i++;
@@ -420,8 +473,8 @@ export class BotContext {
       const baseKey = JSON.stringify([base.name, canonicalizeArgs(base.arguments ?? {})]);
       let run = 1;
       let j = i + 1;
-      while (j < this.stream.length) {
-        const next = this.stream[j]!;
+      while (j < entries.length) {
+        const next = entries[j]!;
         if (next.kind !== "tool_call") break;
         const nextKey = JSON.stringify([next.call.name, canonicalizeArgs(next.call.arguments ?? {})]);
         if (nextKey !== baseKey) break;
@@ -473,27 +526,70 @@ export class BotContext {
 
   // ---------- 压缩 ----------
 
-  /**
-   * 应用压缩结果：归档旧流、刷新置顶区（角色设定重新从 Bot_Status.md 读取，
-   * 工具列表重新渲染 —— 这是唯一允许修改置顶区的时机）。
-   */
-  async applyCompression(result: CompressionResult, worldTime: number): Promise<void> {
-    await this.files.archiveStream();
-    this.stream = [];
-    this.attachAnchor = { pos: 0, skip: 0 };
-    // 「最初设定」在压缩时从定义文件刷新（创世与压缩是仅有的两个更新时机；
-    // 压缩后整个置顶区本就要重建，前缀重算不损失缓存）
-    const { botDef } = await this.files.readDefinitions();
-    this.pinned = {
-      botDefinition: botDef,
-      persona: await this.files.readBotStatus(),
-      historySummary: result.historySummary,
-      toolsText: this.toolsText,
-      memoryDigest: result.memoryDigest,
-      updatedAt: worldTime,
-    };
-    await this.persistPinned();
+  /** Capture a stable prefix. Later appends belong to the next working window. */
+  async compressionSnapshot(): Promise<CompressionSnapshot> {
+    return this.mutate(async () => {
+      const entries = structuredClone(this.stream);
+      return { entries, text: this.serializeForCompression(entries) };
+    });
   }
+
+  /** Only retire the prefix which was actually summarized. Never write objective world state. */
+  async applyCompression(result: CompressionResult, worldTime: number, snapshot?: CompressionSnapshot): Promise<void> {
+    await this.mutate(async () => {
+      const prefix = snapshot?.entries ?? this.stream;
+      const key = (e: StreamEntry) => e.kind === "tool_call" ? e.call.id : e.event.id;
+      if (prefix.some((entry, i) => !this.stream[i] || key(entry) !== key(this.stream[i]!))) {
+        throw new Error("压缩快照已过期，保留当前经历并重新整理");
+      }
+      const remaining = this.stream.slice(prefix.length);
+      const { botDef } = await this.files.readDefinitions();
+      const commit: CompressionCommit = {
+        previousStream: this.stream,
+        stream: remaining,
+        counters: { ...this.counters },
+        pinned: {
+          botDefinition: botDef, persona: botDef,
+          historySummary: result.historySummary, toolsText: this.toolsText,
+          memoryDigest: result.memoryDigest, updatedAt: worldTime,
+        },
+      };
+      // Commit intent is durable before truncating either file. A crash can replay this cutover.
+      await this.files.atomicWrite(this.compressionCommitPath, JSON.stringify(commit));
+      this.needsRecovery = true;
+      await this.recoverCompressionUnlocked();
+    });
+  }
+
+  private get compressionCommitPath(): string { return `${this.files.base}/context-commit.json`; }
+
+  private async recoverCompressionUnlocked(): Promise<void> {
+    let raw: string;
+    try { raw = await fs.readFile(this.compressionCommitPath, "utf8"); }
+    catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+      this.needsRecovery = false;
+      return;
+    }
+    const commit = JSON.parse(raw) as CompressionCommit;
+    if (!Array.isArray(commit.previousStream) || !Array.isArray(commit.stream) || !commit.pinned || !commit.counters) {
+      throw new Error("记忆提交记录损坏，需要恢复归档；当前上下文未被丢弃");
+    }
+    const lines = (entries: StreamEntry[]) => entries.length ? entries.map((entry) => JSON.stringify(entry)).join("\n") + "\n" : "";
+    // Replaying after a failed archive may make another recovery copy, but cannot lose the source stream.
+    await this.files.atomicWrite(this.files.stream, lines(commit.previousStream));
+    await this.files.archiveStream();
+    await this.files.atomicWrite(this.files.stream, lines(commit.stream));
+    this.stream = commit.stream;
+    this.pinned = commit.pinned;
+    this.attachAnchor = { pos: 0, skip: 0 };
+    this.counters.tool = Math.max(this.counters.tool, commit.counters.tool);
+    this.counters.event = Math.max(this.counters.event, commit.counters.event);
+    await this.persistPinnedUnlocked();
+    await fs.rm(this.compressionCommitPath, { force: true });
+    this.needsRecovery = false;
+  }
+
 }
 
 /** 附件 content part 的近似载荷大小（base64 字符数） */

@@ -153,7 +153,7 @@ export class NewsApp implements WorldApp {
     if (await this.isRealWorld()) {
       try {
         for (const it of await searchHeadlines({ feeds: this.cfg.newsFeeds, proxy: this.cfg.browserProxy }, keyword, n)) {
-          items.push({ kind: "rss", headline: it.title, title: it.title, link: it.link });
+          items.push({ kind: "rss", headline: `${it.title}（发布：${it.publishedAt ?? "未知"}；来源：${it.source ?? it.link ?? "未知"}）`, title: it.title, link: it.link });
         }
       } catch (err) {
         this.logger.warn("搜索现实新闻失败: %s", err);

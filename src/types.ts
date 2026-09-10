@@ -87,6 +87,8 @@ export type RichTextPart =
 /** 带附件的富文本（附件 = Bot-LLM 原生支持的模态，以 content part 注入） */
 export interface RichText {
   text: string;
+  /** Original events actually perceived by this actor; inherited by summaries/repeated observations. */
+  originEventIds?: string[];
   attachments?: MediaRef[];
   /**
    * 图文有序分段（含原生附件时提供）：按此顺序把文字与媒体交错呈现，
@@ -112,6 +114,8 @@ export interface PhoneStatus {
 
 export interface BotEvent {
   id: string;
+  /** Original perceived causes, for evidence deduplication (never a global event access grant). */
+  originEventIds?: string[];
   source: EventSource;
   content: string;
   /** 事件进入上下文时的世界时刻（Time Unit） */

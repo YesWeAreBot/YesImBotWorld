@@ -1,4 +1,5 @@
 import { promises as fs } from "node:fs";
+import { legacyChannelKey } from "./channels.js";
 
 interface FocusPersist {
   /** 频道 key（"platform:channelId"）→ 关注到期的世界时刻（TU） */
@@ -58,7 +59,7 @@ export class FocusManager {
   }
 
   isFocused(key: string): boolean {
-    const until = this.channels.get(key);
+    const until = this.channels.get(key) ?? this.channels.get(legacyChannelKey(key));
     return until !== undefined && this.now() < until;
   }
 

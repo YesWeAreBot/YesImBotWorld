@@ -91,6 +91,10 @@ export interface WebUIHost {
   computerOn(): string | null;
   phoneDown(): boolean;
   focusChannels(): string[];
+  /** 世界完整结构化真值，仅管理员可查看。 */
+  getStructuredWorld?(): Promise<unknown>;
+  /** 独立的成长记录，不包含置顶人设或内部上下文。 */
+  getGrowth?(): Promise<unknown>;
   prompts(): Prompts;
   savePromptsOverrides(overrides: PromptOverrides): Promise<void>;
   initWorld(force: boolean): Promise<string>;
@@ -552,6 +556,9 @@ export class WebUIServer {
           ? body.mode
           : (profile.mode ?? "cross");
       }
+      if (mode !== "cross" && (!isAdmin || name !== this.host.residentBotName().trim())) {
+        return void sendJSON(res, 400, { error: "目前只支持穿越独立角色；已有 NPC 的扮演/操纵尚未实现。管理员可同名接管常驻 Bot。" });
+      }
       const r = this.host.arrivePlayer(name, persona, mode);
       if (!r.ok) return void sendJSON(res, 400, { error: r.error });
       // 管理员与常驻 Bot 同名（扮演/操纵）＝接管 Bot：扮演=暂停 Bot-LLM 自主生成，操纵=继续自主运行
@@ -752,6 +759,15 @@ export class WebUIServer {
     }
 
     // ---------- 概览 / 状态 ----------
+    if (pathname === "/api/world/state" && method === "GET") {
+      if (access.kind !== "admin") return void sendJSON(res, 403, { error: "仅管理员可读取世界完整结构化状态" });
+      if (!host.getStructuredWorld) return void sendJSON(res, 503, { error: "结构化世界尚未就绪" });
+      return void sendJSON(res, 200, { state: await host.getStructuredWorld() });
+    }
+    if (pathname === "/api/bot/growth" && method === "GET") {
+      if (!host.getGrowth) return void sendJSON(res, 503, { error: "成长记录尚未就绪" });
+      return void sendJSON(res, 200, { growth: await host.getGrowth() });
+    }
     if (pathname === "/api/overview" && method === "GET") {
       const clock = host.getClock();
       const bot = host.botStatus();
@@ -852,7 +868,7 @@ export class WebUIServer {
       const can = (g: VisitorGrant) => !isVisitor || this.visitors.can(access.session, g);
       const payload: Record<string, unknown> = {
         botStatus: can("bot_status") ? await host.files.readBotStatus() : "",
-        worldStatus: can("world_status") ? await host.files.readWorldStatus() : "",
+        worldStatus: can("world_status") ? await host.files.readWorldStatus(isVisitor) : "",
         news: can("news") ? await readAllNews(host.files.news) : [],
         facts: can("facts") ? await readAllNews(host.files.facts) : [],
         botDef: can("definitions") ? await host.files.readText(host.files.botDef) : "",
@@ -1089,7 +1105,9 @@ export class WebUIServer {
           worldName: cc.worldName.trim() || "未命名世界",
         },
         botName: cc.botName.trim() || "异界来客",
-        invites: cc.invites.map((i) => ({ name: i.name, enabled: i.enabled, code: i.code })),
+        invites: access.kind === "admin"
+          ? cc.invites.map((i) => ({ name: i.name, enabled: i.enabled, code: i.code }))
+          : [],
         // 配置里的完整世界列表（含未填全的，便于用户发现配置问题）
         configuredWorlds: cc.worlds.map((w) => ({
           name: w.name,
@@ -1124,7 +1142,8 @@ export class WebUIServer {
 
     // ---------- 归档 ----------
     if (pathname === "/api/archive" && method === "GET") {
-      sendJSON(res, 200, await listArchive(host.files.archiveDir));
+      sendJSON(res, 200, await listArchive(host.files.archiveDir,
+        access.kind === "visitor" ? (name) => canReadDataFile(access.session, name) : undefined));
       return;
     }
     if (pathname === "/api/archive/file" && method === "GET") {
@@ -1132,6 +1151,9 @@ export class WebUIServer {
       const file = q.get("file") ?? "";
       if (!safeBasename(file)) return void sendJSON(res, 400, { error: "非法文件名" });
       if (folder && !safeBasename(folder)) return void sendJSON(res, 400, { error: "非法归档名" });
+      if (access.kind === "visitor" && !canReadDataFile(access.session, file)) {
+        return void sendJSON(res, 403, { error: "访客无权读取该归档文件的内容" });
+      }
       const target = folder
         ? path.join(host.files.archiveDir, folder, file)
         : path.join(host.files.archiveDir, file);
@@ -1294,17 +1316,26 @@ export class WebUIServer {
       const dataFiles = ["clock.json", "meta.json", "focus.json", "notify.json", "pinned.json"];
       const files = [];
       for (const name of dataFiles) {
+        if (access.kind === "visitor" && !canReadDataFile(access.session, name)) continue;
         const file = path.join(host.files.base, name);
         const stat = await fs.stat(file).catch(() => null);
         files.push({ name, exists: !!stat, size: stat?.size ?? 0 });
       }
-      sendJSON(res, 200, { files, archive: await listArchive(host.files.archiveDir) });
+      const archive = access.kind === "visitor"
+        ? access.session.grants.has("archive")
+          ? await listArchive(host.files.archiveDir, (name) => canReadDataFile(access.session, name))
+          : { snapshots: [], legacy: [] }
+        : await listArchive(host.files.archiveDir);
+      sendJSON(res, 200, { files, archive });
       return;
     }
     if (pathname === "/api/data/file" && method === "GET") {
       const name = q.get("name") ?? "";
       if (!["clock.json", "meta.json", "focus.json", "notify.json", "pinned.json"].includes(name)) {
         return void sendJSON(res, 400, { error: "不允许读取该文件" });
+      }
+      if (access.kind === "visitor" && !canReadDataFile(access.session, name)) {
+        return void sendJSON(res, 403, { error: "访客无权读取该数据文件的内容" });
       }
       const content = await fs.readFile(path.join(host.files.base, name), "utf8").catch(() => "");
       sendJSON(res, 200, { name, content });
@@ -1568,6 +1599,7 @@ interface ArchiveSnapshot {
 
 async function listArchive(
   dir: string,
+  canRead: (name: string) => boolean = () => true,
 ): Promise<{ snapshots: ArchiveSnapshot[]; legacy: string[] }> {
   let names: string[] = [];
   try {
@@ -1587,7 +1619,7 @@ async function listArchive(
       try {
         for (const f of await fs.readdir(full)) {
           const fsStat = await fs.stat(path.join(full, f)).catch(() => null);
-          if (fsStat?.isFile()) files.push({ name: f, size: fsStat.size });
+          if (fsStat?.isFile() && canRead(f)) files.push({ name: f, size: fsStat.size });
         }
         const manifest = await fs.readFile(path.join(full, "manifest.json"), "utf8").catch(() => "");
         if (manifest) {
@@ -1604,7 +1636,7 @@ async function listArchive(
         files: files.sort((a, b) => a.name.localeCompare(b.name)),
       });
     } else {
-      legacy.push(n);
+      if (canRead(n)) legacy.push(n);
     }
   }
   snapshots.sort((a, b) => b.mtime - a.mtime);
@@ -1634,7 +1666,31 @@ function safeBasename(name: string): boolean {
  * 打包端点（overview/state）的字段级裁剪已在 handleApi 内处理，或（health）本就公开。
  * 写端点也会走进这里，但访客的写请求已在 handle 层统一 403，不会到达。
  */
+/** 原始文件可聚合多个权限块；不能把“笔记/存档可见”视为其全部内容可见。 */
+function canReadDataFile(session: VisitorSession, name: string): boolean {
+  const grants: Record<string, VisitorGrant[]> = {
+    "Bot_Definition.md": ["definitions"],
+    "World_Definition.md": ["definitions"],
+    "Bot_Status.md": ["bot_status"],
+    "World_Status.md": ["world_status"],
+    "News.jsonl": ["news"],
+    "facts.jsonl": ["facts"],
+    "stream.jsonl": ["stream"],
+    "pinned.json": ["definitions", "bot_status", "stream"],
+    "clock.json": ["overview"],
+    "meta.json": ["world_status"],
+    "focus.json": ["devices"],
+    "notify.json": ["devices"],
+    "phoneShell.html": ["world_status"],
+    "manifest.json": ["archive"],
+  };
+  const required = grants[name];
+  // 新增状态文件默认不向访客暴露，显式声明内容所属权限后再开放。
+  return !!required && required.every((grant) => session.grants.has(grant));
+}
+
 function grantForEndpoint(pathname: string, method: string): VisitorGrant | null {
+  if (pathname === "/api/bot/growth") return "notes";
   // 设备
   if (pathname === "/api/devices" || pathname === "/api/computer/screen") return "devices";
 

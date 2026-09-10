@@ -1763,15 +1763,16 @@ function playerRenderWorld(holder){
 
   if(!PLAYER_STATE.inWorld){
     // 未入世界：显示「进入世界」+ 进入语义选择（仅进入前可选，进入后锁定）
-    var curMode = (profile.mode === 'avatar' || profile.mode === 'puppet' || profile.mode === 'cross') ? profile.mode : 'cross';
+    var canTakeover = isAdminSameName();
+    var curMode = canTakeover && (profile.mode === 'avatar' || profile.mode === 'puppet') ? profile.mode : 'cross';
     var modeOpts = [
       ['cross', '穿越', '你的角色本不属于这个世界，从外界降临而来。'],
-      ['avatar', '扮演（入替）', '完全接管这个世界里已有的某位角色，替它行动、以它的身份生活。'],
-      ['puppet', '操纵', '只操纵世界里已有角色的身体，角色仍保有自己的意识（身体可能不听使唤）。']
+      ['avatar', '接管常驻 Bot', '仅管理员与常驻 Bot 同名时可用：暂停自主行动，通过工具代理控制。NPC 入替尚未开放。'],
+      ['puppet', '共同操控常驻 Bot', '仅管理员与常驻 Bot 同名时可用：保留 Bot 自主行动，同时通过工具代理控制。']
     ];
     var modeRadios = modeOpts.map(function(o){
       return el('label', {cls:'mode-opt', style:'display:block;padding:8px 10px;margin:6px 0;border:1px solid var(--line);border-radius:8px;cursor:pointer'}, [
-        el('input', {type:'radio', name:'player-mode', value:o[0], checked: o[0]===curMode, onchange:function(){ curMode = o[0]; }}),
+        el('input', {type:'radio', name:'player-mode', value:o[0], checked: o[0]===curMode, disabled:o[0] !== 'cross' && !canTakeover, onchange:function(){ curMode = o[0]; }}),
         el('span', {text: ' ' + o[1], style:'font-weight:600;font-size:13px'}),
         el('div', {text: o[2], style:'font-size:12px;color:var(--fg-dim);margin:2px 0 0 22px'})
       ]);
@@ -1785,7 +1786,7 @@ function playerRenderWorld(holder){
     var enterBar = el('div', {cls:'section'}, [
       el('h3', {text:'进入世界'}),
       el('div', {cls:'body'}, [
-        el('p', {text:'选择你与这个角色的关系，然后进入世界。进入后不可再更改，直到退出世界。', style:'color:var(--fg-dim);font-size:13px'}),
+        el('p', {text:'当前支持独立角色穿越。已有 NPC 的扮演/操纵需要实体控制权绑定，暂未开放；管理员同名接管常驻 Bot 仍可用。', style:'color:var(--fg-dim);font-size:13px'}),
         takeoverHint,
         el('div', {}, modeRadios),
         el('button', {cls:'primary', text:'进入世界', onclick:function(){ playerArrive(curMode); }})
@@ -2948,7 +2949,7 @@ function collectOverrides(section, defaults, prefix, out){
 function loadState(){
   var main = $('#main');
   main.textContent = '';
-  main.appendChild(viewHead('状态', isVisitor() ? '只读浏览世界状态：Bot_Status 由 Bot 维护、World_Status 与 News 由 World-LLM 维护。' : '直接读写世界状态：Bot_Status 由 Bot 维护、World_Status 与 News 由 World-LLM 维护——你改的内容会进入它们的视野。'));
+  main.appendChild(viewHead('状态', '查看世界状态、角色成长与事件。Bot / World 状态文本由结构化世界生成，作为只读视图展示。'));
   var holder = el('div', {text:'加载中…', cls:'empty'});
   main.appendChild(holder);
   api('GET', '/api/state').then(function(r){
@@ -2962,6 +2963,8 @@ function renderStateEditor(s){
   // 每个标签页：id / 标题 / 对应数据块（访客无该块 grant 则整页隐藏）/ 渲染器
   var panes = el('div');
   var tabDefs = [
+    { id:'structured', label:'世界结构', adminOnly:true, build:function(){ return structuredPane('structured', '结构化世界', '/api/world/state', 'state'); } },
+    { id:'growth', label:'角色成长', grant:'notes', build:function(){ return structuredPane('growth', '角色成长记录', '/api/bot/growth', 'growth'); } },
     { id:'bot', label:'Bot_Status.md', grant:'bot_status', build:function(){ return statePane('bot', 'Bot 状态', s.botStatus, '/api/state/bot-status'); } },
     { id:'world', label:'World_Status.md', grant:'world_status', build:function(){ return statePane('world', '世界状态', s.worldStatus, '/api/state/world-status'); } },
     { id:'news', label:'世界新闻 News.jsonl', grant:'news', build:function(){ return jsonlPane('世界新闻', 'World-LLM 记录的世界大事记（JSONL）', s.news, '/api/state/news', '新增一条世界事件…'); } },
@@ -2973,6 +2976,7 @@ function renderStateEditor(s){
   // 过滤：访客只保留有 grant 的标签页
   var visible = tabDefs.filter(function(t){
     if(MODE !== 'visitor') return true;
+    if(t.adminOnly) return false;
     return VISITOR_GRANTS.indexOf(t.grant) >= 0;
   });
   var tabs = el('div', {cls:'tabs'});
@@ -3011,14 +3015,24 @@ function renderStateEditor(s){
   panes.querySelectorAll('[data-pane]').forEach(function(p){ p.classList.toggle('hidden', p.getAttribute('data-pane') !== firstId); });
   return frag;
 }
+function structuredPane(id, title, url, field){
+  var sec = el('div', {cls:'section', 'data-pane':id});
+  var value = el('pre', {text:'加载中…', style:'white-space:pre-wrap;overflow-wrap:anywhere'});
+  sec.appendChild(el('h3', {text:title}));
+  sec.appendChild(el('div', {cls:'body'}, [value]));
+  api('GET', url).then(function(r){ value.textContent = JSON.stringify(r[field] == null ? {} : r[field], null, 2); })
+    .catch(function(err){ value.textContent = err.message || '加载失败'; });
+  return sec;
+}
 function statePane(id, title, content, url){
   var sec = el('div', {cls:'section', 'data-pane': id});
   var ta = el('textarea', {rows: 16});
   ta.value = content;
-  if(isVisitor()) ta.readOnly = true;
-  sec.appendChild(el('h3', {html: esc(title) + ' <span class="hint">' + (isVisitor() ? '只读' : '整体覆盖，保存后实时生效') + '</span>'}));
+  var projection = id === 'bot' || id === 'world';
+  if(isVisitor() || projection) ta.readOnly = true;
+  sec.appendChild(el('h3', {html: esc(title) + ' <span class="hint">' + (projection ? '只读状态视图' : isVisitor() ? '只读' : '整体覆盖，保存后实时生效') + '</span>'}));
   var body = el('div', {cls:'body'}, [ta]);
-  if(!isVisitor()){
+  if(!isVisitor() && !projection){
     body.appendChild(el('div', {cls:'toolbar'}, [el('button', {cls:'primary', text:'保存', onclick:function(){
       api('PUT', url, {content: ta.value}).then(function(){ toast(title + ' 已保存', 'ok'); }).catch(showErr);
     }})]));
@@ -3031,7 +3045,7 @@ function phoneShellPane(shellHtml, meta){
   sec.appendChild(el('h3', {html:'手机外壳 <span class="hint">浏览器带壳截图的外壳 HTML（含 {{screen}} 等占位符），下方为预览；源码标签页可编辑</span>'}));
   var body = el('div', {cls:'body'});
   // 预览 iframe：用样本值替换占位符，展示外壳布局效果
-  var preview = el('iframe', {style:'width:100%;height:560px;border:1px solid var(--line);border-radius:10px;background:#fff'});
+  var preview = el('iframe', {sandbox:'', referrerpolicy:'no-referrer', style:'width:100%;height:560px;border:1px solid var(--line);border-radius:10px;background:#fff'});
   function renderPreview(){
     var html = shellHtml || '';
     if(!html.trim()){
@@ -3047,7 +3061,9 @@ function phoneShellPane(shellHtml, meta){
       .replace(/\{\{\s*time\s*\}\}/g, '12:34')
       .replace(/\{\{\s*width\s*\}\}/g, String(w))
       .replace(/\{\{\s*height\s*\}\}/g, String(h));
-    preview.srcdoc = sample;
+    // 外壳来自模型：禁脚本、导航、表单和外部资源，只允许内嵌样式/图像。
+    var policy = "default-src 'none'; script-src 'none'; style-src 'unsafe-inline'; img-src data: blob:; font-src data:; base-uri 'none'; form-action 'none'";
+    preview.srcdoc = '<meta http-equiv="Content-Security-Policy" content="' + policy + '">' + sample;
   }
   // 源码编辑（textarea）+ 保存
   var ta = el('textarea', {rows:16, style:'width:100%;font-family:var(--mono);font-size:12px;margin-top:8px'});
@@ -3975,6 +3991,7 @@ function refreshData(){
   var main = $('#main');
   main.textContent = '';
   main.appendChild(viewHead('数据文件与记事本', '查看/编辑世界数据目录里的运行时 JSON 文件与 Bot 的记事本（Notes/），以及压缩归档。'));
+  main.appendChild(structuredPane('growth-notes', '角色成长记录', '/api/bot/growth', 'growth'));
   var holder = el('div', {text:'加载中…', cls:'empty'});
   main.appendChild(holder);
   api('GET', '/api/data').then(function(r){

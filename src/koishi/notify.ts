@@ -1,4 +1,5 @@
 import { promises as fs } from "node:fs";
+import { legacyChannelKey } from "./channels.js";
 
 interface NotifyPersist {
   allow: string[];
@@ -67,11 +68,14 @@ export class NotifyManager {
 
   /** 该频道的消息是否投递通知 */
   isNotifyChannel(key: string): boolean {
+    const legacy = legacyChannelKey(key);
     if (!this.managed || !this.loaded) {
-      return this.initial.includes("*") || this.initial.includes(key);
+      return this.initial.includes("*") || (this.initial.includes(key) || this.initial.includes(legacy));
     }
     if (this.deny.has(key)) return false;
-    return this.allow.has("*") || this.allow.has(key);
+    if (this.allow.has(key)) return true;
+    if (this.deny.has(legacy)) return false;
+    return this.allow.has("*") || this.allow.has(legacy);
   }
 
   /** Bot 开启/关闭某频道的通知（仅自管模式） */

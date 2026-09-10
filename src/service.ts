@@ -1,3 +1,4 @@
+import { GrowthLedger } from "./bot/growth.js";
 import { promises as fs } from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
@@ -8,7 +9,6 @@ import { ComputerDevice } from "./apps/computerDevice.js";
 import { FileManagerApp } from "./apps/files.js";
 import { McpApp } from "./apps/mcp.js";
 import { NewsApp } from "./apps/news.js";
-import { fetchAllHeadlines } from "./apps/newsFeed.js";
 import { NotesApp } from "./apps/notes.js";
 import { RemoteDesktopApp } from "./apps/remoteDesktop.js";
 import { TerminalApp } from "./apps/terminal.js";
@@ -219,15 +219,6 @@ export class WorldService extends Service<Config> {
       generateShell: this.config.apps.browserEnabled,
     });
     this.world.visitorPersonaMode = this.config.crossing.visitorPersonaMode;
-    // 现实世界设定：给 World-LLM 注册真实新闻素材源，Tingle 时抓取摘编进 News.jsonl
-    if (this.config.apps.newsEnabled) {
-      const newsCfg = this.config.apps;
-      this.world.setRealNewsProvider(async () => {
-        const items = await fetchAllHeadlines({ feeds: newsCfg.newsFeeds, proxy: newsCfg.browserProxy }, 15);
-        return items.map((it) => it.title);
-      });
-    }
-
     // 先启动 WebUI（初始化 usageStore 并确保 webui 目录存在），再自动恢复世界运行。
     // 否则 autoStart 时 Bot 会先发出 LLM 请求，而 usageStore 尚未 init / 目录未建，
     // 这些用量既写不进文件、也加载不到历史，导致重启后数据不连贯。
@@ -295,7 +286,7 @@ export class WorldService extends Service<Config> {
     if ((await this.files.isInitialized()) && !force) {
       return "世界已经初始化过了。如需重新创世，使用 world.init -f（会归档并清空当前世界状态）。";
     }
-    if (this.worldActive) await this.stopWorld();
+    await this.stopWorld();
     if (force) {
       await this.files.reset();
       await this.focus.clear();
@@ -328,11 +319,11 @@ export class WorldService extends Service<Config> {
     await fs.writeFile(this.files.stream, "");
     const context = new BotContext(this.files, this.pinnedToolsText(), this.promptStore);
     context.pinned.botDefinition = botDef;
-    context.pinned.persona = await this.files.readBotStatus();
+    context.pinned.persona = botDef;
     await context.persistPinned();
 
     this.logger.info("创世完成");
-    return `创世完成。\n- ${this.files.botStatus}\n- ${this.files.worldStatus}\n- ${this.files.news}\n- ${this.files.facts}\n使用 world.start 让世界开始运转。`;
+    return `创世完成，结构化世界已写入 ${this.files.worldJournal}。\n使用 world.start 让世界开始运转。`;
   }
 
   async startWorld(): Promise<string> {
@@ -340,6 +331,8 @@ export class WorldService extends Service<Config> {
     if (!(await this.files.isInitialized())) {
       return "世界尚未初始化。请先编写定义文件并执行 world.init。";
     }
+
+    await this.world.ensureStructuredWorld();
 
     // 实际可用的工具集（如未配置 TTS 则没有 send_voice；平台扩展操作按配置开关）。
     // 置顶列表只放 core 层常驻工具；chat/channel/group 层在打开应用/进入频道时以事件展开
@@ -361,10 +354,10 @@ export class WorldService extends Service<Config> {
       `1 TU = ${this.clock.unitWorldSeconds} 秒` +
       (this.clock.syncRealTime ? "（世界时间与现实同步）" : `（现实中 ${this.clock.unitRealSeconds} 秒）`);
     await this.botContext.load();
-    if (!this.botContext.pinned.persona.trim()) {
-      this.botContext.pinned.persona = await this.files.readBotStatus();
-      await this.botContext.persistPinned();
-    }
+    // Stable authored identity; physical state comes exclusively from observe.
+    this.botContext.pinned.persona = await this.files.readText(this.files.botDef);
+    this.botContext.pinned.botDefinition = this.botContext.pinned.persona;
+    await this.botContext.persistPinned();
     // 原生多模态：附件 → content part。
     // 加载时按【当前】模态配置与格式白名单过滤：用户纠正配置后，历史事件里
     // 已不支持的附件（关掉的模态 / GIF 表情等）不再注入请求，避免持续 400。
@@ -457,7 +450,7 @@ export class WorldService extends Service<Config> {
         : []),
       ...this.config.apps.mcpServers
         .filter((s) => s.enabled && s.name.trim())
-        .map((s) => new McpApp(s, this.logger)),
+        .map((s) => new McpApp(s, this.logger, { media: this.media, renderer: this.renderer })),
     ];
     this.appManager = new AppManager(
       this.config.apps.chatAppName,
@@ -502,41 +495,25 @@ export class WorldService extends Service<Config> {
       );
     }
 
-    // 唤醒 Bot：区分创世第一刻 / 离线恢复（时间照常流逝了）/ 暂停恢复（时间静止）
+    // Recover the last durable perception before taking a fresh one. Source IDs make
+    // this a reread of prior evidence, even if the prior response was lost at shutdown.
+    const kernel = await this.world.structured.kernel();
+    const previousObservation = kernel.latestObservation("bot");
+    if (previousObservation) this.bot.pushEvent("world", JSON.stringify({ recovered: true, observation: previousObservation }));
+    this.bot.pushEvent("world", JSON.stringify(await this.world.observe()));
+    this.bot.pushEvent("system", "可以继续先前的生活。以上 recovered 观测是先前保存的记录；最新处境以随后观测为准。未完成动作需要根据实际回执确认，系统暂停本身不代表角色睡眠或失神。");
     const offline = this.clock.consumeOfflineGap();
-    if (this.botContext.stream.length === 0) {
-      this.bot.pushEvent(
-        "system",
-        `你睁开眼睛，意识逐渐清晰。这是你有意识的第一刻。当前 ${this.clock.timeLine()}。不妨先 check_status 看看自己和这个世界。`,
-      );
-    } else if (offline && offline.gapTU * this.clock.unitWorldSeconds >= 60) {
-      // 离线超过 1 世界分钟才算"意识中断"（更短的间隙用下面的"一瞬间失神"）
-      this.bot.pushEvent(
-        "system",
-        `你的意识中断了一段时间——从 ${this.clock.timeLine(offline.fromTU)} 到现在，` +
-          `过去了约 ${offline.gapTU.toFixed(1)} 个 TU（当前 ${this.clock.timeLine()}）。` +
-          `世界在此期间照常运转。进行中的动作可能已被打断，必要时重新确认状态。`,
-      );
-      // 离线足够久：由 World-LLM 补叙这段时间世界发生了什么（异步，走串行队列）
-      const min = this.config.clock.offlineNarrateMinUnits;
-      if (min > 0 && offline.gapTU >= min) {
-        void this.world
-          .resolveOfflineGap(offline.fromTU, (content) => this.bot?.pushEvent("world", content))
-          .catch((err) => this.logger.warn("离线补叙失败: %s", err));
-      }
-    } else {
-      this.bot.pushEvent(
-        "system",
-        `你回过神来——刚才似乎有一瞬间的失神。当前 ${this.clock.timeLine()}。进行中的动作可能已被打断，必要时重新确认状态。`,
-      );
+    const min = this.config.clock.offlineNarrateMinUnits;
+    if (offline && min > 0 && offline.gapTU >= min) {
+      void this.world.resolveOfflineGap(offline.fromTU, content => this.bot?.pushEvent("world", content))
+        .catch(err => this.logger.warn("离线自然过程结算失败: %s", err));
     }
 
     // 工具集与置顶列表不一致（配置变更/版本升级）：以事件告知，置顶列表在下次 rest 时才同步（保护前缀缓存）
     const toolsNotice = this.botContext.toolsChangeNotice();
     if (toolsNotice) this.bot.pushEvent("system", toolsNotice);
 
-    // 常驻 Bot 的实时事件通道：接待访客时，World-LLM 用 send_event to="bot" 把
-    // 访客与 Bot 的互动送达 Bot 本人（wake：有人当面互动应唤醒等待中的 Bot）
+    // 世界内核提交后，按常驻角色的可见性投递互动观测。
     this.world.setHostBotDeliver((content) => this.bot?.pushEvent("world", content, { wake: true }));
 
     // 旧世界 meta.json 缺 botName（新字段）：从定义补判一次（不阻塞启动，失败下次启动再试）
@@ -547,8 +524,7 @@ export class WorldService extends Service<Config> {
       this.config.clock,
       this.clock,
       this.world,
-      // Tingle 是世界主动演化的唯一入口：若世界演化出「必须 Bot 立即行动」的事件，
-      // 应能打断 Bot 的 wait / 小憩（wake: true）。真正的 rest（压缩）不设 waiting，保持不可打断。
+      // 只有实际可感知变化才会投递，避免无事发生的心跳打断休息。
       (content) => this.bot?.pushEvent("world", content, { wake: true }),
       this.logger,
     );
@@ -579,8 +555,15 @@ export class WorldService extends Service<Config> {
   }
 
   async stopWorld(opts: { suspend?: boolean } = {}): Promise<string> {
-    if (!this.worldActive) return "世界并未在运行。";
+    const wasActive = this.worldActive;
     this.worldActive = false;
+    this.world.stop();
+    this.tingle?.stop();
+    this.tingle = null;
+    await this.bot?.stop();
+    await this.crossingServer?.disconnectVisitors("世界暂停或正在切换存档");
+    await this.world.structured.shutdown();
+    if (!wasActive) return "世界并未在运行。";
     // Bot 还在异世界：礼貌地离开。标记文件保留——下次启动时向 Bot 解释"你回到了自己的世界"
     if (this.crossingClient) {
       const client = this.crossingClient;
@@ -590,9 +573,6 @@ export class WorldService extends Service<Config> {
       void client.leave().catch(() => {});
     }
     this.world.setHostBotDeliver(null);
-    this.tingle?.stop();
-    this.tingle = null;
-    await this.bot?.stop();
     this.bot = null;
     await this.appManager?.closeAll().catch(() => {});
     this.appManager = null;
@@ -648,14 +628,9 @@ export class WorldService extends Service<Config> {
     const client = new CrossingClient(target, profile, {
       // 主世界推来的事件都是冲着这位访客来的（到达场景 / to= 定向）：唤醒等待中的 Bot
       onEvent: (content) => this.bot?.pushEvent("world", content, { wake: true }),
-      // 所在世界的 World-LLM 更新了 Bot 的状态：写回本地 Bot_Status.md
-      //（与本地 World-LLM update(bot_status) 的行为对齐——静默落盘，置顶区在下次 rest 时同步）
-      onStatusUpdate: (content) => {
-        void this.files
-          .writeBotStatus(content)
-          .then(() => this.logger.info("[穿越] 所在世界更新了 Bot_Status.md（%d 字符）", content.length))
-          .catch((err) => this.logger.warn("[穿越] 写回 Bot_Status 失败: %s", err));
-      },
+      // Remote observations never overwrite the local authoritative actor or its identity.
+      onStatusUpdate: (content) => this.bot?.pushEvent("world", content, { wake: true }),
+      unitWorldSeconds: () => this.clock.unitWorldSeconds,
       onLost: (reason) => this.crossingLost(client, reason),
       logger: this.logger,
     });
@@ -781,7 +756,7 @@ export class WorldService extends Service<Config> {
   private async crossingProfile(): Promise<{ name: string; persona: string }> {
     // 名字优先级：显式配置的出行名 > 世界判定的常驻 Bot 名 > "异界来客"
     const name = this.config.crossing.botName.trim() || this.world.residentBotName || "异界来客";
-    const persona = (await this.files.readBotStatus().catch(() => "")).trim();
+    const persona = (await this.files.readText(this.files.botDef)).trim();
     return { name, persona };
   }
 
@@ -932,6 +907,14 @@ export class WorldService extends Service<Config> {
   get configSchema(): unknown {
     return Config;
   }
+
+  async getStructuredWorld(): Promise<unknown> {
+    const kernel = await this.world.structured.kernel();
+    const snapshot = kernel.snapshot();
+    return { snapshot, events: kernel.readEvents(Math.max(0, snapshot.sequence - 100), 1000) };
+  }
+
+  async getGrowth(): Promise<unknown> { return new GrowthLedger(this.files.base).recall({ n: 50 }); }
 
   getClock() {
     return this.clock ?? null;
@@ -1091,11 +1074,12 @@ export class WorldService extends Service<Config> {
     const stat = await fs.stat(snapDir).catch(() => null);
     if (!stat?.isDirectory()) throw new Error("归档不存在（仅支持文件夹形式的快照回档）");
     const wasRunning = this.worldActive;
-    if (wasRunning) await this.stopWorld();
+    await this.stopWorld();
     // 回档前自动存档当前状态，防误操作
     const backup = await this.files.snapshot("回档前");
     await this.files.restoreFrom(snapDir);
     await this.clock.load();
+    await this.world.structured.reload();
     await this.focus.load();
     await this.notifyMgr.load();
     this.phoneStatus.down = false;

@@ -53,26 +53,40 @@ export const BOT_TOOLS: BotToolDef[] = [
   },
   {
     name: "act",
-    signature: 'act(description: string, repeat?: boolean)',
+    signature: 'act(description: string, target?: string, observationId?: string, speech?: string, repeat?: boolean)',
     description:
       "在世界中做一件事，用自然语言描述。description 只写**行动本身**——简短、明确地说你" +
       "要做什么（如「去厨房泡一杯咖啡」「走到窗边看看外面」），**不要写剧情**：不要描写环境、心情，" +
-      "也不要在行动里预设结果或替别人说话。结果由世界裁定，会在动作完成时以事件返回。记得给出合理的 duration。" +
+      "也不要在行动里预设结果或替别人说话。结果由世界裁定，会在动作完成时以事件返回。记得给出合理的 duration；作用于具体对象时，target 填最近 observe 返回的 observedId，observationId 可填对应观察编号。" +
+      "要在物理世界开口说话时，speech 写你自己决定说出的逐字原话；世界只负责传播和他人的反应，不替你生成台词。" +
       "上一个相同的动作还在进行中时，重复的 act 会被拦截（结果会自动送达，无需再发起一次）；确实要同时再做一遍时加 repeat: true。",
   },
   {
     name: "rest",
     signature: "rest(duration?: number)",
     description:
-      "休息一段时间。真正疲惫（经历了很多事）时，休息会整理思绪、把近期经历总结沉淀为记忆；" +
-      "还不疲惫时只是小憩，有动静会醒。休息后会被告知过去了多少 Time Unit。感到疲惫（上下文冗长）时应主动休息。",
+      "按自己的身体状态和生活安排休息一段时间，duration 以 TU 为单位。有重要动静可提前醒来。记忆整理独立进行，不需要为了整理记忆而睡觉。",
   },
   {
     name: "check_status",
     signature: 'check_status(target: "self" | "world", full?: boolean)',
     description:
-      "查看自身状态（self）或世界状态与近期新闻（world）。默认只告诉你自上次查看以来**变化**的部分；" +
-      "需要重温全文时加 full: true。状态不会频繁变化，无事时不必反复查看。",
+      "兼容旧用法：self 观察自身，world 观察周围；与 observe 一样只提供你此刻能感知到的信息。不会提供世界全局状态或他人的秘密。",
+  },
+  {
+    name: "observe",
+    signature: "observe(target?: string, modality?: string)",
+    description: "观察自己或周围。target 可填 self 或最近观察到的 observedId；modality 可选 all（默认，周围视觉与台词）、sight（视觉）或 self（自身状态）。返回可感知实体、属性及观察句柄；看不到的对象和秘密不会出现。行动时可把 observedId 交给 act 的 target。",
+  },
+  {
+    name: "reflect",
+    signature: 'reflect(kind: "relationship" | "commitment" | "preference", subject: string, statement: string, event_ids: string[], relation?: "support" | "counter" | "revise", claim_id?: string)',
+    description: "根据亲身感知的经历形成或修正认识：关系、承诺、偏好。event_ids 引用意识流 event 的 id，至少一个；无法引用未感知的事。新认识保持暂定；已有认识用 claim_id，support 补证据、counter 记录反例、revise 修正判断。重复观察同一来源不会算新证据；单次经历不自动变成永久人格。",
+  },
+  {
+    name: "recall_growth",
+    signature: 'recall_growth(kind?: "relationship" | "commitment" | "preference", subject?: string, keyword?: string, claim_id?: string, n?: number)',
+    description: "回顾自己的关系、承诺和偏好，包括原始感知证据、反例与过去的修正。它们是可修正的主观认识，不是世界真相或不可改变的性格。",
   },
   {
     name: "check_time",
@@ -409,13 +423,13 @@ export const BOT_TOOLS: BotToolDef[] = [
   {
     name: "cancel",
     signature: "cancel(id: string)",
-    description: '取消一个尚未到期望完成时刻的工具调用（如撤回还没发出去的消息）。id 是工具调用编号（形如 "tc_12"）。',
+    description: '取消尚未提交的工具调用（如还没开始发送的消息）。已提交的操作不能保证撤销，真实结果仍会返回。id 是工具调用编号（形如 "tc_12"）。',
   },
   {
     name: "recall",
     signature: "recall(keyword?: string, since?: number, until?: number, n?: number, important?: boolean)",
     description:
-      "回忆自己的过往：翻看私人记事本（facts.jsonl）里属于你的历史与记忆——你的人生经历、性格、习惯、重要的人和事都在这里，是你说起过去时最可靠的依据。\n" +
+      "查看旧版世界作者留下的私人资料（facts.jsonl）。这些记录未经当前感知核实，可能不完整或过时，不能当作新的成长证据；可验证的关系、承诺与偏好请用 recall_growth。\n" +
       "- keyword：按关键词回想（模糊匹配内容），如 recall(keyword: \"童年\")；\n" +
       "- since / until：只回想 T（时间单位）落在该范围内的往事，填 T 的数值（可在结果里的「T=12.5」或 check_time 里看到），可只给一端；\n" +
       "- important: true：只回想那些刻骨铭心、对你影响深远的重要回忆；\n" +

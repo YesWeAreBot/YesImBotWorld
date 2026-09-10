@@ -76,6 +76,20 @@ interface VisitorSession extends VisitorInfo {
   updateStatus: (content: string) => void;
   /** 真人玩家（同部署 WebUI 驾驶舱）：World 裁定过程实时推送 event（流式剧情），而非聚合到 task_result */
   live: boolean;
+  /** 管理员操控现有常驻 Bot 的控制通道，不在世界中创建第二个角色。 */
+  residentControl: boolean;
+  ready: Promise<boolean>;
+  arrivalAbort: AbortController;
+  closed: boolean;
+  tasks: Map<string, SessionTask>;
+  cancelledTaskIds: Set<string>;
+}
+
+interface SessionTask {
+  fingerprint: string;
+  abort: AbortController;
+  promise?: Promise<void>;
+  result?: Extract<CrossingSseMsg, { type: "task_result" }>;
 }
 
 export interface CrossingServerHost {
@@ -93,6 +107,10 @@ export class CrossingServer {
   private server: http.Server | null = null;
   private sessions = new Map<string, VisitorSession>(); // token → session
   private heartbeat: NodeJS.Timeout | null = null;
+  /** 包含已从 sessions 移除、但仍在旧世界完成任务/离场的会话。 */
+  private pendingCleanups = new Set<Promise<void>>();
+  private disconnecting: Promise<void> | null = null;
+  private stopping = false;
 
   constructor(private host: CrossingServerHost) {}
 
@@ -105,6 +123,11 @@ export class CrossingServer {
     return this.host.clock()?.timeLine() ?? "";
   }
 
+  private timeUnits(): { unitWorldSeconds: number; unitRealSeconds: number } {
+    const clock = this.host.clock();
+    return { unitWorldSeconds: clock?.unitWorldSeconds ?? 1, unitRealSeconds: clock?.unitRealSeconds ?? 1 };
+  }
+
   /** 推一条剧情事件给访客，附带当前世界观时间戳 */
   private pushEvent(session: VisitorSession, content: string): void {
     this.push(session, { type: "event", content, timeLine: this.worldTimeLine() });
@@ -115,8 +138,9 @@ export class CrossingServer {
    * 状态档案进 World-LLM 系统提示的 <visitors> 区、send_event to= 定向投递、
    * update_visitor_status 状态写回。
    */
-  visitors(): { name: string; persona: string; mode: PlayerMode; deliver: (content: string) => void; updateStatus: (content: string) => void; expel: (reason: string) => void }[] {
-    return [...this.sessions.values()].map((s) => ({
+  visitors(): { id: string; name: string; persona: string; mode: PlayerMode; deliver: (content: string) => void; updateStatus: (content: string) => void; expel: (reason: string) => void }[] {
+    return [...this.sessions.values()].filter((s) => !s.residentControl).map((s) => ({
+      id: s.id,
       name: s.name,
       persona: s.persona,
       mode: s.mode ?? "cross",
@@ -141,13 +165,14 @@ export class CrossingServer {
     debug.emit("world.task", `穿越·访客「${name}」被驱逐`, { reason });
     this.host.notifyHostBot(`${name ? `「${name}」` : "一位访客"}已被这个世界排除（${reason || "死亡/消散/升天等"}），不再在场。`);
     // 清掉它尚未开始执行的 act/wait，避免"已死角色"的旧行动照常演出来
-    this.host.world.cancelPending(name);
+    this.host.world.cancelPending("visitor:" + session.id);
+    this.trackCleanup(session, false);
     // 最后一位访客离场且常驻 Bot 在外：世界重新进入沉睡
     if (this.sessions.size === 0) this.host.world.notePresenceChange();
   }
 
   visitorList(): { name: string; arrivedAt: number }[] {
-    return [...this.sessions.values()].map((s) => ({ name: s.name, arrivedAt: s.arrivedAt }));
+    return [...this.sessions.values()].filter((s) => !s.residentControl).map((s) => ({ name: s.name, arrivedAt: s.arrivedAt }));
   }
 
   /**
@@ -155,21 +180,20 @@ export class CrossingServer {
    * 其余与 handleArrive 一致：创建会话、同名顶替、触发到达叙事、通知常驻 Bot。
    */
   arrivePlayer(name: string, persona: string, mode: PlayerMode = "cross"): { ok: true; token: string; worldName: string; timeLine: string } | { ok: false; error: string } {
-    if (!this.host.ready()) return { ok: false, error: "这个世界当前未在运行，无法接待访客" };
+    if (!this.accepting()) return { ok: false, error: "这个世界当前未在运行或正在关闭会话，无法接待访客" };
     if (this.sessions.size >= Math.max(1, this.host.cfg.maxVisitors)) {
       return { ok: false, error: "这个世界的访客已满，稍后再来" };
     }
     const safeName = name.trim().slice(0, CROSSING_LIMITS.maxNameChars) || "异界来客";
     const safePersona = persona.slice(0, CROSSING_LIMITS.maxPersonaChars);
     const safeMode: PlayerMode = mode === "avatar" || mode === "puppet" ? mode : "cross";
-    const dupe = [...this.sessions.values()].find((s) => s.name === safeName);
-    if (dupe && dupe.res) {
-      return { ok: false, error: `已有同名访客「${safeName}」在场` };
+    const residentControl = safeMode !== "cross" && safeName === this.host.world.residentBotName;
+    if (safeMode !== "cross" && !residentControl) {
+      return { ok: false, error: "目前只支持穿越独立角色；已有 NPC 的扮演/操纵尚未实现实体授权绑定。管理员仍可同名接管常驻 Bot。" };
     }
+    const dupe = [...this.sessions.values()].find((s) => s.name === safeName);
     if (dupe) {
-      this.sessions.delete(dupe.token);
-      this.closeSession(dupe);
-      this.host.logger.info("[穿越] 玩家「%s」重连，顶替断线的旧会话", safeName);
+      return { ok: false, error: `已有同名访客「${safeName}」在场` };
     }
     const session: VisitorSession = {
       id: crypto.randomUUID(),
@@ -183,6 +207,12 @@ export class CrossingServer {
       absenceTimer: null,
       arrivedAt: Date.now(),
       live: true,
+      residentControl,
+      ready: Promise.resolve(false),
+      arrivalAbort: new AbortController(),
+      closed: false,
+      tasks: new Map(),
+      cancelledTaskIds: new Set(),
       updateStatus: (content: string) => {
         session.persona = content.slice(0, CROSSING_LIMITS.maxPersonaChars);
         this.push(session, { type: "status_update", content });
@@ -193,18 +223,14 @@ export class CrossingServer {
     const timeLine = this.host.clock()?.timeLine() ?? "";
     this.host.logger.info("[穿越] 玩家「%s」入世界", safeName);
     debug.emit("world.task", `穿越·玩家「${safeName}」入世界`, {});
-    this.host.notifyHostBot(playerArriveNotice(safeName, safeMode));
-    void this.host.world
-      .wakeDormant()
-      .catch((err) => this.host.logger.warn("[穿越] 沉睡补叙失败: %s", err));
-    void this.host.world
-      .visitorArrive(session, (content) => this.pushEvent(session, content))
-      .catch((err) => this.host.logger.warn("[穿越] 玩家到达叙事失败: %s", err));
+    if (!residentControl) this.host.notifyHostBot(playerArriveNotice(safeName, safeMode));
+    session.ready = this.initializeSession(session);
     return { ok: true, token: session.token, worldName: this.worldName, timeLine };
   }
 
   async start(): Promise<void> {
     if (this.server) return;
+    this.stopping = false;
     this.server = http.createServer((req, res) => {
       void this.handle(req, res).catch((err) => {
         try {
@@ -237,20 +263,38 @@ export class CrossingServer {
   }
 
   async stop(): Promise<void> {
+    this.stopping = true;
     if (this.heartbeat) clearInterval(this.heartbeat);
     this.heartbeat = null;
+    await this.disconnectVisitors("主世界的穿越服务关闭了");
     this.host.world.setVisitorsProvider(null);
-    for (const s of [...this.sessions.values()]) {
-      this.push(s, { type: "farewell", reason: "主世界的穿越服务关闭了" });
-      this.closeSession(s);
-    }
-    this.sessions.clear();
     const server = this.server;
     this.server = null;
     if (server) {
       server.closeAllConnections?.();
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
+  }
+
+  /** 等待所有旧世界工作收尾；保留监听器，供暂停后恢复/切换存档继续使用。 */
+  disconnectVisitors(reason: string): Promise<void> {
+    if (this.disconnecting) return this.disconnecting;
+    const drain = Promise.resolve().then(async () => {
+      for (const session of [...this.sessions.values()]) {
+        this.push(session, { type: "farewell", reason });
+        this.depart(session, "lost");
+      }
+      // depart/expel 在移除 token 后仍保留清理屏障，不能只检查 sessions.size。
+      await Promise.all([...this.pendingCleanups]);
+    });
+    this.disconnecting = drain;
+    // 失败时保持拒绝接待；调用方不得继续切换到新世界。
+    void drain.then(() => { if (this.disconnecting === drain) this.disconnecting = null; }, () => {});
+    return drain;
+  }
+
+  private accepting(): boolean {
+    return !this.stopping && !this.disconnecting && this.host.ready();
   }
 
   // ---------- HTTP ----------
@@ -261,7 +305,7 @@ export class CrossingServer {
    * 上游收到的是 /world/crossing/arrive）。
    */
   private endpointOf(pathname: string): string | null {
-    const m = pathname.match(/(?:^|\/)crossing\/(arrive|events|task|leave|ping)\/?$/);
+    const m = pathname.match(/(?:^|\/)crossing\/(arrive|events|task|cancel|leave|ping)\/?$/);
     return m ? m[1]! : null;
   }
 
@@ -273,13 +317,15 @@ export class CrossingServer {
     if (ep === "arrive" && method === "POST") return this.handleArrive(req, res);
     if (ep === "events" && method === "GET") return this.handleEvents(url, req, res);
     if (ep === "task" && method === "POST") return this.handleTask(req, res);
+    if (ep === "cancel" && method === "POST") return this.handleCancel(req, res);
     if (ep === "leave" && method === "POST") return this.handleLeave(req, res);
     if (ep === "ping" && method === "GET") {
       return void sendJSON(res, 200, {
         ok: true,
         service: "yesimbot-world-crossing",
         worldName: this.worldName,
-        accepting: this.host.ready(),
+        accepting: this.accepting(),
+        ...this.timeUnits(),
       });
     }
     // 其余 GET 请求（浏览器直接访问任意路径）：引导页——检验网络联通 + 指引对方配置
@@ -297,19 +343,16 @@ export class CrossingServer {
     const code = String(body.code ?? "").trim();
     const invite = this.host.cfg.invites.find((i) => i.enabled && i.code && i.code === code);
     if (!invite) return void sendJSON(res, 403, { error: "邀请码无效或已被吊销" });
-    if (!this.host.ready()) return void sendJSON(res, 503, { error: "这个世界当前未在运行，无法接待访客" });
+    if (body.mode != null && body.mode !== "cross") return void sendJSON(res, 400, { error: "跨部署访客目前只支持 cross，已有角色的控制权转移尚未实现" });
+    if (!this.accepting()) return void sendJSON(res, 503, { error: "这个世界当前未在运行或正在关闭会话，无法接待访客" });
     if (this.sessions.size >= Math.max(1, this.host.cfg.maxVisitors)) {
       return void sendJSON(res, 429, { error: "这个世界的访客已满，稍后再来" });
     }
     const name = String(body.name ?? "").trim().slice(0, CROSSING_LIMITS.maxNameChars) || "异界来客";
     const dupe = [...this.sessions.values()].find((s) => s.name === name);
     if (dupe) {
-      // 旧会话仍有活跃 SSE 连接：真正的同名冲突，拒绝
-      if (dupe.res) return void sendJSON(res, 409, { error: `已有同名访客「${name}」在场` });
-      // 旧会话已断线（多半是访客进程重启后重连）：静默顶替，不做离场叙事
-      this.sessions.delete(dupe.token);
-      this.closeSession(dupe);
-      this.host.logger.info("[穿越] 访客「%s」重连，顶替断线的旧会话", name);
+      // 名字不是认证凭据，断线不能允许另一客户端顶替原会话。
+      return void sendJSON(res, 409, { error: `已有同名访客「${name}」在场，请用原会话令牌重连或等待其离开` });
     }
     const persona = String(body.persona ?? "").slice(0, CROSSING_LIMITS.maxPersonaChars);
     const session: VisitorSession = {
@@ -324,6 +367,12 @@ export class CrossingServer {
       absenceTimer: null,
       arrivedAt: Date.now(),
       live: false,
+      residentControl: false,
+      ready: Promise.resolve(false),
+      arrivalAbort: new AbortController(),
+      closed: false,
+      tasks: new Map(),
+      cancelledTaskIds: new Set(),
       updateStatus: (content: string) => {
         // 同步会话内 persona（后续任务的前言用最新状态）并回传访客世界持久化
         session.persona = content.slice(0, CROSSING_LIMITS.maxPersonaChars);
@@ -333,7 +382,7 @@ export class CrossingServer {
     this.sessions.set(session.token, session);
     this.armAbsence(session);
     const timeLine = this.host.clock()?.timeLine() ?? "";
-    sendJSON(res, 200, { ok: true, token: session.token, worldName: this.worldName, timeLine });
+    sendJSON(res, 200, { ok: true, token: session.token, visitorId: session.id, worldName: this.worldName, timeLine, ...this.timeUnits(), protocolVersion: 2 });
     this.host.logger.info("[穿越] 访客「%s」到达（邀请码备注：%s）", name, invite.name || "未备注");
     debug.emit("world.task", `穿越·访客「${name}」到达`, { invite: invite.name });
 
@@ -341,12 +390,24 @@ export class CrossingServer {
     // 世界若在沉睡（常驻 Bot 外出、此前无访客），先补叙沉睡期间的演化再接待
     // （两个任务同步入队，串行队列保证先后顺序）
     this.host.notifyHostBot(`一位异世界的访客「${name}」穿越降临到了这个世界。`);
-    void this.host.world
-      .wakeDormant()
-      .catch((err) => this.host.logger.warn("[穿越] 沉睡补叙失败: %s", err));
-    void this.host.world
-      .visitorArrive(session, (content) => this.pushEvent(session, content))
-      .catch((err) => this.host.logger.warn("[穿越] 到达叙事失败: %s", err));
+    session.ready = this.initializeSession(session);
+  }
+
+  private async initializeSession(session: VisitorSession): Promise<boolean> {
+    try {
+      if (session.residentControl) {
+        this.pushEvent(session, JSON.stringify(await this.host.world.structured.observe("bot")));
+        return !session.closed;
+      }
+      await this.host.world.wakeDormant();
+      if (session.closed) return false;
+      return await this.host.world.visitorArrive(session, (content) => {
+        if (!session.closed) this.pushEvent(session, content);
+      }, session.arrivalAbort.signal);
+    } catch (err) {
+      this.host.logger.warn("[穿越] 到达初始化失败: %s", err);
+      return false;
+    }
   }
 
   private handleEvents(url: URL, req: http.IncomingMessage, res: http.ServerResponse): void {
@@ -368,7 +429,7 @@ export class CrossingServer {
     if (session.absenceTimer) clearTimeout(session.absenceTimer);
     session.absenceTimer = null;
     const timeLine = this.host.clock()?.timeLine() ?? "";
-    res.write(sseFrame({ type: "hello", worldName: this.worldName, timeLine }));
+    res.write(sseFrame({ type: "hello", worldName: this.worldName, timeLine, visitorId: session.id, ...this.timeUnits() }));
     // 补发离线期间暂存的消息
     for (const msg of session.outbox.splice(0)) res.write(sseFrame(msg));
     req.on("close", () => {
@@ -382,27 +443,71 @@ export class CrossingServer {
   private async handleTask(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     const body = await readJSON(req);
     const session = this.sessions.get(String(body.token ?? ""));
-    if (!session) return void sendJSON(res, 403, { error: "会话不存在或已结束" });
-    const taskId = String(body.taskId ?? "").slice(0, 64);
+    if (!session || session.closed) return void sendJSON(res, 403, { error: "会话不存在或已结束" });
+    const taskId = String(body.taskId ?? "");
     const kind = String(body.kind ?? "") as CrossingTaskKind;
-    if (!taskId || !["act", "wait", "checkTime", "query"].includes(kind)) {
+    if (!taskId || taskId.length > 64 || !["act", "wait", "checkTime", "query", "observe"].includes(kind)) {
       return void sendJSON(res, 400, { error: "taskId / kind 无效" });
+    }
+    if (!body.payload || typeof body.payload !== "object" || Array.isArray(body.payload)) {
+      return void sendJSON(res, 400, { error: "payload 必须是对象" });
+    }
+    const payload = body.payload as CrossingTaskPayload;
+    try {
+      if (kind === "act") this.taskDuration(payload.durationWorldSeconds, payload.duration);
+      if (kind === "wait") this.taskDuration(payload.waitWorldSeconds, payload.n);
+    } catch (err) { return void sendJSON(res, 400, { error: String(err) }); }
+    if (session.cancelledTaskIds.has(taskId)) return void sendJSON(res, 409, { error: "该 taskId 已在接收前取消" });
+    const fingerprint = JSON.stringify([kind, Object.fromEntries(Object.entries(payload).sort(([a], [b]) => a.localeCompare(b)))]);
+    const existing = session.tasks.get(taskId);
+    if (existing) {
+      if (existing.fingerprint !== fingerprint) return void sendJSON(res, 409, { error: "同一 taskId 不得提交不同任务" });
+      sendJSON(res, 200, { ok: true, duplicate: true, ...this.timeUnits() });
+      if (existing.result) this.push(session, existing.result);
+      return;
     }
     if (session.pendingTasks >= CROSSING_LIMITS.maxPendingTasks) {
       return void sendJSON(res, 429, { error: "待处理任务过多，稍后再试" });
     }
-    const payload = (body.payload ?? {}) as CrossingTaskPayload;
-    sendJSON(res, 200, { ok: true });
-
+    // 保留已完成 id，防止迟到重试重复执行。满额后要求建立新会话，而非丢掉去重记录。
+    if (session.tasks.size + session.cancelledTaskIds.size >= 4096) return void sendJSON(res, 429, { error: "会话任务记录已满，请离开后重新进入" });
+    const task: SessionTask = { fingerprint, abort: new AbortController() };
+    session.tasks.set(taskId, task);
     session.pendingTasks++;
-    void this.runTask(session, taskId, kind, payload)
+    sendJSON(res, 200, { ok: true, ...this.timeUnits() });
+    task.promise = this.runTask(session, taskId, kind, payload, task)
       .catch((err) => {
         this.host.logger.warn("[穿越] 访客「%s」任务 %s 失败: %s", session.name, kind, err);
-        this.push(session, { type: "task_result", taskId, ok: false, content: "" });
+        task.result = { type: "task_result", taskId, ok: false, content: task.abort.signal.aborted ? "取消请求已处理；已提交的变更不会回滚，请重新观察确认状态。" : "主世界任务失败。" };
+        if (!session.closed) this.push(session, task.result);
       })
-      .finally(() => {
-        session.pendingTasks--;
-      });
+      .finally(() => { session.pendingTasks--; });
+  }
+
+  /** 新协议用世界秒，旧 duration/n 明确按主世界 TU 解读。 */
+  private taskDuration(worldSeconds: unknown, legacyUnits: unknown): number {
+    const value = Number(worldSeconds ?? legacyUnits ?? 0);
+    if (!Number.isFinite(value) || value < 0) throw new Error("时长必须为有限非负数");
+    return worldSeconds != null ? value / this.timeUnits().unitWorldSeconds : value;
+  }
+
+  private async handleCancel(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    const body = await readJSON(req);
+    const session = this.sessions.get(String(body.token ?? ""));
+    if (!session) return void sendJSON(res, 403, { error: "会话不存在或已结束" });
+    const taskId = String(body.taskId ?? "");
+    if (!taskId || taskId.length > 64) return void sendJSON(res, 400, { error: "taskId 无效" });
+    const task = session.tasks.get(taskId);
+    if (!task) {
+      if (session.tasks.size + session.cancelledTaskIds.size >= 4096) return void sendJSON(res, 429, { error: "会话任务记录已满" });
+      // cancel 可能比 task 请求先到；保留墓碑阻止稍后到达的任务执行。
+      session.cancelledTaskIds.add(taskId);
+      return void sendJSON(res, 200, { ok: true, status: "cancellation_requested" });
+    }
+    if (task.result) return void sendJSON(res, 200, { ok: false, status: "too_late", result: task.result });
+    task.abort.abort();
+    // 请求中止不等于回滚已提交状态；客户端必须以最终 task_result 为准。
+    sendJSON(res, 200, { ok: true, status: "cancellation_requested" });
   }
 
   private async runTask(
@@ -410,33 +515,48 @@ export class CrossingServer {
     taskId: string,
     kind: CrossingTaskKind,
     payload: CrossingTaskPayload,
+    task: SessionTask,
   ): Promise<void> {
+    if (!await session.ready) throw new Error("访客到达初始化尚未成功");
+    task.abort.signal.throwIfAborted();
+    if (session.closed) throw new Error("访客已离开");
     const clip = (s: unknown) => String(s ?? "").slice(0, CROSSING_LIMITS.maxTaskChars);
     const parts: string[] = [];
-    // deliver：真人玩家（live）实时推送每段 send_event（流式剧情）；
-    // 跨部署 Bot 访客保持原来的「收集后聚合到 task_result」（一次 deliver 进意识流）
     const deliver = (content: string) => {
       parts.push(content);
-      if (session.live) this.pushEvent(session, content);
+      if (session.live && !session.closed) this.pushEvent(session, content);
     };
-    this.host.logger.info("[穿越] 访客「%s」任务 %s 开始（kind=%s, live=%s）", session.name, taskId, kind, session.live);
     let ok = false;
+    if (session.residentControl) {
+      if (kind === "act" || kind === "wait") throw new Error("请通过管理员 Bot 工具代理操控常驻 Bot");
+      parts.push(JSON.stringify(await this.host.world.structured.observe("bot", { target: payload.target, modality: payload.modality })));
+      task.result = { type: "task_result", taskId, ok: true, content: parts.join("\n") };
+      if (!session.closed) this.push(session, task.result);
+      return;
+    }
     if (kind === "act") {
-      ok = await this.host.world.visitorAct(session, clip(payload.desc), Number(payload.duration) || 0, deliver);
+      ok = await this.host.world.visitorAct(session, clip(payload.desc), this.taskDuration(payload.durationWorldSeconds, payload.duration), deliver, task.abort.signal, taskId, {
+        ...(payload.speech ? { speech: clip(payload.speech) } : {}),
+        ...(payload.target ? { target: clip(payload.target) } : {}),
+        ...(payload.observationId ? { observationId: clip(payload.observationId) } : {}),
+      });
     } else if (kind === "wait") {
-      ok = await this.host.world.visitorWait(session, Number(payload.n) || 0, deliver);
+      ok = await this.host.world.visitorWait(session, this.taskDuration(payload.waitWorldSeconds, payload.n), deliver, task.abort.signal, taskId);
     } else if (kind === "checkTime") {
       ok = await this.host.world.visitorCheckTime(session, deliver);
+    } else if (kind === "observe") {
+      const observation = await this.host.world.structured.observe("visitor:" + session.id, {
+        ...(payload.target ? { target: clip(payload.target) } : {}),
+        ...(payload.modality ? { modality: clip(payload.modality) } : {}),
+      });
+      parts.push(JSON.stringify(observation));
+      ok = true;
     } else {
-      try {
-        parts.push(await this.host.world.visitorQuery(session, clip(payload.task)));
-        ok = true;
-      } catch {
-        ok = false;
-      }
+      parts.push(await this.host.world.visitorQuery(session, clip(payload.task)));
+      ok = true;
     }
-    this.host.logger.info("[穿越] 访客「%s」任务 %s 完成（ok=%s, parts=%d, 正在推 task_result）", session.name, taskId, ok, parts.length);
-    this.push(session, { type: "task_result", taskId, ok, content: parts.join("\n") });
+    task.result = { type: "task_result", taskId, ok, content: parts.join("\n") };
+    if (!session.closed) this.push(session, task.result);
   }
 
   private async handleLeave(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
@@ -455,17 +575,31 @@ export class CrossingServer {
     this.closeSession(session);
     this.host.logger.info("[穿越] 访客「%s」离开（%s，mode=%s）", session.name, cause, session.mode ?? "cross");
     debug.emit("world.task", `穿越·访客「${session.name}」离开`, { cause, mode: session.mode ?? "cross" });
-    this.host.notifyHostBot(playerLeaveNotice(session.name, session.mode ?? "cross", cause));
+    if (!session.residentControl) this.host.notifyHostBot(playerLeaveNotice(session.name, session.mode ?? "cross", cause));
     // 先清掉该玩家尚未开始执行的 act/wait（避免它离开后，队列里的旧行动还照常演一遍）
-    this.host.world.cancelPending(session.name);
-    void this.host.world
-      .visitorLeave(session)
-      .catch((err) => this.host.logger.warn("[穿越] 离开善后失败: %s", err));
+    if (!session.residentControl) {
+      this.host.world.cancelPending("visitor:" + session.id);
+    }
+    this.trackCleanup(session, !session.residentControl);
     // 最后一位访客离开且常驻 Bot 也在外：世界重新进入沉睡
     if (this.sessions.size === 0) this.host.world.notePresenceChange();
   }
 
+  private trackCleanup(session: VisitorSession, leave: boolean): void {
+    const cleanup = (async () => {
+      await session.ready;
+      await Promise.all([...session.tasks.values()].map((task) => task.promise));
+      if (leave) await this.host.world.visitorLeave(session);
+    })();
+    this.pendingCleanups.add(cleanup);
+    // 拒绝的清理保留在集合中，让后续 disconnect 明确失败，避免覆盖新世界。
+    void cleanup.then(() => this.pendingCleanups.delete(cleanup), (err) => {
+      this.host.logger.warn("[穿越] 离开善后失败: %s", err);
+    });
+  }
+
   private armAbsence(session: VisitorSession): void {
+    if (session.closed) return;
     if (session.absenceTimer) clearTimeout(session.absenceTimer);
     session.absenceTimer = setTimeout(() => this.depart(session, "lost"), ABSENCE_MS);
   }
@@ -484,6 +618,9 @@ export class CrossingServer {
   }
 
   private closeSession(session: VisitorSession): void {
+    session.closed = true;
+    session.arrivalAbort.abort();
+    for (const task of session.tasks.values()) if (!task.result) task.abort.abort();
     if (session.absenceTimer) clearTimeout(session.absenceTimer);
     session.absenceTimer = null;
     try {
@@ -501,7 +638,7 @@ export class CrossingServer {
    */
   private guidePage(): string {
     const name = escapeHtml(this.worldName);
-    const accepting = this.host.ready();
+    const accepting = this.accepting();
     const visitors = this.sessions.size;
     const max = Math.max(1, this.host.cfg.maxVisitors);
     const statusText = accepting

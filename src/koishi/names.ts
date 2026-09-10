@@ -1,5 +1,6 @@
 import type { Context } from "koishi";
 import type { MessageStore } from "./messages.js";
+import { parseChannelKey } from "./channels.js";
 
 /**
  * 频道显示名解析：把 "platform:channelId" 渲染成对 Bot 友好的形式——
@@ -31,26 +32,24 @@ export class ChannelNameResolver {
   }
 
   private async resolve(key: string): Promise<string> {
-    const sep = key.indexOf(":");
-    if (sep <= 0) return key;
-    const platform = key.slice(0, sep);
-    const channelId = key.slice(sep + 1);
+    const { platform, channelId, selfId, error } = parseChannelKey(key);
+    if (error) return key;
     // 权威私聊标记：优先消息记录里的 isDirect，读不到回退 onebot 的 private: 前缀约定
-    const isDirect = (await this.lookupIsDirect(platform, channelId)) ?? channelId.startsWith("private:");
+    const isDirect = (await this.lookupIsDirect(platform, channelId, selfId)) ?? channelId.startsWith("private:");
     if (isDirect) {
       const userId = channelId.startsWith("private:") ? channelId.slice("private:".length) : channelId;
-      const name = await this.peerName(platform, userId);
+      const name = await this.peerName(platform, userId, selfId);
       return name && name !== userId ? `与${name}的私聊(${key})` : key;
     }
-    const name = await this.groupName(platform, channelId);
+    const name = await this.groupName(platform, channelId, selfId);
     return name && name !== channelId ? `${name}(${key})` : key;
   }
 
   /** 从消息记录查该频道的私聊标记（platform:channelId 精确匹配），查不到返回 null */
-  private async lookupIsDirect(platform: string, channelId: string): Promise<boolean | null> {
+  private async lookupIsDirect(platform: string, channelId: string, selfId?: string): Promise<boolean | null> {
     try {
       const channels = await this.store.knownChannels();
-      const hit = channels.find((c) => c.platform === platform && c.channelId === channelId);
+      const hit = channels.find((c) => c.platform === platform && c.channelId === channelId && (!selfId || c.selfId === selfId));
       if (hit) return hit.isDirect;
     } catch {
       /* 查询失败回退 */
@@ -58,16 +57,17 @@ export class ChannelNameResolver {
     return null;
   }
 
-  private bot(platform: string) {
-    return this.ctx.bots.find((b) => b.platform === platform);
+  private bot(platform: string, selfId?: string) {
+    const candidates = this.ctx.bots.filter((b) => b.platform === platform && (!selfId || b.selfId === selfId));
+    return candidates.length === 1 ? candidates[0] : undefined;
   }
 
   /** 私聊对方的名字：消息记录里的名字优先（零成本），退回平台的用户资料接口 */
-  private async peerName(platform: string, userId: string): Promise<string> {
+  private async peerName(platform: string, userId: string, selfId?: string): Promise<string> {
     try {
       const channels = await this.store.knownChannels();
       for (const c of channels) {
-        if (c.platform !== platform) continue;
+        if (c.platform !== platform || (selfId && c.selfId !== selfId)) continue;
         const hit = c.participants.find((p) => p.userId === userId && p.username);
         if (hit) return hit.username;
       }
@@ -75,7 +75,7 @@ export class ChannelNameResolver {
       /* 查询失败继续尝试平台 API */
     }
     try {
-      const user = await this.bot(platform)?.getUser?.(userId);
+      const user = await this.bot(platform, selfId)?.getUser?.(userId);
       const name = user?.nick || user?.name;
       if (name) return name;
     } catch {
@@ -85,8 +85,8 @@ export class ChannelNameResolver {
   }
 
   /** 群名：getChannel 优先（satori 标准），退回 getGuild（OneBot 群的 channelId 即 guildId） */
-  private async groupName(platform: string, channelId: string): Promise<string> {
-    const bot = this.bot(platform);
+  private async groupName(platform: string, channelId: string, selfId?: string): Promise<string> {
+    const bot = this.bot(platform, selfId);
     if (!bot) return "";
     try {
       const channel = await bot.getChannel?.(channelId);

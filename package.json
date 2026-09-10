@@ -29,7 +29,8 @@
   "scripts": {
     "build": "pkgroll --sourcemap",
     "check": "tsc --noEmit",
-    "prepublishOnly": "npm run check && npm run build"
+    "prepublishOnly": "npm run check && npm run build",
+    "test": "node scripts/test.mjs"
   },
   "dependencies": {
     "rfb2": "0.2.2",

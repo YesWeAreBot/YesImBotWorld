@@ -481,27 +481,7 @@ export class FileManagerApp implements WorldApp {
   }
 
   private async virtualWrite(args: Record<string, unknown>, action: string): Promise<string> {
-    const rawPath = args.path ?? args.file ?? args.patch;
-    const what = String(rawPath ?? "").trim() || "目标文件";
-    const actText =
-      action === "write"
-        ? `写入/修改文件 ${what}`
-        : action === "patch"
-          ? `对文件 ${what} 应用补丁`
-          : action === "mkdir"
-            ? `新建目录 ${what}`
-            : `删除 ${what}`;
-    const task =
-      `Bot 在自己电脑上的资源管理器里执行了「${actText}」（当前 ${this.clock.timeLine()}）。\n` +
-      `请扮演这台电脑，用一两句符合世界观的话描述屏幕上反馈的结果（成功/失败/权限不足等）：\n` +
-      `1. check world_status 保持设定一致（这个世界有没有电脑、这个目录/文件是否应该存在、Bot 有没有权限）；\n` +
-      `2. 只输出屏幕上显示的内容，不要解释或旁白。`;
-    try {
-      return await this.world.query(task);
-    } catch (err) {
-      this.logger.warn("虚构资源管理器操作结果生成失败: %s", err);
-      return "（资源管理器好像没有反应。）";
-    }
+    return this.world.executeAppAction("在角色实际可用的虚构电脑上执行文件操作；只能改变已存在设备内的结构化文件，保留精确文件内容。请求=" + JSON.stringify({ action, ...args }));
   }
 
   private async isRealWorld(): Promise<boolean> {

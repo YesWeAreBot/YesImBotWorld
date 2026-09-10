@@ -24,6 +24,7 @@ import type { ChannelNameResolver } from "./names.js";
 import type { NotifyManager } from "./notify.js";
 import type { OwnSendTracker } from "./ownsends.js";
 import type { RequestStore } from "./requests.js";
+import { channelKey as makeChannelKey, parseChannelKey } from "./channels.js";
 
 /** msg 中的内联媒体标记：Bot 会照抄事件里见到的 [图片#12]、[视频#3：描述] 等形式 */
 const INLINE_MEDIA = /\[(图片|视频|音频|语音)#(\d+)[^\]]*\]/g;
@@ -117,7 +118,7 @@ export class KoishiMessenger implements MessengerApi {
     const resolved = await this.resolveChannel(id);
     if ("error" in resolved) return resolved;
     return {
-      key: `${resolved.platform}:${resolved.channelId}`,
+      key: makeChannelKey(resolved.platform, resolved.channelId, resolved.selfId),
       isPrivate: resolved.isDirect,
     };
   }
@@ -139,11 +140,11 @@ export class KoishiMessenger implements MessengerApi {
   async channelMessages(id: string, n: number, opts?: { intro?: "open" | "read" | "echo" }): Promise<RichText> {
     const resolved = await this.resolveChannel(id);
     if ("error" in resolved) return { text: resolved.error };
-    const { platform, channelId } = resolved;
+    const { platform, channelId, selfId } = resolved;
     // 打开频道 = 开始关注：一段时间内该频道的新消息会直接呈现内容
-    await this.focus.focus(`${platform}:${channelId}`);
-    const display = await this.names.display(`${platform}:${channelId}`);
-    const rows = await this.store.channelMessages(platform, channelId, n);
+    await this.focus.focus(makeChannelKey(platform, channelId, selfId));
+    const display = await this.names.display(makeChannelKey(platform, channelId, selfId));
+    const rows = await this.store.channelMessages(platform, channelId, n, selfId);
     if (!rows.length) return { text: `频道 ${display} 里还没有任何消息记录。` };
 
     const attachments: MediaRef[] = [];
@@ -182,7 +183,7 @@ export class KoishiMessenger implements MessengerApi {
       : "";
     // 打开群聊页时自查禁言状态（像 QQ 顶部的禁言横幅）：
     // 即使禁言发生在插件离线期间（notice 没被捕获），Bot 也能在这里发现
-    const bot = this.ctx.bots.find((b) => b.platform === platform);
+    const bot = this.ctx.bots.find((b) => b.platform === platform && (!selfId || b.selfId === selfId));
     if (bot) {
       const mute = await this.muteHint({ bot, platform, channelId });
       if (mute) tail += `\n（${mute}，禁言解除前没法在这个群里发消息）`;
@@ -498,7 +499,7 @@ export class KoishiMessenger implements MessengerApi {
     // 在实际发出时刻检查（而非生成时刻）——打字期间对方回复了就不拦。
     const coldLimit = this.messaging.coldChannelMsgs;
     if (coldLimit > 0 && !insist) {
-      const recent = await this.store.channelMessages(target.platform, target.channelId, coldLimit);
+      const recent = await this.store.channelMessages(target.platform, target.channelId, coldLimit, target.bot.selfId);
       if (recent.length >= coldLimit && recent.every((r) => r.self)) {
         return (
           `（消息没有发出：你已经连着给 ${id} 发了至少 ${recent.length} 条消息，对方一直没有回应。` +
@@ -528,7 +529,7 @@ export class KoishiMessenger implements MessengerApi {
       try {
         const channels = await this.store.knownChannels();
         participants =
-          channels.find((c) => c.platform === target.platform && c.channelId === target.channelId)
+          channels.find((c) => c.platform === target.platform && c.channelId === target.channelId && c.selfId === target.bot.selfId)
             ?.participants ?? [];
       } catch {
         participants = [];
@@ -569,7 +570,7 @@ export class KoishiMessenger implements MessengerApi {
       stored += `[引用 msg:${replyTo}] `;
       if (target.isDirect) atSender = false;
       if (atSender) {
-        const quoted = await this.store.findByMessageId(target.platform, target.channelId, replyTo);
+        const quoted = await this.store.findByMessageId(target.platform, target.channelId, replyTo, target.bot.selfId);
         if (quoted && !quoted.self && quoted.userId) {
           elements.push(h("at", { id: quoted.userId, name: quoted.username || undefined }), h.text(" "));
           stored += `@${quoted.username || quoted.userId} `;
@@ -632,7 +633,7 @@ export class KoishiMessenger implements MessengerApi {
     if (stickerElements.length) batches.push(stickerElements);
 
     const sentMsgIds: string[] = [];
-    const channelKey = `${target.platform}:${target.channelId}`;
+    const channelKey = makeChannelKey(target.platform, target.channelId, target.bot.selfId);
     for (let bi = 0; bi < batches.length; bi++) {
       const batch = batches[bi]!;
       const isStickerBatch = batch === stickerElements;
@@ -716,17 +717,17 @@ export class KoishiMessenger implements MessengerApi {
     }
 
     let msgIds: string[] = [];
-    this.ownSends.expect(`${target.platform}:${target.channelId}`);
+    this.ownSends.expect(makeChannelKey(target.platform, target.channelId, target.bot.selfId));
     try {
       msgIds = await target.bot.sendMessage(target.channelId, element);
     } catch (err) {
-      this.ownSends.unexpect(`${target.platform}:${target.channelId}`);
+      this.ownSends.unexpect(makeChannelKey(target.platform, target.channelId, target.bot.selfId));
       const mute = await this.muteHint(target);
       if (mute) return `（文件没发出去：${mute}，禁言解除前没法在这个群里发东西。）`;
       return `（文件发送失败：${sendFailText(err)}）`;
     }
     await this.storeSelf(target, stored, msgIds[0]);
-    await this.focus.focus(`${target.platform}:${target.channelId}`);
+    await this.focus.focus(makeChannelKey(target.platform, target.channelId, target.bot.selfId));
     return `文件已发送到 ${id}。`;
   }
 
@@ -743,14 +744,14 @@ export class KoishiMessenger implements MessengerApi {
       return `（语音合成失败：${(err as Error).message ?? err}）`;
     }
     let msgIds: string[] = [];
-    this.ownSends.expect(`${target.platform}:${target.channelId}`);
+    this.ownSends.expect(makeChannelKey(target.platform, target.channelId, target.bot.selfId));
     try {
       msgIds = await target.bot.sendMessage(
         target.channelId,
         h("audio", { src: toDataUrl(audio.data, audio.mime) }),
       );
     } catch (err) {
-      this.ownSends.unexpect(`${target.platform}:${target.channelId}`);
+      this.ownSends.unexpect(makeChannelKey(target.platform, target.channelId, target.bot.selfId));
       const mute = await this.muteHint(target);
       if (mute) return `（语音没发出去：${mute}，禁言解除前没法在这个群里发东西。）`;
       return `（语音发送失败：${sendFailText(err)}）`;
@@ -761,7 +762,7 @@ export class KoishiMessenger implements MessengerApi {
     const stored =
       mediaId !== null ? `${mediaPlaceholder(mediaId, "audio")}（语音内容：${text}）` : `[语音] ${text}`;
     await this.storeSelf(target, stored, msgIds[0]);
-    await this.focus.focus(`${target.platform}:${target.channelId}`);
+    await this.focus.focus(makeChannelKey(target.platform, target.channelId, target.bot.selfId));
     return `语音已发送到 ${id}：「${text}」`;
   }
 
@@ -838,7 +839,7 @@ export class KoishiMessenger implements MessengerApi {
     const ids = msgIds.slice(0, 50);
     const messages = ids.map((m) => ({ type: "node", data: { id: toIdValue(m) } }));
     const isPrivate = target.isDirect;
-    const key = `${target.platform}:${target.channelId}`;
+    const key = makeChannelKey(target.platform, target.channelId, target.bot.selfId);
     this.ownSends.expect(key);
     let data: Record<string, unknown>;
     try {
@@ -892,7 +893,7 @@ export class KoishiMessenger implements MessengerApi {
     let lastErr = "";
     if (!nodes) {
       const bot = this.findOnebot();
-      if (!bot) return { text: "（查看聊天记录目前只支持 QQ（OneBot）平台，但当前没有在线的 OneBot 账号。）" };
+      if (!bot) return { text: "（查看聊天记录目前只支持 QQ（OneBot）平台，但当前没有唯一可确定的在线 OneBot 账号。）" };
       // 依次尝试：message_id（NapCat 按所在消息取）→ id（resid，go-cqhttp/旧记录）。
       // 不能同时传：部分实现端优先读 id，resid 失效时会直接报错、轮不到 message_id
       for (const params of [{ message_id: toIdValue(rawId) }, { id: rawId }]) {
@@ -1016,7 +1017,7 @@ export class KoishiMessenger implements MessengerApi {
   /** 识别图片中的文字（OCR，仅 OneBot） */
   async ocrImage(image: string): Promise<string> {
     const bot = this.findOnebot();
-    if (!bot) return "（图片文字识别目前只支持 QQ（OneBot）平台，但没有可用的 OneBot 账号。）";
+    if (!bot) return "（图片文字识别目前只支持 QQ（OneBot）平台，但没有唯一可确定的在线 OneBot 账号（多账号的全局资料操作需先明确账号）。）";
     const resolved = await this.resolveMediaRef(image, ["image"]);
     if ("error" in resolved) return resolved.error;
     const data = await this.media.readFile(resolved.ref);
@@ -1070,7 +1071,7 @@ export class KoishiMessenger implements MessengerApi {
     const req = this.requests.get(requestId);
     if (!req) return `（找不到待处理的请求 ${requestId}，它可能已被处理过或已失效。）`;
     const candidates = this.ctx.bots.filter((b) => b.platform === req.platform && b.isActive);
-    const bot = candidates.find((b) => b.selfId === req.selfId) ?? candidates[0];
+    const bot = req.selfId ? candidates.find((b) => b.selfId === req.selfId) : candidates.length === 1 ? candidates[0] : undefined;
     if (!bot) return `（手机没有信号：${req.platform} 的连接暂时断开，处理不了这个请求。稍后再试。）`;
     try {
       if (req.kind === "friend") await bot.handleFriendRequest(req.messageId, approve, reason);
@@ -1083,7 +1084,7 @@ export class KoishiMessenger implements MessengerApi {
     const who = req.username || req.userId;
     if (req.kind === "friend") {
       return approve
-        ? `你通过了 ${who} 的好友申请。现在可以在 ${req.platform}:private:${req.userId} 和 TA 聊天了。`
+        ? `你通过了 ${who} 的好友申请。现在可以在 ${makeChannelKey(req.platform, `private:${req.userId}`, bot.selfId)} 和 TA 聊天了。`
         : `你拒绝了 ${who} 的好友申请。`;
     }
     if (req.kind === "guild") {
@@ -1095,7 +1096,7 @@ export class KoishiMessenger implements MessengerApi {
   /** 修改自己的账号资料（昵称 / 签名 / 头像，仅 OneBot） */
   async setProfile(opts: { nickname?: string; signature?: string; avatar?: string }): Promise<string> {
     const bot = this.findOnebot();
-    if (!bot) return "（修改资料目前只支持 QQ（OneBot）平台，但没有可用的 OneBot 账号。）";
+    if (!bot) return "（修改资料目前只支持 QQ（OneBot）平台，但没有唯一可确定的在线 OneBot 账号（多账号的全局资料操作需先明确账号）。）";
     if (!opts.nickname && !opts.signature && !opts.avatar) {
       return "（set_profile 需要 nickname、signature、avatar 中至少一个参数。）";
     }
@@ -1125,7 +1126,7 @@ export class KoishiMessenger implements MessengerApi {
   /** 修改资料卡上显示的在线机型（仅 OneBot） */
   async setModelShow(model: string): Promise<string> {
     const bot = this.findOnebot();
-    if (!bot) return "（修改在线机型目前只支持 QQ（OneBot）平台，但没有可用的 OneBot 账号。）";
+    if (!bot) return "（修改在线机型目前只支持 QQ（OneBot）平台，但没有唯一可确定的在线 OneBot 账号（多账号的全局资料操作需先明确账号）。）";
     const params = { model, model_show: model };
     try {
       await callOnebot(bot, "set_model_show", params);
@@ -1162,7 +1163,7 @@ export class KoishiMessenger implements MessengerApi {
   /** 查看某个用户的资料 */
   async userInfo(userId: string): Promise<string> {
     const bot = this.findOnebot();
-    if (!bot) return "（没有可用的 OneBot 账号。）";
+    if (!bot) return "（没有唯一可确定的在线 OneBot 账号（多账号的全局资料操作需先明确账号）。）";
     const uid = parseUserId(userId);
     if (!uid) return `（无法理解的用户 id："${userId}"）`;
     let data: Record<string, unknown>;
@@ -1185,7 +1186,7 @@ export class KoishiMessenger implements MessengerApi {
   /** 给某人的资料卡点赞 */
   async sendLike(userId: string, times: number): Promise<string> {
     const bot = this.findOnebot();
-    if (!bot) return "（没有可用的 OneBot 账号。）";
+    if (!bot) return "（没有唯一可确定的在线 OneBot 账号（多账号的全局资料操作需先明确账号）。）";
     const uid = parseUserId(userId);
     if (!uid) return `（无法理解的用户 id："${userId}"）`;
     try {
@@ -1199,7 +1200,7 @@ export class KoishiMessenger implements MessengerApi {
   /** 删除好友 */
   async deleteFriend(userId: string): Promise<string> {
     const bot = this.findOnebot();
-    if (!bot) return "（没有可用的 OneBot 账号。）";
+    if (!bot) return "（没有唯一可确定的在线 OneBot 账号（多账号的全局资料操作需先明确账号）。）";
     const uid = parseUserId(userId);
     if (!uid) return `（无法理解的用户 id："${userId}"）`;
     try {
@@ -1215,7 +1216,7 @@ export class KoishiMessenger implements MessengerApi {
   /** 查看自己加入的群列表 */
   async listGroups(): Promise<string> {
     const bot = this.findOnebot();
-    if (!bot) return "（没有可用的 OneBot 账号。）";
+    if (!bot) return "（没有唯一可确定的在线 OneBot 账号（多账号的全局资料操作需先明确账号）。）";
     let data: Record<string, unknown>[];
     try {
       data = ((await callOnebot(bot, "get_group_list", {})) ?? []) as Record<string, unknown>[];
@@ -1505,14 +1506,14 @@ export class KoishiMessenger implements MessengerApi {
     } catch (err) {
       return `（退群失败：${(err as Error).message ?? err}）`;
     }
-    await this.focus.unfocus(`${target.platform}:${target.channelId}`);
+    await this.focus.unfocus(makeChannelKey(target.platform, target.channelId, target.bot.selfId));
     return `你退出了群 ${id}。`;
   }
 
   /** 设置 / 移出群精华消息 */
   async setEssence(msgId: string, remove: boolean): Promise<string> {
     const bot = this.findOnebot();
-    if (!bot) return "（没有可用的 OneBot 账号。）";
+    if (!bot) return "（没有唯一可确定的在线 OneBot 账号（多账号的全局资料操作需先明确账号）。）";
     try {
       await callOnebot(bot, remove ? "delete_essence_msg" : "set_essence_msg", {
         message_id: toIdValue(msgId),
@@ -1642,7 +1643,9 @@ export class KoishiMessenger implements MessengerApi {
 
   private findOnebot(): Bot | undefined {
     // 只返回在线实例（断线中的实例 internal 未就绪，见 resolveBot）
-    return this.ctx.bots.find((b) => b.platform === "onebot" && b.isActive);
+    const candidates = this.ctx.bots.filter((b) => b.platform === "onebot");
+    const accounts = new Set(candidates.map((b) => b.selfId));
+    return accounts.size === 1 ? candidates.find((b) => b.isActive) : undefined;
   }
 
   /** 解析并校验一个 OneBot 群频道 id */
@@ -1670,7 +1673,7 @@ export class KoishiMessenger implements MessengerApi {
             const uid = user.id;
             if (!uid) continue;
             const name = friend.nick || user.nick || user.name || uid;
-            lines.push(`- ${name}（${bot.platform}:private:${uid}）`);
+            lines.push(`- ${name}（${makeChannelKey(bot.platform ?? "unknown", `private:${uid}`, bot.selfId)}）`);
           }
           next = page.next;
         } while (next && lines.length < 500);
@@ -1718,13 +1721,12 @@ export class KoishiMessenger implements MessengerApi {
     const channels: { key: string; count: number }[] = [];
     let total = 0;
     for (const key of keys) {
-      const idx = key.indexOf(":");
-      if (idx <= 0) continue;
-      const platform = key.slice(0, idx);
-      const channelId = key.slice(idx + 1);
+      const resolved = await this.resolveChannel(key);
+      if ("error" in resolved) continue;
+      const { platform, channelId, selfId } = resolved;
       if (platform !== "onebot" || channelId.startsWith("private:")) continue;
       try {
-        const count = await this.syncGroupHistory(platform, channelId);
+        const count = await this.syncGroupHistory(platform, channelId, selfId);
         if (count > 0) {
           channels.push({ key, count });
           total += count;
@@ -1744,17 +1746,19 @@ export class KoishiMessenger implements MessengerApi {
    * count=50/页，最多 4 页，按时间正序入库；取本页最小 message_seq（或响应的 next_seq）
    * 继续往前翻，翻到水位线以内、页不满或 seq 不再递减时终止。
    */
-  private async syncGroupHistory(platform: string, channelId: string): Promise<number> {
-    const bot = this.findOnebot();
+  private async syncGroupHistory(platform: string, channelId: string, accountId?: string): Promise<number> {
+    const bot = accountId
+      ? this.ctx.bots.find((b) => b.platform === platform && b.selfId === accountId && b.isActive)
+      : this.findOnebot();
     if (!bot) return 0;
 
     // 水位线：群内最后一条已存消息的时间（毫秒）；群还没有记录就不拉
-    const latest = await this.store.channelMessages(platform, channelId, 1);
+    const latest = await this.store.channelMessages(platform, channelId, 1, bot.selfId);
     if (!latest.length) return 0;
     const watermarkMs = latest[0]!.timestamp.getTime();
     // 去重依据：该群已存的最近消息 id（也覆盖边界上同一秒实时入库的新消息）
     const known = new Set<string>();
-    for (const row of await this.store.channelMessages(platform, channelId, 500)) {
+    for (const row of await this.store.channelMessages(platform, channelId, 500, bot.selfId)) {
       if (row.messageId) known.add(row.messageId);
     }
 
@@ -1804,6 +1808,7 @@ export class KoishiMessenger implements MessengerApi {
         await this.store.store({
           platform,
           channelId,
+          selfId: bot.selfId,
           guildId: "",
           userId: r.userId,
           username: r.username,
@@ -1838,8 +1843,8 @@ export class KoishiMessenger implements MessengerApi {
   ): Promise<{ bot: Bot; platform: string; channelId: string; isDirect: boolean } | { error: string }> {
     const resolved = await this.resolveChannel(id);
     if ("error" in resolved) return resolved;
-    const { platform, channelId, isDirect } = resolved;
-    const candidates = this.ctx.bots.filter((b) => b.platform === platform);
+    const { platform, channelId, isDirect, selfId } = resolved;
+    const candidates = this.ctx.bots.filter((b) => b.platform === platform && (!selfId || b.selfId === selfId));
     if (!candidates.length) return { error: `（消息没发出去：没有接入 ${platform} 平台的账号。）` };
     // 只用在线的实例：断线/重连中的僵尸实例内部未就绪，调用会炸出费解的底层错误
     const bot = candidates.find((b) => b.isActive);
@@ -1859,8 +1864,8 @@ export class KoishiMessenger implements MessengerApi {
    */
   private async resolveChannel(
     id: string,
-  ): Promise<{ platform: string; channelId: string; isDirect: boolean } | { error: string }> {
-    const { platform, channelId, error } = parseChannelKey(id);
+  ): Promise<{ platform: string; channelId: string; selfId?: string; isDirect: boolean } | { error: string }> {
+    const { platform, channelId, selfId, error } = parseChannelKey(id);
     let channels: KnownChannel[] = [];
     try {
       channels = await this.store.knownChannels();
@@ -1869,8 +1874,11 @@ export class KoishiMessenger implements MessengerApi {
     }
 
     if (!error) {
-      const hit = channels.find((c) => c.platform === platform && c.channelId === channelId);
-      if (hit) return { platform, channelId, isDirect: hit.isDirect };
+      const hits = channels.filter((c) => c.platform === platform && c.channelId === channelId && (!selfId || c.selfId === selfId));
+      const accounts = [...new Set(hits.map((c) => c.selfId).filter(Boolean))];
+      if (hits.length) return this.withAccount(platform, channelId, hits[0]!.isDirect, selfId ?? (accounts.length === 1 ? accounts[0] : undefined));
+      // 显式账号可打开该账号尚无历史的新频道；不能被另一个账号的同名频道纠错抢走。
+      if (selfId) return this.withAccount(platform, channelId, channelId.startsWith("private:"), selfId);
     }
 
     // 模糊匹配：取 id 中的非平台片段作为查询词
@@ -1910,7 +1918,17 @@ export class KoishiMessenger implements MessengerApi {
 
     if (error) return { error };
     // 存储查不到（新频道/历史数据）：回退 onebot 的 private: 前缀约定
-    return { platform, channelId, isDirect: channelId.startsWith("private:") };
+    return this.withAccount(platform, channelId, channelId.startsWith("private:"), selfId);
+  }
+
+  private withAccount(platform: string, channelId: string, isDirect: boolean, selfId?: string):
+    { platform: string; channelId: string; selfId?: string; isDirect: boolean } | { error: string } {
+    if (selfId) return { platform, channelId, selfId, isDirect };
+    const accounts = [...new Set(this.ctx.bots.filter((b) => b.platform === platform).map((b) => b.selfId).filter(Boolean))];
+    if (accounts.length > 1) {
+      return { error: `（频道属于哪个账号尚不明确，没有执行操作。请使用：${accounts.map((account) => makeChannelKey(platform, channelId, account)).join("、")}。）` };
+    }
+    return { platform, channelId, selfId: accounts[0], isDirect };
   }
 
   /**
@@ -1979,6 +1997,7 @@ export class KoishiMessenger implements MessengerApi {
     await this.store.store({
       platform: target.platform,
       channelId: target.channelId,
+      selfId: target.bot.selfId,
       guildId: "",
       userId: target.bot.selfId ?? "self",
       username: "（我）",
@@ -2211,18 +2230,6 @@ function emojiToOnebotId(emoji: string): number {
   const cp = trimmed.codePointAt(0);
   if (!cp) throw new Error("emoji 参数为空");
   return cp;
-}
-
-function parseChannelKey(id: string): { platform: string; channelId: string; error?: string } {
-  const idx = id.indexOf(":");
-  if (idx <= 0) {
-    return {
-      platform: "",
-      channelId: "",
-      error: `（频道 id 格式不对："${id}"。应为 "platform:channelId"，可先用 check_msg 查看可用频道。）`,
-    };
-  }
-  return { platform: id.slice(0, idx), channelId: id.slice(idx + 1) };
 }
 
 function parseGalleryRef(refText: string): string | null {
