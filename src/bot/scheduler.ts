@@ -2,7 +2,7 @@ import type { Logger } from "koishi";
 import type { WorldClock } from "../clock.js";
 import type { RichText, ToolCallRecord } from "../types.js";
 
-export type DeliverFn = (content: string | RichText, refToolCallId?: string) => void;
+export type DeliverFn = (content: string | RichText, refToolCallId?: string, outcome?: { ok: boolean }) => void;
 
 interface ScheduledTask {
   call: ToolCallRecord;
@@ -23,6 +23,9 @@ export interface TaskControl {
 
 export interface ScheduleOptions {
   executeAt: "now" | "expected";
+  /** Serialize actual side effects, without owning the device during receipt delays. */
+  serialKey?: string;
+  beforeStart?: () => void;
   /** Default: execution itself is the commit boundary (platform/API tools).
    * Cooperative operations must check signal and call beginCommit before changing state. */
   cancellation?: "before_start" | "cooperative";
@@ -32,6 +35,7 @@ export interface ScheduleOptions {
 /** Execution and delivery are separate; cancellation must never hide a committed action. */
 export class Scheduler {
   private tasks = new Map<string, ScheduledTask>();
+  private serialQueues = new Map<string, Promise<void>>();
 
   constructor(private clock: WorldClock, private deliver: DeliverFn, private logger: Logger) {}
 
@@ -50,11 +54,11 @@ export class Scheduler {
         return true;
       },
     };
-    const deliver = (result: string | RichText | null) => {
+    const deliver = (result: string | RichText | null, ok: boolean) => {
       if (task.abort.signal.aborted || task.delivered) return;
       task.delivered = true;
       this.tasks.delete(call.id);
-      if (result !== null) this.deliver(result, call.id);
+      if (result !== null) this.deliver(result, call.id, { ok });
     };
     const atExpected = (fn: () => void) => {
       if (task.retired && task.committed) { fn(); return; }
@@ -65,21 +69,33 @@ export class Scheduler {
         if (!task.abort.signal.aborted) atExpected(fn);
       }, Math.min(remaining, 2_147_483_647));
     };
-    const run = async () => {
+    const execute = async () => {
       if (task.abort.signal.aborted) return;
-      if (opts.cancellation !== "cooperative") control.beginCommit();
       let result: string | RichText | null;
+      let ok = true;
       try {
+        opts.beforeStart?.();
+        if (opts.cancellation !== "cooperative") control.beginCommit();
         result = await opts.run(control);
       } catch (err) {
         if (task.abort.signal.aborted) return;
         this.logger.warn("工具 %s (%s) 执行失败: %s", call.name, call.id, err);
+        ok = false;
         result = `（动作 ${call.name} 执行失败：${(err as Error).message ?? err}）`;
       }
       if (task.abort.signal.aborted) return;
       task.committed = true;
-      if (opts.executeAt === "now") { task.pendingDelivery = () => deliver(result); atExpected(task.pendingDelivery); }
-      else deliver(result);
+      if (opts.executeAt === "now") { task.pendingDelivery = () => deliver(result, ok); atExpected(task.pendingDelivery); }
+      else deliver(result, ok);
+    };
+    const run = () => {
+      if (!opts.serialKey) return execute();
+      const key = opts.serialKey;
+      const pending = (this.serialQueues.get(key) ?? Promise.resolve()).then(execute, execute);
+      this.serialQueues.set(key, pending);
+      const cleanup = () => { if (this.serialQueues.get(key) === pending) this.serialQueues.delete(key); };
+      void pending.then(cleanup, cleanup);
+      return pending;
     };
     if (opts.executeAt === "expected") atExpected(() => void run());
     else void run();

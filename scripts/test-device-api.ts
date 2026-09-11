@@ -92,12 +92,20 @@ async function backend(dir: string) {
 
 async function remoteDesktop() {
   const cfg = Config({ autoStart: false }).apps.computer.remoteDesktop;
-  const remote: any = new RemoteDesktopApp(cfg, {} as never, logger);
+  const imageRef = { id: 1, type: "image", file: "local-fixture.png" };
+  const remote: any = new RemoteDesktopApp(cfg, { ingest: async () => 1, get: async () => ({ ref: imageRef }) } as never, logger);
   await assert.rejects(remote.peek(), /未连接/);
+  await assert.rejects(remote.observe(), /未连接/);
   const pointers: number[][] = [], keys: unknown[][] = [];
   remote.session = { connected: true, screenSize: { width: 1600, height: 900 }, lastPointer: { x: 12, y: 34 }, snapshot: async (_w: number, opts: any) => { assert.equal(opts.connect, false); return { png: Buffer.from("fixture"), width: 800, height: 450 }; }, pointer: (...args: number[]) => pointers.push(args), keyHold: async (...args: unknown[]) => keys.push(args), disconnect() {} };
   const shot = await remote.peek(800);
   assert.equal(shot.width, 800); assert.equal(shot.desktopWidth, 1600);
+  const observed = await remote.observe();
+  assert.deepEqual(observed.attachments, [imageRef]);
+  assert.doesNotMatch(observed.text, /你打开|你抬头|人类|管理员/);
+  const closing: any = new RemoteDesktopApp(cfg, { ingest: async () => { closing.abortInput(); return 1; }, get: async () => ({ ref: imageRef }) } as never, logger);
+  closing.session = { ...remote.session };
+  await assert.rejects(closing.observe(), /读取画面期间远程桌面已断开/, "late screen capture cannot pretend a closed desktop remains visible");
   await remote.call("mouse", { action: "press", x: 10, y: 10 });
   await remote.call("mouse", { action: "move", x: 20, y: 20 });
   assert.equal(pointers[1]![2], 1, "moving while pressed preserves drag button");
@@ -165,7 +173,8 @@ async function namespaceAndLifecycle() {
 async function httpPolicy(dir: string) {
   const cfg = Config({ autoStart: false }); cfg.webui.token = "fixture-admin";
   let reads = 0, writes = 0;
-  const server: any = new WebUIServer({ config: cfg, webuiDir: dir, files: { base: dir }, deviceSession: async () => { reads++; return { running: true }; }, deviceControl: async (paused: boolean) => { writes++; return { ok: true, paused }; }, deviceToolCall: async () => { writes++; return { ok: true, text: "fixture" }; } } as never);
+  const toolRequests: unknown[][] = [];
+  const server: any = new WebUIServer({ config: cfg, webuiDir: dir, files: { base: dir }, deviceSession: async () => { reads++; return { running: true }; }, deviceControl: async (paused: boolean) => { writes++; return { ok: true, paused }; }, deviceToolCall: async (...args: unknown[]) => { writes++; toolRequests.push(args); return { ok: true, text: "fixture" }; } } as never);
   const tokens: Record<string, string> = {};
   for (const preset of ["viewer", "player"] as const) { await server.visitors.create(preset, "fixture-password", preset); tokens[preset] = (await server.visitors.login(preset, "fixture-password")).token; }
   server.crossingPost = async (route: string, body: any) => { assert.equal(route, "/crossing/cancel"); assert.deepEqual(body, { token: "crossing-fixture", taskId: "task-fixture" }); return { ok: false, status: "too_late", result: { content: "committed" } }; };
@@ -183,7 +192,14 @@ async function httpPolicy(dir: string) {
   assert.equal(reads, 1); assert.equal(writes, 0);
   assert.equal((await request("POST", "/api/device/tool", { name: "send", args: null })).status, 400);
   assert.equal((await request("POST", "/api/device/control", { paused: "true" })).status, 400);
+  assert.equal((await request("POST", "/api/device/tool", { name: "open_app", args: {}, mode: "background" })).status, 400);
+  assert.equal((await request("POST", "/api/device/tool", { name: "open_app", args: {}, mode: "stealth" }, "viewer")).status, 403);
+  assert.equal((await request("POST", "/api/device/tool", { name: "open_app", args: {}, mode: "stealth" }, "player")).status, 403);
   assert.equal(writes, 0);
+  assert.equal((await request("POST", "/api/device/tool", { name: "send", args: { msg: "fixture" }, mode: "stealth", confirmSend: true })).status, 200);
+  assert.deepEqual(toolRequests[0], ["send", { msg: "fixture" }, undefined, true, "stealth"]);
+  assert.equal((await request("POST", "/api/device/tool", { name: "open_app", args: { name: "notes" } })).status, 200);
+  assert.equal(toolRequests[1]?.[4], undefined, "old clients retain the service's takeover default");
   assert.equal((await request("POST", "/api/player/cancel", { token: "crossing-fixture", taskId: "task-fixture" }, "viewer")).status, 403);
   const cancelled = await request("POST", "/api/player/cancel", { token: "crossing-fixture", taskId: "task-fixture" }, "player");
   assert.equal(cancelled.status, 200); assert.equal(cancelled.data.status, "too_late"); assert.equal(cancelled.data.result.content, "committed");

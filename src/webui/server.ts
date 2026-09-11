@@ -28,12 +28,14 @@ import type { ComputerExecResult, ComputerInspection } from "../computer.js";
 import { collectSecretPaths, introspect, validateConfig } from "./schema.js";
 import { debug, type DebugEntry } from "./debug.js";
 import { usageStore } from "./usage.js";
+import { callStore } from "./calls.js";
 import { llmFetch, forEachStreamLine } from "../llm/http.js";
 import { PAGE_HTML } from "./page.js";
 import { VisitorStore, type VisitorSession, type VisitorGrant, type VisitorPreset, type PlayerProfile } from "./visitors.js";
 import type { PlayerMode } from "../crossing/protocol.js";
 import type { ManualToolResult } from "../bot/agent.js";
-import type { DeviceSession, DeviceControlResult } from "./device.js";
+import type { DeviceSession, DeviceControlResult, DeviceOperationMode } from "./device.js";
+import type { BotIdentity } from "./avatar.js";
 
 export interface BotStatusSummary {
   running: boolean;
@@ -91,6 +93,7 @@ export interface WebUIHost {
   worldRunning(): boolean;
   worldQueue(): number;
   botStatus(): BotStatusSummary | null;
+  getBotIdentity?(): Promise<BotIdentity | null>;
   appOpen(): string | null;
   computerOn(): string | null;
   phoneDown(): boolean;
@@ -118,7 +121,7 @@ export interface WebUIHost {
   devicesInfo(): Promise<DevicesInfo>;
   deviceSession(): Promise<DeviceSession>;
   deviceControl(paused: boolean): Promise<DeviceControlResult>;
-  deviceToolCall(name: string, args: Record<string, unknown>, duration?: number, confirmSend?: boolean): Promise<ManualToolResult>;
+  deviceToolCall(name: string, args: Record<string, unknown>, duration?: number, confirmSend?: boolean, mode?: DeviceOperationMode): Promise<ManualToolResult>;
   /** 远程桌面实时截屏（peek，不影响 Bot 视野）；不可用/连不上时抛错 */
   computerScreen(maxWidth?: number): Promise<{ png: Buffer; width: number; height: number; desktopWidth?: number; desktopHeight?: number }>;
   /** Docker 电脑的开关机管理 */
@@ -820,6 +823,7 @@ export class WebUIServer {
             }
           : null,
         bot,
+        botIdentity: await host.getBotIdentity?.() ?? null,
         appOpen: host.appOpen(),
         computerOn: host.computerOn(),
         phoneDown: host.phoneDown(),
@@ -847,7 +851,8 @@ export class WebUIServer {
         const body = await readJson(req, 1024 * 1024).catch(() => null);
         if (!body || typeof body.name !== "string" || !body.name.trim() || !body.args || typeof body.args !== "object" || Array.isArray(body.args)) return void sendJSON(res, 400, { error: "需要工具名 name 与 JSON 对象 args" });
         if (body.duration !== undefined && (typeof body.duration !== "number" || !Number.isFinite(body.duration) || body.duration < 0)) return void sendJSON(res, 400, { error: "duration 必须为有限非负数" });
-        return void sendJSON(res, 200, await host.deviceToolCall(body.name.trim(), body.args as Record<string, unknown>, body.duration as number | undefined, body.confirmSend === true));
+        if (body.mode !== undefined && body.mode !== "stealth" && body.mode !== "takeover") return void sendJSON(res, 400, { error: "mode 必须为 stealth 或 takeover" });
+        return void sendJSON(res, 200, await host.deviceToolCall(body.name.trim(), body.args as Record<string, unknown>, body.duration as number | undefined, body.confirmSend === true, body.mode as DeviceOperationMode | undefined));
       }
       return void sendJSON(res, 404, { error: "设备端点或方法不存在" });
     }
@@ -1405,6 +1410,17 @@ export class WebUIServer {
     }
 
     // ---------- 调试 ----------
+    if (pathname === "/api/calls" && method === "GET") {
+      sendJSON(res, 200, { calls: callStore.recent(), retention: { maxCalls: 200, maxBytes: 32 * 1024 * 1024, maxCallBytes: 8 * 1024 * 1024, persistent: false } });
+      return;
+    }
+    if (pathname.startsWith("/api/calls/") && method === "GET") {
+      const id = pathname.slice("/api/calls/".length);
+      const detail = callStore.detail(id, Number(q.get("after") ?? 0), q.get("request") !== "0");
+      if (!detail) return void sendJSON(res, 404, { error: "调用不存在或已超出历史保留数量" });
+      sendJSON(res, 200, detail);
+      return;
+    }
     if (pathname === "/api/debug" && method === "GET") {
       const n = Math.min(Number(q.get("n")) || 200, 500);
       sendJSON(res, 200, { entries: debug.recent(n), snapshot: debug.snapshot() });
@@ -1750,7 +1766,7 @@ function grantForEndpoint(pathname: string, method: string): VisitorGrant | null
   if (pathname === "/api/config") return "config";
   if (pathname === "/api/prompts") return "prompts";
   if (pathname === "/api/usage") return "usage";
-  if (pathname === "/api/debug") return "debug";
+  if (pathname === "/api/debug" || pathname === "/api/calls" || pathname.startsWith("/api/calls/")) return "debug";
 
   // 意识流 / 归档
   if (pathname === "/api/stream") return "stream";

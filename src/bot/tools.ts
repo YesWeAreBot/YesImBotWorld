@@ -79,6 +79,11 @@ export const BOT_TOOLS: BotToolDef[] = [
     description: "观察自己或周围。target 可填 self 或最近观察到的 observedId；modality 可选 all（默认，周围视觉与台词）、sight（视觉）或 self（自身状态）。返回可感知实体、属性及观察句柄；看不到的对象和秘密不会出现。行动时可把 observedId 交给 act 的 target。",
   },
   {
+    name: "observe_device",
+    signature: 'observe_device(device: "phone" | "computer")',
+    description: "只读查看当前可及的手机或电脑界面，并开始留意它。不拿起手机、不打开应用、不启动电脑或建立远程连接；已放在身边的手机也可看，关机只能看到关闭状态。返回已有界面内容或已连接桌面的当前画面，应用操作随当前界面更新。这是随身/当前使用设备的感知入口；设备尚无空间位置与遮挡绑定，不能据此声称看见远处或被遮挡的屏幕。",
+  },
+  {
     name: "reflect",
     signature: 'reflect(kind: "relationship" | "commitment" | "preference", subject: string, statement: string, event_ids: string[], relation?: "support" | "counter" | "revise", claim_id?: string)',
     description: "根据亲身感知的经历形成或修正认识：关系、承诺、偏好。event_ids 引用意识流 event 的 id，至少一个；无法引用未感知的事。新认识保持暂定；已有认识用 claim_id，support 补证据、counter 记录反例、revise 修正判断。重复观察同一来源不会算新证据；单次经历不自动变成永久人格。",

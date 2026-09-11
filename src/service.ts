@@ -1,4 +1,5 @@
 import { GrowthLedger } from "./bot/growth.js";
+import { BotIdentityResolver } from "./webui/avatar.js";
 import { promises as fs } from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
@@ -34,7 +35,7 @@ import { MessageStore } from "./koishi/messages.js";
 import { KoishiMessenger } from "./koishi/messenger.js";
 import { ChannelNameResolver } from "./koishi/names.js";
 import { parseChannelKey } from "./koishi/channels.js";
-import { deviceTools, type DeviceSession, type DeviceControlResult } from "./webui/device.js";
+import { deviceTools, type DeviceSession, type DeviceControlResult, type DeviceOperationMode } from "./webui/device.js";
 import { NotifyManager } from "./koishi/notify.js";
 import { OwnSendTracker } from "./koishi/ownsends.js";
 import { RequestStore } from "./koishi/requests.js";
@@ -70,6 +71,7 @@ function readPackageVersion(): string {
 }
 
 export class WorldService extends Service<Config> {
+  private botIdentityResolver = new BotIdentityResolver();
   // puppeteer 可选：未安装时浏览器 App 不提供截图（其余功能照常），安装后无需改动即可用
   static readonly inject = {
     database: { required: true },
@@ -490,6 +492,20 @@ export class WorldService extends Service<Config> {
             goHome: () => this.crossingGoHome(),
           }
         : null,
+      async kind => {
+        if (kind === "computer" && this.remoteDesktopApp?.connected) {
+          return this.remoteDesktopApp.observe();
+        }
+        if (kind === "phone") {
+          const key = this.bot?.status().phoneUi?.channelKey;
+          const channel = key ? parseChannelKey(key) : null;
+          if (channel && !channel.error) {
+            const messages = await this.store.channelMessages(channel.platform, channel.channelId, 12, channel.selfId);
+            return { text: messages.map(row => `${row.username || row.userId}: ${row.content}`).join("\n") };
+          }
+        }
+        return null;
+      },
     );
 
     await this.clock.resume();
@@ -770,17 +786,19 @@ export class WorldService extends Service<Config> {
     });
   }
 
-  async deviceToolCall(name: string, args: Record<string, unknown>, duration?: number, confirmSend = false): Promise<ManualToolResult> {
+  async deviceToolCall(name: string, args: Record<string, unknown>, duration?: number, confirmSend = false, mode: DeviceOperationMode = "takeover"): Promise<ManualToolResult> {
     return this.withDeviceLock(async () => {
       const bot = this.bot;
       if (!this.worldActive || !bot) return { ok: false, text: "世界尚未运行。" };
-      if (!bot.manualMode || bot.manualBusy) return { ok: false, text: "请先接管并等待现有操作完成。" };
+      if (mode !== "stealth" && mode !== "takeover") return { ok: false, text: "未知设备操作模式。" };
+      if (mode === "takeover" && (!bot.manualMode || bot.manualBusy)) return { ok: false, text: "请先强制接管并等待现有操作完成。" };
+      if (mode === "stealth" && (name === "pick_up_phone" || name === "put_down_phone")) return { ok: false, text: "偷偷操作改变设备界面，不代替角色拿起或放下手机。" };
       const tool = this.deviceToolDefs().find(tool => tool.name === name);
       if (!tool) return { ok: false, text: "此设备工具当前不可用，请先打开对应应用或进入频道。" };
       if (tool.effect === "send" && !confirmSend) return { ok: false, text: "发送需由用户明确点击发送（confirmSend=true）。" };
       if (!args || typeof args !== "object" || Array.isArray(args)) return { ok: false, text: "args 必须为 JSON 对象。" };
       if (duration !== undefined && (!Number.isFinite(duration) || duration < 0)) return { ok: false, text: "duration 必须为有限非负数。" };
-      return bot.injectExternalToolCall(name, args, { duration });
+      return bot.injectExternalToolCall(name, args, { duration, stealth: mode === "stealth" });
     });
   }
 
@@ -793,7 +811,7 @@ export class WorldService extends Service<Config> {
     const messages = parsed && !parsed.error ? await this.store.channelMessages(parsed.platform, parsed.channelId, 100, parsed.selfId) : [];
     return {
       running: this.worldActive && !!this.bot?.status().running,
-      control: { paused: this.bot?.manualMode ?? false, busy: this.devicePending > 0 || !!this.bot?.manualBusy },
+      control: { paused: this.bot?.manualMode ?? false, busy: this.devicePending > 0 || !!this.bot?.manualBusy, deviceBusy: this.devicePending > 0 || !!this.bot?.deviceBusy, attention: this.bot?.deviceAttention ?? null },
       devices,
       apps: (this.appManager?.installedApps() ?? []).map(app => ({ ...app, active: app.kind === "chat" ? devices.phone.chatOpen : app.active })),
       tools: this.deviceToolDefs(),
@@ -1094,6 +1112,10 @@ export class WorldService extends Service<Config> {
 
   focusChannels(): string[] {
     return this.focus.activeKeys();
+  }
+
+  getBotIdentity() {
+    return this.botIdentityResolver.resolve(this.ctx.bots, this.bot?.status().phoneUi?.channelKey);
   }
 
   prompts(): Prompts {

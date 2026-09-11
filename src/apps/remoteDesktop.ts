@@ -120,6 +120,17 @@ export class RemoteDesktopApp implements WorldApp {
 
   get connected(): boolean { return this.session?.connected ?? false; }
 
+  /** Passive Bot perception. Unlike the screen action, never reconnects a lost session. */
+  async observe(): Promise<RichText> {
+    const epoch = this.epoch, session = this.session;
+    const shot = await this.peek();
+    const id = await this.media.ingest(`data:image/png;base64,${shot.png.toString("base64")}`, "image");
+    const row = id === null ? null : await this.media.get(id);
+    if (epoch !== this.epoch || session !== this.session || !session?.connected) throw new Error("读取画面期间远程桌面已断开");
+    if (!row) throw new Error("当前屏幕图像无法保存");
+    return { text: `当前屏幕图像（${shot.width}x${shot.height}）。`, attachments: [row.ref] };
+  }
+
   /** 交还控制/关机时释放真人按住的输入，避免远端遗留 Ctrl 或鼠标拖动。 */
   async releaseInputs(): Promise<void> {
     const session = this.session;

@@ -11,6 +11,7 @@ var Studio = (function () {
         ['devices', '设备工作台', 'monitor', ['devices']],
         ['player', '走进世界', 'door', ['__player__']],
         { group: '观察与记录' },
+        ['live', '实时调用', 'activity', ['debug']],
         ['debug', '运行洞察', 'activity', ['debug']],
         ['usage', '模型用量', 'chart', ['usage']],
         ['gallery', '相册', 'image', ['gallery']],
@@ -115,9 +116,9 @@ var Studio = (function () {
         });
         var mobile = $('#mobile-nav');
         mobile.replaceChildren();
-        ['overview', 'world', 'devices', 'player', 'debug'].filter(can).slice(0, 5).forEach(function (name) {
+        ['overview', 'world', 'devices', 'player', 'live'].filter(can).slice(0, 5).forEach(function (name) {
             var r = routeFor(name);
-            mobile.appendChild(el('a', { href: '#' + name, cls: activeView === name ? 'active' : '', 'aria-current': activeView === name ? 'page' : 'false', onclick: function (e) { e.preventDefault(); navigate(name); } }, [el('span', { html: icon(r[2]) }), el('span', { text: { overview: '总览', world: '世界', devices: '设备', player: '入世界', debug: '洞察' }[name] })]));
+            mobile.appendChild(el('a', { href: '#' + name, cls: activeView === name ? 'active' : '', 'aria-current': activeView === name ? 'page' : 'false', onclick: function (e) { e.preventDefault(); navigate(name); } }, [el('span', { html: icon(r[2]) }), el('span', { text: { overview: '总览', world: '世界', devices: '设备', player: '入世界', live: '实时', debug: '洞察' }[name] })]));
         });
         $('#account-name').textContent = isVisitor() ? (VISITOR_PRESET === 'player' ? '世界中的旅人' : '工作室访客') : '工作室管理员';
         $('#account-role').textContent = isVisitor() ? (VISITOR_PRESET === 'player' ? '体验与互动' : '按授权范围观测') : '管理与观测';
@@ -151,8 +152,8 @@ var Studio = (function () {
             return;
         }
         evtSource = new EventSource(withToken('/api/events?since=' + lastEventId));
-        evtSource.onopen = function () { $('#sse-dot').className = 'on'; $('#connection-label').textContent = '实时连接'; };
-        evtSource.onerror = function () { $('#sse-dot').className = 'off'; $('#connection-label').textContent = '正在重连'; };
+        evtSource.onopen = function () { $('#sse-dot').className = 'on'; $('#connection-label').textContent = '实时连接'; dispatch('studio:connection', { connected: true }); };
+        evtSource.onerror = function () { $('#sse-dot').className = 'off'; $('#connection-label').textContent = '正在重连'; dispatch('studio:connection', { connected: false }); };
         evtSource.onmessage = function (event) {
             var msg;
             try {
@@ -162,8 +163,10 @@ var Studio = (function () {
                 return;
             }
             // Server restart can reset the in-memory debug sequence.
-            if (msg.channel === 'hello' && Number.isFinite(msg.snapshot))
+            if (msg.channel === 'hello' && Number.isFinite(msg.snapshot)) {
                 lastEventId = msg.snapshot;
+                dispatch('studio:connection', { connected: true });
+            }
             else if (event.lastEventId)
                 lastEventId = Math.max(lastEventId, Number(event.lastEventId) || 0);
             localStorage.setItem('wui_last_id', String(lastEventId));
@@ -218,11 +221,25 @@ var Studio = (function () {
         return '<svg class="studio-hero-art" viewBox="0 0 440 280" fill="none" aria-label="手绘的虚拟世界微缩工作室" role="img"><ellipse cx="237" cy="235" rx="162" ry="28" fill="#bcccad" opacity=".3"/><path d="m70 165 159-87 145 83-158 91Z" fill="#ccd7bd"/><path d="m70 165 146 85v10L70 175Z" fill="#aabca0"/><path d="m216 250 158-89v10l-158 89Z" fill="#b8c9ab"/><path d="M94 159V75l129-71v84Z" fill="#eaf0e1" stroke="#c5d1b8"/><path d="m223 4 121 69v84L223 88Z" fill="#d9e4cc" stroke="#c5d1b8"/><path d="m241 37 61 34v51l-61-34Z" fill="#b5c8ab"/><path d="m247 43 49 28v41l-49-28Z" fill="#f8fbef"/><path d="m270 57 1 41m-24-33 49 28" stroke="#c5d4b9" stroke-width="3"/><path d="m110 94 64-35v41l-64 35Z" fill="#73946d"/><path d="m117 98 47-26m-47 37 28-15m-28 25 40-22" stroke="#aac69d" stroke-width="2"/><path d="m163 164 91-51 59 34-91 52Z" fill="#c2a985"/><path d="M174 171v35m39-12v37m88-80v34" stroke="#7b856a" stroke-width="6"/><path d="m163 164 59 34v7l-59-34Z" fill="#a89475"/><path d="m222 198 91-51v7l-91 51Z" fill="#b5a17d"/><path d="m216 136 36-20 27 15-36 21Z" fill="#809678"/><path d="m224 140-5-32 39-22 5 32Z" fill="#436857"/><path d="m226 132-3-21 32-18 3 23Z" fill="#c7dfbc"/><path d="m232 112 15-8m-14 14 21-12" stroke="#89ad80" stroke-width="2"/><path d="m261 158 15-8 15 9-15 8Z" fill="#f8f6e6"/><path d="m192 152 13-7 10 6-13 7Z" fill="#dedbc4"/><path d="M190 202v-21l-22-12-14 8v22l23 13Z" fill="#6e8b67"/><ellipse cx="173" cy="158" rx="15" ry="9" fill="#e8c2a4"/><path d="M158 157v-13c0-20 30-20 30 0v13" fill="#454d3e"/><path d="M156 175c2-14 29-14 33 0v19l-14 8-19-11Z" fill="#efe7cf"/><path d="m181 176 15-10m-34 10 7 14" stroke="#e6ba97" stroke-width="7" stroke-linecap="round"/><path d="m170 204-4 14m16-8 1 12" stroke="#637260" stroke-width="7" stroke-linecap="round"/><path d="M320 169c-1-17 7-33 16-46m-15 34c-16-7-18-19-15-28m16 12c-1-16 7-29 16-35" stroke="#6e9465" stroke-width="3"/><ellipse cx="311" cy="136" rx="7" ry="15" transform="rotate(-36 311 136)" fill="#a4bf90"/><ellipse cx="333" cy="131" rx="7" ry="16" transform="rotate(38 333 131)" fill="#90af7e"/><ellipse cx="332" cy="113" rx="6" ry="13" transform="rotate(34 332 113)" fill="#b4c99d"/><path d="m310 163 25 1-5 25h-16Z" fill="#bd8c67"/><ellipse cx="322" cy="164" rx="12" ry="4" fill="#947454"/><path d="m110 164 27-15 24 14-27 15Z" fill="#eff3e3"/><path d="m110 164 24 14v6l-24-14Z" fill="#b7caaa"/><path d="m134 178 27-15v6l-27 15Z" fill="#ccdaba"/><path d="M372 75v12m-6-6h12M77 108v8m-4-4h8" stroke="#a3b896" stroke-width="1.5"/><circle cx="359" cy="116" r="3" fill="#e0b488"/></svg>';
     }
     function avatar() { return '<svg viewBox="0 0 60 70" fill="none" aria-hidden="true"><path d="M12 70V51c0-17 36-17 36 0v19Z" fill="#6c886b"/><path d="M17 38V24c0-19 26-19 26 0v14Z" fill="#465647"/><ellipse cx="30" cy="30" rx="13" ry="16" fill="#e9bc9b"/><path d="M17 28V18c3-14 25-12 27 2l-1 10-8-13-18 11Z" fill="#465647"/><circle cx="25" cy="29" r="1" fill="#556044"/><circle cx="36" cy="29" r="1" fill="#556044"/><path d="M28 36c2 1 4 1 6-1" stroke="#ac755d" stroke-linecap="round"/><path d="m24 46 6 8 7-8" stroke="#c8d3b1" stroke-width="2"/></svg>'; }
+    function botAvatar(identity) {
+        var holder = el('div', { cls: 'studio-avatar', html: avatar() });
+        if (!identity?.avatar) return holder;
+        try {
+            var url = new URL(identity.avatar, location.href);
+            if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) return holder;
+            var photo = el('img', { src: url.href, alt: (identity.name || 'Bot') + '的平台头像', referrerpolicy: 'no-referrer', decoding: 'async', onerror: function () { holder.innerHTML = avatar(); } });
+            holder.title = identity.platform + ' · ' + identity.name;
+            holder.replaceChildren(photo);
+        } catch (_) {}
+        return holder;
+    }
     function kpi(label, value, note, img) { return el('div', { cls: 'studio-kpi' }, [el('span', { cls: 'label', text: label }), el('span', { cls: 'number', text: value }), el('span', { cls: 'note', text: note }), el('span', { cls: 'kpi-icon', html: icon(img) })]); }
     function row(key, value) { return el('div', { cls: 'studio-detail-row' }, [el('span', { text: key }), el('span', { text: value })]); }
     function panel() { return el('section', { cls: 'studio-panel' }); }
     function renderOverviewView(holder) {
         var alive = true, refreshing = false;
+        var liveHost = can('live') && window.LiveCalls ? el('div', { cls: 'studio-live-overview' }) : null;
+        var liveCleanup = liveHost ? window.LiveCalls.mount(liveHost, { compact: true }) : null;
         holder.appendChild(el('div', { cls: 'studio-skeleton' }));
         function refresh() {
             if (!alive || refreshing || document.hidden)
@@ -239,7 +256,7 @@ var Studio = (function () {
             var running = Object.values(snapshot?.actions || {}).filter(function (a) { return a.status === 'pending'; });
             holder.replaceChildren(title('YOUR WORLD, AT A GLANCE', '世界工作室', '看见世界如何变化，也参与角色的每一个当下。', [button('走进世界', 'door', function () { navigate('player'); }, true)].filter(function () { return can('player'); })));
             var hero = el('section', { cls: 'studio-hero' });
-            var heroCopy = el('div', { cls: 'studio-hero-copy' }, [el('div', { cls: 'studio-eyebrow', text: o.initialized ? 'A WORLD IN PROGRESS' : 'THE FIRST CHAPTER' }), el('h2', { text: o.initialized ? '你好，' + (bot?.name || '世界') + '。' : '从一个世界开始。' }), el('p', { text: !o.initialized ? '写下角色与世界设定，让第一组事实成为故事的起点。' : o.worldRunning ? '世界正在运转。观察发生了什么，或拿起设备，与角色共享此刻。' : '世界目前未运行。你可以先探索已有状态，再继续角色的生活。' })]);
+            var heroCopy = el('div', { cls: 'studio-hero-copy' }, [el('div', { cls: 'studio-eyebrow', text: o.initialized ? 'A WORLD IN PROGRESS' : 'THE FIRST CHAPTER' }), el('h2', { text: o.initialized ? '你好，欢迎回来。' : '从一个世界开始。' }), el('p', { text: !o.initialized ? '写下角色与世界设定，让第一组事实成为故事的起点。' : o.worldRunning ? '世界正在运转。观察发生了什么，或拿起设备，与角色共享此刻。' : '世界目前未运行。你可以先探索已有状态，再继续角色的生活。' })]);
             var actions = el('div', { cls: 'studio-hero-actions' });
             if (!isVisitor()) {
                 actions.appendChild(button(!o.initialized ? '准备世界设定' : o.worldRunning ? '暂停世界' : '继续世界', !o.initialized ? 'edit' : o.worldRunning ? 'pause' : 'play', function (e) {
@@ -260,6 +277,7 @@ var Studio = (function () {
             heroCopy.appendChild(actions);
             hero.append(heroCopy, el('div', { html: art() }), el('span', { cls: 'studio-hero-footnote', text: 'WORLD / STUDIO' }));
             holder.appendChild(hero);
+            if (liveHost) holder.appendChild(liveHost);
             holder.appendChild(el('div', { cls: 'studio-kpi-row' }, [
                 kpi('世界实体', snapshot ? entities.length : '—', snapshot ? entities.filter(function (e) { return e.kind === 'place'; }).length + ' 个地点 · ' + entities.filter(function (e) { return e.kind === 'object'; }).length + ' 件物品' : '完整世界仅管理员可见', 'world'),
                 kpi('正在行动', snapshot ? running.length : o.worldQueue, snapshot ? '已开始、尚未结束的动作' : '等待世界裁定的任务', 'activity'),
@@ -295,7 +313,7 @@ var Studio = (function () {
             left.appendChild(activity);
             var character = panel();
             character.appendChild(section('常驻角色', 'RESIDENT'));
-            character.appendChild(el('div', { cls: 'studio-bot-card' }, [el('div', { cls: 'studio-avatar', html: avatar() }), el('div', null, [el('h3', { text: bot?.name || RESIDENT_BOT_NAME || '常驻 Bot' }), el('span', { cls: 'studio-badge', text: o.bot?.paused ? '手动接管中' : o.bot?.running ? '正在自主行动' : o.initialized ? '等待下一刻' : '尚未初始化' })])]));
+            character.appendChild(el('div', { cls: 'studio-bot-card' }, [botAvatar(o.botIdentity), el('div', null, [el('h3', { text: bot?.name || RESIDENT_BOT_NAME || '常驻 Bot' }), el('span', { cls: 'studio-badge', text: o.bot?.paused ? '手动接管中' : o.bot?.running ? '正在自主行动' : o.initialized ? '等待下一刻' : '尚未初始化' })])]));
             character.appendChild(row('所在位置', bot?.location ? snapshot.entities[bot.location]?.name || bot.location : '未知'));
             character.appendChild(row('当前状态', o.bot?.waiting || (running[0]?.intent) || '暂无进行中的意图'));
             var attrs = Object.entries(bot?.attributes || {}).filter(function (a) { return ['posture', 'energy', 'hunger', 'health', 'consciousness'].includes(a[0]); }).slice(0, 3);
@@ -322,7 +340,7 @@ var Studio = (function () {
         var timer = setInterval(refresh, 12000);
         var onRefresh = function () { refresh(); };
         window.addEventListener('studio:refresh', onRefresh);
-        return function () { alive = false; clearInterval(timer); window.removeEventListener('studio:refresh', onRefresh); };
+        return function () { alive = false; if (liveCleanup) liveCleanup(); clearInterval(timer); window.removeEventListener('studio:refresh', onRefresh); };
     }
     register('overview', renderOverviewView);
     // Definitions remain authored text; authoritative structured state lives in its own views.
@@ -427,5 +445,5 @@ var Studio = (function () {
             dispatch('studio:refresh', { channel: 'visibility' });
         } });
     }
-    return { register: register, navigate: navigate, start: start, can: can, title: title, button: button, empty: empty, error: error, section: section, fetchWorld: fetchWorld, fetchGrowth: fetchGrowth, cache: cache, inspectEntity: inspectEntity, takeSelectedEntity: function () { var id = selectedEntity; selectedEntity = null; return id; }, avatar: avatar };
+    return { register: register, navigate: navigate, start: start, can: can, title: title, button: button, empty: empty, error: error, section: section, fetchWorld: fetchWorld, fetchGrowth: fetchGrowth, cache: cache, inspectEntity: inspectEntity, takeSelectedEntity: function () { var id = selectedEntity; selectedEntity = null; return id; }, avatar: avatar, botAvatar: botAvatar };
 })();

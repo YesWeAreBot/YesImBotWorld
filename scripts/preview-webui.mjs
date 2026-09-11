@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { createRequire, Module } from 'node:module';
 import { createDeviceFixture } from './webui-preview-devices.mjs';
+import { createLiveFixture } from './webui-preview-live.mjs';
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 process.env.NODE_PATH = join(root, 'node_modules');
 Module._initPaths();
@@ -17,6 +18,8 @@ await build({ stdin: { contents: 'export { Config } from "./src/config.ts"; expo
 const { Config, introspect } = require(configModule);
 let config = Config({ autoStart: false });
 const fixture = createDeviceFixture();
+const debugStreams = new Set();
+const liveFixture = createLiveFixture(entry => {for(const res of debugStreams)res.write('data: '+JSON.stringify({channel:'debug',entry,update:true})+'\n\n');});
 const now = Date.now(), at = 4268;
 const attr = (value, visibility = 'public') => ({ value, visibility });
 const entities = {
@@ -66,14 +69,18 @@ const server=http.createServer(async(req,res)=>{
    const source=await readFile(join(root,'src/webui/page.ts'),'utf8');const page=JSON.parse(source.slice(source.indexOf('export const PAGE_HTML = ')+24).trim().replace(/;$/,''));
    res.writeHead(200,{'content-type':'text/html; charset=utf-8','cache-control':'no-store'});res.end(page.replace('</body>','<div style="position:fixed;bottom:6px;left:12px;z-index:65;padding:3px 8px;border-radius:5px;background:#fff2d4;color:#896428;font:9px sans-serif;pointer-events:none">开发预览 · 全部为本地样本数据</div></body>'));return;
   }
-  if(path==='/api/events'){res.writeHead(200,{'content-type':'text/event-stream','cache-control':'no-cache'});res.write('data: '+JSON.stringify({channel:'hello',snapshot:45})+'\n\n');const timer=setInterval(()=>res.write(': keepalive\n\n'),15000);req.on('close',()=>clearInterval(timer));return;}
+  if(path==='/api/events'){res.writeHead(200,{'content-type':'text/event-stream','cache-control':'no-cache'});debugStreams.add(res);res.write('data: '+JSON.stringify({channel:'hello',snapshot:45})+'\n\n');const timer=setInterval(()=>res.write(': keepalive\n\n'),15000);req.on('close',()=>{debugStreams.delete(res);clearInterval(timer);});return;}
   if(path==='/api/player/events'){res.writeHead(200,{'content-type':'text/event-stream','cache-control':'no-cache'});streams.add(res);res.write('data: '+JSON.stringify({type:'hello',worldName:'林间小屋',unitWorldSeconds:1,timeLine:'09:41 · 初秋的清晨'})+'\n\n');const timer=setInterval(()=>res.write(': keepalive\n\n'),15000);req.on('close',()=>{streams.delete(res);clearInterval(timer);});return;}
-  let body={};if(!['GET','HEAD'].includes(req.method)){let raw='';for await(const chunk of req){raw+=chunk;if(raw.length>1000000)throw Error('body too large');}if(raw)body=JSON.parse(raw);}
+  let body={};if(!['GET','HEAD'].includes(req.method)){const chunks=[];let size=0;for await(const chunk of req){size+=chunk.length;if(size>1000000)throw Error('body too large');chunks.push(chunk);}const raw=Buffer.concat(chunks).toString('utf8');if(raw)body=JSON.parse(raw);}
   if(path==='/api/health')return json({ok:true,preview:true});
-  if(path==='/api/overview'){const s=fixture.session();return json({version:'0.2.1-preview',initialized:true,worldRunning:running,worldQueue:0,clock:{syncRealTime:false,timeLine:'09:41 · 初秋的清晨',unitRealSeconds:1,unitWorldSeconds:1},bot:{running:running,paused:s.control.paused,waiting:null,streamLength:48,approxChars:16400,pendingTasks:1},appOpen:s.devices.phone.appOpen,computerOn:s.devices.computer.on,phoneDown:false,focusChannels:[],news:[],facts:[],galleryCounts:[],crossing:{location:null,serverEnabled:true,visitors:[],worlds:[]},tokenSet:false,addresses:[]});}
+  if(path==='/fixture-avatar.svg'){res.writeHead(200,{'content-type':'image/svg+xml'});res.end('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 80 80"><rect width="80" height="80" fill="#b5d0b6"/><path d="M16 80V62c0-27 48-27 48 0v18" fill="#41634e"/><circle cx="40" cy="31" r="19" fill="#edd0aa"/><path d="M21 30C14 2 67 0 60 31L48 17 21 30" fill="#394b3e"/><circle cx="33" cy="31" r="2" fill="#394b3e"/><circle cx="47" cy="31" r="2" fill="#394b3e"/><path d="M36 40h8" stroke="#b68263" stroke-width="2"/></svg>');return;}
+  if(path==='/api/overview'){const s=fixture.session();return json({botIdentity:{platform:'preview',selfId:'fixture',name:'样本平台账号',avatar:'http://127.0.0.1:'+server.address().port+'/fixture-avatar.svg'},version:'0.2.1-preview',initialized:true,worldRunning:running,worldQueue:0,clock:{syncRealTime:false,timeLine:'09:41 · 初秋的清晨',unitRealSeconds:1,unitWorldSeconds:1},bot:{running:running,paused:s.control.paused,waiting:null,streamLength:48,approxChars:16400,pendingTasks:1},appOpen:s.devices.phone.appOpen,computerOn:s.devices.computer.on,phoneDown:false,focusChannels:[],news:[],facts:[],galleryCounts:[],crossing:{location:null,serverEnabled:true,visitors:[],worlds:[]},tokenSet:false,addresses:[]});}
   if(path==='/api/world/state')return json({state:{snapshot,events}});
   if(path==='/api/bot/growth')return json({growth});
   if(path==='/api/debug')return json({entries:debugEntries,snapshot:45});
+  if(path==='/api/calls')return json(liveFixture.list());
+  if(path.startsWith('/api/calls/')){const detail=liveFixture.detail(path.slice('/api/calls/'.length),Number(url.searchParams.get('after') || 0),url.searchParams.get('request')!=='0');return detail?json(detail):json({error:'调用已不可用'},404);}
+  if(path==='/api/preview/calls/step' && req.method==='POST')return json(liveFixture.step(body));
   if(path==='/api/usage')return json({summary,entries:usageEntries,snapshot:70});
   if(path==='/api/state')return json({initialized:true,botDef:'小澈，住在林间小屋，喜欢阅读、植物与安静的午后。她会根据自己的经历，慢慢形成判断。',worldDef:'一间光线柔和的工作室，窗外是一座小花园。周围的事物遵循稳定的空间与物理规则。',botStatus:'开发预览：只读的角色状态投影。',worldStatus:'开发预览：小澈在窗边的工作室。',meta:{botName:'小澈',realWorld:false},news:[],facts:[],phoneShell:''});
   if(path==='/api/device/session')return json(fixture.session());

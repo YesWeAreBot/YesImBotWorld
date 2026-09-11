@@ -10,6 +10,8 @@
 export type DebugLevel = "info" | "warn" | "error";
 
 export type DebugKind =
+  /** Lightweight call metadata; complete raw data is held in CallStore. */
+  | "llm.call"
   /** LLM 原始请求（发送给服务端的完整输入） */
   | "llm.req"
   /** LLM 原始响应 */
@@ -61,7 +63,7 @@ export class DebugBus {
       ts: Date.now(),
       kind,
       label: String(label),
-      detail: typeof detail === "string" ? detail : safeStringify(detail, this.maxDetail),
+      detail: serializeDetail(detail, this.maxDetail),
       level,
     };
     this.entries.push(entry);
@@ -83,7 +85,7 @@ export class DebugBus {
     if (!entry) return;
     if (patch.label !== undefined) entry.label = String(patch.label);
     if (patch.detail !== undefined) {
-      entry.detail = typeof patch.detail === "string" ? patch.detail : safeStringify(patch.detail, this.maxDetail);
+      entry.detail = serializeDetail(patch.detail, this.maxDetail);
     }
     if (patch.level !== undefined) entry.level = patch.level;
     entry.ts = Date.now();
@@ -101,6 +103,9 @@ export class DebugBus {
     this.listeners.add(fn);
     return () => this.listeners.delete(fn);
   }
+
+  /** Whether a stream update still has a live entry in the bounded debug buffer. */
+  has(id: number): boolean { return this.entries.some(entry => entry.id === id); }
 
   /** 最近的 n 条 */
   recent(n: number): DebugEntry[] {
@@ -123,15 +128,18 @@ export class DebugBus {
   }
 }
 
-function safeStringify(value: unknown, max: number): string {
+function serializeDetail(value: unknown, max: number): string {
+  if (typeof value === "string") return value.length > max ? value.slice(0, Math.max(0, max - 20)) + "\n…（调试文本已截断）" : value;
   try {
-    const text = JSON.stringify(value);
-    return text && text.length > max
-      ? text.slice(0, max) + "\n…（调试记录过长，仅显示截断——不影响实际请求/结果）"
-      : (text ?? String(value));
-  } catch {
-    return String(value).slice(0, max);
-  }
+    const text = JSON.stringify(value) ?? String(value);
+    if (text.length <= max) return text;
+    const record = value && typeof value === "object" ? value as Record<string, unknown> : {};
+    // Keep the envelope valid JSON even when a large ordinary debug payload is capped.
+    const envelope = { truncated: true, originalChars: text.length, callId: record.callId, model: record.model, ms: record.ms, preview: text.slice(0, Math.max(0, max - 300)), note: "普通调试摘要已截断；完整调用请查看实时调用的原始数据。" };
+    let serialized = JSON.stringify(envelope);
+    while (serialized.length > max && envelope.preview.length) { envelope.preview = envelope.preview.slice(0, Math.floor(envelope.preview.length / 2)); serialized = JSON.stringify(envelope); }
+    return serialized.length <= max ? serialized : JSON.stringify({ truncated: true, originalChars: text.length });
+  } catch { return String(value).slice(0, max); }
 }
 
 /** 模块级单例：全局共享 */

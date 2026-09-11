@@ -1,4 +1,5 @@
 import type { Logger } from "koishi";
+import { AsyncLocalStorage } from "node:async_hooks";
 import type { ComputerDevice } from "../apps/computerDevice.js";
 import type { AppManager } from "../apps/manager.js";
 import type { WorldClock } from "../clock.js";
@@ -12,7 +13,8 @@ import type { NotifyManager } from "../koishi/notify.js";
 import { debug } from "../webui/debug.js";
 import { createBackend, type BotBackend } from "./backend.js";
 import type { BotContext } from "./context.js";
-import { Scheduler } from "./scheduler.js";
+import { Scheduler, type ScheduleOptions } from "./scheduler.js";
+import { deviceKind, type DeviceKind } from "../apps/deviceTools.js";
 import { GrowthLedger, type GrowthKind, type ReflectionRelation } from "./growth.js";
 import { ReceiptInbox } from "./receipts.js";
 import type { WorldObservation } from "../world/state.js";
@@ -20,6 +22,7 @@ import { typingSlackTU } from "./typing.js";
 import { BOT_TOOLS, renderToolsText, toolLayer, type BotToolDef } from "./tools.js";
 import type { AppToolDef } from "../apps/app.js";
 import { signatureParams } from "./nativeTools.js";
+import { sliceText } from "../text.js";
 
 /** 代理执行单个工具调用的回传结果（管理员「手动驾驶」Bot） */
 export interface ManualToolResult {
@@ -202,6 +205,16 @@ export class BotAgent {
    */
   private manualPaused = false;
   private autonomousDispatch: Promise<void> | null = null;
+  private deviceExecution = new AsyncLocalStorage<{ stealth: boolean }>();
+  private stealthCalls = new Set<string>();
+  private attention: DeviceKind | null = null;
+  /** Explicitly looking at the nearby screen need not pick up the phone. */
+  private observingPlacedPhone = false;
+  private deviceOperations = 0;
+  private knownDeviceTools = new Map<string, DeviceKind>();
+  private concealedDevices = new Set<DeviceKind>();
+  private perceivedToolNames: string[] = [];
+  private perceivedAppDefs: AppToolDef[] = [];
   /**
    * 外部注入（管理员代理）工具调用的结果回传表：callId → 解析器。
    * 结果经 scheduler 的 deliver 通道（source=tool）回传；校验拒绝时的 system 提示在此暂存，
@@ -254,6 +267,8 @@ export class BotAgent {
     tools?: BotToolDef[],
     /** 穿越能力（service 注入；未配置任何世界时为 null） */
     private crossing: BotCrossingApi | null = null,
+    /** Passive pixels from the already-open desktop; called only while Bot attends it. */
+    private peekDevice?: (kind: DeviceKind) => Promise<RichText | null>,
   ) {
     this.toolDefs = tools ?? BOT_TOOLS;
     this.growth = new GrowthLedger(files.base);
@@ -271,12 +286,19 @@ export class BotAgent {
     );
     // 原生声明用全量内置工具（稳定，不随界面状态变）；允许集另行按分层控制
     this.backend = createBackend(config.bot, this.layerNames("core"), this.toolDefs);
+    this.perceivedToolNames = this.currentToolNames();
     this.scheduler = new Scheduler(
       clock,
-      (content, ref) => {
+      (content, ref, outcome) => {
+        if (ref && this.stealthCalls.has(ref)) {
+          this.externalToolResults.get(ref)?.resolve({ ok: outcome?.ok ?? true, text: toPlainText(content), ...(typeof content === "string" ? {} : { content }) });
+          this.externalToolResults.delete(ref);
+          this.stealthCalls.delete(ref);
+          return;
+        }
         if (this.retired) {
           if (ref) {
-            this.externalToolResults.get(ref)?.resolve({ ok: true, text: toPlainText(content), ...(typeof content === "string" ? {} : { content }) });
+            this.externalToolResults.get(ref)?.resolve({ ok: outcome?.ok ?? true, text: toPlainText(content), ...(typeof content === "string" ? {} : { content }) });
             this.externalToolResults.delete(ref);
           }
           void this.receipts.save(content, this.clock.now(), ref).catch(error => this.logger.error("停止后的工具回执保存失败：%s", error));
@@ -290,7 +312,7 @@ export class BotAgent {
           const pending = this.externalToolResults.get(ref);
           if (pending) {
             this.externalToolResults.delete(ref);
-            pending.resolve({ ok: true, text: toPlainText(gated), ...(typeof gated === "string" ? {} : { content: gated }) });
+            pending.resolve({ ok: outcome?.ok ?? true, text: toPlainText(gated), ...(typeof gated === "string" ? {} : { content: gated }) });
           }
         }
         this.pushEvent("tool", gated, { ref });
@@ -334,8 +356,15 @@ export class BotAgent {
   }
 
   private refreshToolGate(): void {
-    const allowed = this.currentToolNames();
-    const appDefs = [...(this.apps?.activeToolDefs() ?? []), ...(this.computer?.activeToolDefs() ?? [])];
+    if (this.deviceExecution.getStore()?.stealth) return;
+    let allowed = this.currentToolNames();
+    let appDefs = [...(this.apps?.activeToolDefs() ?? []), ...(this.computer?.activeToolDefs() ?? [])];
+    for (const name of allowed) { const kind = this.classifyDevice(name); if (kind) this.knownDeviceTools.set(name, kind); }
+    const hidden = (name: string) => { const kind = this.classifyDevice(name); return !!kind && this.concealedDevices.has(kind); };
+    allowed = [...allowed.filter(name => !hidden(name)), ...this.perceivedToolNames.filter(hidden)];
+    appDefs = [...appDefs.filter(def => !hidden(def.name)), ...this.perceivedAppDefs.filter(def => hidden(def.name))];
+    this.perceivedToolNames = [...allowed];
+    this.perceivedAppDefs = [...appDefs];
     this.backend.setToolNames(allowed);
     this.backend.setToolDefs?.([...this.toolDefs, ...appDefs]);
   }
@@ -428,6 +457,7 @@ export class BotAgent {
       if (this.scheduler.isPending(id)) continue;
       pending.resolve({ ok: false, text: "（Bot 已停止，此调用未继续执行。）" });
       this.externalToolResults.delete(id);
+      this.stealthCalls.delete(id);
     }
   }
 
@@ -476,6 +506,7 @@ export class BotAgent {
       const pending = this.externalToolResults.get(opts.ref);
       if (pending && pending.systemText === null) pending.systemText = rich.text;
     }
+    if ((opts.ref && this.stealthCalls.has(opts.ref)) || (this.deviceExecution.getStore()?.stealth && (source === "system" || source === "tool"))) return;
     const isWaitResult = this.waiting !== null && opts.ref === this.waiting.callId;
     // 唤醒规则：等待中的工具结果必定唤醒；wake 事件可以提前唤醒 wait（等待本来就是"直到有事发生"）。
     // act 不再阻塞生成（blockingAct 只管住下一个 act），因此没有"专注做事顾不上别的"的暂停态。
@@ -595,11 +626,14 @@ export class BotAgent {
     for (const id of cancelled) {
       this.externalToolResults.get(id)?.resolve({ ok: false, text: "（管理员接管前已取消尚未提交的调用。）" });
       this.externalToolResults.delete(id);
+      this.stealthCalls.delete(id);
     }
     return { busy: this.manualBusy };
   }
 
   get manualBusy(): boolean { return this.autonomousDispatch !== null || this.scheduler.pendingCount > 0; }
+  get deviceBusy(): boolean { return this.deviceOperations > 0; }
+  get deviceAttention(): DeviceKind | null { return this.attention === "phone" && this.phone.down && !this.observingPlacedPhone ? null : this.attention; }
 
   /** 当前分层真正允许的工具与原始应用 schema；读取无副作用。 */
   manualTools(): AppToolDef[] {
@@ -628,12 +662,14 @@ export class BotAgent {
   async injectExternalToolCall(
     name: string,
     args: Record<string, unknown> = {},
-    opts: { duration?: number } = {},
+    opts: { duration?: number; stealth?: boolean } = {},
   ): Promise<ManualToolResult> {
     if (!this.running) {
       return { ok: false, text: "（Bot-LLM 当前未在运行，无法代理其工具调用。）" };
     }
     if (!this.currentToolNames().includes(name)) return { ok: false, text: `（${name} 此刻不可用，请先打开对应应用或进入频道。）` };
+    if (opts.stealth && (!this.classifyDevice(name) || name === "pick_up_phone" || name === "put_down_phone")) return { ok: false, text: "偷偷操作只能改变设备界面，不能代替角色拿起或放下手机。" };
+    if (opts.stealth && (name === "pick_media" || (name === "send" && this.countImgPlaceholders(String(args.msg ?? ""))))) return { ok: false, text: "偷偷发送请在 send 中提供完整 msg 和 media，不能接续角色尚未完成的选图草稿。" };
     const issuedAt = this.clock.now();
     let duration = opts.duration;
     // 与 finalize 一致：wait 以参数 n 为准（模型常输出 duration:0 + n:x 的组合）
@@ -651,7 +687,8 @@ export class BotAgent {
       issuedAt,
       expectedAt: issuedAt + (duration && duration > 0 ? duration : 0),
     };
-    await this.context.appendToolCall(call);
+    if (opts.stealth) this.stealthCalls.add(call.id);
+    else await this.context.appendToolCall(call);
     debug.emit("bot.tool", `${call.id} ${call.name}`, {
       id: call.id,
       name: call.name,
@@ -659,7 +696,7 @@ export class BotAgent {
       duration: call.duration,
       issuedAt: call.issuedAt,
       expectedAt: call.expectedAt,
-      source: "manual",
+      source: opts.stealth ? "device-stealth" : "manual",
     });
     this.logger.info(
       "[tool:manual] %s %s(%s)",
@@ -674,15 +711,17 @@ export class BotAgent {
 
     if (!this.running) {
       this.externalToolResults.delete(call.id);
+      this.stealthCalls.delete(call.id);
       return { ok: false, text: "（Bot 已停止，此调用没有开始。）" };
     }
-    await this.dispatch(call);
+    await this.deviceExecution.run({ stealth: !!opts.stealth }, () => this.dispatch(call));
 
     // 校验拒绝（未进入调度）：dispatch 已同步经 pushEvent(system) 推送了拒绝原因（ref=call.id），
     // 且 scheduler 无对应 pending 任务 → 兜底以该拒绝原因回传；否则等待 scheduler deliver 的结果。
     const entry = this.externalToolResults.get(call.id);
     if (entry && !this.scheduler.isPending(call.id)) {
       this.externalToolResults.delete(call.id);
+      this.stealthCalls.delete(call.id);
       entry.resolve({ ok: false, text: entry.systemText ?? `（${name} 未被接受。）` });
     }
     return resultPromise;
@@ -948,6 +987,11 @@ export class BotAgent {
   // ---------- 工具派发 ----------
 
   private async dispatch(call: ToolCallRecord): Promise<void> {
+    if (call.role === "agent" && (["act", "rest", "nap", "travel", "go_home"].includes(call.name) ||
+      (call.name === "observe" && call.arguments.target !== "self" && call.arguments.modality !== "self"))) {
+      this.attention = null;
+      this.observingPlacedPhone = false;
+    }
     // 通用防重复守卫：观察这次调用，连续重复达到阈值时注入提醒。
     // 放在 dispatch 最前，让所有工具——包括下面被目标误写/参数缺失拦截的
     // denied 调用——都计入链（模型反复撞被拒的调用，正是最该打断的循环）。
@@ -979,6 +1023,14 @@ export class BotAgent {
         return this.dispatchLocal(call, async () => this.readStatus(call));
       case "observe":
         return this.dispatchLocal(call, async () => this.observe(call));
+      case "observe_device": {
+        const device = call.arguments.device;
+        if (device !== "phone" && device !== "computer") {
+          this.pushEvent("system", "（observe_device 的 device 必须为 phone 或 computer。）", { ref: call.id });
+          return;
+        }
+        return this.dispatchLocal(call, () => this.deviceObservation(device));
+      }
       case "reflect":
         return this.dispatchLocal(call, async () => {
           const a = call.arguments;
@@ -1580,7 +1632,7 @@ export class BotAgent {
             try {
               return await this.apps!.call(call.name, call.arguments);
             } catch (err) {
-              return `（「${appName}」的 ${call.name} 操作失败：${(err as Error).message ?? err}）`;
+              throw new Error(`「${appName}」的 ${call.name} 操作失败：${(err as Error).message ?? err}`);
             }
           });
         }
@@ -1590,9 +1642,12 @@ export class BotAgent {
             try {
               return await this.computer!.call(call.name, call.arguments);
             } catch (err) {
-              return `（电脑的 ${call.name} 操作失败：${(err as Error).message ?? err}）`;
+              throw new Error(`电脑的 ${call.name} 操作失败：${(err as Error).message ?? err}`);
             }
           });
+        }
+        if (call.role === "agent" && this.classifyDevice(call.name)) {
+          return this.dispatchLocal(call, async () => { throw new Error("设备界面已改变，原操作不可用"); });
         }
         this.pushEvent("system", `（没有名为 ${call.name} 的能力。）`, { ref: call.id });
     }
@@ -1679,7 +1734,7 @@ export class BotAgent {
     // an early read would consume another actor's speech even when this wait is interrupted.
     const narrateMinMs = this.config.world.waitNarrateMinRealSeconds * 1000;
     const shouldObserve = narrateMinMs > 0 && this.clock.realMsUntil(call.expectedAt) >= narrateMinMs;
-    this.scheduler.schedule(call, {
+    this.schedule(call, {
       executeAt: "expected",
       run: async () => {
         this.recordWait(call.issuedAt);
@@ -1727,7 +1782,7 @@ export class BotAgent {
     this.lastAct = { sig, callId: call.id };
     this.lastActBlock = null; // 成功发起（或重置）一个 act，重复计数归零
     this.ackStart(call);
-    this.scheduler.schedule(call, {
+    this.schedule(call, {
       executeAt: "now",
       cancellation: "cooperative",
       run: async (task) => {
@@ -1821,7 +1876,77 @@ export class BotAgent {
 
   private dispatchLocal(call: ToolCallRecord, run: () => Promise<string | RichText>): void {
     this.ackStart(call);
-    this.scheduler.schedule(call, { executeAt: "now", run });
+    this.schedule(call, { executeAt: "now", run });
+  }
+
+  private classifyDevice(name: string): DeviceKind | null {
+    return deviceKind(name, new Set(this.apps?.activeToolNames() ?? []), new Set(this.computer?.activeToolNames() ?? [])) ?? this.knownDeviceTools.get(name) ?? null;
+  }
+
+  /** Both autonomous and human calls serialize one side effect, then release the device. */
+  private schedule(call: ToolCallRecord, opts: ScheduleOptions): void {
+    const kind = call.name === "observe_device" ? call.arguments.device as DeviceKind : this.classifyDevice(call.name);
+    if (!kind) { this.scheduler.schedule(call, opts); return; }
+    const phoneApp = this.apps?.hasTool(call.name) ? this.apps.view()?.id : null;
+    const stealth = this.stealthCalls.has(call.id);
+    let revealOnAttention = false;
+    this.scheduler.schedule(call, {
+      ...opts, serialKey: "devices",
+      beforeStart: () => {
+        if (!this.running) throw new Error("设备所属世界已停止，此操作没有执行");
+        if (call.role === "agent") {
+          revealOnAttention = this.concealedDevices.has(kind);
+          this.attention = kind;
+          if (call.name === "observe_device") this.observingPlacedPhone = kind === "phone";
+          this.concealedDevices.delete(kind);
+          this.refreshToolGate();
+        }
+        if (stealth) this.concealedDevices.add(kind);
+        if (!this.currentToolNames().includes(call.name) || (phoneApp && this.apps?.view()?.id !== phoneApp)) {
+          throw new Error("设备界面已改变，此操作已不可用；请查看当前界面后重新决定");
+        }
+        opts.beforeStart?.();
+      },
+      run: async task => {
+        this.deviceOperations++;
+        try {
+          const result = await opts.run(task);
+          if (call.role === "agent" && (call.name === "put_down_phone" || call.name === "close_computer")) {
+            this.attention = null;
+            this.observingPlacedPhone = false;
+          }
+          if (call.name !== "observe_device" && (stealth || revealOnAttention) && this.running && this.deviceAttention === kind) await this.perceiveDeviceChange(kind);
+          return result;
+        } finally { this.deviceOperations--; }
+      },
+    });
+  }
+
+  /** Read the current interface only. This cannot open, connect, or change device state. */
+  private async deviceObservation(kind: DeviceKind): Promise<RichText> {
+    let pixels: RichText | null = null;
+    try { if (kind === "phone" || this.computer?.isOpen) pixels = await this.peekDevice?.(kind) ?? null; }
+    catch (error) { this.logger.debug("读取可见设备画面失败：%s", error); }
+    const view = kind === "phone" ? this.apps?.view()?.result : this.computer?.view()?.result;
+    const visible = pixels ?? (typeof view === "string" ? { text: view } : view);
+    const label = kind === "phone"
+      ? `手机当前显示：${this.phoneUi.chatOpen ? "聊天应用" + (this.phoneUi.channelKey ? `，频道 ${this.phoneUi.channelKey}` : "，消息列表") : this.apps?.currentName ?? "桌面"}`
+      : !this.computer ? "当前没有可用电脑" : `电脑当前${this.computer.isOpen ? "处于打开状态" : "已关闭"}`;
+    return {
+      text: `（你正看着${kind === "phone" ? "手机" : "电脑"}，当前可见界面：${label}。）` +
+        (visible?.text ? `\n${pixels ? "界面上显示的内容" : "已有界面回显"}（不是你的行动或心理记录）：\n${truncate(visible.text, 3000)}` : ""),
+      attachments: visible?.attachments,
+    };
+  }
+
+  private async perceiveDeviceChange(kind: DeviceKind): Promise<void> {
+    const visible = await this.deviceObservation(kind);
+    if (!this.running || this.deviceAttention !== kind) return;
+    this.deviceExecution.run({ stealth: false }, () => {
+      this.concealedDevices.delete(kind);
+      this.refreshToolGate();
+      this.pushEvent("system", visible);
+    });
   }
 
   /**
@@ -1902,8 +2027,8 @@ export class BotAgent {
     // head/tail 各占约 45%，中间省略标记
     const headChars = Math.floor(threshold * 0.45);
     const tailChars = Math.floor(threshold * 0.45);
-    const head = content.slice(0, headChars);
-    const tail = content.slice(content.length - tailChars);
+    const head = sliceText(content, 0, headChars);
+    const tail = sliceText(content, content.length - tailChars);
     const omitted = content.length - headChars - tailChars;
     const spillFile = this.files.spillPath(ref ? `${ref}.txt` : `result_${Date.now()}.txt`);
     const marker = `\n\n[... 中间 ${omitted} 字符已省略，完整结果见 ${spillFile} ...]\n\n`;
@@ -1981,6 +2106,7 @@ export class BotAgent {
    * 返回 true 表示已按延期发送处理（调用方直接 return）。
    */
   private maybeDeferSend(call: ToolCallRecord, kind: "text" | "file" | "voice", id: string, content: string): boolean {
+    if (this.deviceExecution.getStore()?.stealth) return false;
     if (this.config.bot.ignoreSendDuration) return false;
     const n = call.duration ?? 0;
     const slack = typingSlackTU(
@@ -2068,6 +2194,7 @@ export class BotAgent {
 
   /** 自己的账号（无论何种原因：其他插件、主人顶号、自己刚发的）在频道里发出了消息：打断对该频道的延期发送意图 */
   noteDeferredSelfSent(key: string): void {
+    if (this.deviceExecution.getStore()?.stealth) return;
     if (!this.pendingDeferred.length) return;
     const hit = this.pendingDeferred.filter((p) => this.matchesDeferred(p, key));
     for (const pend of hit) {
@@ -2082,6 +2209,7 @@ export class BotAgent {
 
   /** 注意力转移到别处（换频道 / 放下手机）：打断全部延期发送意图 */
   private interruptAllDeferred(reason: string): void {
+    if (this.deviceExecution.getStore()?.stealth) return;
     if (!this.pendingDeferred.length) return;
     for (const pend of this.pendingDeferred) {
       if (pend.timer) clearTimeout(pend.timer);
@@ -2264,7 +2392,7 @@ export class BotAgent {
     this.recordSendSig(sig);
     this.ackStart(call);
     const insist = isTruthy(call.arguments.insist);
-    this.scheduler.schedule(call, {
+    this.schedule(call, {
       executeAt: "expected",
       run: async () => {
         const out = await this.deliverSend(id, msg, media, replyTo, atSender, insist);
@@ -2284,6 +2412,7 @@ export class BotAgent {
 
   /** 记录一条已发出的 send 签名，滑窗维护「最近 N 条」（超窗滑出最老） */
   private recordSendSig(sig: string): void {
+    if (this.deviceExecution.getStore()?.stealth) return;
     this.recentSendSigs.push(sig);
     const window = this.config.messaging.recentRepeatWindow;
     if (this.recentSendSigs.length > window) {
@@ -2385,7 +2514,7 @@ export class BotAgent {
     // expectedAt 只影响调度不进入上下文渲染，可安全修正（duration 可能写在 arguments 里）
     call.expectedAt = call.issuedAt + n;
     this.waiting = { callId: call.id, kind: "nap" };
-    this.scheduler.schedule(call, {
+    this.schedule(call, {
       executeAt: "expected",
       run: async () => {
         const napWake = pickMeta(
@@ -2489,7 +2618,7 @@ export function misusedTargetKeys(args: Record<string, unknown>): string[] {
 
 function truncate(text: string, max: number): string {
   const single = text.replace(/\n/g, "\\n");
-  return single.length > max ? single.slice(0, max) + "…" : single;
+  return single.length > max ? sliceText(single, 0, max) + "…" : single;
 }
 
 /** RichText / string 统一取纯文本 */
@@ -2596,7 +2725,7 @@ const SEND_TOOL_NAMES = ["send", "pick_media"];
 
 /** 打破死循环时不该被移除的"安全"工具：计时/书签类，移除它们反而会让模型无处安放、更疯狂 */
 function isBreakLoopSafeTool(name: string): boolean {
-  return name === "wait" || name === "rest" || name === "check_status" || name === "check_time";
+  return name === "wait" || name === "rest" || name === "check_status" || name === "check_time" || name === "observe_device";
 }
 
 /**

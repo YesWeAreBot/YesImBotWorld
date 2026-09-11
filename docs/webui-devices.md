@@ -1,6 +1,21 @@
 # WebUI 设备接口
 
-设备页共享 Bot 当前手机、电脑和应用状态。管理员操作通过 Bot 的实际工具分发与调度器执行，结果会进入 Bot 上下文；它不是独立的手机模拟器，也不会为每个浏览器另建一台设备。
+设备页共享 Bot 当前手机、电脑和应用状态。管理员操作通过 Bot 的实际工具分发与调度器执行，不会为每个浏览器另建一台设备。界面默认使用“偷偷操作”，也可明确点击“强制接管”。
+
+## 两种操作语义
+
+`POST /api/device/tool` 支持 `mode:"stealth"|"takeover"`，省略时使用 `takeover` 以兼容原客户端。
+
+- **偷偷操作**：不暂停 Bot，也不取消它的等待、行动或尚未完成的发送意图。人和 Bot 的实际设备操作共享单次执行队列；每次动作结束即释放设备，不锁住模型推理。双方可以在操作之间切换应用或开关电脑，排队调用在真正执行前会重新校验工具与应用，界面已改变时返回失败，不能把旧操作错发到新应用。
+- **强制接管**：先通过 control 暂停自主生成并等待已提交操作；随后以 takeover 调工具。交还也必须得到 control 的真实响应。本地切换表单模式不会改变 Bot 的暂停状态。
+
+偷偷调用的原始工具参数、开始确认和完整回执仅返回管理员，不伪装成 Bot 自己发出的调用。Bot 的注意力依据它实际执行的设备工具，使用某台设备后保留该设备的关注；世界行动、明确观察周围、休息或穿越会移开关注。查时间、查状态或观察自身保留原关注。这是操作级注意力记录，不推测角色心理或世界中的视线几何。
+
+Bot 可以用核心只读工具 `observe_device(device:"phone"|"computer")` 主动查看当前界面并恢复该设备的可用工具认知，不需要先开关应用。它不会拿起手机、启动电脑、连接 VNC 或执行应用工具；电脑关闭时只返回关闭状态。手机放下后默认不看屏幕，但明确调用此工具可看放在身边的屏幕，`phone.down` 与通知规则不变。当前设备没有空间位置或遮挡绑定，这个入口限于角色当前可及的随身/在用设备，不证明远处或被遮挡屏幕可见。设备页不能通过偷偷调用此工具强行改变 Bot 的关注。
+
+只有 Bot 当时关注的设备发生变化，才投递中性的当前界面变化与可见内容；真实远程桌面可补充一帧当前图像。事件不指认操作者，不替角色写疑惑、恐惧或因果解释。未关注时，不注入偷偷操作事件，也不通过模型工具声明提前透露新开的应用；既有消息通知与手机振动继续走原来的感知规则。Bot 下一次主动查看设备时会同步它实际看到的状态。
+
+偷偷模式可在手机已放下时操作应用，但不能代理角色的 `pick_up_phone/put_down_phone` 身体动作。发送必须明确确认，并在 `send` 中提供完整 `msg` 和可选 `media`；不接续 Bot 私有的 `pick_media`/`<img>` 多步草稿。强制接管保留原工具能力。
 
 ## 权限与接管
 
@@ -24,7 +39,7 @@ GET 不打开应用、不连接 VNC、不调用模型、不刷新 Bot 观测或�
 ```json
 {
   "running": true,
-  "control": {"paused": true, "busy": false},
+  "control": {"paused": false, "busy": true, "deviceBusy": false, "attention": "phone"},
   "devices": {
     "computer": {"mode": "remote_desktop", "effectiveMode": "remote_desktop", "on": "电脑", "docker": null, "remote": {"host": "configured-host", "port": 5900, "connected": true}},
     "phone": {"down": false, "appOpen": "聊天", "chatOpen": true, "channelKey": "onebot@account:channel", "channelIsGroup": false, "chatAppName": "聊天", "resolution": {"width": 390, "height": 844}}
@@ -39,14 +54,16 @@ GET 不打开应用、不连接 VNC、不调用模型、不刷新 Bot 观测或�
 
 `apps` 是实际安装目录。聊天应用的 `id` 以服务器返回值为准。`appView` 是当前应用的 `{id,name,opening?,lastTool?,result?}`；`computerView` 为 `{lastTool?,result?}`。这些是已有回执缓存，GET 不会再次调用应用。频道 key 包含可选的 Bot 账号 `selfId`，前端应原样传回，不得截掉账号自行拼频道号。
 
+`control.busy` 包含等待回执等全部在途工作；`deviceBusy` 仅表示设备执行或管理员请求队列有工作。`attention` 为 `phone|computer|null`，用于解释当前感知边界，读取不会让 Bot 转移注意力。偷偷模式不因自主工作 busy 而禁用；接管模式必须同时检查 `paused:true,busy:false`。
+
 工具只有当前可用时才列在 `tools`，仍受 Bot 配置、当前应用、频道及临时工具禁用约束。打开/关闭应用或设备后应重新读取 session。MCP 的嵌套 `inputSchema` 会原样保留；按服务提供的工具定义填写参数，不要仅从显示签名推断复杂数组或对象。遇到同名工具，服务器可能返回 `terminal.run_command` 等前缀名称；前端应先按 `device` 找对应工具，再把完整 `name` 发回。
 
 ```json
-{"name":"open_app","args":{"name":"实际应用 ID 或名称"}}
+{"name":"open_app","args":{"name":"实际应用 ID 或名称"},"mode":"stealth"}
 ```
 
 ```json
-{"name":"send","args":{"msg":"用户写下的消息"},"confirmSend":true}
+{"name":"send","args":{"msg":"用户写下的消息"},"mode":"stealth","confirmSend":true}
 ```
 
 可选 `duration` 是有限非负的世界时间单位 TU，和 Bot 工具相同；不是毫秒或世界秒。真实桌面输入通常省略它。响应为 `{ok,text,content?}`，`content` 可包含 RichText 图片/音频附件。通过 `/api/media/file?id=...` 访问已保存附件；不要把附件本地文件路径当作浏览器 URL，不要执行返回文本或 HTML。
@@ -72,7 +89,7 @@ GET 不打开应用、不连接 VNC、不调用模型、不刷新 Bot 观测或�
 
 ### VNC 坐标与输入
 
-`GET /api/computer/screen?w=1200` 只截取已经连接的会话，不临时建立连接，也不把画面加入 Bot 上下文。未开机、未连接或不支持屏幕时返回 503。与之不同，显式调用 `screen` 工具会生成 Bot 可感知的媒体回执。
+`GET /api/computer/screen?w=1200` 只截取已经连接的会话，不临时建立连接，也不把画面加入 Bot 上下文。未开机、未连接或不支持屏幕时返回 503。显式调用 `screen` 工具会生成媒体回执；偷偷模式仅在 Bot 正关注电脑时补充其可见画面，完整调用回执仍只给管理员。
 
 PNG 可能缩小：`x-screen-width` / `x-screen-height` 是返回图片尺寸；`x-desktop-width` / `x-desktop-height` 是真实远端桌面尺寸。鼠标参数必须使用远端原始像素坐标，左上角为 `(0,0)`。若图像在页面显示矩形为 `(left,top,width,height)`，转换为：
 
@@ -81,7 +98,7 @@ x = (clientX - left) / width  * desktopWidth
 y = (clientY - top)  / height * desktopHeight
 ```
 
-后端会将指针限制在远端桌面边界。不要把缩略图尺寸或 CSS 像素直接作为桌面坐标。鼠标 `action` 支持 `move/click/double_click/right_click/middle_click/press/release/drag/scroll`；拖动支持 `button:left|middle|right`；滚轮方向支持 `up/down/left/right`。键盘支持 `type/key/combo/press/release`，详细参数以当前工具 schema 为准。所有输入必须先接管并在同一前端队列逐条等待，页面失效或失去控制时丢弃尚未发送的输入。
+后端会将指针限制在远端桌面边界。不要把缩略图尺寸或 CSS 像素直接作为桌面坐标。鼠标 `action` 支持 `move/click/double_click/right_click/middle_click/press/release/drag/scroll`；拖动支持 `button:left|middle|right`；滚轮方向支持 `up/down/left/right`。键盘支持 `type/key/combo/press/release`，详细参数以当前工具 schema 为准。输入明确指定偷偷或接管模式；接管模式要求真实暂停成功。两种模式均在同一前端队列逐条等待，页面失效或切换操作模式时丢弃尚未发送的输入。
 
 交还会释放保持状态的键鼠；关闭电脑或停止世界会断开远端连接并停止剩余排队输入。已经写给远端或外部平台的输入不会回滚；网络错误不构成安全重放的依据。
 
@@ -95,4 +112,4 @@ y = (clientY - top)  / height * desktopHeight
 
 `node scripts/preview-webui.mjs` 在 `127.0.0.1:18131` 提供生成后的页面与固定样本 API，`STUDIO_PREVIEW_PORT` 可选择其他本地端口。其设备、聊天、天气、新闻、MCP 与玩家回执由内存 fixture 提供；操作只改变样本内存，重启即恢复。它不连接运行中的 `18111`、真实平台、模型、Docker 或 VNC，页面应始终标明开发样本。
 
-预览可验证布局与交互，不证明真实外部设备已连通。`scripts/test-device-api.ts` 使用真实服务/工具分发逻辑和本地 stub 验证鉴权、工具状态、发送确认、互斥队列、接管/关闭、原始坐标尺寸、取消回执及有效电脑模式。运行 `npm test` 执行隔离套件；测试不需要线上实例或真实凭据。
+预览可验证布局与交互，不证明真实外部设备已连通。`scripts/test-device-api.ts` 使用真实服务/工具分发逻辑和本地 stub 验证鉴权、工具状态、发送确认、互斥队列、接管/关闭、原始坐标尺寸、取消回执及有效电脑模式。`scripts/test-device-stealth.ts` 验证自主与人为竞争、旧工具执行前重新校验、不取消 Bot 意图、关注与未关注的感知边界、秘密调用回执隔离。运行 `npm test` 执行隔离套件；测试不需要线上实例或真实凭据。

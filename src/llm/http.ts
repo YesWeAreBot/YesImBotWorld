@@ -40,7 +40,7 @@ export interface LlmFetchInit {
  * 逐行读取流式响应体（OpenAI SSE / llama.cpp NDJSON 都按行切分）。
  * 同时兼容两种换行；每行 trim 后回调（空行跳过）。
  */
-export async function forEachStreamLine(res: LlmResponse, onLine: (line: string) => void): Promise<void> {
+export async function forEachStreamLine(res: LlmResponse, onLine: (line: string) => void, onText?: (text: string) => void): Promise<void> {
   if (!res.body) throw new Error("LLM 响应无 body 流（后端不支持流式？）");
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
@@ -49,7 +49,9 @@ export async function forEachStreamLine(res: LlmResponse, onLine: (line: string)
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
-      buf += decoder.decode(value, { stream: true });
+      const text = decoder.decode(value, { stream: true });
+      onText?.(text);
+      buf += text;
       let idx: number;
       while ((idx = buf.indexOf("\n")) >= 0) {
         const raw = buf.slice(0, idx).trim();
@@ -57,7 +59,9 @@ export async function forEachStreamLine(res: LlmResponse, onLine: (line: string)
         if (raw) onLine(raw);
       }
     }
-    buf += decoder.decode();
+    const tail = decoder.decode();
+    onText?.(tail);
+    buf += tail;
     buf
       .trim()
       .split("\n")

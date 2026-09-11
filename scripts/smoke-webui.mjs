@@ -8,10 +8,11 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import smokeJourney from './webui-smoke-journey.mjs';
 import smokeDevices from './webui-smoke-devices.mjs';
+import smokeLive from './webui-smoke-live.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const children = [];
-let socket, profile;
+let socket, profile, closeBrowser;
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 function launch(command, args, pattern, options = {}) {
   const child = spawn(command, args, { cwd: root, stdio: ['ignore', 'pipe', 'pipe'], ...options });
@@ -61,6 +62,7 @@ try {
     const id = ++next, timer = setTimeout(() => { pending.delete(id); reject(new Error(method + ' timed out')); }, 20000);
     pending.set(id, { resolve, reject, timer }); socket.send(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) }));
   });
+  closeBrowser = () => call('Browser.close');
   const { targetId } = await call('Target.createTarget', { url: 'about:blank' });
   const { sessionId } = await call('Target.attachToTarget', { targetId, flatten: true });
   const page = (method, params) => call(method, params, sessionId);
@@ -83,8 +85,11 @@ try {
   await page('Emulation.setDeviceMetricsOverride', { width: 1440, height: 1050, deviceScaleFactor: 1, mobile: false });
   await page('Page.navigate', { url: base });
   await wait("typeof Studio !== 'undefined' && !!document.querySelector('.studio-hero')");
+  assert.equal(await evaluate("document.querySelector('.studio-hero h2').textContent"), '你好，欢迎回来。');
+  await wait("document.querySelector('.studio-avatar img')?.naturalWidth > 0");
+  assert.ok(await evaluate("document.querySelector('.studio-avatar img').alt.includes('样本平台账号')"));
   const helpers = { evaluate, wait, assert, navigate };
-  const routes = ['overview', 'world', 'growth', 'devices', 'player', 'debug', 'usage', 'state', 'crossing', 'config', 'prompts', 'gallery', 'media', 'data', 'visitors'];
+  const routes = ['overview', 'world', 'growth', 'devices', 'player', 'live', 'debug', 'usage', 'state', 'crossing', 'config', 'prompts', 'gallery', 'media', 'data', 'visitors'];
   for (const width of [1440, 768, 375]) {
     await page('Emulation.setDeviceMetricsOverride', { width, height: 1050, deviceScaleFactor: 1, mobile: width < 600 });
     for (const route of routes) {
@@ -116,6 +121,7 @@ try {
   assert.equal(await evaluate('document.body.dataset.theme'), 'dark');
   await evaluate("document.querySelector('#btn-theme').click()");
   console.log('PASS login cancellation, command search and theme switch');
+  console.log('PASS', await smokeLive(helpers));
   console.log('PASS', await smokeDevices(helpers));
   console.log('PASS', await smokeJourney(helpers));
   assert.deepEqual(errors, [], 'Browser exceptions or unexpected external requests');
@@ -133,12 +139,13 @@ try {
   console.log('PASS isolated browser smoke; no production world, LLM, chat, Docker or VNC used.');
   await call('Browser.close').catch(() => {});
 } finally {
+  if (socket?.readyState === WebSocket.OPEN) await closeBrowser?.().catch(() => {});
   socket?.close();
   for (const child of children.reverse()) {
     if (child.exitCode !== null) continue;
-    child.kill('SIGTERM');
+    try { child.kill('SIGTERM'); } catch { /* Snap may own the launcher; CDP closes the browser above. */ }
     await Promise.race([new Promise(resolve => child.once('exit', resolve)), delay(2000)]);
-    if (child.exitCode === null) child.kill('SIGKILL');
+    if (child.exitCode === null) try { child.kill('SIGKILL'); } catch { /* Preserve the original test failure. */ }
   }
   if (profile) await rm(profile, { recursive: true, force: true }).catch(() => {});
 }

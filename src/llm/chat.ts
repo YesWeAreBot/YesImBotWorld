@@ -2,7 +2,10 @@
 
 import { llmFetch, forEachStreamLine, type LlmResponse } from "./http.js";
 import { debug } from "../webui/debug.js";
+import { callStore } from "../webui/calls.js";
 import { usageStore } from "../webui/usage.js";
+import { sliceText } from "../text.js";
+import { normalizeChatRequest } from "./normalize.js";
 
 export type ContentPart =
   | { type: "text"; text: string }
@@ -112,11 +115,18 @@ export class ChatClient {
       body.chat_template_kwargs = { enable_thinking: false, thinking: false };
     }
 
+    const normalized = normalizeChatRequest(body);
+    const requestMessages = normalized.body.messages as ChatMessage[];
     const startedAt = Date.now();
+    const label = this.cfg.label ?? "LLM";
+    const requestBody = JSON.stringify(normalized.body);
+    const callId = callStore.begin({ source: label, model: this.cfg.model, url, requestBody, unicodeRepairedStrings: normalized.repairedStrings });
     const input = {
+      callId,
       url,
       model: this.cfg.model,
-      messages: messages.map((m) => ({
+      ...(normalized.repairedStrings ? { unicodeRepairedStrings: normalized.repairedStrings } : {}),
+      messages: requestMessages.map((m) => ({
         role: m.role,
         content: summarizeContent(m.content, 3000),
         ...(m.tool_calls ? { tool_calls: m.tool_calls } : {}),
@@ -125,27 +135,31 @@ export class ChatClient {
       max_tokens: opts.maxTokens ?? this.cfg.maxTokens ?? 2048,
       stream,
     };
-    const label = this.cfg.label ?? "LLM";
     debug.emit("llm.req", `${label}·请求发送`, input);
 
+    try {
     const res = await llmFetch(url, {
       method: "POST",
       headers: {
         "content-type": "application/json",
         ...(this.cfg.apiKey ? { authorization: `Bearer ${this.cfg.apiKey}` } : {}),
       },
-      body: JSON.stringify(body),
+      body: requestBody,
       signal: opts.signal ?? null,
     });
+    callStore.update(callId, { httpStatus: res.status, responseFormat: res.headers.get("content-type") ?? (stream ? "text/event-stream" : "application/json") });
     if (!res.ok) {
       const text = await res.text().catch(() => "");
+      callStore.append(callId, text);
       debug.emit("llm.req", `${label}·请求失败(${res.status})`, { ...input, ms: Date.now() - startedAt }, "error");
       throw new Error(`chat completion 请求失败 (${res.status}): ${text.slice(0, 500)}`);
     }
 
     // 非流式：一次性 JSON 响应
     if (!stream) {
-      const data = (await res.json()) as ChatRawResponse;
+      const responseBody = await res.text();
+      callStore.append(callId, responseBody);
+      const data = JSON.parse(responseBody) as ChatRawResponse;
       const message = data.choices?.[0]?.message;
       if (!message) {
         debug.emit("llm.req", `${label}·无响应`, { ...input, ms: Date.now() - startedAt }, "error");
@@ -157,6 +171,7 @@ export class ChatClient {
         "llm.res",
         `${label}·${ms}ms${message.tool_calls?.length ? "·工具调用" : "·正文"}${usage ? ` · ${usage.total_tokens} tok` : ""}`,
         {
+          callId,
           url,
           model: this.cfg.model,
           ms,
@@ -169,6 +184,7 @@ export class ChatClient {
         },
       );
       this.recordUsage(usage);
+      callStore.update(callId, { status: "completed", usage, preview: message.content || JSON.stringify(message.tool_calls ?? []) });
       return { content: message.content ?? "", toolCalls: message.tool_calls ?? [] };
     }
 
@@ -181,6 +197,7 @@ export class ChatClient {
       const result = await readChatCompletionStream(res, (progress) => {
         const labelNow = `${label}·流式 ${Date.now() - startedAt}ms`;
         const detail = {
+          callId,
           url,
           model: this.cfg.model,
           ms: Date.now() - startedAt,
@@ -195,9 +212,10 @@ export class ChatClient {
               }
             : {}),
         };
+        callStore.update(callId, { status: "streaming", usage: progress.usage, preview: progress.content || JSON.stringify(progress.toolCalls) });
         if (streamId == null) streamId = debug.emit("llm.res", labelNow, detail);
         else debug.update(streamId, { label: labelNow, detail });
-      });
+      }, (text) => callStore.append(callId, text));
       content = result.content;
       toolCalls = result.toolCalls;
       usage = result.usage;
@@ -210,6 +228,7 @@ export class ChatClient {
     const finalUsage = normalizeUsage(usage);
     const finalLabel = `${label}·${ms}ms${toolCalls.length ? "·工具调用" : "·正文"}${finalUsage ? ` · ${finalUsage.total_tokens} tok` : ""}`;
     const finalDetail = {
+      callId,
       url,
       model: this.cfg.model,
       ms,
@@ -219,7 +238,13 @@ export class ChatClient {
     };
     if (streamId != null) debug.update(streamId, { label: finalLabel, detail: finalDetail });
     else debug.emit("llm.res", finalLabel, finalDetail);
+    callStore.update(callId, { status: "completed", usage: finalUsage, preview: content || JSON.stringify(toolCalls) });
     return { content, toolCalls };
+    } catch (error) {
+      const cancelled = opts.signal?.aborted || (error instanceof Error && error.name === "AbortError");
+      callStore.update(callId, { status: cancelled ? "cancelled" : "error", error: error instanceof Error ? error.message : String(error) });
+      throw error;
+    }
   }
 
   private recordUsage(usage: ChatUsage | null): void {
@@ -257,6 +282,7 @@ interface ChatProgress {
 async function readChatCompletionStream(
   res: LlmResponse,
   onProgress: (p: ChatProgress) => void,
+  onText?: (text: string) => void,
 ): Promise<ChatProgress> {
   const slots: Array<StreamedToolCall | undefined> = [];
   let content = "";
@@ -316,7 +342,7 @@ async function readChatCompletionStream(
       dirty = false;
       onProgress(snapshot());
     }
-  });
+  }, onText);
   if (dirty) onProgress(snapshot());
 
   // 兼容"忽略 stream 直接返回整段 JSON"的后端
@@ -442,5 +468,5 @@ function clipField(value: string | undefined): string {
 function clipMiddle(value: string, head: number, tail: number): string {
   if (value.length <= head + tail) return value;
   const omitted = value.length - head - tail;
-  return value.slice(0, head) + `…（中间省略 ${omitted} 字符——仅调试视图省略，实际请求已完整发送）` + value.slice(-tail);
+  return sliceText(value, 0, head) + `…（中间省略 ${omitted} 字符——仅调试视图省略，实际请求已完整发送）` + sliceText(value, -tail);
 }

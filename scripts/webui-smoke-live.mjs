@@ -1,0 +1,45 @@
+/** Dynamic call-view regression against the isolated preview's explicit SSE fixture. */
+export default async function smokeLive({evaluate,wait,assert,navigate}) {
+  const target=await evaluate('({hostname:location.hostname,port:location.port})');
+  assert(['127.0.0.1','localhost','[::1]'].includes(target.hostname)&&target.port!=='18111','Live smoke requires an isolated loopback preview');
+  assert(await evaluate("fetch('/api/health').then(r=>r.json()).then(r=>r.preview===true)"),'Live smoke requires preview marker');
+  const q=JSON.stringify,id='live_smoke_'+Date.now().toString(36),other=id+'_parallel';
+  const step=body=>evaluate(`fetch('/api/preview/calls/step',{method:'POST',headers:{'content-type':'application/json'},body:${q(JSON.stringify(body))}}).then(r=>r.json())`);
+  const request=JSON.stringify({model:'完整样本',messages:[{role:'user',content:'请求正文'.repeat(12000)+'原文尾部😀'}]});
+  const first=': keepalive\r\ndata: {"choices":[{"delta":{"content":"第一段😀"}}]}\r\n\r\n';
+  const second='data: {"choices":[{"delta":{"content":"第二段"}}]}\n\n';
+  await navigate('overview');await wait("document.querySelector('.live-compact [data-live-source=\"World\"]')");
+  await step({id:id+'_overview',action:'begin',source:'World'});
+  await step({id:id+'_overview',action:'append',text:'data: overview\n\n',preview:'总览实时增量样本'});
+  await wait("document.querySelector('.live-compact [data-live-source=\"World\"] .live-lane-preview').textContent.includes('总览实时增量样本')");
+  await step({id:id+'_overview',action:'finish'});
+  assert(await evaluate("document.querySelectorAll('.live-compact .live-lane').length===2"),'Overview receives live World/Bot metadata before opening the call page');
+  await navigate('live');await wait("document.querySelector('.live-call-row')");
+  await step({id,action:'begin',source:'World',requestBody:request});
+  await wait(`document.querySelector('.live-call-selected')?.dataset.callId===${q(id)}`);
+  await evaluate("document.querySelectorAll('.live-raw-tab')[0].click()");
+  await evaluate(`window.__liveSmokeRequest=${q(request)}`);
+  await wait("document.querySelector('.live-raw-code').textContent===window.__liveSmokeRequest");
+  assert(await evaluate("document.querySelector('.live-raw-code').textContent.length>40000"),'Full request survives the old debug truncation boundary');
+  await evaluate("document.querySelectorAll('.live-raw-tab')[1].click()");
+  await step({id,action:'append',text:first,preview:'第一段😀'});
+  await wait(`document.querySelector('.live-raw-code').textContent===${q(first)}`);
+  await evaluate("window.__liveSmokeRow=document.querySelector('.live-call-selected');window.__liveSmokeText=document.querySelector('.live-raw-code').firstChild;document.querySelector('.live-follow').click()");
+  await step({id:other,action:'begin',source:'Bot',requestBody:'{"parallel":true}'});
+  await step({id,action:'append',text:second,preview:'第一段😀第二段'});
+  await wait(`document.querySelector('.live-raw-code').textContent===${q(first+second)}`);
+  assert(await evaluate(`document.querySelector('.live-call-selected').dataset.callId===${q(id)} && document.querySelector('.live-call-selected')===window.__liveSmokeRow && document.querySelector('.live-raw-code').firstChild===window.__liveSmokeText`),'Paused follow preserves selected call, row and existing text nodes while real output appends');
+  assert(await evaluate(`document.querySelectorAll('[data-call-id="${id}"]').length===1`),'Streaming updates do not duplicate timeline entries');
+  await navigate('world');await step({id,action:'append',text:'data: [DONE]\n\n',preview:'第一段😀第二段'});await step({id,action:'finish'});
+  await navigate('live');
+  await wait(`document.querySelector('.live-call-selected')?.dataset.callId===${q(id)} && document.querySelector('.live-raw-code').textContent===${q(first+second+'data: [DONE]\n\n')}`);
+  assert(await evaluate("document.querySelector('.live-detail-meta .live-status').textContent==='已完成'"),'Switching routes retains selection and retrieves the completed raw stream');
+  await step({id:other,action:'error',error:'开发样本 HTTP 400'});
+  await evaluate(`document.querySelector('[data-call-id="${other}"]').click()`);
+  await wait("document.querySelector('.live-detail-meta .live-status')?.textContent==='失败'");
+  await step({id:other,action:'evict'});
+  await wait("document.querySelector('.live-raw-notice').textContent.includes('淘汰')");
+  assert(await evaluate("document.querySelector('.live-raw-notice').textContent.includes('淘汰')"),'Evicted raw data is explicitly identified');
+  await evaluate("delete window.__liveSmokeRow;delete window.__liveSmokeText;delete window.__liveSmokeRequest");
+  return 'live calls: complete raw request, real incremental SSE, stable paused selection, no duplicate rows, route continuity and explicit eviction';
+}

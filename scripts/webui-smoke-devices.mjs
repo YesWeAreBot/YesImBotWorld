@@ -39,13 +39,12 @@ export async function smokeDevices({ evaluate, wait, assert, navigate }) {
   // A reusable run may start with the previous preview already taken over.
   if (await evaluate("document.querySelector('[data-device-control]').getAttribute('aria-label')==='交还给 Bot'")) {
     await click('[data-device-control]');
-    await wait("document.querySelector('[data-device-control]')?.getAttribute('aria-label')==='接管设备'");
+    await wait("document.querySelector('[data-device-control]')?.getAttribute('aria-label')==='强制接管'");
   }
   await evaluate("document.querySelector('.app-back')?.click()");
-  await check("document.querySelectorAll('.phone-app-tile').length===6 && Array.from(document.querySelectorAll('.phone-app-tile')).every(n=>n.disabled)",
-    'The six fixture apps are visible and read only before takeover');
-  await click('[data-device-control]');
-  await wait("document.querySelector('[data-device-control]')?.getAttribute('aria-label')==='交还给 Bot' && !document.querySelector('.phone-app-tile').disabled");
+  await check("document.querySelectorAll('.phone-app-tile').length===6 && Array.from(document.querySelectorAll('.phone-app-tile')).every(n=>!n.disabled)",
+    'Stealth mode makes the six fixture apps usable without pausing Bot');
+  await check("fetch('/api/device/session').then(r=>r.json()).then(r=>r.control.paused===false)", 'Default mode leaves autonomous use running');
 
   await openApp('消息', 'chat');
   await click('.app-chat-channel');
@@ -111,11 +110,17 @@ export async function smokeDevices({ evaluate, wait, assert, navigate }) {
   await wait(`document.querySelector('.device-terminal-log').textContent.includes(${quote(`echo preview-${stamp}`)}) && document.querySelector('.device-terminal-log').textContent.includes('未执行真实命令')`);
   await check("document.querySelector('.device-terminal-status').textContent.includes('容器运行中')", 'The fixture terminal updates its status and displays the unexecuted command receipt');
 
+  await check("fetch('/api/device/session').then(r=>r.json()).then(r=>r.control.paused===false)", 'All six apps and computer were operated without pausing Bot');
   await click('[data-device-control]');
-  await wait("document.querySelector('[data-device-control]')?.getAttribute('aria-label')==='接管设备'");
+  await wait("document.querySelector('[data-device-control]')?.getAttribute('aria-label')==='交还给 Bot'");
+  await check("fetch('/api/device/session').then(r=>r.json()).then(r=>r.control.paused===true)", 'Explicit takeover pauses autonomous use');
+  await click('[data-device-control]');
+  await wait("document.querySelector('[data-device-control]')?.getAttribute('aria-label')==='强制接管'");
+  await check("!document.querySelector('.device-terminal-run').disabled", 'Handback restores stealth operation');
+  await evaluate("Array.from(document.querySelectorAll('.device-operation-modes button')).find(n=>n.textContent==='接管后操作').click()");
   await check("document.querySelector('.device-terminal-run').disabled && Array.from(document.querySelectorAll('[data-device-mutation]')).every(n=>n.disabled)",
-    'Handing control back disables all device mutation controls');
-  return 'devices: takeover, six apps, local messages, draft isolation, notes, typed schema, terminal and handback';
+    'Takeover mode requires actual control; switching the local mode alone cannot grant it');
+  return 'devices: autonomous stealth, explicit takeover, six apps, local messages, draft isolation, notes, typed schema, terminal and handback';
 }
 
 export default smokeDevices;

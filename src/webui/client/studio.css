@@ -1454,3 +1454,12 @@ body[data-theme=dark] .studio-hero p,body[data-theme=dark] .studio-hero .studio-
     transition:none!important
   }
 }
+
+.studio-avatar img {
+  width:100%;
+  height:100%;
+  object-fit:cover;
+}
+.studio-live-overview {
+  margin-bottom:23px;
+}

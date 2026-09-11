@@ -42,7 +42,7 @@
         return null;
     } }
     Studio.register('devices', function (container) {
-        var live = true, synced = false, session = null, tab = 'phone', selected = null, busy = 0, refreshing = false, polling = null, generation = 0;
+        var live = true, synced = false, session = null, tab = 'phone', selected = null, busy = 0, refreshing = false, polling = null, generation = 0, operationMode = 'stealth';
         var results = {}, drafts = {}, noteList = null, noteDraft = null, screenUrl = null, screenAbort = null, screenTimer = null, screenBusy = false, screenGeneration = 0, clickTimer = null, clickPoint = null, appViewStamp = '', computerViewStamp = '';
         var screenWidth = 0, screenHeight = 0, pointer = null, remoteReady = false, terminalEntries = [], history = [], historyIndex = 0, remoteQueue = Promise.resolve(), remotePending = 0, inputEpoch = 0;
         var root = el('section', { cls: 'device-studio' }), header = el('div', { cls: 'device-heading' }), control = el('div', { cls: 'device-control' }), workspace = el('div', { cls: 'device-workspace' }), status = el('div', { cls: 'device-live-status', 'aria-live': 'polite' });
@@ -55,9 +55,9 @@
         header.appendChild(switches);
         root.append(header, control, status, workspace);
         function computerMode() { var computer = session && session.devices && session.devices.computer || {}; return computer.effectiveMode || computer.mode || 'off'; }
-        function controlled() { return !!(synced && session && session.control && session.control.paused && !session.control.busy && !isVisitor()); }
+        function controlled() { return !!(synced && session && session.running && session.control && !isVisitor() && (operationMode === 'stealth' || session.control.paused && !session.control.busy)); }
         function toolDef(name, device) { device = device || (['mouse', 'keyboard', 'screen', 'run_command', 'open_computer', 'close_computer'].includes(name) ? 'computer' : 'phone'); var tools = (session && session.tools || []).filter(function (t) { return t.device === device; }); return tools.find(function (t) { return t.name === name; }) || tools.find(function (t) { return t.name.endsWith('.' + name); }); }
-        function available(name, device) { return !!toolDef(name, device); }
+        function available(name, device) { return !(operationMode === 'stealth' && ['pick_up_phone', 'put_down_phone', 'pick_media'].includes(name)) && !!toolDef(name, device); }
         function report(err) { if (!live)
             return; status.textContent = err && err.message || String(err); status.classList.add('device-status-error'); toast(status.textContent, 'err'); }
         function setBusy(delta) { busy = Math.max(0, busy + delta); updateControls(); }
@@ -80,10 +80,19 @@
             if (!session)
                 return;
             var c = session.control || {}, paused = !!c.paused, waiting = !!c.busy;
-            var title = isVisitor() ? '访客只读' : waiting ? '设备正在完成操作' : paused ? '你正在使用设备' : 'Bot 正在自主使用';
-            control.appendChild(el('div', { cls: 'device-control-copy' }, [el('span', { cls: 'device-presence ' + (paused ? 'device-presence-human' : '') }), el('div', {}, [el('strong', { text: title }), el('p', { text: isVisitor() ? '可查看开放的设备信息。' : waiting ? (paused ? '操作完成后即可继续使用或交还。' : '接管会暂停自主使用，已执行的操作会等到完成。') : paused ? '操作会同步到 Bot 的真实设备。完成后请交还。' : '接管后可操作应用、终端与远程桌面。' })])]));
+            var title = isVisitor() ? '访客只读' : paused ? 'Bot 自主操作已暂停' : operationMode === 'stealth' ? '偷偷操作 · Bot 仍在自主行动' : '等待强制接管';
+            var hint = isVisitor() ? '可查看开放的设备信息。' : operationMode === 'stealth'
+                ? (paused ? '偷偷操作不会改变暂停状态；点击交还才能恢复 Bot。' : '双方共享设备，操作会依次执行，界面可能随时被切换。Bot 关注设备时能看到变化。')
+                : paused ? (waiting ? '已有操作正在完成，请等待真实回执。' : '自主生成已暂停，可以操作设备；完成后请交还给 Bot。') : '点击强制接管后暂停自主生成；已开始的操作会等待完成。';
+            control.appendChild(el('div', { cls: 'device-control-copy' }, [el('span', { cls: 'device-presence ' + (paused ? 'device-presence-human' : '') }), el('div', {}, [el('strong', { text: title }), el('p', { text: hint })])]));
             if (!isVisitor()) {
-                var take = button(paused ? '交还给 Bot' : '接管设备', async function () {
+                var modes = el('div', { cls: 'device-operation-modes', role: 'group', 'aria-label': '设备操作模式' });
+                [['stealth', '偷偷操作'], ['takeover', '接管后操作']].forEach(function (mode) {
+                    var choice = button(mode[1], function () { if (busy || operationMode === mode[0]) return; operationMode = mode[0]; inputEpoch++; viewKey = ''; renderControl(); render(); }, 'device-mode-choice');
+                    choice.setAttribute('aria-pressed', String(operationMode === mode[0])); choice.disabled = !!busy; modes.appendChild(choice);
+                });
+                control.appendChild(modes);
+                var take = button(paused ? '交还给 Bot' : '强制接管', async function () {
                     take.disabled = true;
                     inputEpoch++;
                     setBusy(1);
@@ -92,6 +101,9 @@
                         var r = await api('POST', '/api/device/control', { paused: !paused });
                         if (!live)
                             return;
+                        if (r.paused === true) operationMode = 'takeover';
+                        else if (r.ok && r.paused === false) operationMode = 'stealth';
+                        viewKey = '';
                         toast(r.text || (r.paused ? '已接管设备' : '已交还设备'), r.ok === false ? 'err' : 'ok');
                         await refresh(true);
                     }
@@ -179,7 +191,7 @@
         }
         async function perform(name, args, options) {
             if (!controlled())
-                throw new Error('请先接管设备，等待当前操作完成。');
+                throw new Error(operationMode === 'stealth' ? '设备所属世界尚未运行或状态未同步。' : '请先强制接管设备，等待当前操作完成。');
             var opts = options || {};
             if (!available(name, opts.device))
                 throw new Error('当前设备未开放这个操作，请刷新状态后再试。');
@@ -187,7 +199,7 @@
             if (!opts.quiet)
                 setBusy(1);
             try {
-                var response = await api('POST', '/api/device/tool', { name: def.name, args: args || {}, confirmSend: !!opts.confirmSend || sending && !!opts.explicitSend });
+                var response = await api('POST', '/api/device/tool', { name: def.name, args: args || {}, mode: operationMode, confirmSend: !!opts.confirmSend || sending && !!opts.explicitSend });
                 if (response.ok === false)
                     throw new Error(response.text || response.error || '操作没有完成');
                 if (live && !opts.quiet) {
@@ -292,7 +304,7 @@
             var physical = el('div', { cls: 'device-facts' });
             physical.append(el('span', { text: '设备状态' }), el('strong', { text: session.devices.phone.down ? '已放下' : '已拿起' }));
             rail.append(physical);
-            rail.append(phoneAction(session.devices.phone.down ? '拿起手机' : '放下手机', session.devices.phone.down ? 'pick_up_phone' : 'put_down_phone', {}, 'device-button device-button-soft', 'phone'));
+            if (operationMode === 'takeover') rail.append(phoneAction(session.devices.phone.down ? '拿起手机' : '放下手机', session.devices.phone.down ? 'pick_up_phone' : 'put_down_phone', {}, 'device-button device-button-soft', 'phone'));
             if (session.devices.phone.appOpen || session.devices.phone.chatOpen)
                 rail.append(phoneAction('关闭当前应用', 'close_app', {}, 'device-button', 'close'));
             if (!selected) {
