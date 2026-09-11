@@ -44,6 +44,61 @@ async function main(): Promise<void> {
     assert.deepEqual(kernel.snapshot(), before);
     pass("batch rollback, valid references, actor ownership, and containment cycles");
 
+    const migration = await WorldKernel.open(path.join(dir, "migration"), { now: () => now });
+    const forwardEntities: EntityInput[] = [
+      { id: "phone", kind: "object", name: "Phone", location: "bot", owner: "bot" },
+      { id: "bot", kind: "actor", name: "Bot", controller: "bot", location: "room" },
+      { id: "room", kind: "place", name: "Dormitory", location: null },
+    ];
+    assert.equal(migration.propose({ idempotencyKey: "forward-references", operations: forwardEntities.map(entity => ({ op: "create", entity })) }).changedEntityIds.length, 3);
+    const badEntities: EntityInput[] = [
+      { id: "room", kind: "place", name: "Dormitory", location: "中国沈阳" },
+      { id: "bot", kind: "actor", name: "Bot", controller: "bot", location: "room", owner: "bot" },
+      { id: "phone", kind: "object", name: "Phone", location: "互联网", owner: "room" },
+      { id: "shelf", kind: "object", name: "Shelf", location: "校园内", owner: "unknown" },
+      { id: "elsewhere", kind: "place", name: "Other place", location: "phone" },
+      { id: "student", kind: "actor", name: "Student", controller: "world", location: "bot" },
+    ];
+    const badProposal = { idempotencyKey: "all-reference-errors", operations: badEntities.map(entity => ({ op: "create" as const, entity })) };
+    let referenceError: KernelError | undefined;
+    try { migration.propose(badProposal); } catch (error) { assert(error instanceof KernelError); referenceError = error; }
+    assert(referenceError);
+    assert.equal(referenceError.code, "MISSING_ENTITY", "the first diagnostic keeps the existing error code");
+    assert.equal(referenceError.details?.length, 8);
+    assert.deepEqual(referenceError.details?.map(issue => [issue.entityId, issue.field, issue.targetId, issue.reason]), [
+      ["room", "location", "中国沈阳", "missing"],
+      ["bot", "owner", "bot", "owner_not_allowed"],
+      ["phone", "location", "互联网", "missing"],
+      ["phone", "owner", "room", "wrong_kind"],
+      ["shelf", "location", "校园内", "missing"],
+      ["shelf", "owner", "unknown", "missing"],
+      ["elsewhere", "location", "phone", "wrong_kind"],
+      ["student", "location", "bot", "wrong_kind"],
+    ]);
+    const wrongOwner = referenceError.details!.find(issue => issue.entityId === "phone" && issue.field === "owner")!;
+    assert.deepEqual(wrongOwner.expectedKinds, ["actor"]); assert.equal(wrongOwner.actualKind, "place");
+    for (const issue of referenceError.details!) assert(referenceError.message.includes(`${issue.entityId}.${issue.field} -> ${issue.targetId}`));
+    await rejectsCode(() => migration.commit(badProposal), "MISSING_ENTITY");
+    assert.equal(Object.keys(migration.snapshot().entities).length, 0);
+    assert.deepEqual(migration.readEvents(), []);
+    pass("migration reports every missing and wrong-kind location/owner with source paths; forward creates remain valid");
+
+    const cyclicEntities: EntityInput[] = [
+      { id: "a", kind: "place", name: "A", location: "b" },
+      { id: "b", kind: "place", name: "B", location: "a" },
+      { id: "orphan", kind: "object", name: "Orphan", location: "missing-parent" },
+    ];
+    assert.throws(() => migration.propose({ idempotencyKey: "mixed-graph-errors", operations: cyclicEntities.map(entity => ({ op: "create", entity })) }), error => {
+      assert(error instanceof KernelError);
+      const cycles = error.details!.filter(issue => issue.reason === "cycle");
+      assert.equal(cycles.length, 1, "one diagnostic per cycle rather than one per traversal");
+      assert.deepEqual(cycles[0]!.path, ["a", "b", "a"]);
+      assert(error.details!.some(issue => issue.entityId === "orphan" && issue.reason === "missing"));
+      return true;
+    });
+    assert.equal(Object.keys(migration.snapshot().entities).length, 0);
+    pass("cycles remain forbidden alongside dangling references without undefined traversal failures");
+
     const observed = await kernel.observe("bot");
     assert(!JSON.stringify(observed).includes("hidden-serial"));
     assert(!JSON.stringify(observed).includes("unconscious-secret"));

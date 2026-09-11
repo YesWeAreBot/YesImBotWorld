@@ -70,6 +70,8 @@ export interface ChatUsage {
 
 export interface ChatCompleteOptions {
   tools?: ChatToolDef[];
+  /** Require a specific tool for callers whose result must be a validated proposal. */
+  toolChoice?: { type: "function"; function: { name: string } };
   signal?: AbortSignal;
   /** 覆盖配置里的 maxTokens；用于解析失败后对“疑似截断”的 JSON 放大一次输出上限 */
   maxTokens?: number;
@@ -96,6 +98,7 @@ export class ChatClient {
       body.stream_options = { include_usage: true };
     }
     if (opts.tools?.length) body.tools = opts.tools;
+    if (opts.toolChoice) body.tool_choice = opts.toolChoice;
     if (this.cfg.disableThinking) {
       // 覆盖主流后端/模型的"关闭思考"写法：
       // - enable_thinking: false —— DashScope / SGLang / Ollama(OpenAI 兼容) 等

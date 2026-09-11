@@ -207,7 +207,9 @@ export class WorldAgent {
       stream: cfg.stream,
       label: "World",
     });
-    this.structured = new StructuredWorld(files, clock, (messages, tools, signal) => withEndpointLock(cfg.baseURL, () => this.client.complete(messages, { tools, signal }), signal));
+    this.structured = new StructuredWorld(files, clock, (messages, tools, signal) => withEndpointLock(cfg.baseURL, () => this.client.complete(messages, {
+      tools, signal, toolChoice: { type: "function", function: { name: "propose_world" } },
+    }), signal));
   }
 
   /**

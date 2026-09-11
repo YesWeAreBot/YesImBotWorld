@@ -30,7 +30,11 @@ async function fixture(cap = 10000) {
   await files.atomicWrite(files.botDef, definition); await files.atomicWrite(files.worldDef, "客厅里有小澈、阿青和一个关着的盒子。");
   const clock = { now: () => 10, syncRealTime: true, unitRealSeconds: 1, realMsUntil: () => 0, timeLine: () => "T10" } as any;
   const world = new WorldAgent({ baseURL: `http://fake-${randomUUID()}.invalid`, model: "fake", compressMaxInputChars: cap } as any, files, clock, logger, new Prompts(), { resolution: "320x640", generateShell: false });
-  let handler: (messages: ChatMessage[], options: any) => Promise<ChatResult> = async (_messages, options) => options.tools?.length ? proposal(seed.map(entity => ({ op: "create", entity }))) : plain('{"realWorld":false}');
+  let handler: (messages: ChatMessage[], options: any) => Promise<ChatResult> = async (_messages, options) => {
+    if (!options.tools?.length) { assert.equal(options.toolChoice, undefined); return plain('{"realWorld":false}'); }
+    assert.deepEqual(options.toolChoice, { type: "function", function: { name: "propose_world" } });
+    return proposal(seed.map(entity => ({ op: "create", entity })));
+  };
   (world as any).client = { complete: (messages: ChatMessage[], options: any = {}) => handler(messages, options) };
   await world.initialize(definition, await files.readText(files.worldDef));
   return { files, world, definition, setHandler(next: typeof handler) { handler = next; }, kernel: await world.structured.kernel() };

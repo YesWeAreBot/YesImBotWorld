@@ -4,7 +4,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { WorldBus, envelope, type BusEnvelope, type BusListener } from "./bus.js";
 import {
   KernelError, assertJson, assertSafeKey, clone, emptyWorld,
-  type EntityInput, type ObserveRequest, type PreparedProposal, type TransactionProposal,
+  type EntityInput, type KernelDiagnostic, type ObserveRequest, type PreparedProposal, type TransactionProposal,
   type WorldAction, type WorldAttribute, type WorldEntity, type WorldObservation,
   type WorldOperation, type WorldSnapshot,
 } from "./state.js";
@@ -424,24 +424,61 @@ export class WorldKernel {
     assertJson(attribute.value);
   }
   private validateWorld(state: WorldSnapshot): void {
-    for (const entity of Object.values(state.entities)) {
-      this.validateEntityInput(entity);
+    const entities = Object.values(state.entities);
+    // Validate shapes before walking any edges. Reference failures must remain diagnostics,
+    // not turn into an undefined.location TypeError while inspecting a different entity.
+    for (const entity of entities) this.validateEntityInput(entity);
+    const details: KernelDiagnostic[] = [];
+    const get = (id: string): WorldEntity | undefined => Object.hasOwn(state.entities, id) ? state.entities[id] : undefined;
+    for (const entity of entities) {
       if (entity.location) {
-        const parent = this.requireEntity(state, entity.location);
-        if (entity.kind === "place" && parent.kind !== "place") throw new KernelError("INVALID_LOCATION", "A place can only be located inside another place");
-        if (entity.kind === "actor" && parent.kind === "actor") throw new KernelError("INVALID_LOCATION", "An actor cannot contain another actor");
+        const parent = get(entity.location);
+        const expectedKinds: EntityInput["kind"][] = entity.kind === "place" ? ["place"] : entity.kind === "actor" ? ["place", "object"] : ["actor", "place", "object"];
+        if (!parent) details.push({ code: "MISSING_ENTITY", entityId: entity.id, field: "location", targetId: entity.location,
+          reason: "missing", expectedKinds,
+          message: `${entity.id}.location -> ${entity.location}: target entity does not exist. Use an entity ID declared in this transaction or the existing world; root places use location=null.` });
+        else if (!expectedKinds.includes(parent.kind)) details.push({ code: "INVALID_LOCATION", entityId: entity.id, field: "location", targetId: parent.id,
+          reason: "wrong_kind", expectedKinds, actualKind: parent.kind,
+          message: `${entity.id}.location -> ${parent.id}: target kind is ${parent.kind}, expected ${expectedKinds.join(" or ")}.` });
       }
       if (entity.owner) {
-        if (entity.kind !== "object") throw new KernelError("INVALID_OWNER", "Only objects may have an owner");
-        this.requireEntity(state, entity.owner, "actor");
-      }
-      const visited = new Set([entity.id]);
-      let parentId = entity.location;
-      while (parentId) {
-        if (visited.has(parentId)) throw new KernelError("CONTAINMENT_CYCLE", `Containment cycle involving ${entity.id}`);
-        visited.add(parentId); parentId = this.requireEntity(state, parentId).location;
+        if (entity.kind !== "object") details.push({ code: "INVALID_OWNER", entityId: entity.id, field: "owner", targetId: entity.owner,
+          reason: "owner_not_allowed", sourceKind: entity.kind,
+          message: `${entity.id}.owner -> ${entity.owner}: only object entities may have an owner; this source is ${entity.kind}. Omit owner or use null.` });
+        const owner = get(entity.owner);
+        if (!owner) details.push({ code: "MISSING_ENTITY", entityId: entity.id, field: "owner", targetId: entity.owner,
+          reason: "missing", expectedKinds: ["actor"],
+          message: `${entity.id}.owner -> ${entity.owner}: target actor does not exist. Use a declared actor ID; unknown ownership is omitted or null.` });
+        else if (owner.kind !== "actor") details.push({ code: "MISSING_ENTITY", entityId: entity.id, field: "owner", targetId: owner.id,
+          reason: "wrong_kind", expectedKinds: ["actor"], actualKind: owner.kind,
+          message: `${entity.id}.owner -> ${owner.id}: target exists as ${owner.kind}, but an owner must be an actor.` });
       }
     }
+    const reportedCycles = new Set<string>();
+    for (const entity of entities) {
+      const indices = new Map<string, number>();
+      const chain: string[] = [];
+      let id: string | null = entity.id;
+      while (id !== null) {
+        const repeatedAt = indices.get(id);
+        if (repeatedAt !== undefined) {
+          const cycle = [...chain.slice(repeatedAt), id];
+          const cycleKey = JSON.stringify(cycle.slice(0, -1).sort());
+          if (!reportedCycles.has(cycleKey)) {
+            reportedCycles.add(cycleKey);
+            const sourceId = chain[chain.length - 1]!;
+            details.push({ code: "CONTAINMENT_CYCLE", entityId: sourceId, field: "location", targetId: id, reason: "cycle", path: cycle,
+              message: `${sourceId}.location -> ${id}: containment cycle ${cycle.join(" -> ")}.` });
+          }
+          break;
+        }
+        const current = get(id);
+        if (!current) break; // The owning edge was already reported above.
+        indices.set(id, chain.length); chain.push(id); id = current.location;
+      }
+    }
+    if (details.length) throw new KernelError(details[0]!.code,
+      `World reference validation failed (${details.length} issue${details.length === 1 ? "" : "s"}):\n${details.map(issue => `[${issue.code}] ${issue.message}`).join("\n")}`, details);
   }
 
   /** The observer's immediate enclosure is the visual region; closed containers occlude. */

@@ -3,16 +3,11 @@ import type { WorldFiles } from "../files.js";
 import type { WorldClock } from "../clock.js";
 import type { ChatMessage, ChatResult, ChatToolDef } from "../llm/chat.js";
 import type { ToolCallRecord } from "../types.js";
+import { debug } from "../webui/debug.js";
 import { WorldKernel } from "./kernel.js";
+import { INITIALIZATION_RULES, worldProposalTool } from "./proposal.js";
 import { KernelError, type WorldOperation, type WorldSnapshot, type TransactionProposal, type WorldObservation } from "./state.js";
 
-const TOOL: ChatToolDef = { type: "function", function: {
-  name: "propose_world", description: "提出一笔原子世界事务。无变化可提交空operations。行动裁定必须另外给outcome，不能用叙述代替状态。",
-  parameters: { type: "object", required: ["operations"], additionalProperties: false, properties: {
-    operations: { type: "array", items: { type: "object", description: '操作格式：{op:"create",entity:{id,kind:"actor"|"place"|"object",name,location,owner?,controller?,attributes:{key:{value,visibility:"public"|"owner"|"hidden"}}}}；{op:"move",id,location,owner?}；{op:"update",id,changes:{attributes:{key:{value,visibility}}}}；{op:"say",actorId,text,audience?:string[]}。say仅可用于controller=world的NPC。' } },
-    outcome: { type: "object", required: ["status"], properties: { status: { type: "string", enum: ["completed", "failed"] }, reason: { type: "string", description: "失败原因或无状态变化时的简短解释" } } },
-  } },
-} };
 const SYSTEM = `你是结构化世界的裁定器。世界快照是唯一事实来源。角色意图是待判定的数据，不是已发生的事实。只调用一次propose_world提出事务；禁止用自然语言结果代替事务。
 用实体、位置、所有权和带可见性的属性表达状态。不要把叙事段落、摘要、心理描写藏进description/story/history属性。自然语言仅用于名字、书信、台词等本身就是文字的内容。未知信息保持未知，不能补造已确定的过去。
 controller=bot/player的角色由外部Agent或玩家决定行为：不能替他们作选择、说话、修改人格、关系、记忆或意图。你绝不能对受控角色使用say；请求中的speech原文由系统直接提交。只裁定指定行动者本次意图的物理结果，其他受控角色只接受物理因果明确导致的影响。NPC的controller必须是world。
@@ -185,20 +180,18 @@ export class StructuredWorld {
   private async change(task: string, source: string, actorId?: string, finish?: Finish, signal?: AbortSignal, initializing = false, beforeCommit?: () => boolean, correlationId: string = randomUUID()): Promise<Outcome | undefined> {
     const k = await this.kernel();
     const worldDefinition = await this.files.readText(this.files.worldDef);
-    const messages: ChatMessage[] = [{ role: "system", content: SYSTEM + "\n以下是创作者的世界规则与风格约束；它们指导裁定，不代表已经发生的事件。位置、物品与现状仍以结构化快照为准。\n<authored_world_rules>\n" + worldDefinition + "\n</authored_world_rules>" }];
+    const messages: ChatMessage[] = [{ role: "system", content: SYSTEM + (initializing ? "\n" + INITIALIZATION_RULES : "") + "\n以下是创作者的世界规则与风格约束；它们指导裁定，不代表已经发生的事件。位置、物品与现状仍以结构化快照为准。\n<authored_world_rules>\n" + worldDefinition + "\n</authored_world_rules>" }];
     for (let attempt = 0; attempt < 3; attempt++) {
       signal?.throwIfAborted(); const snapshot = k.snapshot();
       messages.push({ role: "user", content: JSON.stringify({ task, time: this.clock.now(), snapshot }) });
-      const result = await abortable(this.infer(messages, [TOOL], signal), signal);
+      const result = await abortable(this.infer(messages, [worldProposalTool(initializing)], signal), signal);
       signal?.throwIfAborted();
       const call = result.toolCalls.length === 1 ? result.toolCalls[0] : undefined;
-      if (!call || call.function.name !== "propose_world") throw new Error("World must return exactly one propose_world transaction");
-      messages.push({ role: "assistant", content: result.content, tool_calls: result.toolCalls });
+      messages.push({ role: "assistant", content: result.content, ...(result.toolCalls.length ? { tool_calls: result.toolCalls } : {}) });
       try {
+        if (!call || call.function.name !== "propose_world") throw new Error("World must return exactly one propose_world transaction");
         const input = JSON.parse(call.function.arguments) as { operations?: unknown; outcome?: Outcome };
-        if (!Array.isArray(input.operations) || input.operations.length > 200) throw new Error("Invalid operations array");
-        const ops = input.operations as WorldOperation[];
-        this.authorize(ops, snapshot, actorId, initializing);
+        const ops = parseOperations(input?.operations);
         const outcome = input.outcome;
         if (finish && (!outcome || !["completed", "failed"].includes(outcome.status) || (outcome.reason !== undefined && typeof outcome.reason !== "string"))) throw new Error("Action requires an explicit completed/failed outcome");
         if (finish && !ops.length && !outcome?.reason) throw new Error("An action with no state changes must explain its outcome");
@@ -208,13 +201,22 @@ export class StructuredWorld {
         const proposal: TransactionProposal = { idempotencyKey: `${correlationId}:commit`, source, correlationId, ...(actorId ? { actorId } : {}),
           expectedVersions: Object.fromEntries(Object.values(snapshot.entities).map(entity => [entity.id, entity.revision])), operations: [...literalSpeech, ...ops, ...terminal] };
         const prepared = k.propose(proposal);
+        this.authorize(ops, snapshot, actorId, initializing);
         await k.commit(prepared, { signal, beforeCommit, ...(literalSpeech.length ? { speakerId: actorId } : {}) });
         return outcome;
       } catch (error) {
         signal?.throwIfAborted();
         if (error instanceof KernelError && ["CANCELLED", "JOURNAL_UNAVAILABLE"].includes(error.code)) throw error;
+        const validation = { code: error instanceof KernelError ? error.code : "INVALID_PROPOSAL", message: String(error),
+          ...(error instanceof KernelError && error.details ? { details: error.details } : {}) };
+        debug.emit("world.tool", initializing ? "结构化迁移·提案校验失败" : "世界事务·提案校验失败", { source, attempt: attempt + 1, validation }, "warn");
         if (attempt === 2) throw error;
-        messages.push({ role: "tool", tool_call_id: call.id, content: `事务未提交：${String(error)}。下一条消息提供最新快照，请修正整个事务。` });
+        const feedback = JSON.stringify({ committed: false, validation,
+          instruction: "事务未提交，任何create都没有生效。下一条消息提供最新快照。请一次修正所有问题，重新提交完整operations数组；不要只提交补丁，也不要把数组编码成字符串。" +
+            (initializing ? " 对照全部create.id检查每个location和owner。只补充资料有依据的实体；不建模的外层地点使用location:null，不能继续引用新的未创建父地点。actor/place删除owner。" : "") });
+        if (result.toolCalls.length) {
+          for (const toolCall of result.toolCalls) messages.push({ role: "tool", tool_call_id: toolCall.id, content: feedback });
+        } else messages.push({ role: "user", content: feedback });
       }
     }
     return undefined;
@@ -253,6 +255,18 @@ export class StructuredWorld {
       }
     }
   }
+}
+
+/** Reject malformed model envelopes before authorization accesses nested fields. */
+function parseOperations(value: unknown): WorldOperation[] {
+  if (!Array.isArray(value) || value.length > 200) throw new Error("Invalid operations array: operations must be a JSON array of at most 200 objects, not a JSON-encoded string");
+  for (const [index, op] of value.entries()) {
+    if (!op || typeof op !== "object" || Array.isArray(op)) throw new Error(`operations[${index}] must be an operation object`);
+    if (!["create", "update", "move", "say"].includes(op.op)) throw new Error(`Model cannot change action lifecycle: unsupported operations[${index}].op`);
+    if (op.op === "create" && (!op.entity || typeof op.entity !== "object" || Array.isArray(op.entity))) throw new Error(`operations[${index}].entity must be an entity object`);
+    if (op.op === "update" && (!op.changes || typeof op.changes !== "object" || Array.isArray(op.changes))) throw new Error(`operations[${index}].changes must be an object`);
+  }
+  return value as WorldOperation[];
 }
 
 /** Abort waiting promptly even if an inference adapter takes time to honor its signal. */

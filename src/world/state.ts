@@ -81,8 +81,22 @@ export interface WorldObservation {
   utterances: { eventId: string; speakerName: string; speakerObservedId?: string; text: string; spokenAt: number }[];
 }
 export interface ObserveRequest { target?: string; sinceSequence?: number; consume?: boolean; publicOnly?: boolean; selfOnly?: boolean; includeSpeech?: boolean }
+/** Machine-readable graph errors: all references are checked against the complete candidate transaction. */
+export interface KernelDiagnostic {
+  code: string;
+  entityId: string;
+  field: "location" | "owner";
+  targetId: string;
+  reason: "missing" | "wrong_kind" | "owner_not_allowed" | "cycle";
+  expectedKinds?: EntityInput["kind"][];
+  actualKind?: EntityInput["kind"];
+  sourceKind?: EntityInput["kind"];
+  /** Closed containment path, e.g. ["room", "building", "room"]. */
+  path?: string[];
+  message: string;
+}
 export class KernelError extends Error {
-  constructor(readonly code: string, message: string) { super(message); this.name = "KernelError"; }
+  constructor(readonly code: string, message: string, readonly details?: KernelDiagnostic[]) { super(message); this.name = "KernelError"; }
 }
 export function emptyWorld(): WorldSnapshot {
   return { schemaVersion: 1, sequence: 0, effectiveAt: 0, entities: {}, actions: {} };
