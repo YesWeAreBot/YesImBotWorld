@@ -14,6 +14,7 @@ import { RemoteDesktopApp } from "./apps/remoteDesktop.js";
 import { TerminalApp } from "./apps/terminal.js";
 import { WeatherApp } from "./apps/weather.js";
 import { BotAgent } from "./bot/agent.js";
+import type { ManualToolResult } from "./bot/agent.js";
 import { BotContext } from "./bot/context.js";
 import { availableTools, renderToolsText, toolLayer, type AppInfo } from "./bot/tools.js";
 import { describeCalendar } from "./calendar.js";
@@ -32,6 +33,8 @@ import { Gateway } from "./koishi/gateway.js";
 import { MessageStore } from "./koishi/messages.js";
 import { KoishiMessenger } from "./koishi/messenger.js";
 import { ChannelNameResolver } from "./koishi/names.js";
+import { parseChannelKey } from "./koishi/channels.js";
+import { deviceTools, type DeviceSession, type DeviceControlResult } from "./webui/device.js";
 import { NotifyManager } from "./koishi/notify.js";
 import { OwnSendTracker } from "./koishi/ownsends.js";
 import { RequestStore } from "./koishi/requests.js";
@@ -103,6 +106,8 @@ export class WorldService extends Service<Config> {
   private computerDevice: ComputerDevice | null = null;
   /** 远程桌面实现（remote_desktop 模式）：WebUI 窥屏直接用它 peek */
   private remoteDesktopApp: RemoteDesktopApp | null = null;
+  private deviceTail: Promise<void> = Promise.resolve();
+  private devicePending = 0;
   private worldActive = false;
   /** 提示词容器：默认值 + WebUI 覆盖（覆盖持久化于 <basePath>/webui/prompts.json） */
   private promptStore!: Prompts;
@@ -424,6 +429,7 @@ export class WorldService extends Service<Config> {
       this.config.apps.computer,
       new Set(tools.map((t) => t.name)),
       this.logger,
+      () => this.appManager?.activeToolNames() ?? [],
     );
     // 手机应用（Apps / MCP）：内置天气/浏览器 + 外接 MCP Server（电脑不在手机里，是平级的另一台设备）
     const worldApps = [
@@ -457,6 +463,7 @@ export class WorldService extends Service<Config> {
       worldApps,
       new Set(tools.map((t) => t.name)),
       this.logger,
+      () => this.computerDevice?.activeToolNames() ?? [],
     );
 
     this.bot = new BotAgent(
@@ -560,7 +567,9 @@ export class WorldService extends Service<Config> {
     this.world.stop();
     this.tingle?.stop();
     this.tingle = null;
+    this.remoteDesktopApp?.abortInput();
     await this.bot?.stop();
+    await this.deviceTail;
     await this.crossingServer?.disconnectVisitors("世界暂停或正在切换存档");
     await this.world.structured.shutdown();
     if (!wasActive) return "世界并未在运行。";
@@ -714,15 +723,84 @@ export class WorldService extends Service<Config> {
     return this.crossingServer.arrivePlayer(name, persona, mode);
   }
 
+  playerControlsBot(token: string): boolean {
+    return this.crossingServer?.playerControlsBot(token) ?? false;
+  }
+
   /** WebUI：管理员代理 Bot 执行任意工具调用（手动驾驶） */
-  async botToolCall(name: string, args: Record<string, unknown>, duration?: number): Promise<{ ok: boolean; text: string }> {
-    if (!this.bot) return { ok: false, text: "（Bot-LLM 当前未在运行。）" };
-    return this.bot.injectExternalToolCall(name, args, { duration });
+  async botToolCall(name: string, args: Record<string, unknown>, duration?: number): Promise<ManualToolResult> {
+    return this.withDeviceLock(async () => {
+      if (!this.worldActive || !this.bot) return { ok: false, text: "（Bot-LLM 当前未在运行。）" };
+      if (this.deviceToolDefs().some(tool => tool.name === name) && (!this.bot.manualMode || this.bot.manualBusy)) {
+        return { ok: false, text: "请先接管并等待设备空闲，再操作 Bot 的设备。" };
+      }
+      return this.bot.injectExternalToolCall(name, args, { duration });
+    });
   }
 
   /** WebUI：管理员接管 Bot 时暂停/恢复其自主生成 */
-  botSetManualPaused(paused: boolean): void {
-    this.bot?.setManualPaused(paused);
+  async botSetManualPaused(paused: boolean): Promise<DeviceControlResult> {
+    return this.deviceControl(paused);
+  }
+
+  private withDeviceLock<T>(run: () => Promise<T>): Promise<T> {
+    this.devicePending++;
+    const result = this.deviceTail.then(run, run);
+    this.deviceTail = result.then(() => { this.devicePending--; }, () => { this.devicePending--; });
+    return result;
+  }
+
+  private deviceToolDefs() {
+    return deviceTools(this.bot?.manualTools() ?? [], new Set(this.appManager?.activeToolNames() ?? []), new Set(this.computerDevice?.activeToolNames() ?? []));
+  }
+
+  async deviceControl(paused: boolean): Promise<DeviceControlResult> {
+    return this.withDeviceLock(async () => {
+      const bot = this.bot;
+      if (!this.worldActive || !bot) return { ok: false, paused: false, busy: false, text: "世界尚未运行，无法接管设备。" };
+      if (paused) {
+        const { busy } = await bot.acquireManualControl();
+        if (!busy) await this.remoteDesktopApp?.releaseInputs();
+        return { ok: !busy, paused: true, busy, text: busy ? "自主生成已暂停；已有操作正在提交，等待真实回执后即可操作。" : "已接管设备，自主生成已暂停。" };
+      }
+      if (bot.manualBusy) return { ok: false, paused: bot.manualMode, busy: true, text: "已有操作尚未完成，请等待回执后交还控制。" };
+      await this.remoteDesktopApp?.releaseInputs();
+      bot.setManualPaused(false);
+      return { ok: true, paused: false, busy: false, text: "已交还设备，Bot 恢复自主运行。" };
+    });
+  }
+
+  async deviceToolCall(name: string, args: Record<string, unknown>, duration?: number, confirmSend = false): Promise<ManualToolResult> {
+    return this.withDeviceLock(async () => {
+      const bot = this.bot;
+      if (!this.worldActive || !bot) return { ok: false, text: "世界尚未运行。" };
+      if (!bot.manualMode || bot.manualBusy) return { ok: false, text: "请先接管并等待现有操作完成。" };
+      const tool = this.deviceToolDefs().find(tool => tool.name === name);
+      if (!tool) return { ok: false, text: "此设备工具当前不可用，请先打开对应应用或进入频道。" };
+      if (tool.effect === "send" && !confirmSend) return { ok: false, text: "发送需由用户明确点击发送（confirmSend=true）。" };
+      if (!args || typeof args !== "object" || Array.isArray(args)) return { ok: false, text: "args 必须为 JSON 对象。" };
+      if (duration !== undefined && (!Number.isFinite(duration) || duration < 0)) return { ok: false, text: "duration 必须为有限非负数。" };
+      return bot.injectExternalToolCall(name, args, { duration });
+    });
+  }
+
+  async deviceSession(): Promise<DeviceSession> {
+    const devices = await this.devicesInfo();
+    const channel = devices.phone.channelKey;
+    const [known, recent] = await Promise.all([this.store.knownChannels(), this.store.recentChannels(100)]);
+    const latest = new Map(recent.map(row => [row.key, row.latest]));
+    const parsed = channel ? parseChannelKey(channel) : null;
+    const messages = parsed && !parsed.error ? await this.store.channelMessages(parsed.platform, parsed.channelId, 100, parsed.selfId) : [];
+    return {
+      running: this.worldActive && !!this.bot?.status().running,
+      control: { paused: this.bot?.manualMode ?? false, busy: this.devicePending > 0 || !!this.bot?.manualBusy },
+      devices,
+      apps: (this.appManager?.installedApps() ?? []).map(app => ({ ...app, active: app.kind === "chat" ? devices.phone.chatOpen : app.active })),
+      tools: this.deviceToolDefs(),
+      appView: this.appManager?.view() ?? null,
+      computerView: this.computerDevice?.view() ?? null,
+      chat: { channelKey: channel, channels: known.map(row => ({ ...row, ...(latest.has(row.key) ? { latest: latest.get(row.key) } : {}) })), messages },
+    };
   }
 
   /** WebUI：Bot 是否处于手动驾驶（自主生成已暂停） */
@@ -952,13 +1030,16 @@ export class WorldService extends Service<Config> {
 
   async devicesInfo(): Promise<DevicesInfo> {
     const cc = this.config.apps.computer;
+    const meta = await this.files.readMeta();
+    const effectiveMode = (meta.realWorld ?? this.clock?.syncRealTime ?? false) ? cc.mode : "virtual";
     const botSt = this.bot?.status() ?? null;
     return {
       computer: {
         mode: cc.mode,
+        effectiveMode,
         on: this.computerDevice?.currentName ?? null,
-        docker: cc.mode === "docker" && this.computer ? await this.computer.inspect() : null,
-        remote: cc.mode === "remote_desktop" ? { host: cc.remoteDesktop.host, port: cc.remoteDesktop.port } : null,
+        docker: effectiveMode === "docker" && this.computer ? await this.computer.inspect() : null,
+        remote: effectiveMode === "remote_desktop" ? { host: cc.remoteDesktop.host, port: cc.remoteDesktop.port, connected: this.remoteDesktopApp?.connected ?? false } : null,
       },
       phone: {
         down: this.phoneStatus.down,
@@ -967,36 +1048,48 @@ export class WorldService extends Service<Config> {
         channelKey: botSt?.phoneUi?.channelKey ?? null,
         channelIsGroup: botSt?.phoneUi?.channelIsGroup ?? false,
         chatAppName: this.config.apps.chatAppName || "QQ",
-        resolution: resolvePhoneResolution(this.config.apps.phoneResolution, await this.files.readMeta()),
+        resolution: resolvePhoneResolution(this.config.apps.phoneResolution, meta),
       },
     };
   }
 
-  async computerScreen(maxWidth?: number): Promise<{ png: Buffer; width: number; height: number }> {
+  async computerScreen(maxWidth?: number): Promise<{ png: Buffer; width: number; height: number; desktopWidth?: number; desktopHeight?: number }> {
     const cc = this.config.apps.computer;
+    const meta = await this.files.readMeta();
+    if (!(meta.realWorld ?? this.clock?.syncRealTime)) throw new Error("虚构世界的电脑由模型模拟，没有真实屏幕。");
     if (cc.mode !== "remote_desktop") {
       throw new Error(cc.mode === "docker" ? "Docker 电脑没有屏幕——它是纯终端，用下面的控制台操作。" : "电脑未启用（apps.computer.mode = off）。");
     }
     if (!this.remoteDesktopApp) {
       throw new Error("远程桌面未接线（需要 bot.modalities.image 开启图片模态）。");
     }
+    if (!this.computerDevice?.isOpen) throw new Error("请先接管并打开电脑。");
     return this.remoteDesktopApp.peek(maxWidth);
   }
 
   async computerAction(action: "start" | "stop" | "restart"): Promise<string> {
-    if (this.config.apps.computer.mode !== "docker" || !this.computer) {
-      return "这台电脑不是 Docker 模式，没有容器可管理。";
-    }
-    if (action === "start") return this.computer.start();
-    if (action === "stop") return this.computer.stop();
-    return this.computer.restart();
+    return this.withDeviceLock(async () => {
+      if (!this.worldActive || !this.bot?.manualMode || this.bot.manualBusy) throw new Error("请先接管并等待设备空闲。");
+      const meta = await this.files.readMeta();
+      if (!(meta.realWorld ?? this.clock?.syncRealTime)) throw new Error("虚构世界的电脑由模型模拟，不能管理真实 Docker 容器。");
+      if (this.config.apps.computer.mode !== "docker" || !this.computer) throw new Error("这台电脑不是 Docker 模式，没有容器可管理。");
+      if (action === "start") return (await this.bot.injectExternalToolCall("open_computer", {})).text;
+      if (this.computerDevice?.isOpen) await this.bot.injectExternalToolCall("close_computer", {});
+      const text = action === "stop" ? await this.computer.stop() : await this.computer.restart();
+      if (action === "restart") return text + "\n" + (await this.bot.injectExternalToolCall("open_computer", {})).text;
+      return text;
+    });
   }
 
   async computerExec(command: string) {
-    if (this.config.apps.computer.mode !== "docker" || !this.computer) {
-      return { code: null, output: "（这台电脑不是 Docker 模式——远程桌面请用窥屏，未启用请先在配置里打开。）" };
-    }
-    return this.computer.exec(command);
+    const meta = await this.files.readMeta();
+    if ((meta.realWorld ?? this.clock?.syncRealTime) && this.config.apps.computer.mode !== "docker") throw new Error("这台电脑没有终端模式。");
+    const tool = this.computerDevice?.activeToolDefs().find(def => def.name === "run_command" || def.name.endsWith(".run_command"));
+    if (!tool) throw new Error("请先接管并打开电脑。");
+    const result = await this.deviceToolCall(tool.name, { command });
+    if (!result.ok) throw new Error(result.text);
+    // 统一经 Bot 的真实终端工具执行，不另开旁路；文本回执不虚构退出码。
+    return { code: null, output: result.text };
   }
 
   focusChannels(): string[] {

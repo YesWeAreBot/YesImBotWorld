@@ -27,6 +27,9 @@ export class RemoteDesktopApp implements WorldApp {
   readonly description = "连到另一台电脑（VNC 远程桌面）的屏幕：看画面、动鼠标键盘";
 
   private session: RfbSession | null = null;
+  private pressedButtons = 0;
+  private heldKeys = new Map<number, boolean>();
+  private epoch = 0;
 
   constructor(
     private cfg: RemoteDesktopConfig,
@@ -35,13 +38,16 @@ export class RemoteDesktopApp implements WorldApp {
   ) {}
 
   async open(): Promise<{ tools: AppRawTool[]; opening?: string }> {
+    this.abortInput();
+    const epoch = this.epoch;
     const session = new RfbSession(
       { host: this.cfg.host, port: this.cfg.port, password: this.cfg.password, connectTimeoutMs: this.cfg.connectTimeoutMs },
       this.logger,
     );
+    this.session = session;
     try {
       await session.connect();
-      this.session = session;
+      if (epoch !== this.epoch) { session.disconnect(); throw new Error("远程桌面打开已取消"); }
       const { width, height } = session.screenSize;
       return {
         tools: TOOLS,
@@ -51,7 +57,8 @@ export class RemoteDesktopApp implements WorldApp {
           `先 screen 看一眼桌面再动手。`,
       };
     } catch (err) {
-      this.session = null;
+      session.disconnect();
+      if (this.session === session) this.session = null;
       return {
         tools: TOOLS,
         opening: `你走到桌前想打开电脑，但连不上远程桌面 ${this.cfg.host}:${this.cfg.port}（${(err as Error).message ?? err}）。`,
@@ -62,61 +69,85 @@ export class RemoteDesktopApp implements WorldApp {
   async call(tool: string, args: Record<string, unknown>): Promise<string | RichText> {
     const notConnected = await this.requireSession();
     if (notConnected) return notConnected;
+    const epoch = this.epoch;
+    const session = this.session;
+    let result: string | RichText;
     switch (tool) {
       case "screen":
-        return this.screen();
+        result = await this.screen();
+        break;
       case "mouse":
-        return this.mouse(args);
+        result = await this.mouse(args);
+        break;
       case "keyboard":
-        return this.keyboard(args);
+        result = await this.keyboard(args);
+        break;
       default:
         throw new Error(`远程桌面没有 ${tool} 这个操作`);
     }
+    if (epoch !== this.epoch || session !== this.session || !session?.connected) {
+      throw new Error("远程桌面操作期间连接已关闭，操作可能已部分执行；请重新观察结果，不能自动重发。");
+    }
+    return result;
   }
 
   async close(): Promise<void> {
+    this.abortInput();
+  }
+
+  /** 世界停止时立刻停止剩余输入和正在建立的连接，后续回执仍说明已执行部分。 */
+  abortInput(): void {
+    this.epoch++;
     this.session?.disconnect();
     this.session = null;
+    this.heldKeys.clear();
+    this.pressedButtons = 0;
   }
 
   /**
    * WebUI「设备」页的实时窥屏：截一帧当前画面（不入 Bot 的工作窗口，纯运维观察）。
-   * 优先复用 Bot 打开着的会话；没开时临时连一次截完即断，不干扰 Bot 侧状态。
+   * 只复用 Bot 打开着的会话；没开/断线时拒绝，GET 不创建外部连接。
    * 连不上时抛错，由调用方转成提示。
    */
-  async peek(maxWidth?: number): Promise<{ png: Buffer; width: number; height: number }> {
-    const width = maxWidth ?? this.cfg.maxWidth;
-    if (this.session?.connected) {
-      const shot = await this.session.snapshot(width);
-      if (shot.png.length) return shot;
+  async peek(maxWidth?: number): Promise<{ png: Buffer; width: number; height: number; desktopWidth: number; desktopHeight: number }> {
+    const session = this.session;
+    if (!session?.connected) throw new Error("远程桌面未连接；请先接管并打开电脑。");
+    const width = Number.isFinite(maxWidth) ? Math.max(64, Math.min(4096, maxWidth!)) : this.cfg.maxWidth;
+    const shot = await session.snapshot(width, { connect: false });
+    if (!shot.png.length) throw new Error("截到的画面是空的");
+    return { ...shot, desktopWidth: session.screenSize.width, desktopHeight: session.screenSize.height };
+  }
+
+  get connected(): boolean { return this.session?.connected ?? false; }
+
+  /** 交还控制/关机时释放真人按住的输入，避免远端遗留 Ctrl 或鼠标拖动。 */
+  async releaseInputs(): Promise<void> {
+    const session = this.session;
+    if (session?.connected) {
+      for (const [keysym, shift] of this.heldKeys) await session.keyHold(keysym, false, shift);
+      if (this.pressedButtons) session.pointer(session.lastPointer.x, session.lastPointer.y, 0);
     }
-    const temp = new RfbSession(
-      { host: this.cfg.host, port: this.cfg.port, password: this.cfg.password, connectTimeoutMs: this.cfg.connectTimeoutMs },
-      this.logger,
-    );
-    try {
-      await temp.connect();
-      const shot = await temp.snapshot(width);
-      if (!shot.png.length) throw new Error("截到的画面是空的");
-      return shot;
-    } finally {
-      temp.disconnect();
-    }
+    this.heldKeys.clear();
+    this.pressedButtons = 0;
   }
 
   /** 确保已有连接；连接断开/从未连上时尝试重连。返回 null 表示就绪，否则返回给 Bot 的提示 */
   private async requireSession(): Promise<string | null> {
     if (this.session?.connected) return null;
+    const epoch = this.epoch;
     const session = new RfbSession(
       { host: this.cfg.host, port: this.cfg.port, password: this.cfg.password, connectTimeoutMs: this.cfg.connectTimeoutMs },
       this.logger,
     );
+    this.session = session;
     try {
       await session.connect();
-      this.session = session;
+      if (epoch !== this.epoch) { session.disconnect(); throw new Error("远程桌面连接已取消"); }
       this.logger.info("远程桌面重连成功：%s:%s", this.cfg.host, this.cfg.port);
       return null;
     } catch (err) {
+      session.disconnect();
+      if (this.session === session) this.session = null;
       return (
         `（远程桌面当前没有连接：${(err as Error).message ?? err}。` +
         `这通常是网络不通或那台电脑上的 VNC 没开。重新打开电脑（open_computer）再试。）`
@@ -168,7 +199,7 @@ export class RemoteDesktopApp implements WorldApp {
     switch (action) {
       case "move":
         if (!hasPos) return "（move 需要 x、y 坐标。）";
-        session.pointer(cur.x, cur.y, 0);
+        session.pointer(cur.x, cur.y, this.pressedButtons);
         return `你把鼠标移到了屏幕的 (${cur.x}, ${cur.y}) 处。`;
       case "click":
         session.pointer(cur.x, cur.y, buttonMask);
@@ -194,25 +225,27 @@ export class RemoteDesktopApp implements WorldApp {
         return `你点了${buttonName(mask)}（${cur.x}, ${cur.y}）。`;
       }
       case "press":
+        this.pressedButtons = buttonMask;
         session.pointer(cur.x, cur.y, buttonMask);
         return `你按住了${buttonName(buttonMask)}（${cur.x}, ${cur.y}）没松手——需要移动/拖动就先调 move，要松开就用 mouse action: release。`;
       case "release":
+        this.pressedButtons = 0;
         session.pointer(cur.x, cur.y, 0);
         return `你松开了鼠标按钮（${cur.x}, ${cur.y}）。`;
       case "drag": {
         const x2 = num(args.x2)!;
         const y2 = num(args.y2)!;
-        session.pointer(cur.x, cur.y, MOUSE.LEFT);
+        session.pointer(cur.x, cur.y, buttonMask);
         await sleep(60);
         // 分步移动，让远程应用识别出"拖动"
         const steps = 6;
         for (let i = 1; i <= steps; i++) {
-          session.pointer(cur.x + ((x2 - cur.x) * i) / steps, cur.y + ((y2 - cur.y) * i) / steps, MOUSE.LEFT);
+          session.pointer(cur.x + ((x2 - cur.x) * i) / steps, cur.y + ((y2 - cur.y) * i) / steps, buttonMask);
           await sleep(30);
         }
         await sleep(40);
         session.pointer(x2, y2, 0);
-        return `你按住鼠标左键，从 (${cur.x}, ${cur.y}) 拖到了 (${x2}, ${y2}) 才松开。`;
+        return `你按住${buttonName(buttonMask)}，从 (${cur.x}, ${cur.y}) 拖到了 (${x2}, ${y2}) 才松开。`;
       }
       case "scroll": {
         const dir = String(args.direction ?? args.dir ?? "down");
@@ -263,6 +296,8 @@ export class RemoteDesktopApp implements WorldApp {
         const ks = resolveKey(key);
         if (ks === null) return `（不认识的键：${key}。）`;
         await session.keyHold(ks.keysym, action === "press", ks.shift);
+        if (action === "press") this.heldKeys.set(ks.keysym, ks.shift);
+        else this.heldKeys.delete(ks.keysym);
         return action === "press" ? `你按住了 ${keyLabel(key)} 没松手。` : `你松开了 ${keyLabel(key)}。`;
       }
       default:
@@ -290,7 +325,7 @@ const TOOLS: AppRawTool[] = [
       "操作远程桌面的鼠标。坐标以像素计，(0,0) 在屏幕左上角。action：" +
       "move 移动；click 单击（button 可指定 left/right/middle，默认左键）；double_click 双击；" +
       "right_click / middle_click 右击/中击；press 按住按钮不松开；release 松开；" +
-      "drag 按住左键从 (x,y) 拖到 (x2,y2) 再松开；scroll 滚动滚轮（direction: up/down/left/right，times 滚几格）。" +
+      "drag 按住 button 指定按钮（默认左键）从 (x,y) 拖到 (x2,y2) 再松开；scroll 滚动滚轮（direction: up/down/left/right，times 滚几格）。" +
       "操作后记得 screen 看结果。",
     inputSchema: {
       type: "object",

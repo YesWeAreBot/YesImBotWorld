@@ -22,6 +22,8 @@ export interface AppToolDef {
   name: string;
   signature: string;
   description: string;
+  /** 保留应用原始 schema，供真实设备表单与原生工具声明复用。 */
+  inputSchema?: Record<string, unknown>;
 }
 
 export interface WorldApp {

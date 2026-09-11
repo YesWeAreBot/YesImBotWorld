@@ -27,10 +27,12 @@
     "url": "https://github.com/YesWeAreBot/YesImBotWorld/issues"
   },
   "scripts": {
-    "build": "pkgroll --sourcemap",
+    "build": "node scripts/gen-page.mjs && pkgroll --sourcemap",
     "check": "tsc --noEmit",
     "prepublishOnly": "npm run check && npm run build",
-    "test": "node scripts/test.mjs"
+    "test": "node scripts/gen-page.mjs && node scripts/test.mjs",
+    "preview:webui": "node scripts/gen-page.mjs && node scripts/preview-webui.mjs",
+    "test:webui": "node scripts/gen-page.mjs && node scripts/smoke-webui.mjs"
   },
   "dependencies": {
     "rfb2": "0.2.2",

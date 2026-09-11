@@ -98,6 +98,8 @@ export class RfbSession {
   private snapMaxWidth = 1024;
   private snapLock: Promise<void> = Promise.resolve();
   private inputLock: Promise<void> = Promise.resolve();
+  private inputEpoch = 0;
+  private heldKeysyms = new Set<number>();
   private closed = false;
   /** 最近一次指针位置（press/release/scroll 缺省用这里） */
   private pointerPos = { x: -1, y: -1 };
@@ -214,6 +216,13 @@ export class RfbSession {
   }
 
   disconnect(): void {
+    this.inputEpoch++;
+    // 尽力释放真实远端输入；关闭连接只停止余下输入，不能撤销已发送按键。
+    try {
+      for (const keysym of this.heldKeysyms) this.key(keysym, false);
+      this.pointer(this.pointerPos.x, this.pointerPos.y, 0);
+    } catch { /* 断线时只能停止本地输入；无法撤销远端已经收到的事件。 */ }
+    this.heldKeysyms.clear();
     const socket = this.socket;
     this.socket = null;
     this.client = null;
@@ -233,9 +242,9 @@ export class RfbSession {
    * 截取当前屏幕：请求一次全量刷新，等画布被刷新完整后下采样（最大宽度 maxWidth）
    * 并编码为 PNG。串行化（同一时间只有一个截屏在进行）。
    */
-  async snapshot(maxWidth: number): Promise<ScreenShot> {
+  async snapshot(maxWidth: number, options: { connect?: boolean } = {}): Promise<ScreenShot> {
     const run = this.snapLock.then(async () => {
-      await this.connect();
+      if (options.connect !== false) await this.connect();
       if (!this.client || this.closed) throw new Error("远程桌面连接已断开");
       const { width, height } = this.screenSize;
       if (!width || !height) throw new Error("远程桌面还没有收到画面");
@@ -311,6 +320,7 @@ export class RfbSession {
   /** 键盘事件：按下/松开一个 keysym（KeyEvent=5，同上面指针的规范修正） */
   key(keysym: number, down: boolean): void {
     if (!this.client) return;
+    if (down) this.heldKeysyms.add(keysym); else this.heldKeysyms.delete(keysym);
     const msg = Buffer.alloc(8);
     msg[0] = 5; // KeyEvent
     msg[1] = down ? 1 : 0;
@@ -320,9 +330,11 @@ export class RfbSession {
 
   /** 输入一段文本：ASCII 按键输入，非 ASCII（中文等）走剪贴板 + Ctrl+V */
   typeText(text: string): Promise<void> {
+    const epoch = this.inputEpoch;
     return this.queued(async () => {
       let i = 0;
       while (i < text.length) {
+        if (epoch !== this.inputEpoch || !this.connected) throw new Error("远程输入已停止；已发送的按键不会回滚");
         const ks = charKey(text[i]!);
         if (ks) {
           await this.tapKey(ks.keysym, ks.shift);
@@ -397,7 +409,12 @@ export class RfbSession {
   // ---------- 内部 ----------
 
   private queued(fn: () => Promise<void>): Promise<void> {
-    const run = this.inputLock.then(fn, fn);
+    const epoch = this.inputEpoch;
+    const guarded = () => {
+      if (epoch !== this.inputEpoch || !this.connected) throw new Error("远程输入已停止");
+      return fn();
+    };
+    const run = this.inputLock.then(guarded, guarded);
     this.inputLock = run.catch(() => {});
     return run;
   }

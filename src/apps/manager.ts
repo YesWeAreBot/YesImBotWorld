@@ -15,7 +15,7 @@ const CHAT_ALIASES = ["聊天", "chat", "koishi", "qq", "消息", "messages"];
  * - 切换 App / close / rest / 世界停止时关闭并失效。
  */
 export class AppManager {
-  private current: { app: WorldApp; toolMap: Map<string, string>; defs: AppToolDef[] } | null = null;
+  private current: { app: WorldApp; toolMap: Map<string, string>; defs: AppToolDef[]; opening?: string; lastTool?: string; result?: string | RichText } | null = null;
 
   constructor(
     private chatName: string,
@@ -23,6 +23,7 @@ export class AppManager {
     /** 常驻工具名（冲突时 App 工具加前缀） */
     private reserved: Set<string>,
     private logger: Logger,
+    private otherToolNames: () => string[] = () => [],
   ) {}
 
   /** 按名字（或 id）找 App；聊天平台的常用别名也能匹配 */
@@ -40,6 +41,12 @@ export class AppManager {
     return names.join("、");
   }
 
+  /** 只读取注册信息，不打开 App、不建立 MCP 连接。 */
+  installedApps(): { id: string; name: string; description: string; kind: "chat" | "app"; active: boolean }[] {
+    return [{ id: "chat", name: this.chatName, description: "聊天与消息", kind: "chat", active: false },
+      ...this.apps.map(app => ({ id: app.id, name: app.name, description: app.description, kind: "app" as const, active: this.current?.app === app }))];
+  }
+
   /** 打开一个 App：关闭上一个，连接并展开工具。返回关闭的 App 名、拟人化开场与暴露的工具定义 */
   async open(app: WorldApp): Promise<{ closed: string | null; opening?: string; defs: AppToolDef[] }> {
     const closed = await this.closeCurrent();
@@ -48,16 +55,18 @@ export class AppManager {
     const defs: AppToolDef[] = [];
     for (const t of tools) {
       let exposed = t.name;
-      if (this.reserved.has(exposed) || toolMap.has(exposed)) exposed = `${app.id}.${t.name}`;
-      if (toolMap.has(exposed)) continue; // 仍冲突（重复工具名），丢弃
+      const occupied = new Set([...this.reserved, ...this.otherToolNames(), ...toolMap.keys()]);
+      if (occupied.has(exposed)) exposed = `${app.id}.${t.name}`;
+      if (occupied.has(exposed)) continue; // 仍冲突（重复工具名），丢弃
       toolMap.set(exposed, t.name);
       defs.push({
         name: exposed,
         signature: renderSignature(exposed, t.inputSchema),
         description: t.description || "（无说明）",
+        ...(t.inputSchema ? { inputSchema: structuredClone(t.inputSchema) } : {}),
       });
     }
-    this.current = { app, toolMap, defs };
+    this.current = { app, toolMap, defs, opening };
     this.logger.info("打开应用「%s」：%d 个工具（%s）", app.name, defs.length, defs.map((d) => d.name).join(", "));
     return { closed, opening, defs };
   }
@@ -84,6 +93,11 @@ export class AppManager {
     return this.current?.app.name ?? null;
   }
 
+  view(): { id: string; name: string; opening?: string; lastTool?: string; result?: string | RichText } | null {
+    const current = this.current;
+    return current ? structuredClone({ id: current.app.id, name: current.app.name, opening: current.opening, lastTool: current.lastTool, result: current.result }) : null;
+  }
+
   /** 当前展开的工具名（供动态加入允许列表/GBNF 语法） */
   activeToolNames(): string[] {
     return this.current ? [...this.current.toolMap.keys()] : [];
@@ -103,6 +117,9 @@ export class AppManager {
     if (!this.current) throw new Error("当前没有打开的应用");
     const real = this.current.toolMap.get(exposedName);
     if (!real) throw new Error(`当前应用没有 ${exposedName} 这个操作`);
-    return this.current.app.call(real, args);
+    const current = this.current;
+    const result = await current.app.call(real, args);
+    if (this.current === current) { current.lastTool = exposedName; current.result = result; }
+    return result;
   }
 }

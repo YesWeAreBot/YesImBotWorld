@@ -101,6 +101,13 @@ export class Scheduler {
   }
   get pendingCount(): number { return this.tasks.size; }
 
+  /** 管理员接管时只能取消尚未提交的任务；已提交任务继续交付真实回执。 */
+  cancelUncommitted(): string[] {
+    const cancelled: string[] = [];
+    for (const id of this.tasks.keys()) if (this.cancel(id) === "cancelled") cancelled.push(id);
+    return cancelled;
+  }
+
   stopAll(): void {
     for (const [id, task] of this.tasks) {
       if (task.committed) {

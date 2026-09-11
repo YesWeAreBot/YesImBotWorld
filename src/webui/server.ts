@@ -32,6 +32,8 @@ import { llmFetch, forEachStreamLine } from "../llm/http.js";
 import { PAGE_HTML } from "./page.js";
 import { VisitorStore, type VisitorSession, type VisitorGrant, type VisitorPreset, type PlayerProfile } from "./visitors.js";
 import type { PlayerMode } from "../crossing/protocol.js";
+import type { ManualToolResult } from "../bot/agent.js";
+import type { DeviceSession, DeviceControlResult } from "./device.js";
 
 export interface BotStatusSummary {
   running: boolean;
@@ -54,10 +56,12 @@ export interface NoteEntry {
 export interface DevicesInfo {
   computer: {
     mode: "off" | "docker" | "remote_desktop";
+    /** 实际世界中的实现；虚构世界始终使用模型模拟，mode 只保留用户配置。 */
+    effectiveMode?: "off" | "docker" | "remote_desktop" | "virtual";
     /** Bot 侧打开着的电脑应用名（开着 = 电脑开机中） */
     on: string | null;
     docker: ComputerInspection | null;
-    remote: { host: string; port: number } | null;
+    remote: { host: string; port: number; connected?: boolean } | null;
   };
   phone: {
     down: boolean;
@@ -112,8 +116,11 @@ export interface WebUIHost {
   deleteNote(name: string): Promise<void>;
   /** 设备页：电脑 + 手机的实时状态 */
   devicesInfo(): Promise<DevicesInfo>;
+  deviceSession(): Promise<DeviceSession>;
+  deviceControl(paused: boolean): Promise<DeviceControlResult>;
+  deviceToolCall(name: string, args: Record<string, unknown>, duration?: number, confirmSend?: boolean): Promise<ManualToolResult>;
   /** 远程桌面实时截屏（peek，不影响 Bot 视野）；不可用/连不上时抛错 */
-  computerScreen(maxWidth?: number): Promise<{ png: Buffer; width: number; height: number }>;
+  computerScreen(maxWidth?: number): Promise<{ png: Buffer; width: number; height: number; desktopWidth?: number; desktopHeight?: number }>;
   /** Docker 电脑的开关机管理 */
   computerAction(action: "start" | "stop" | "restart"): Promise<string>;
   /** 在 Docker 电脑里执行一条命令（运维用途） */
@@ -132,7 +139,9 @@ export interface WebUIHost {
   /** 管理员代理 Bot 执行任意工具调用（手动驾驶） */
   botToolCall(name: string, args: Record<string, unknown>, duration?: number): Promise<{ ok: boolean; text: string }>;
   /** 管理员接管 Bot 时暂停/恢复其自主生成（扮演=暂停；操纵/交还=恢复） */
-  botSetManualPaused(paused: boolean): void;
+  botSetManualPaused(paused: boolean): void | DeviceControlResult | Promise<void | DeviceControlResult>;
+  /** 当前有效 crossing 会话是否为管理员同名接管常驻 Bot。 */
+  playerControlsBot?(token: string): boolean;
   /** Bot 是否处于手动驾驶（自主生成已暂停） */
   botManualMode(): boolean;
   /** 常驻 Bot 名字（供管理员同名判定） */
@@ -563,10 +572,15 @@ export class WebUIServer {
       if (!r.ok) return void sendJSON(res, 400, { error: r.error });
       // 管理员与常驻 Bot 同名（扮演/操纵）＝接管 Bot：扮演=暂停 Bot-LLM 自主生成，操纵=继续自主运行
       const botName = this.host.residentBotName().trim();
+      let control: void | DeviceControlResult = undefined;
       if (isAdmin && botName && name === botName && (mode === "avatar" || mode === "puppet")) {
-        this.host.botSetManualPaused(mode === "avatar");
+        control = await this.host.botSetManualPaused(mode === "avatar");
+        if (control && !control.ok && !(mode === "avatar" && control.paused)) {
+          await this.crossingPost("/crossing/leave", { token: r.token });
+          return void sendJSON(res, 409, { error: control.text, control });
+        }
       }
-      return void sendJSON(res, 200, { ok: true, token: r.token, worldName: r.worldName, timeLine: r.timeLine, mode, botName });
+      return void sendJSON(res, 200, { ok: true, token: r.token, worldName: r.worldName, timeLine: r.timeLine, mode, botName, ...(control ? { control } : {}) });
     }
 
     // 代理 Bot 工具调用（管理员手动驾驶）：管理员接管 Bot 时经此真正执行任意 Bot 工具
@@ -577,7 +591,7 @@ export class WebUIServer {
       const name = String(body.name ?? "").trim();
       if (!name) return void sendJSON(res, 400, { error: "缺少工具名 name" });
       const args = (body.arguments ?? body.args ?? {}) as Record<string, unknown>;
-      if (typeof args !== "object" || Array.isArray(args)) {
+      if (!args || typeof args !== "object" || Array.isArray(args)) {
         return void sendJSON(res, 400, { error: "arguments 必须是 JSON 对象" });
       }
       const duration = body.duration != null ? Number(body.duration) : undefined;
@@ -608,12 +622,26 @@ export class WebUIServer {
     }
 
     // 离开
+    if (pathname === "/api/player/cancel" && method === "POST") {
+      const body = await readJson(req, 64 * 1024).catch(() => null);
+      if (!body || typeof body.token !== "string" || !body.token || typeof body.taskId !== "string" || !body.taskId || body.taskId.length > 64) {
+        return void sendJSON(res, 400, { error: "需要 crossing 会话 token 与有效 taskId；管理员直调工具没有可撤销的 crossing taskId。" });
+      }
+      const result = await this.crossingPost("/crossing/cancel", { token: body.token, taskId: body.taskId });
+      return void sendJSON(res, 200, result);
+    }
+
+    // 离开
     if (pathname === "/api/player/leave" && method === "POST") {
-      const body = await readJson(req, 64 * 1024).catch(() => ({}));
-      // 管理员离开：解除 Bot 接管（恢复自主生成）
-      if (isAdmin) this.host.botSetManualPaused(false);
+      const body = await readJson(req, 64 * 1024).catch(() => null);
+      if (!body || typeof body.token !== "string" || !body.token) return void sendJSON(res, 400, { error: "需要 crossing 会话 token" });
+      // 只有有效的常驻角色接管会话才交还 Bot；独立访客离开不影响设备页的接管。
+      if (isAdmin && this.host.playerControlsBot?.(body.token)) {
+        const control = await this.host.botSetManualPaused(false);
+        if (control && !control.ok) return void sendJSON(res, 409, { error: control.text, control });
+      }
       const r = await this.crossingPost("/crossing/leave", body);
-      return void sendJSON(res, 200, { ok: true });
+      return void sendJSON(res, r.ok ? 200 : 400, r);
     }
 
     // 事件流：SSE 转发 crossing events
@@ -806,6 +834,23 @@ export class WebUIServer {
     }
 
     // ---------- 设备（电脑 + 手机窥视） ----------
+    if (pathname.startsWith("/api/device/")) {
+      if (access.kind !== "admin") return void sendJSON(res, 403, { error: "仅管理员可读取和操作 Bot 的真实设备会话" });
+      res.setHeader?.("cache-control", "no-store");
+      if (pathname === "/api/device/session" && method === "GET") return void sendJSON(res, 200, await host.deviceSession());
+      if (pathname === "/api/device/control" && method === "POST") {
+        const body = await readJson(req, 64 * 1024).catch(() => null);
+        if (!body || typeof body.paused !== "boolean") return void sendJSON(res, 400, { error: "paused 必须是布尔值" });
+        return void sendJSON(res, 200, await host.deviceControl(body.paused));
+      }
+      if (pathname === "/api/device/tool" && method === "POST") {
+        const body = await readJson(req, 1024 * 1024).catch(() => null);
+        if (!body || typeof body.name !== "string" || !body.name.trim() || !body.args || typeof body.args !== "object" || Array.isArray(body.args)) return void sendJSON(res, 400, { error: "需要工具名 name 与 JSON 对象 args" });
+        if (body.duration !== undefined && (typeof body.duration !== "number" || !Number.isFinite(body.duration) || body.duration < 0)) return void sendJSON(res, 400, { error: "duration 必须为有限非负数" });
+        return void sendJSON(res, 200, await host.deviceToolCall(body.name.trim(), body.args as Record<string, unknown>, body.duration as number | undefined, body.confirmSend === true));
+      }
+      return void sendJSON(res, 404, { error: "设备端点或方法不存在" });
+    }
     if (pathname === "/api/devices" && method === "GET") {
       sendJSON(res, 200, await host.devicesInfo());
       return;
@@ -820,6 +865,8 @@ export class WebUIServer {
           "cache-control": "no-store",
           "x-screen-width": String(shot.width),
           "x-screen-height": String(shot.height),
+          "x-desktop-width": String(shot.desktopWidth ?? shot.width),
+          "x-desktop-height": String(shot.desktopHeight ?? shot.height),
         });
         res.end(shot.png);
       } catch (err) {

@@ -175,6 +175,11 @@ export class CrossingServer {
     return [...this.sessions.values()].filter((s) => !s.residentControl).map((s) => ({ name: s.name, arrivedAt: s.arrivedAt }));
   }
 
+  /** 只查询仍有效的接管会话；过期 token 不得交还后来建立的设备控制。 */
+  playerControlsBot(token: string): boolean {
+    return this.sessions.get(token)?.residentControl ?? false;
+  }
+
   /**
    * 同部署真人玩家到达（供 WebUI 内部调用，不走 HTTP / 不校验邀请码——玩家已通过 WebUI 登录鉴权）。
    * 其余与 handleArrive 一致：创建会话、同名顶替、触发到达叙事、通知常驻 Bot。

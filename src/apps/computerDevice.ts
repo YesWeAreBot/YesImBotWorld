@@ -32,6 +32,8 @@ interface ActiveComputer {
   apps: WorldApp[];
   toolMap: Map<string, { app: WorldApp; tool: string }>;
   defs: AppToolDef[];
+  lastTool?: string;
+  result?: string | RichText;
 }
 
 export class ComputerDevice {
@@ -48,6 +50,7 @@ export class ComputerDevice {
     /** 常驻工具名（电脑工具与之同名时加前缀消歧） */
     private reserved: Set<string>,
     private logger: Logger,
+    private otherToolNames: () => string[] = () => [],
   ) {}
 
   /** 电脑是否已开机 */
@@ -103,6 +106,10 @@ export class ComputerDevice {
     return this.active?.defs ?? [];
   }
 
+  view(): { lastTool?: string; result?: string | RichText } | null {
+    return this.active ? structuredClone({ lastTool: this.active.lastTool, result: this.active.result }) : null;
+  }
+
   hasTool(name: string): boolean {
     return this.active?.toolMap.has(name) ?? false;
   }
@@ -112,7 +119,10 @@ export class ComputerDevice {
     if (!this.active) throw new Error("当前没有打开电脑");
     const entry = this.active.toolMap.get(exposed);
     if (!entry) throw new Error(`电脑没有 ${exposed} 这个操作`);
-    return entry.app.call(entry.tool, args);
+    const active = this.active;
+    const result = await entry.app.call(entry.tool, args);
+    if (this.active === active) { active.lastTool = exposed; active.result = result; }
+    return result;
   }
 
   // ---------- 内部 ----------
@@ -132,13 +142,15 @@ export class ComputerDevice {
       if (opening) openings.push(opening);
       for (const t of tools) {
         let exposed = t.name;
-        if (this.reserved.has(exposed) || toolMap.has(exposed)) exposed = `${app.id}.${t.name}`;
-        if (toolMap.has(exposed)) continue;
+        const occupied = new Set([...this.reserved, ...this.otherToolNames(), ...toolMap.keys()]);
+        if (occupied.has(exposed)) exposed = `${app.id}.${t.name}`;
+        if (occupied.has(exposed)) continue;
         toolMap.set(exposed, { app, tool: t.name });
         defs.push({
           name: exposed,
           signature: renderSignature(exposed, t.inputSchema),
           description: t.description || "（无说明）",
+          ...(t.inputSchema ? { inputSchema: structuredClone(t.inputSchema) } : {}),
         });
       }
     }

@@ -1,0 +1,98 @@
+# WebUI 设备接口
+
+设备页共享 Bot 当前手机、电脑和应用状态。管理员操作通过 Bot 的实际工具分发与调度器执行，结果会进入 Bot 上下文；它不是独立的手机模拟器，也不会为每个浏览器另建一台设备。
+
+## 权限与接管
+
+`/api/device/*` 仅管理员可用，使用现有 WebUI `Authorization: Bearer <token>` 鉴权。若部署没有设置 `webui.token`，遵循现有无令牌管理员模式。普通查看者与玩家不能操作设备；拥有 `devices` 查看权限的访客可读取旧的 `/api/devices` 摘要和已连接电脑的 `/api/computer/screen`，不能获取完整设备会话、消息和工具列表。
+
+| 请求 | 用途 |
+| --- | --- |
+| `GET /api/device/session` | 读取状态、已安装应用、当前可用工具及 JSON Schema、缓存应用回执、当前频道本地消息 |
+| `POST /api/device/control`，`{"paused":true}` | 暂停 Bot 自主生成，取消尚未提交的调度工作，申请设备控制 |
+| `POST /api/device/control`，`{"paused":false}` | 当前工作结束后释放按住的键鼠，恢复 Bot 自主生成 |
+| `POST /api/device/tool` | 执行当前开放的一个设备工具 |
+
+接管响应为 `{ok, paused, busy, text}`。`paused:true,busy:true,ok:false` 表示自主生成已暂停，但既有操作正在提交；必须等待真实回执，并重新读取 session，直到 `paused:true,busy:false` 才能操作。Bot 忙碌时仍允许申请接管。交还遇到 busy 会保持暂停，不能把失败响应显示成已恢复。控制是服务级共享状态，多个管理员浏览器使用同一输入队列，不具备独立控制租约。
+
+GET 不打开应用、不连接 VNC、不调用模型、不刷新 Bot 观测或发送消息。会话中的聊天记录来自本地消息库；读取它不会要求平台拉取新消息。管理员 POST、底层应用打开和工具执行可能访问真实平台或模型。
+
+## 会话与调用格式
+
+会话结构的关键字段如下，字段值只是格式示例：
+
+```json
+{
+  "running": true,
+  "control": {"paused": true, "busy": false},
+  "devices": {
+    "computer": {"mode": "remote_desktop", "effectiveMode": "remote_desktop", "on": "电脑", "docker": null, "remote": {"host": "configured-host", "port": 5900, "connected": true}},
+    "phone": {"down": false, "appOpen": "聊天", "chatOpen": true, "channelKey": "onebot@account:channel", "channelIsGroup": false, "chatAppName": "聊天", "resolution": {"width": 390, "height": 844}}
+  },
+  "apps": [{"id": "chat", "name": "聊天", "kind": "chat", "description": "聊天应用", "active": true}],
+  "tools": [{"name": "send", "device": "phone", "effect": "send", "description": "发送消息", "inputSchema": {"type": "object", "properties": {"msg": {"type": "string"}}}}],
+  "appView": null,
+  "computerView": null,
+  "chat": {"channelKey": "onebot@account:channel", "channels": [], "messages": []}
+}
+```
+
+`apps` 是实际安装目录。聊天应用的 `id` 以服务器返回值为准。`appView` 是当前应用的 `{id,name,opening?,lastTool?,result?}`；`computerView` 为 `{lastTool?,result?}`。这些是已有回执缓存，GET 不会再次调用应用。频道 key 包含可选的 Bot 账号 `selfId`，前端应原样传回，不得截掉账号自行拼频道号。
+
+工具只有当前可用时才列在 `tools`，仍受 Bot 配置、当前应用、频道及临时工具禁用约束。打开/关闭应用或设备后应重新读取 session。MCP 的嵌套 `inputSchema` 会原样保留；按服务提供的工具定义填写参数，不要仅从显示签名推断复杂数组或对象。遇到同名工具，服务器可能返回 `terminal.run_command` 等前缀名称；前端应先按 `device` 找对应工具，再把完整 `name` 发回。
+
+```json
+{"name":"open_app","args":{"name":"实际应用 ID 或名称"}}
+```
+
+```json
+{"name":"send","args":{"msg":"用户写下的消息"},"confirmSend":true}
+```
+
+可选 `duration` 是有限非负的世界时间单位 TU，和 Bot 工具相同；不是毫秒或世界秒。真实桌面输入通常省略它。响应为 `{ok,text,content?}`，`content` 可包含 RichText 图片/音频附件。通过 `/api/media/file?id=...` 访问已保存附件；不要把附件本地文件路径当作浏览器 URL，不要执行返回文本或 HTML。
+
+设备 API 不开放 `act`、世界管理或任意记忆工具。已知聊天发送工具要求 `confirmSend:true`，前端仅在用户明确点击发送时传入；刷新、应用导航、键盘 Enter 不自动发送聊天。`effect` 为 `read|action|send`，这是设备表单提示与已知发送校验，不是第三方 MCP 的安全沙箱：任意 MCP 工具仍可能有外部副作用，必须由用户明确执行，并展示实际工具说明与参数。
+
+`/api/player/tool` 仍是管理员通用 Bot 工具入口，权限范围大于设备 API；设备前端不要用它绕过设备白名单或发送确认。
+
+## 电脑实际模式
+
+`computer.mode` 保留 `apps.computer.mode` 配置，`effectiveMode` 表示当前世界实际使用的实现。新界面应优先看 `effectiveMode`，老响应可回退到 `mode`。
+
+| `effectiveMode` | 实际能力 | 限制 |
+| --- | --- | --- |
+| `off` | 真实世界未启用电脑 | `open_computer` 返回不可用 |
+| `docker` | 配置的 Docker 终端与文件工具 | 没有图形桌面或 PNG 截图；按实际开放工具执行 |
+| `remote_desktop` | 连接配置的 VNC，截屏、鼠标、键盘和滚轮 | 需要开启 Bot 图片模态及可连接的 VNC；不提供 Docker 终端 |
+| `virtual` | 虚构世界由 World 模型模拟终端和文件操作 | 没有真实容器或桌面，不能管理 Docker，工具执行会产生模型裁定 |
+
+虚构世界优先使用 `virtual`，即使配置中 `mode` 为 `off`、`docker` 或 `remote_desktop`。只读摘要在此模式下不会探查真实 Docker，`docker` 和 `remote` 都为 null。
+
+优先用实际工具 `open_computer`、`close_computer`、`run_command`、`screen`、`mouse`、`keyboard`。保留的 `POST /api/computer/action {action:"start"|"stop"|"restart"}` 仅用于真实 Docker 管理，也要求接管及空闲。`POST /api/computer/exec {command}` 复用当前已打开的终端工具，支持 Docker 或虚拟终端，返回 `{code:null,output}`；文本工具回执没有可靠退出码，不能把 null 显示为成功退出 0。
+
+### VNC 坐标与输入
+
+`GET /api/computer/screen?w=1200` 只截取已经连接的会话，不临时建立连接，也不把画面加入 Bot 上下文。未开机、未连接或不支持屏幕时返回 503。与之不同，显式调用 `screen` 工具会生成 Bot 可感知的媒体回执。
+
+PNG 可能缩小：`x-screen-width` / `x-screen-height` 是返回图片尺寸；`x-desktop-width` / `x-desktop-height` 是真实远端桌面尺寸。鼠标参数必须使用远端原始像素坐标，左上角为 `(0,0)`。若图像在页面显示矩形为 `(left,top,width,height)`，转换为：
+
+```text
+x = (clientX - left) / width  * desktopWidth
+y = (clientY - top)  / height * desktopHeight
+```
+
+后端会将指针限制在远端桌面边界。不要把缩略图尺寸或 CSS 像素直接作为桌面坐标。鼠标 `action` 支持 `move/click/double_click/right_click/middle_click/press/release/drag/scroll`；拖动支持 `button:left|middle|right`；滚轮方向支持 `up/down/left/right`。键盘支持 `type/key/combo/press/release`，详细参数以当前工具 schema 为准。所有输入必须先接管并在同一前端队列逐条等待，页面失效或失去控制时丢弃尚未发送的输入。
+
+交还会释放保持状态的键鼠；关闭电脑或停止世界会断开远端连接并停止剩余排队输入。已经写给远端或外部平台的输入不会回滚；网络错误不构成安全重放的依据。
+
+## 玩家任务与离场
+
+玩家 crossing 动作使用 `/api/player/task` 的 `taskId`，取消使用 `POST /api/player/cancel {token,taskId}`。取消返回的 `status` 与 `result` 原样来自 crossing；`too_late` 表示已提交或已有结果，不能显示为已撤销。断线后不能自动重发动作，原请求可能尚未到达服务器。
+
+管理员 `/api/player/tool` 直调工具没有 crossing `taskId`，不提供可撤销承诺。同名接管常驻 Bot 的入场响应可包含 `control`；自主生成已暂停但 `busy` 时，应等待已有回执。离场只有该有效接管会话会交还 Bot；普通独立角色离场不会释放设备页控制。已有操作未完时 `/api/player/leave` 返回 409 并保留会话，不能提前清除前端会话或显示交还成功。
+
+## 隔离样本与验证
+
+`node scripts/preview-webui.mjs` 在 `127.0.0.1:18131` 提供生成后的页面与固定样本 API，`STUDIO_PREVIEW_PORT` 可选择其他本地端口。其设备、聊天、天气、新闻、MCP 与玩家回执由内存 fixture 提供；操作只改变样本内存，重启即恢复。它不连接运行中的 `18111`、真实平台、模型、Docker 或 VNC，页面应始终标明开发样本。
+
+预览可验证布局与交互，不证明真实外部设备已连通。`scripts/test-device-api.ts` 使用真实服务/工具分发逻辑和本地 stub 验证鉴权、工具状态、发送确认、互斥队列、接管/关闭、原始坐标尺寸、取消回执及有效电脑模式。运行 `npm test` 执行隔离套件；测试不需要线上实例或真实凭据。

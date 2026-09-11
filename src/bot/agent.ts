@@ -18,12 +18,15 @@ import { ReceiptInbox } from "./receipts.js";
 import type { WorldObservation } from "../world/state.js";
 import { typingSlackTU } from "./typing.js";
 import { BOT_TOOLS, renderToolsText, toolLayer, type BotToolDef } from "./tools.js";
+import type { AppToolDef } from "../apps/app.js";
+import { signatureParams } from "./nativeTools.js";
 
 /** 代理执行单个工具调用的回传结果（管理员「手动驾驶」Bot） */
 export interface ManualToolResult {
   ok: boolean;
   /** 工具结果 / 校验拒绝原因 */
   text: string;
+  content?: RichText;
 }
 
 /** 穿越能力（前往异世界作客），由 service 层实现注入 */
@@ -198,6 +201,7 @@ export class BotAgent {
    * 处理外部注入的工具调用，不再自主 generate；「操纵（puppet）」不暂停。
    */
   private manualPaused = false;
+  private autonomousDispatch: Promise<void> | null = null;
   /**
    * 外部注入（管理员代理）工具调用的结果回传表：callId → 解析器。
    * 结果经 scheduler 的 deliver 通道（source=tool）回传；校验拒绝时的 system 提示在此暂存，
@@ -272,7 +276,7 @@ export class BotAgent {
       (content, ref) => {
         if (this.retired) {
           if (ref) {
-            this.externalToolResults.get(ref)?.resolve({ ok: true, text: toPlainText(content) });
+            this.externalToolResults.get(ref)?.resolve({ ok: true, text: toPlainText(content), ...(typeof content === "string" ? {} : { content }) });
             this.externalToolResults.delete(ref);
           }
           void this.receipts.save(content, this.clock.now(), ref).catch(error => this.logger.error("停止后的工具回执保存失败：%s", error));
@@ -286,7 +290,7 @@ export class BotAgent {
           const pending = this.externalToolResults.get(ref);
           if (pending) {
             this.externalToolResults.delete(ref);
-            pending.resolve({ ok: true, text: toPlainText(gated) });
+            pending.resolve({ ok: true, text: toPlainText(gated), ...(typeof gated === "string" ? {} : { content: gated }) });
           }
         }
         this.pushEvent("tool", gated, { ref });
@@ -310,7 +314,7 @@ export class BotAgent {
    * 原生 tools **声明**保持稳定：始终是全量内置工具（分层解锁照旧只以 Event 通知、由允许集把关），
    * 请求前缀不随频道进出/界面切换变化；只有打开/关闭应用或电脑时，其动态工具才进出声明。
    */
-  private refreshToolGate(): void {
+  private currentToolNames(): string[] {
     const names = [...this.layerNames("core")];
     if (this.phoneUi.chatOpen) {
       names.push(...this.layerNames("chat"));
@@ -326,7 +330,12 @@ export class BotAgent {
     const appDefs = [...(this.apps?.activeToolDefs() ?? []), ...(this.computer?.activeToolDefs() ?? [])];
     names.push(...appDefs.map((d) => d.name));
     // 打破死循环：临时禁用被判定为「反复调用」的工具（下次压缩后自然恢复）
-    const allowed = names.filter((n) => !this.tempBannedTools.has(n));
+    return names.filter((n) => !this.tempBannedTools.has(n));
+  }
+
+  private refreshToolGate(): void {
+    const allowed = this.currentToolNames();
+    const appDefs = [...(this.apps?.activeToolDefs() ?? []), ...(this.computer?.activeToolDefs() ?? [])];
     this.backend.setToolNames(allowed);
     this.backend.setToolDefs?.([...this.toolDefs, ...appDefs]);
   }
@@ -575,6 +584,37 @@ export class BotAgent {
     return this.manualPaused;
   }
 
+  /** 接管不是计时猜测：等待正在派发的调用，取消未提交计划，已提交者保持 busy。 */
+  async acquireManualControl(): Promise<{ busy: boolean }> {
+    this.setManualPaused(true);
+    await this.autonomousDispatch;
+    this.interruptAllDeferred("管理员接管了设备");
+    this.pendingImageFill = null;
+    const cancelled = this.scheduler.cancelUncommitted();
+    if (this.waiting && cancelled.includes(this.waiting.callId)) { this.waiting = null; this.wakeFn?.(); }
+    for (const id of cancelled) {
+      this.externalToolResults.get(id)?.resolve({ ok: false, text: "（管理员接管前已取消尚未提交的调用。）" });
+      this.externalToolResults.delete(id);
+    }
+    return { busy: this.manualBusy };
+  }
+
+  get manualBusy(): boolean { return this.autonomousDispatch !== null || this.scheduler.pendingCount > 0; }
+
+  /** 当前分层真正允许的工具与原始应用 schema；读取无副作用。 */
+  manualTools(): AppToolDef[] {
+    const allowed = new Set(this.currentToolNames());
+    return [...this.toolDefs, ...(this.apps?.activeToolDefs() ?? []), ...(this.computer?.activeToolDefs() ?? [])]
+      .filter(def => allowed.has(def.name))
+      .map(def => {
+        const params = signatureParams(def.signature);
+        return { ...def, inputSchema: structuredClone((def as AppToolDef).inputSchema ?? {
+          type: "object", properties: Object.fromEntries(params.map(param => [param.name, param.schema])),
+          required: params.filter(param => param.required).map(param => param.name), additionalProperties: true,
+        }) };
+      });
+  }
+
   /**
    * 管理员代理 Bot 执行任意工具调用（send/act/check_status/check_time/wait/open_app/gallery 等）：
    * 构造一个合法的 ToolCallRecord，append 进上下文后走 dispatch 真正执行（复用全部参数校验、
@@ -593,6 +633,7 @@ export class BotAgent {
     if (!this.running) {
       return { ok: false, text: "（Bot-LLM 当前未在运行，无法代理其工具调用。）" };
     }
+    if (!this.currentToolNames().includes(name)) return { ok: false, text: `（${name} 此刻不可用，请先打开对应应用或进入频道。）` };
     const issuedAt = this.clock.now();
     let duration = opts.duration;
     // 与 finalize 一致：wait 以参数 n 为准（模型常输出 duration:0 + n:x 的组合）
@@ -783,7 +824,9 @@ export class BotAgent {
           call.duration ? ` +${call.duration}TU` : "",
         );
         if (!this.running || this.manualPaused) continue;
-        await this.dispatch(call);
+        const dispatch = this.dispatch(call);
+        this.autonomousDispatch = dispatch;
+        try { await dispatch; } finally { if (this.autonomousDispatch === dispatch) this.autonomousDispatch = null; }
       } catch (err) {
         if (!this.running) break;
         this.logger.error("Bot-LLM 循环出错: %s", err);
@@ -909,7 +952,7 @@ export class BotAgent {
     // 放在 dispatch 最前，让所有工具——包括下面被目标误写/参数缺失拦截的
     // denied 调用——都计入链（模型反复撞被拒的调用，正是最该打断的循环）。
     // 开启 breakLoop 时，除 advisory 提醒外还会真正干预：先移除被重复的工具，仍重复则强制 rest。
-    const repeat = this.repeatGuard.observe(call);
+    const repeat = call.role === "system" ? null : this.repeatGuard.observe(call);
     if (repeat && this.handleRepeat(call, repeat)) return;
     // 目标参数误写拦截（频道类工具）：Bot 幻觉出 OneBot API 风格的 detail/channel_id
     // 等写法且没给 id 时，绝不静默回退到当前频道（那会把消息发进无关频道）——
