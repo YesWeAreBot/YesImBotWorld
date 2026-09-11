@@ -240,7 +240,7 @@ export class BotContext {
   /** wait 工具被移除（service 按 bot.disableWait 注入）：行为准则不再提及等待 */
   waitRemoved = false;
 
-  renderSystemText(timeLine: string): string {
+  renderSystemText(timeLine: string, nativeToolCalls = true): string {
     const accounts = this.accountsProvider?.() ?? "";
     const botName = this.botNameProvider?.()?.trim() ?? "";
     const c = this.constitution;
@@ -251,7 +251,7 @@ export class BotContext {
       ...(botName ? [`# 你的名字\n你叫「${botName}」——这就是你，别人这样称呼你、@ 你时就是在跟你说话。`] : []),
       c.constitutionHead +
         "\n\n" +
-        c.outputFormatNative +
+        (nativeToolCalls ? c.outputFormatNative : c.outputFormatText) +
         "\n" +
         c.constitution +
         "\n" +
@@ -261,18 +261,18 @@ export class BotContext {
             "# 你的聊天账号\n" +
               accounts +
               (botName
-                ? `\n消息里的 <at id=\"…\"/> 指向这些 id 时，那是别人在 @ 你、在叫「${botName}」（你的名字）——那就是在跟你说话；说话人标为「你自己」的消息是你之前说过的，不要回复它。`
-                : `\n消息里的 <at id=\"…\"/> 指向这些 id、或说话人标为「你自己」时，那都是你——被 @ 是别人在叫你，「你自己」的消息是你说过的话。`),
+                ? `\n消息里的 <at id=\"…\"/> 指向这些 id 时，那是别人在 @ 你、在叫「${botName}」（你的名字）——那就是在跟你说话；说话人标为「你自己」的消息来自你的账号，不一定由你亲自发送；不要当成他人新消息或自动纳入自己的经历。`
+                : `\n消息里的 <at id=\"…\"/> 指向这些 id、或说话人标为「你自己」时，那都是你——被 @ 是别人在叫你，「你自己」只标识账号，不证明你亲自说过这些话。`),
           ]
         : []),
-      "# 可用工具\n" + this.pinned.toolsText,
+      "# 基础工具说明（以当前展开和有效的工具为准）\n" + this.pinned.toolsText,
       "# 过往经历（压缩）\n" + this.pinned.historySummary,
       "# 记忆摘要\n" + this.pinned.memoryDigest,
       "# 时间\n世界以 Time Unit (TU) 计时" +
         (this.timeInfo ? `，${this.timeInfo}` : "") +
         (this.waitRemoved
-          ? "。工具调用的 duration 以 TU 为单位，按此换算估计现实的耗时。"
-          : "。工具调用的 duration 与 wait 的 n 都以 TU 为单位，按此换算估计现实的耗时。") +
+          ? "。工具调用的 duration 以 TU 为单位，按此换算估计世界中的耗时。"
+          : "。工具调用的 duration 与 wait 的 n 都以 TU 为单位，按此换算估计世界中的耗时。") +
         "\n你恢复意识时的时刻：" +
         timeLine +
         "\n此后时间的流逝，以意识流中事件的 t 属性为准。",
@@ -369,7 +369,7 @@ export class BotContext {
    * 不设总预算的话 base64 会无限累积，最终撑爆服务端的请求体上限（413）。
    * 预算从最新的事件往前分配，更早的附件退化为纯文字标记。
    */
-  async toChatMessages(timeLine: string): Promise<ChatMessage[]> {
+  async toChatMessages(timeLine: string, nativeToolCalls = true): Promise<ChatMessage[]> {
     await this.settled();
     const entries = structuredClone(this.stream);
     const loader = this.attachmentLoader && !this.attachmentsDisabled ? this.attachmentLoader : null;
@@ -416,7 +416,7 @@ export class BotContext {
     }
 
     const built: { role: ChatMessage["role"]; parts: ContentPart[] }[] = [
-      { role: "system", parts: [{ type: "text", text: this.renderSystemText(timeLine) }] },
+      { role: "system", parts: [{ type: "text", text: this.renderSystemText(timeLine, nativeToolCalls) }] },
     ];
     for (const entry of entries) {
       const role = entry.kind === "tool_call" ? "assistant" : "user";
@@ -520,7 +520,7 @@ export class BotContext {
     if (added.length) parts.push(`【新增】\n${added.map((n) => newTools.get(n)).join("\n")}`);
     if (changed.length) parts.push(`【用法更新】\n${changed.map((n) => newTools.get(n)).join("\n")}`);
     if (removed.length) parts.push(`【失效】${removed.join("、")}（不要再调用它们）`);
-    parts.push("置顶的可用工具列表会在你下次 rest 之后同步刷新。）");
+    parts.push("置顶的可用工具列表会在下次记忆整理完成后同步刷新，以本次用法更新为准。）");
     return parts.join("\n");
   }
 

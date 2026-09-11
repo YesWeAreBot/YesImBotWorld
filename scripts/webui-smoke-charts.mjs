@@ -1,0 +1,57 @@
+/** Real browser mouse/touch tests for the merged observatory and interactive charts. */
+export default async function smokeCharts({ evaluate, wait, assert, navigate, page }) {
+  await navigate('live');
+  assert.equal(await evaluate("document.querySelectorAll('#nav a[href=\"#live\"]').length"), 1);
+  assert.equal(await evaluate("document.querySelectorAll('#nav a[href=\"#debug\"]').length"), 0);
+  await evaluate("document.querySelector('#observatory-tab-events').click()");
+  await wait("document.querySelector('#observatory-events .insight-plot-mark')");
+  assert(await evaluate("document.querySelector('#observatory-calls').hidden && !document.querySelector('#observatory-events').hidden && document.querySelectorAll('.live-lane').length === 2"));
+  await evaluate("Array.from(document.querySelectorAll('.insight-tabs button')).find(b=>b.textContent==='事件密度').click()");
+  await wait("document.querySelector('.insight-plot-detail').textContent.includes('条事件')");
+  await evaluate("document.querySelector('.insight-plot-detail button').click()");
+  assert(await evaluate("document.querySelector('.insight-detail .insight-raw')?.textContent.length > 0"));
+  await evaluate("document.querySelector('.live-lane .live-link').click()");
+  assert(await evaluate("!document.querySelector('#observatory-calls').hidden && document.querySelector('#observatory-events').hidden"));
+  await evaluate("Studio.navigate('debug')");
+  await wait("activeView==='live' && location.hash==='#live'");
+  await page('Emulation.setDeviceMetricsOverride', { width: 375, height: 1000, deviceScaleFactor: 1, mobile: true });
+  await page('Emulation.setTouchEmulationEnabled', { enabled: true, maxTouchPoints: 1 });
+  await navigate('usage');
+  await wait("document.querySelectorAll('.insight-plot-mark').length > 2 && document.querySelector('.insight-plot-viewport').scrollLeft > 0");
+  await evaluate("document.querySelector('.insight-plot-viewport').scrollIntoView({block:'center',behavior:'instant'})");
+  const target = await evaluate("(()=>{const m=document.querySelector('.insight-plot-mark:nth-last-child(2)').getBoundingClientRect(),v=document.querySelector('.insight-plot-viewport').getBoundingClientRect();return {x:Math.min(v.right-25,(m.left+m.right)/2),y:v.top+75}})()");
+  await page('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x: target.x, y: target.y }] });
+  await page('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+  await wait("document.querySelector('.insight-plot-selected')===document.querySelector('.insight-plot-mark:nth-last-child(2)') && document.querySelector('.insight-plot-detail').textContent.includes('总 TOKEN')");
+  const before = await evaluate("document.querySelector('.insight-plot-viewport').scrollLeft");
+  const region = await evaluate("(()=>{const r=document.querySelector('.insight-plot-viewport').getBoundingClientRect();return {x:r.left+55,y:r.top+100}})()");
+  await page('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x: region.x, y: region.y }] });
+  for (let i=1; i<=10; i++) await page('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [{ x: region.x+i*15, y: region.y }] });
+  await page('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+  await wait(`document.querySelector('.insight-plot-viewport').scrollLeft < ${before - 20}`);
+  // Let native touch momentum settle before checking programmatic scroll restoration.
+  await evaluate("new Promise(resolve=>{var previous=-1,stable=0,frames=0;function frame(){var current=document.querySelector('.insight-plot-viewport').scrollLeft;stable=current===previous?stable+1:0;previous=current;if(stable>=8||frames++>180)resolve();else requestAnimationFrame(frame)}frame()})");
+  const height = await evaluate("document.querySelector('.insight-chart-svg').getBoundingClientRect().height");
+  await evaluate("var zoom=document.querySelector('[aria-label=\"图表缩放\"]');zoom.value='2';zoom.dispatchEvent(new Event('input'))");
+  assert.equal(await evaluate("document.querySelector('.insight-chart-svg').getBoundingClientRect().height"), height, 'Zoom only expands the time axis');
+  await evaluate("var v=document.querySelector('.insight-plot-viewport');v.scrollLeft=500;window.__plotKey=document.querySelector('.insight-plot-selected').dataset.plotKey;window.__plotViewport=v;window.dispatchEvent(new CustomEvent('studio:refresh'))");
+  await wait("document.querySelector('.insight-plot-viewport') !== window.__plotViewport");
+  await wait("Math.abs(document.querySelector('.insight-plot-viewport').scrollLeft-500)<2");
+  assert.equal(await evaluate("document.querySelector('.insight-plot-selected').dataset.plotKey === window.__plotKey && document.querySelector('[aria-label=\"图表缩放\"]').value==='2'"), true, 'Refresh preserves selected bucket, zoom and scroll');
+  await evaluate("document.querySelector('.insight-plot-selected').dispatchEvent(new KeyboardEvent('keydown',{key:'Home',bubbles:true}))");
+  assert.equal(await evaluate("document.querySelector('.insight-plot-selected')===document.querySelector('.insight-plot-mark')"), true);
+  assert(await evaluate("document.querySelector('.insight-plot-detail').textContent.includes('0 次')"), 'Zero buckets remain selectable');
+  await evaluate("document.querySelector('.insight-plot-selected').dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowRight',bubbles:true}))");
+  assert.equal(await evaluate("document.querySelectorAll('.insight-plot-mark')[1]===document.querySelector('.insight-plot-selected')"), true);
+  await page('Emulation.setTouchEmulationEnabled', { enabled: false });
+  await evaluate("document.querySelector('.insight-plot-viewport').scrollLeft=300;document.querySelector('.insight-plot-viewport').scrollIntoView({block:'center',behavior:'instant'});window.__beforeDragKey=document.querySelector('.insight-plot-selected').dataset.plotKey");
+  const drag = await evaluate("(()=>{const r=document.querySelector('.insight-plot-viewport').getBoundingClientRect();return {x:r.left+100,y:r.top+100}})()");
+  await page('Input.dispatchMouseEvent', { type: 'mouseMoved', x: drag.x, y: drag.y });
+  await page('Input.dispatchMouseEvent', { type: 'mousePressed', x: drag.x, y: drag.y, button: 'left', clickCount: 1 });
+  await page('Input.dispatchMouseEvent', { type: 'mouseMoved', x: drag.x + 65, y: drag.y, button: 'left', buttons: 1 });
+  await page('Input.dispatchMouseEvent', { type: 'mouseReleased', x: drag.x + 65, y: drag.y, button: 'left', clickCount: 1 });
+  assert(await evaluate("document.querySelector('.insight-plot-viewport').scrollLeft < 270 && document.querySelector('.insight-plot-selected').dataset.plotKey === window.__beforeDragKey"), 'Mouse dragging pans without accidentally selecting a bucket');
+  assert(await evaluate('document.documentElement.scrollWidth <= innerWidth'));
+  await evaluate("delete window.__plotKey;delete window.__plotViewport;delete window.__beforeDragKey");
+  return 'merged observatory, event details, mobile touch selection/swipe, mouse drag, horizontal zoom, keyboard selection and stable refresh';
+}

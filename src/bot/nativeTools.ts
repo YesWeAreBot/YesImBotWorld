@@ -13,6 +13,7 @@ export interface NamedToolDef {
   name: string;
   signature: string;
   description: string;
+  inputSchema?: Record<string, unknown>;
 }
 
 /** 解析签名的参数列表；解析不了的参数按 string 兜底（绝不让工具缺席声明） */
@@ -65,12 +66,15 @@ function typeSchema(type: string): Record<string, unknown> {
 export function toNativeToolDefs(defs: NamedToolDef[]): ChatToolDef[] {
   return defs.map((def) => {
     const params = signatureParams(def.signature);
-    const properties: Record<string, unknown> = {};
-    for (const p of params) properties[p.name] = p.schema;
+    const original = def.inputSchema ? structuredClone(def.inputSchema) : null;
+    const properties: Record<string, unknown> = original?.properties && typeof original.properties === "object"
+      ? { ...original.properties } : {};
+    if (!original) for (const p of params) properties[p.name] = p.schema;
     if (!("duration" in properties)) {
       properties.duration = {
         type: "number",
-        description: "这个动作在世界中要花费的 Time Unit 数，由你自己估计；省略表示瞬间完成",
+        minimum: 0,
+        description: "期望耗时（TU），省略通常为 0；不是超时限制或可撤销窗口。普通工具可能先执行后延迟返回，具体以工具说明为准",
       };
     }
     return {
@@ -80,10 +84,11 @@ export function toNativeToolDefs(defs: NamedToolDef[]): ChatToolDef[] {
         description: def.description,
         parameters: {
           type: "object",
+          ...original,
           properties,
-          required: params.filter((p) => p.required).map((p) => p.name),
+          required: original?.required ?? params.filter((p) => p.required).map((p) => p.name),
           // 描述里提到的确认/绕过类参数（confirm / repeat / insist…）不在签名里，放行未知键
-          additionalProperties: true,
+          additionalProperties: original?.additionalProperties ?? true,
         },
       },
     };

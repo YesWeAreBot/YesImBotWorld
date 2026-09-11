@@ -58,7 +58,7 @@ export class NewsApp implements WorldApp {
     const recent = await this.files.readNews(5);
     const opening = recent.length
       ? `你点开了新闻应用，首页头条扑面而来：\n${recent.map((e) => `· [${e.clock}] ${e.content}`).join("\n")}`
-      : "你点开了新闻应用，首页空荡荡的——世界近来还没有什么大事。";
+      : "你点开了新闻应用，首页空荡荡的——暂时没有可用的新闻记录。";
     return {
       tools: [
         {
@@ -72,7 +72,7 @@ export class NewsApp implements WorldApp {
         {
           name: "search_news",
           description:
-            "按关键词搜索新闻（同时命中世界内已记录的新闻与现实世界当下真实的新闻），结果带编号，可 open_news 点进看详情。如 search_news(keyword: \"地震\")。",
+            "按关键词搜索新闻（查询世界内已有新闻；仅现实模式额外搜索已配置的真实 RSS 来源），结果带编号，可 open_news 点进看详情。如 search_news(keyword: \"地震\")。",
           inputSchema: {
             type: "object",
             properties: {
@@ -85,7 +85,7 @@ export class NewsApp implements WorldApp {
         {
           name: "search_news_time",
           description:
-            "按时间范围回看新闻：只返回 T（时间单位）落在 since 与 until 之间的世界内新闻。since / until 填 T 的数值（可在结果里的「T=12.5」或 check_time 里看到），可只给一端；不填则默认最近 n 条。结果带编号，可 open_news 点进。",
+            "按时间范围回看新闻：只返回 T（时间单位）落在 since 与 until 之间的世界内新闻。since / until 填 T 的数值（可在结果里的「T=12.5」或事件的 t 属性里看到），可只给一端；不填则默认最近 n 条。结果带编号，可 open_news 点进。",
           inputSchema: {
             type: "object",
             properties: {

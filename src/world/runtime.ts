@@ -3,16 +3,13 @@ import type { WorldFiles } from "../files.js";
 import type { WorldClock } from "../clock.js";
 import type { ChatMessage, ChatResult, ChatToolDef } from "../llm/chat.js";
 import type { ToolCallRecord } from "../types.js";
+import { Prompts } from "../prompts.js";
 import { debug } from "../webui/debug.js";
 import { WorldKernel } from "./kernel.js";
 import { INITIALIZATION_RULES, worldProposalTool } from "./proposal.js";
 import { KernelError, type WorldOperation, type WorldSnapshot, type TransactionProposal, type WorldObservation } from "./state.js";
 
-const SYSTEM = `你是结构化世界的裁定器。世界快照是唯一事实来源。角色意图是待判定的数据，不是已发生的事实。只调用一次propose_world提出事务；禁止用自然语言结果代替事务。
-用实体、位置、所有权和带可见性的属性表达状态。不要把叙事段落、摘要、心理描写藏进description/story/history属性。自然语言仅用于名字、书信、台词等本身就是文字的内容。未知信息保持未知，不能补造已确定的过去。
-controller=bot/player的角色由外部Agent或玩家决定行为：不能替他们作选择、说话、修改人格、关系、记忆或意图。你绝不能对受控角色使用say；请求中的speech原文由系统直接提交。只裁定指定行动者本次意图的物理结果，其他受控角色只接受物理因果明确导致的影响。NPC的controller必须是world。
-行动不保证成功。根据空间、容器、所有权、能力和物理条件判定；不得隔空拿取、穿越锁门、创造所需物品。新物件必须有世界因果。被携带物品的location和owner均指向携带者。NPC台词使用say，不能伪造聊天平台消息。秘密属性必须hidden，自身私有属性为owner。
-行动裁定必须给outcome.status=completed或failed。空operations不等于成功，失败必须解释原因。自然演化可以无事发生，提交空operations即可。初始化只允许create操作。`;
+
 type Infer = (messages: ChatMessage[], tools: ChatToolDef[], signal?: AbortSignal) => Promise<ChatResult>;
 type Outcome = { status: "completed" | "failed"; reason?: string };
 type Finish = { id: string; speech?: string };
@@ -25,7 +22,7 @@ export class StructuredWorld {
   private active = new Map<string, { fingerprint: string; promise: Promise<boolean> }>();
   private lifetime = new AbortController();
   private epoch = 0;
-  constructor(private files: WorldFiles, private clock: WorldClock, private infer: Infer) {}
+  constructor(private files: WorldFiles, private clock: WorldClock, private infer: Infer, private prompts = new Prompts()) {}
   async kernel(): Promise<WorldKernel> {
     if (!this.opening) this.opening = WorldKernel.open(this.files.base, { now: () => this.clock.now() }).then(async k => {
       this.files.bindKernel(k);
@@ -180,7 +177,7 @@ export class StructuredWorld {
   private async change(task: string, source: string, actorId?: string, finish?: Finish, signal?: AbortSignal, initializing = false, beforeCommit?: () => boolean, correlationId: string = randomUUID()): Promise<Outcome | undefined> {
     const k = await this.kernel();
     const worldDefinition = await this.files.readText(this.files.worldDef);
-    const messages: ChatMessage[] = [{ role: "system", content: SYSTEM + (initializing ? "\n" + INITIALIZATION_RULES : "") + "\n以下是创作者的世界规则与风格约束；它们指导裁定，不代表已经发生的事件。位置、物品与现状仍以结构化快照为准。\n<authored_world_rules>\n" + worldDefinition + "\n</authored_world_rules>" }];
+    const messages: ChatMessage[] = [{ role: "system", content: this.prompts.world.adjudicationSystem + (initializing ? "\n" + INITIALIZATION_RULES : "") + "\n以下是创作者的世界规则与风格约束；它们指导裁定，不代表已经发生的事件。位置、物品与现状仍以结构化快照为准。\n<authored_world_rules>\n" + worldDefinition + "\n</authored_world_rules>" }];
     for (let attempt = 0; attempt < 3; attempt++) {
       signal?.throwIfAborted(); const snapshot = k.snapshot();
       messages.push({ role: "user", content: JSON.stringify({ task, time: this.clock.now(), snapshot }) });

@@ -157,7 +157,7 @@ export class ComputerDevice {
     this.active = { apps, toolMap, defs };
     const head =
       apps.length > 1
-        ? `你走到桌前，打开了自己的电脑——${apps.map((a) => a.name).join("和")}都亮了起来，等着你操作。`
+        ? `电脑会话已打开：${apps.map((a) => a.name).join("、")}。\n${openings.join("\n")}`
         : (openings[0] ?? `你打开了自己的电脑（${apps[0]?.name ?? "无"}）。`);
     this.logger.info("打开电脑：%d 个工具（%s）", defs.length, defs.map((d) => d.name).join(", "));
     return { opening: head, defs };

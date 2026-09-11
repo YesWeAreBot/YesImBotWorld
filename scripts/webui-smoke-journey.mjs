@@ -119,7 +119,8 @@ export async function smokeJourney({ evaluate, wait, assert, navigate }) {
     await wait(`!!document.querySelector('.journey-identity') && !document.querySelector('.journey-session-bar')`);
     checks.push('player cancellation receipt and leave');
 
-    await navigate('debug');
+    await navigate('live');
+    await click('事件与图表');
     await wait(`document.querySelectorAll('.insight-event-row').length > 0 && !!document.querySelector('.insight-main-chart svg circle')`);
     await click('请求 Token');
     assert(await run(() => document.querySelector('.insight-main-chart svg')?.getAttribute('aria-label').includes('tokens')),

@@ -22,7 +22,7 @@ import type { WorldFiles } from "../files.js";
 import type { GalleryStore } from "../media/gallery.js";
 import { normalizeCategory, UNSORTED_CATEGORY, sanitizeFileName } from "../media/gallery.js";
 import type { MediaStore } from "../media/store.js";
-import type { Prompts, PromptOverrides } from "../prompts.js";
+import { DEFAULT_PROMPTS, type Prompts, type PromptOverrides } from "../prompts.js";
 import type { WorldClock } from "../clock.js";
 import type { ComputerExecResult, ComputerInspection } from "../computer.js";
 import { collectSecretPaths, introspect, validateConfig } from "./schema.js";
@@ -1089,7 +1089,7 @@ export class WebUIServer {
     // ---------- 提示词 ----------
     if (pathname === "/api/prompts" && method === "GET") {
       sendJSON(res, 200, {
-        defaults: host.prompts().effective(),
+        defaults: DEFAULT_PROMPTS,
         overrides: host.prompts().get(),
       });
       return;
@@ -1099,8 +1099,8 @@ export class WebUIServer {
       if (!overrides || typeof overrides !== "object") {
         return void sendJSON(res, 400, { error: "缺少 overrides 字段" });
       }
-      host.prompts().setOverrides(overrides as PromptOverrides);
       await host.savePromptsOverrides(overrides as PromptOverrides);
+      host.prompts().setOverrides(overrides as PromptOverrides);
       sendJSON(res, 200, { ok: true, effective: host.prompts().effective() });
       return;
     }

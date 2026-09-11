@@ -124,7 +124,7 @@
     function button(text, run, cls) { return el('button', { type: 'button', cls: cls || 'live-button', text: text, onclick: run }); }
     function badge(call) { return el('span', { cls: 'live-status live-status-' + call.status, text: status(call) }); }
     function empty(text) { return el('div', { cls: 'live-empty', text: text }); }
-    function heading() { return el('div', { cls: 'live-page-heading' }, [el('div', {}, [el('span', { cls: 'live-eyebrow', text: 'LIVE CALLS' }), el('h1', { text: '实时调用' }), el('p', { text: '跟着真实请求与响应，看看世界和角色此刻在做什么。' })])]); }
+    function heading() { return el('div', { cls: 'live-page-heading' }, [el('div', {}, [el('span', { cls: 'live-eyebrow', text: 'OBSERVATORY / LIVE' }), el('h1', { text: '运行洞察' }), el('p', { text: '实时看见思考发生，再沿着原始调用与事件追踪结果。' })])]); }
     function mount(container, options) {
         options = options || {};
         if (!allowed()) {
@@ -136,8 +136,17 @@
         var connection = el('div', { cls: 'live-connection', 'aria-live': 'polite' }), lanes = el('div', { cls: 'live-lanes' }), notice = el('div', { cls: 'live-notice', 'aria-live': 'polite' });
         root.append(head, connection, lanes, notice);
         container.appendChild(root);
+        var insightsCleanup = null, showCallPanel = null;
         var timeline = null, detail = null, requestButton = null, responseButton = null, followButton = null, code = null, detailMeta = null, rawNotice = null, copyButton = null, wrapButton = null, count = null;
         if (!compact) {
+            var workspace = el('div', { id: 'observatory-calls', role: 'tabpanel', 'aria-labelledby': 'observatory-tab-calls' }), insightHost = el('div', { id: 'observatory-events', role: 'tabpanel', 'aria-labelledby': 'observatory-tab-events', hidden: true });
+            var sectionTabs = el('div', { cls: 'observatory-tabs', role: 'tablist', 'aria-label': '运行洞察内容' });
+            var callTab = button('调用原文', function () { switchPanel(false); }), eventTab = button('事件与图表', function () { switchPanel(true); });
+            [callTab, eventTab].forEach(function (tab, i) { tab.id = 'observatory-tab-' + (i ? 'events' : 'calls'); tab.setAttribute('role', 'tab'); tab.setAttribute('aria-controls', i ? insightHost.id : workspace.id); tab.setAttribute('aria-selected', String(!i)); tab.tabIndex = i ? -1 : 0; tab.onkeydown = function (event) { if (['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) { event.preventDefault(); var next = event.key === 'Home' ? false : event.key === 'End' ? true : !i; switchPanel(next); (next ? eventTab : callTab).focus(); } }; });
+            function switchPanel(events) { workspace.hidden = events; insightHost.hidden = !events; callTab.setAttribute('aria-selected', String(!events)); eventTab.setAttribute('aria-selected', String(events)); callTab.tabIndex = events ? -1 : 0; eventTab.tabIndex = events ? 0 : -1; if (events && !insightsCleanup) insightsCleanup = window.RuntimeInsights.mount(insightHost); }
+            showCallPanel = function () { switchPanel(false); };
+            sectionTabs.append(callTab, eventTab);
+            root.append(sectionTabs, workspace, insightHost);
             var toolbar = el('div', { cls: 'live-toolbar' }), filter = el('select', { 'aria-label': '调用来源', cls: 'live-filter' }, [['all', '全部调用'], ['Bot', 'Bot'], ['World', 'World'], ['其他', '其他']].map(function (pair) { return el('option', { value: pair[0], text: pair[1], selected: selection.source === pair[0] }); }));
             filter.onchange = function () { selection.source = filter.value; render(); };
             var search = el('input', { type: 'search', cls: 'live-search', placeholder: '搜索模型、调用 ID 或状态…', 'aria-label': '搜索调用', value: selection.search });
@@ -145,7 +154,7 @@
             followButton = button('', function () { selection.follow = !selection.follow; if (selection.follow)
                 selection.id = ordered().at(-1)?.callId || null; render(); }, 'live-button live-follow');
             toolbar.append(filter, search, followButton, button('同步', refresh));
-            root.appendChild(toolbar);
+            workspace.appendChild(toolbar);
             var grid = el('div', { cls: 'live-workbench' }), history = el('div', { cls: 'live-history' });
             count = el('div', { cls: 'live-history-heading' });
             timeline = el('div', { cls: 'live-timeline', role: 'list', 'aria-label': '按时间排列的模型调用' });
@@ -170,7 +179,7 @@
             code = el('pre', { cls: 'live-raw-code', tabindex: '0', 'aria-label': '调用原始数据' });
             detail.append(detailMeta, tabs, rawNotice, code);
             grid.append(history, detail);
-            root.append(grid, el('p', { cls: 'live-retention', text: '原始数据仅保存在服务端内存：最多 200 次调用、合计 32 MB、单次 8 MB。超限会明确显示不可用；历史普通调试摘要仍可在运行洞察查看。' }));
+            workspace.append(grid, el('p', { cls: 'live-retention', text: '原始数据仅保存在服务端内存：最多 200 次调用、合计 32 MB、单次 8 MB。超限会明确显示不可用；普通调试摘要与事务可在本页「事件与图表」查看。' }));
             timeline.addEventListener('wheel', function () { if (selection.follow) {
                 selection.follow = false;
                 render();
@@ -200,8 +209,9 @@
                 if (call) {
                     footer.append(el('span', { text: (call.httpStatus ? 'HTTP ' + call.httpStatus + ' · ' : '') + elapsed(call) + ' · ' + bytes(call.responseBytes) }), button('查看', function () { selection.id = call.callId; selection.follow = false; if (compact)
                         Studio.navigate('live');
-                    else
-                        render(); }, 'live-link'));
+                    else {
+                        showCallPanel(); render();
+                    } }, 'live-link'));
                 }
             });
         }
@@ -293,7 +303,7 @@
         var unwatch = watch(schedule), clockTimer = setInterval(function () { if (alive && !document.hidden && ordered().some(active))
             schedule(); }, 1000);
         render();
-        return function () { alive = false; unwatch(); clearTimeout(scheduled); clearTimeout(detailTimer); clearInterval(clockTimer); root.remove(); };
+        return function () { alive = false; if (insightsCleanup) insightsCleanup(); unwatch(); clearTimeout(scheduled); clearTimeout(detailTimer); clearInterval(clockTimer); root.remove(); };
     }
     window.LiveCalls = { mount: mount, refresh: refresh };
     Studio.register('live', function (container) { return mount(container); });

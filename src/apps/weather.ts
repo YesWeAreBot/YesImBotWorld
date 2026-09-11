@@ -3,8 +3,7 @@
  *
  * - 现实世界设定（创世时由 World-LLM 判定，持久化在 meta.json）：
  *   走 Open-Meteo（免费、无需 API key）查询真实天气；
- * - 虚构世界设定：由 World-LLM 依据世界状态生成天气，并把天气沉淀进
- *   World_Status.md，保证连续查询与世界裁定的一致性。
+ * - 虚构世界设定：由 World-LLM 只读呈现当前观测中的天气记录，缺失时显示未知。
  */
 
 import type { Logger } from "koishi";
@@ -51,7 +50,7 @@ export class WeatherApp implements WorldApp {
       tools: [
         {
           name: "query_weather",
-          description: "查询当前天气与未来几天的简要预报。city 不填时查询你当前所在的位置。",
+          description: "查询当前天气与未来几天的简要预报。现实模式中 city 缺省使用配置的默认城市，无默认城市则需要指定；虚构模式缺省查询当前可观测地区，只展示已有记录，不生成天气或预报。",
           inputSchema: {
             type: "object",
             properties: {
@@ -149,19 +148,15 @@ export class WeatherApp implements WorldApp {
     return lines.join("\n");
   }
 
-  // ---------- 虚构天气（World-LLM 生成，读写 world_status 保持一致） ----------
+  // ---------- 虚构天气（只读呈现已有观测） ----------
 
   private async virtualWeather(city?: string): Promise<string> {
     const where = city ? `「${city}」` : "它当前所在的地区";
     const task =
       `Bot 打开了手机上的天气应用，查询${where}的天气（当前 ${this.clock.timeLine()}）。\n` +
       `请扮演这个天气应用给出查询结果：\n` +
-      `1. check world_status（必要时也看 bot_status 确认它的位置），天气必须与世界状态中已有的天气、` +
-      `季节、时段与世界设定保持一致；\n` +
-      `2. 若 world_status 里没有当前天气记录或已经过时，构思合理的天气并 update world_status 把它记录下来` +
-      `（这样之后的裁定与再次查询都会一致）；若查询的地点在世界设定中不存在，如实反馈查无此地；\n` +
-      `3. 最后直接输出天气应用屏幕上显示的内容：当前天气与未来两三天的简要预报，` +
-      `简洁、像天气 App 的界面文本，不要输出任何解释或旁白。`;
+      `仅使用提供的角色观测中已存在的天气或预报；缺少记录、地点不明或资料过时就说明未知/不可用。\n` +
+      `这是只读查询，不修改世界，不新增天气，也不编造未来预报。只输出有来源支持的应用结果。`;
     try {
       return await this.world.query(task);
     } catch (err) {

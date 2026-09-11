@@ -75,7 +75,7 @@ export class ChatBackend implements BotBackend {
   }
 
   async generate(context: BotContext, timeLine: string, signal?: AbortSignal): Promise<ParsedToolCall> {
-    const messages = await context.toChatMessages(timeLine);
+    const messages = await context.toChatMessages(timeLine, this.useNativeTools);
     const tools = this.useNativeTools ? this.currentNativeDefs() : undefined;
     // 端点锁：与 World-LLM 共用同一换载端点时排队执行（不同源时无影响）
     return withEndpointLock(
@@ -102,6 +102,7 @@ export class ChatBackend implements BotBackend {
 
   private parseResult(result: ChatResult): ParsedToolCall {
     // 原生 tool_calls（开启原生声明时的正路；未开启时兼容意外走了原生的模型）
+    if (result.toolCalls.length > 1) throw new ToolCallParseError("每次只能调用一个工具；本次多个调用均未执行，请选择一个动作。");
     const native = result.toolCalls[0];
     if (native) {
       const name = native.function.name;
@@ -111,7 +112,9 @@ export class ChatBackend implements BotBackend {
           `工具 ${name} 此刻不可用——它需要先进入相应的页面或打开相应的应用（先打开聊天应用/进入频道/打开 App，参考此前的解锁提示）`,
         );
       }
-      const args = safeParse(native.function.arguments);
+      let args: unknown;
+      try { args = JSON.parse(native.function.arguments); }
+      catch { throw new ToolCallParseError("工具参数 JSON 未闭合或格式无效，本次未执行。", native.function.arguments); }
       // duration 是本协议的通用顶层字段；原生声明里它以参数形式出现，解析时提升回顶层
       let duration: unknown;
       if (typeof args === "object" && args !== null && "duration" in args) {
@@ -122,14 +125,6 @@ export class ChatBackend implements BotBackend {
     }
     // 正文 JSON（文本协议的正路；原生模式下也保留兜底——模型偶尔仍会以正文回答）
     return extractToolCall(result.content, this.toolNames);
-  }
-}
-
-function safeParse(raw: string): unknown {
-  try {
-    return JSON.parse(raw);
-  } catch {
-    return {};
   }
 }
 

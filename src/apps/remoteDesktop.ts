@@ -52,7 +52,7 @@ export class RemoteDesktopApp implements WorldApp {
       return {
         tools: TOOLS,
         opening:
-          `你走到桌前，打开了自己的电脑——屏幕闪烁了几下，` +
+          `远程桌面会话已建立，` +
           `连上了 ${this.cfg.host}:${this.cfg.port} 的那台电脑（屏幕 ${width}x${height}）。` +
           `先 screen 看一眼桌面再动手。`,
       };
@@ -61,7 +61,7 @@ export class RemoteDesktopApp implements WorldApp {
       if (this.session === session) this.session = null;
       return {
         tools: TOOLS,
-        opening: `你走到桌前想打开电脑，但连不上远程桌面 ${this.cfg.host}:${this.cfg.port}（${(err as Error).message ?? err}）。`,
+        opening: `无法连接远程桌面 ${this.cfg.host}:${this.cfg.port}（${(err as Error).message ?? err}）。`,
       };
     }
   }

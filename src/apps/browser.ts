@@ -229,7 +229,7 @@ export class BrowserApp implements WorldApp {
         },
       );
     }
-    return { tools };
+    return { tools: real ? tools : tools.map(tool => ({ ...tool, description: tool.description + "虚构模式只呈现已观测的页面内容，没有已知内容则显示不可用，不会访问真实互联网。" })) };
   }
 
   async call(tool: string, args: Record<string, unknown>): Promise<string | RichText> {
@@ -443,14 +443,14 @@ export class BrowserApp implements WorldApp {
     }
 
     const task =
-      `Bot 拿出手机，${what}（当前 ${this.clock.timeLine()}）。\n` +
-      `请扮演这个世界的互联网，生成 Bot 屏幕上加载出的网页：\n` +
+      `浏览器收到请求：${what}（当前 ${this.clock.timeLine()}）。\n` +
+      `请只读呈现已有网页内容，不模拟尚未存在的互联网事实：\n` +
       `1. 仅依据提供的可感知结构化信息呈现页面；` +
-      `如果这个世界没有互联网、无信号、或该网址不存在，就如实生成对应的错误页（如无法连接/404）。\n` +
+      `观测明确记录无网络或网址不存在时才显示对应错误；没有记录时只说明未知/不可用，不能猜测 404 或断网。\n` +
       `2. 缺少已知网页内容时生成不可用页面，不创建世界事实。\n` +
       `3. 最后输出这个网页的完整 HTML 文档（从 <!DOCTYPE html> 或 <html> 开始）：\n` +
-      `   - 像真实网页：有 <title>，正文内容具体、信息量适中（正文几百字为宜），不要写"这是一个关于…的网页"式的描述；\n` +
-      `   - ${nav.search ? "这是搜索结果页：列出若干条结果，每条是一个 <a href=\"虚构但合理的网址\">标题</a> 加一两句摘要；" : "页面里可以放几个 <a href=\"虚构但合理的网址\">链接</a> 供继续点击；"}\n` +
+      `   - 保留已提供的标题和原文；没有内容时只显示不可用，不为凑长度补写。\n` +
+      `   - 只保留观测中提供的链接、地址和搜索结果；没有来源就不生成链接，不虚构合理的网址。\n` +
       `   - 不要引用任何外部资源（图片、脚本、样式表都不要）；需要样式就写在 <style> 里；\n` +
       `   - 除 HTML 外不要输出任何解释。`;
 

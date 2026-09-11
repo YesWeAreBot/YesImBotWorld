@@ -29,18 +29,18 @@ const READ_ONLY_HINT =
 const TOOLS: AppRawTool[] = [
   {
     name: "list",
-    description: "列出资源管理器当前目录（或指定子目录）里的文件和文件夹。这是只读结果，看完后继续输出 JSON 工具调用。",
+    description: "列出电脑主目录（或指定路径）里的文件和文件夹。这是只读结果，看完后继续按当前协议调用工具。",
     inputSchema: {
       type: "object",
       properties: {
-        path: { type: "string", description: "相对于当前目录的路径；省略为当前目录" },
+        path: { type: "string", description: "相对于电脑主目录的路径；省略为主目录" },
       },
     },
   },
   {
     name: "show",
     description:
-      "打开一个文本文件查看内容并带行号。默认从第 1 行开始最多 200 行；修改文件前先用它确认当前内容。看到内容后不要复述，继续用 write 或 patch 修改时仍然只输出 JSON 工具调用。",
+      "打开一个文本文件查看内容并带行号。默认从第 1 行开始最多 200 行；修改文件前先用它确认当前内容。看到内容后不要复述，继续用 write 或 patch 修改时仍然只输出 符合当前协议的工具调用。",
     inputSchema: {
       type: "object",
       properties: {
@@ -54,7 +54,7 @@ const TOOLS: AppRawTool[] = [
   {
     name: "write",
     description:
-      "写入或覆盖一个文本文件；父目录不存在时会自动创建。content 参数就是文件正文，但你的输出仍然是 JSON 工具调用。单次别塞太长；超过约 8000 字符就先 write 创建/写开头，再用 append: true 分块追加。append: true 表示追加。",
+      "写入或覆盖一个文本文件；父目录不存在时会自动创建。content 参数就是文件正文，但你的输出仍然是 符合当前协议的工具调用。单次别塞太长；超过约 8000 字符就先 write 创建/写开头，再用 append: true 分块追加。append: true 表示追加。",
     inputSchema: {
       type: "object",
       properties: {
@@ -68,7 +68,7 @@ const TOOLS: AppRawTool[] = [
   {
     name: "patch",
     description:
-      "用 apply_patch 块或 unified diff 精确修改文件，支持新增、修改、删除文件。patch 参数传补丁文本；调用本身仍然是 JSON 工具调用，不要直接把补丁或代码作为正文输出。只 patch 当前要改的局部，不要一次塞整个长文件；超过约 8000 字符就分多次。修改前先 show 确认上下文。",
+      "用 apply_patch 块或 unified diff 精确修改文件，支持新增、修改、删除文件。patch 参数传补丁文本；调用本身仍然是 符合当前协议的工具调用，不要直接把补丁或代码作为正文输出。只 patch 当前要改的局部，不要一次塞整个长文件；超过约 8000 字符就分多次。修改前先 show 确认上下文。",
     inputSchema: {
       type: "object",
       properties: {
@@ -149,17 +149,17 @@ export class FileManagerApp implements WorldApp {
       if (ready.ok) {
         return {
           tools: TOOLS,
-          opening: `你坐到电脑前，点开了文件资源管理器，窗口里是这台电脑 ${this.displayPath(".") === "." ? "主目录" : `的 ${this.displayPath(".")} 目录`} 的文件。`,
+          opening: `文件资源管理器已打开，起始目录：${this.computer.homeDir}。`,
         };
       }
       return {
         tools: TOOLS,
-        opening: `你坐到电脑前想打开文件资源管理器，但电脑没有开机（${ready.error}）。`,
+        opening: `文件资源管理器不可用（${ready.error}）。`,
       };
     }
     return {
       tools: TOOLS,
-      opening: "你坐到电脑前，点开了文件资源管理器，窗口里是这台电脑的文件。",
+      opening: "虚构文件资源管理器已打开，只能查看已建模的设备与文件。",
     };
   }
 
@@ -448,18 +448,18 @@ export class FileManagerApp implements WorldApp {
   // ---------- 虚构模式：World-LLM 扮演这台电脑 ----------
 
   private async virtualList(args: Record<string, unknown>): Promise<string> {
-    const where = args.path != null && String(args.path).trim() ? `目录 ${String(args.path).trim()}` : "当前目录";
+    const where = args.path != null && String(args.path).trim() ? `目录 ${String(args.path).trim()}` : "主目录";
     const task =
       `Bot 打开了自己电脑上的文件资源管理器，查看${where}（当前 ${this.clock.timeLine()}）。\n` +
       `请扮演这台电脑，输出资源管理器窗口里显示的目录内容：\n` +
-      `1. check world_status（必要时也看 bot_status）：这台电脑符合世界观；如果这个世界没有电脑，或该路径不存在，就如实显示空白或对应的报错/空目录；\n` +
+      `1. 只读使用提供的角色观测，不调用工具、不改变世界；设备或目录未被观测时显示未知/不可用，不把未知当作空目录；\n` +
       `2. 一行一个条目，目录以 / 结尾，文件可附大小；最多列 ${MAX_LIST_ITEMS} 条；与世界状态中已有的设定保持一致，不要凭空出现这个世界不该有的文件；\n` +
       `3. 只输出资源管理器屏幕上的内容，不要任何解释、旁白或代码围栏。`;
     try {
       return await this.world.query(task);
     } catch (err) {
       this.logger.warn("虚构资源管理器目录生成失败: %s", err);
-      return "（资源管理器好像卡住了，窗口里什么都没有。）";
+      return "（目录查询失败，未取得结果。）";
     }
   }
 
@@ -469,8 +469,8 @@ export class FileManagerApp implements WorldApp {
     const task =
       `Bot 在自己电脑上的资源管理器里打开了文件 ${file.trim()}（当前 ${this.clock.timeLine()}）。\n` +
       `请扮演这台电脑，输出文件在屏幕上显示的内容：\n` +
-      `1. check world_status：文件内容必须符合世界观；文件不存在或不是文本时，如实输出对应的画面（文件不存在/打不开）；\n` +
-      `2. 这是只读查看，内容会显示行号；输出文件内容本身（带行号），不要太长；\n` +
+      `1. 只读使用提供的角色观测；有明确证据才显示文件不存在或非文本，未观测的内容显示未知/不可用，禁止补写文件；\n` +
+      `2. 这是只读查看；仅将已提供的文件原文加行号，不得续写或补全。按请求的 start/max_lines 取窗口，请求为 ${JSON.stringify({ start: args.start ?? 1, max_lines: args.max_lines ?? 200 })}；\n` +
       `3. 只输出屏幕上显示的内容，不要解释或旁白。`;
     try {
       return (await this.world.query(task)) + READ_ONLY_HINT;
@@ -481,7 +481,7 @@ export class FileManagerApp implements WorldApp {
   }
 
   private async virtualWrite(args: Record<string, unknown>, action: string): Promise<string> {
-    return this.world.executeAppAction("在角色实际可用的虚构电脑上执行文件操作；只能改变已存在设备内的结构化文件，保留精确文件内容。请求=" + JSON.stringify({ action, ...args }));
+    return this.world.executeAppAction("在角色实际可用的虚构电脑上执行文件操作；只能改变已存在设备内的结构化文件，保留精确文件内容。请求=" + JSON.stringify({ ...args, action }));
   }
 
   private async isRealWorld(): Promise<boolean> {

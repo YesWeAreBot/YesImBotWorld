@@ -363,15 +363,15 @@ export const Config: Schema<Config> = Schema.intersect([
         .description(
           "工具的原生声明（仅 chat 模式生效）：开启后，工具通过 OpenAI tools 参数正式声明，" +
             "模型以 function calling 接口调用（利用模型训练时的工具调用特殊 token，对云端 API 与做过工具调用训练的模型更稳）。" +
-            "声明是全量且稳定的（不随进频道/开应用变化，请求前缀不受影响）；" +
-            "分层解锁照旧只以事件通知，调用尚未解锁的工具会被拦下并提示。" +
+            "声明仅包含当前实际可用的工具，随进频道/开应用变化；" +
+            "分层解锁同时以事件通知，调用已失效的工具会被拦下并提示。" +
             "关闭时沿用文本协议：工具列在置顶区，模型在正文输出 JSON",
         ),
       disableWait: Schema.boolean()
         .default(false)
         .description(
           "移除 wait 工具：Bot 不再拥有\"暂停等待\"的能力，会以 minIntervalMs 的节奏持续行动" +
-            "（小憩式的 rest 与压缩休息不受影响）。行为准则与相关提示中关于 wait 的说明会一并消失",
+            "（rest 计时休息与独立记忆压缩不受影响）。基础工具列表不再包含 wait",
         ),
       ignoreSendDuration: Schema.boolean()
         .default(false)
@@ -408,13 +408,12 @@ export const Config: Schema<Config> = Schema.intersect([
       restCompressMinChars: Schema.natural()
         .default(8000)
         .description(
-          "rest 真正执行总结压缩的上下文阈值（近似字符数）：达到阈值时 rest 才会调用 World-LLM " +
-            "总结沉淀记忆（期间不可打断）；低于阈值时 rest 只是小憩——像 wait 一样可被消息唤醒打断，" +
-            "不压缩、不清空上下文。上下文满导致的强制休息不受此限。0 表示 rest 总是压缩",
+          "rest 触发记忆整理的上下文阈值（近似字符数）；达到阈值时请求独立压缩，0 表示总是请求压缩。" +
+          "休息始终可被通知打断，压缩不会让角色睡着或恢复体力。上下文超限时的独立压缩不受此阈值限制。",
         ),
       maxWindowChars: Schema.natural()
         .default(32000)
-        .description("上下文预算（近似字符数）。超出后强制触发 rest() 压缩上下文"),
+        .description("上下文预算（近似字符数）。超出后在生成边界独立压缩上下文，不改变身体状态"),
       minIntervalMs: Schema.natural()
         .default(1000)
         .description(

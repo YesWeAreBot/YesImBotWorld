@@ -9,6 +9,7 @@ import { fileURLToPath } from 'node:url';
 import smokeJourney from './webui-smoke-journey.mjs';
 import smokeDevices from './webui-smoke-devices.mjs';
 import smokeLive from './webui-smoke-live.mjs';
+import smokeCharts from './webui-smoke-charts.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const children = [];
@@ -77,6 +78,7 @@ try {
     throw new Error('Condition timed out: ' + expression + '\n' + await evaluate('document.querySelector("main")?.innerText.slice(0,1000)'));
   };
   const navigate = async route => {
+    if (route === 'debug') route = 'live';
     await evaluate(`Studio.navigate(${JSON.stringify(route)})`);
     await wait(`activeView === ${JSON.stringify(route)} && document.querySelector('main').childElementCount > 0 && !document.querySelector('.studio-skeleton') && !Array.from(document.querySelectorAll('main .empty')).some(e=>e.textContent.includes('加载中'))`);
     await delay(100);
@@ -88,7 +90,7 @@ try {
   assert.equal(await evaluate("document.querySelector('.studio-hero h2').textContent"), '你好，欢迎回来。');
   await wait("document.querySelector('.studio-avatar img')?.naturalWidth > 0");
   assert.ok(await evaluate("document.querySelector('.studio-avatar img').alt.includes('样本平台账号')"));
-  const helpers = { evaluate, wait, assert, navigate };
+  const helpers = { evaluate, wait, assert, navigate, page };
   const routes = ['overview', 'world', 'growth', 'devices', 'player', 'live', 'debug', 'usage', 'state', 'crossing', 'config', 'prompts', 'gallery', 'media', 'data', 'visitors'];
   for (const width of [1440, 768, 375]) {
     await page('Emulation.setDeviceMetricsOverride', { width, height: 1050, deviceScaleFactor: 1, mobile: width < 600 });
@@ -122,6 +124,7 @@ try {
   await evaluate("document.querySelector('#btn-theme').click()");
   console.log('PASS login cancellation, command search and theme switch');
   console.log('PASS', await smokeLive(helpers));
+  console.log('PASS', await smokeCharts(helpers));
   console.log('PASS', await smokeDevices(helpers));
   console.log('PASS', await smokeJourney(helpers));
   assert.deepEqual(errors, [], 'Browser exceptions or unexpected external requests');

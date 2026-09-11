@@ -6,6 +6,7 @@ export interface BotToolDef {
   name: string;
   signature: string;
   description: string;
+  inputSchema?: Record<string, unknown>;
 }
 
 /**
@@ -49,7 +50,7 @@ export const BOT_TOOLS: BotToolDef[] = [
     name: "wait",
     signature: 'wait(n: number)',
     description:
-      "等待 n 个 Time Unit。你会暂停思考，直到等待结束（世界会告诉你期间发生了什么）。收到重要通知可能会提前唤醒你。",
+      "等待 n 个 Time Unit。你会暂停思考，直到等待结束（返回当时可感知的观测，不补造期间经历）。收到重要通知可能会提前唤醒你。",
   },
   {
     name: "act",
@@ -65,7 +66,7 @@ export const BOT_TOOLS: BotToolDef[] = [
     name: "rest",
     signature: "rest(duration?: number)",
     description:
-      "按自己的身体状态和生活安排休息一段时间，duration 以 TU 为单位。有重要动静可提前醒来。记忆整理独立进行，不需要为了整理记忆而睡觉。",
+      "主动暂停自主思考一段时间，duration 以 TU 为单位，缺省或非正数使用 300 TU。有重要动静可提前恢复。此工具是休息计时，不提交睡姿或体力恢复；身体动作需要 act，身体状态以 observe 为准。记忆整理独立进行。",
   },
   {
     name: "check_status",
@@ -75,7 +76,7 @@ export const BOT_TOOLS: BotToolDef[] = [
   },
   {
     name: "observe",
-    signature: "observe(target?: string, modality?: string)",
+    signature: 'observe(target?: string, modality?: "all" | "sight" | "self")',
     description: "观察自己或周围。target 可填 self 或最近观察到的 observedId；modality 可选 all（默认，周围视觉与台词）、sight（视觉）或 self（自身状态）。返回可感知实体、属性及观察句柄；看不到的对象和秘密不会出现。行动时可把 observedId 交给 act 的 target。",
   },
   {
@@ -97,7 +98,7 @@ export const BOT_TOOLS: BotToolDef[] = [
     name: "check_time",
     signature: "check_time()",
     description:
-      "看一眼现在几点了（看手表、掏手机、找附近的时钟）。能否看到、通过什么看到由世界决定——身边没有计时工具时可能失败。",
+      "查询当前可见的计时信息，不自动掏手机或寻找时钟。本地返回结构化观测；没有可用读数时返回未知，不保证给出钟表时间。",
   },
   {
     name: "check_msg",
@@ -169,12 +170,12 @@ export const BOT_TOOLS: BotToolDef[] = [
     description:
       "打开你自己的电脑：一台与手机平级的另一台设备，不是手机里的应用。打开后电脑上的工具会展开" +
       "（取决于它的实现方式：终端/文件管理器，或远程桌面的屏幕/鼠标/键盘），" +
-      "关闭手机里的应用不影响电脑，反之亦然；用 close_computer 关机后这些工具随之失效。",
+      "关闭手机里的应用不影响电脑，反之亦然；用 close_computer 结束会话后这些工具随之失效。",
   },
   {
     name: "close_computer",
     signature: "close_computer()",
-    description: "关闭你的电脑（关机），它提供的工具随之失效。",
+    description: "结束电脑会话，收起其工具。远程桌面会断开连接，不会关闭远端主机。",
   },
   {
     name: "check_gallery",
@@ -225,7 +226,7 @@ export const BOT_TOOLS: BotToolDef[] = [
     description:
       "发送消息。id 缺省为当前所在频道页；要发给别的频道就给出完整频道 id（格式 \"platform:channelId\"）。" +
       "要发**图文混排**时，在 msg 里要插图的位置写 `<img>` 占位符（几张图写几个 `<img>`）——" +
-      "这样消息不会立刻发出，而是提示你选图；你再用 pick_media 按占位符顺序选出对应张图，选满后消息自动发出。" +
+      "这样消息不会立刻发出，而是提示你选图；你再用 pick_media 按占位符顺序选出对应张图，选满后尝试发送，仍受发送确认与限制约束，以成功回执为准。" +
       "若只是想单纯发文字/在末尾附一张图，也可用 media 参数直接给媒体编号。",
   },
   {
@@ -233,7 +234,7 @@ export const BOT_TOOLS: BotToolDef[] = [
     signature: 'pick_media(media: string[])',
     description:
       "按 msg 里 `<img>` 占位符的顺序选图填充（结合 send 的图文混排用）。media 为媒体编号或收藏夹文件的列表（如 [\"12\", \"gallery:表情包/xx.png\"]）。" +
-      "发图务必先用 check_gallery / check_media / view_media 看清内容——光凭编号随手选很容易发出不相关的图。选了 N 张就填 N 个占位符，填满后那张消息自动发出。",
+      "发图务必先用 check_gallery / check_media / view_media 看清内容——光凭编号随手选很容易发出不相关的图。选了 N 张就填 N 个占位符，填满后尝试发送，仍可能要求确认，以成功回执为准。",
   },
   {
     name: "unsend",
@@ -584,6 +585,9 @@ export function availableTools(opts: {
           `已安装的应用：${opts.apps.map((a) => `${a.name}（${a.description}）`).join("、")}。`,
       };
     }
+    if (["send", "pick_media"].includes(def.name) && opts.ignoreSendDuration) {
+      def = { ...def, description: def.description + "当前配置忽略发送耗时：一旦满足发送条件就立即发送，duration 不会延后发送或提供取消窗口。" };
+    }
     // travel 的描述里列出可去的世界
     if (def.name === "travel" && opts.crossingWorlds?.length) {
       def = {
@@ -600,5 +604,5 @@ export function availableTools(opts: {
 }
 
 export function renderToolsText(tools: BotToolDef[] = BOT_TOOLS): string {
-  return tools.map((t) => `- ${t.signature}\n  ${t.description}`).join("\n");
+  return tools.map((t) => `- ${t.signature}\n  ${t.description}${t.inputSchema ? "\n  参数 JSON Schema（参数结构以此为准）：" + JSON.stringify(t.inputSchema) : ""}`).join("\n");
 }

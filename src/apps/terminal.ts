@@ -40,17 +40,17 @@ export class TerminalApp implements WorldApp {
       if (ready.ok) {
         return {
           tools: TOOLS,
-          opening: `你走到桌前，打开了自己的电脑，点开终端窗口——屏幕亮起，光标停在 ${this.computer.homeDir} 的提示符前等着你。`,
+          opening: `终端会话已打开，默认工作目录为 ${this.computer.homeDir}。`,
         };
       }
       return {
         tools: TOOLS,
-        opening: `你走到桌前想打开电脑，但电脑没有开机（${ready.error}）。`,
+        opening: `终端不可用（${ready.error}）。`,
       };
     }
     return {
       tools: TOOLS,
-      opening: "你走到桌前，打开了自己的电脑，点开终端窗口——屏幕亮起，光标停在提示符前等着你。",
+      opening: "虚构终端界面已打开。命令只能通过已建模状态裁定，不会在真实操作系统中运行。",
     };
   }
 
@@ -82,19 +82,11 @@ export class TerminalApp implements WorldApp {
 
   /** 虚构世界：World-LLM 扮演这台电脑 */
   private async virtualRun(command: string, cwd?: string): Promise<string> {
-    const task =
-      `Bot 打开了自己电脑上的终端，在${cwd ? `目录 ${cwd}` : "主目录"}敲下了命令：${command}（当前 ${this.clock.timeLine()}）\n` +
-      `请扮演这台电脑的终端，直接输出它屏幕上显示的结果：\n` +
-      `1. check world_status（必要时也看 bot_status）：这台电脑符合世界观（可能是魔法世界的炼金台、星际联邦的终端，` +
-      `也可能这个世界根本没有电脑——那就输出对应的画面）；\n` +
-      `2. 命令合理且世界观允许时，给出逼真的输出（目录/文件列表、进度、回显等）；不存在的命令、无权限或世界观不允许时，` +
-      `如实输出报错或失败；不要凭空编造这个世界不该有的文件或程序；\n` +
-      `3. 只输出终端屏幕上的内容（像普通命令行那样简洁），不要输出任何解释、旁白或代码围栏。`;
     try {
-      return (await this.world.executeAppAction("执行虚构电脑命令。只在能根据已建模设备和文件精确结算时执行，否则返回不支持。命令=" + JSON.stringify(command))) + PROMPT_HINT;
+      return (await this.world.executeAppAction("执行虚构电脑命令。只在能根据已建模设备和文件精确结算时执行，否则返回不支持。命令=" + JSON.stringify({ command, cwd: cwd || "." }))) + PROMPT_HINT;
     } catch (err) {
       this.logger.warn("虚构终端输出生成失败: %s", err);
-      return "（终端好像卡住了，屏幕上什么都没有。）" + PROMPT_HINT;
+      return "（终端请求失败，未取得结果，不能据此判断是否执行成功。）" + PROMPT_HINT;
     }
   }
 }
@@ -103,13 +95,13 @@ const TOOLS: AppRawTool[] = [
   {
     name: "run_command",
     description:
-      "在当前终端里执行一条命令，返回它在电脑上产生的输出。cwd 可指定相对电脑主目录的工作目录（缺省为打开终端时所在目录）。" +
-      "执行失败/无权限时终端会如实报错。",
+      "在当前终端里执行一条命令，返回它在电脑上产生的输出。cwd 可指定相对电脑主目录的工作目录（缺省为电脑主目录；cd 与环境变量不跨调用保留）。" +
+      "真实模式执行容器命令；虚构模式仅裁定已建模设备，返回结构化结果或不支持，不保证得到真实终端输出。",
     inputSchema: {
       type: "object",
       properties: {
         command: { type: "string", description: "要执行的命令，如 ls -la" },
-        cwd: { type: "string", description: "工作目录，相对电脑主目录；省略为当前目录" },
+        cwd: { type: "string", description: "工作目录，相对电脑主目录；省略为电脑主目录，每次调用独立" },
       },
       required: ["command"],
     },

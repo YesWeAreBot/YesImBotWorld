@@ -11,8 +11,7 @@ var Studio = (function () {
         ['devices', '设备工作台', 'monitor', ['devices']],
         ['player', '走进世界', 'door', ['__player__']],
         { group: '观察与记录' },
-        ['live', '实时调用', 'activity', ['debug']],
-        ['debug', '运行洞察', 'activity', ['debug']],
+        ['live', '运行洞察', 'activity', ['debug']],
         ['usage', '模型用量', 'chart', ['usage']],
         ['gallery', '相册', 'image', ['gallery']],
         ['data', '记事与存档', 'folder', ['notes', 'archive']],
@@ -45,11 +44,12 @@ var Studio = (function () {
         shield: svgIcon('<path d="m12 3 8 3v6c0 5-8 9-8 9s-8-4-8-9V6Z"/><path d="m8 12 3 3 5-6"/>')
     });
     NAV = routes;
-    function routeFor(name) { return routes.find(function (r) { return r[0] === name; }); }
+    function routeFor(name) { if (name === 'debug') name = 'live'; return routes.find(function (r) { return r[0] === name; }); }
     function can(name) { var r = routeFor(name); return !!r && visitorCanSee(r[3]); }
     function firstRoute() { return (routes.find(function (r) { return !r.group && visitorCanSee(r[3]); }) || ['overview'])[0]; }
     function register(name, render) { views.set(name, render); }
     function navigate(name) {
+        if (name === 'debug') name = 'live';
         if (!can(name))
             name = firstRoute();
         if (cfgDirty && activeView === 'config' && name !== 'config' && !confirm('配置有未保存的修改，仍要离开吗？'))
@@ -118,7 +118,7 @@ var Studio = (function () {
         mobile.replaceChildren();
         ['overview', 'world', 'devices', 'player', 'live'].filter(can).slice(0, 5).forEach(function (name) {
             var r = routeFor(name);
-            mobile.appendChild(el('a', { href: '#' + name, cls: activeView === name ? 'active' : '', 'aria-current': activeView === name ? 'page' : 'false', onclick: function (e) { e.preventDefault(); navigate(name); } }, [el('span', { html: icon(r[2]) }), el('span', { text: { overview: '总览', world: '世界', devices: '设备', player: '入世界', live: '实时', debug: '洞察' }[name] })]));
+            mobile.appendChild(el('a', { href: '#' + name, cls: activeView === name ? 'active' : '', 'aria-current': activeView === name ? 'page' : 'false', onclick: function (e) { e.preventDefault(); navigate(name); } }, [el('span', { html: icon(r[2]) }), el('span', { text: { overview: '总览', world: '世界', devices: '设备', player: '入世界', live: '洞察', debug: '洞察' }[name] })]));
         });
         $('#account-name').textContent = isVisitor() ? (VISITOR_PRESET === 'player' ? '世界中的旅人' : '工作室访客') : '工作室管理员';
         $('#account-role').textContent = isVisitor() ? (VISITOR_PRESET === 'player' ? '体验与互动' : '按授权范围观测') : '管理与观测';

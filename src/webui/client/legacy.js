@@ -1013,7 +1013,7 @@ function loadPrompts(){
   if(activeView !== 'prompts') return;
   var main = $('#main');
   main.textContent = '';
-  main.appendChild(viewHead('提示词', isVisitor() ? '只读模式：可浏览提示词，无法修改。' : '改写内置提示词（Bot 行为准则 / World 任务模板），保存后立即生效。带 {{变量}} 的是占位符，会被实际内容替换。'));
+  main.appendChild(viewHead('提示词', isVisitor() ? '只读模式：可浏览提示词，无法修改。' : '改写内置提示词（Bot 行为准则 / World 任务模板），保存后用于后续生成。这里只列实际使用的模板；旧世界工具模板已停用，首次保存时旧覆盖会备份为 prompts.legacy.json。带 {{变量}} 的是占位符。'));
   var holder = el('div', {text:'加载中…', cls:'empty'});
   main.appendChild(holder);
   api('GET', '/api/prompts').then(function(r){
@@ -1065,21 +1065,16 @@ function promptGroup(title, defaults, current, prefix){
 function descOf(key, prefix){
   var map = {
     bot: {
-      constitutionHead: '行为准则开头段（两种工具协议的共同前言）',
+      constitutionHead: '行为准则开头段（原生工具调用协议的前言）',
       outputFormatNative: '输出格式段 · 原生协议（function calling）',
+      outputFormatText: '输出格式段 · 正文 JSON 协议（nativeToolCalls 关闭时）',
       constitution: '输出格式之后的通用规则（事件/电脑/媒体/手机/身份/心态等大段）',
       lifestyleWithWait: '心态段收尾（有 wait 工具时）',
       lifestyleNoWait: '心态段收尾（wait 被移除时）'
     },
     world: {
-      system: 'World-LLM 系统提示。{{worldDef}} 世界定义、{{timeLine}} 当前时刻（默认模板不含时间——把易变内容挡在系统提示外，前缀缓存才能跨调用复用；时间由各任务文本自带）',
-      adjudicateAct: '裁定 Bot 的 act 动作。{{desc}} {{issuedAt}} {{duration}} {{expectedAt}}',
-      resolveWait: 'wait 补叙。{{issuedAt}} {{n}} {{expectedAt}}',
-      resolveCheckTime: 'Bot 主动查看时间。{{timeLine}}',
-      tingle: '世界心跳。{{timeLine}}',
-      resolveOfflineGap: '离线补叙。{{fromTimeLine}} {{toTimeLine}} {{gapTU}}',
-      reconcileDefinitions: '用户修改定义后重载。{{timeLine}} {{botDef}} {{worldDef}}',
-      initialize: '创世初始化。{{timeLine}} {{botDef}} {{worldDef}}',
+      adjudicationSystem: '结构化世界裁定 · system。只声明 propose_world；世界规则、快照和任务由运行时附加。',
+      presentationSystem: '只读界面呈现 · system。只接收角色观测，无工具和写入权限。',
       compressSystem: '上下文压缩 · system',
       compressUser: '上下文压缩 · user。{{timeLine}} {{persona}} {{historySummary}} {{memoryDigest}} {{streamText}}',
       assessRealWorldSystem: '世界性质判定 · system',
@@ -1090,10 +1085,7 @@ function descOf(key, prefix){
       phoneSpecUser: '手机屏幕规格判定 · user。{{botDef}} {{worldDef}}',
       phoneShellSystem: '浏览器带壳截图外壳生成 · system（创世调用）',
       phoneShellUser: '带壳截图外壳生成 · user。{{botDef}} {{worldDef}} {{width}} {{height}}；生成的 HTML 里保留 {{screen}} {{url}} {{time}} 占位符',
-      visitorPreamble: '穿越 · 访客任务前言（act/wait/查时间/查询的开头段）。{{name}} {{persona}} {{personaWhere}}（档案位置提示，随 visitorPersonaMode 变化）',
-      visitorArrive: '穿越 · 访客到达叙事。{{name}} {{persona}} {{personaWhere}} {{timeLine}}',
-      visitorLeave: '穿越 · 访客离开善后。{{name}} {{timeLine}}',
-      dormantCatchup: '穿越 · 世界沉睡后苏醒的补叙（Bot 外出且无访客期间暂停演化，有人出现时补上）。{{fromTimeLine}} {{toTimeLine}} {{gapTU}}'
+
     }
   };
   return map[prefix][key] || '';

@@ -333,8 +333,7 @@ export class BotAgent {
 
   /**
    * 手机界面状态 / App 打开状态变化后：重算**允许集**并同步进后端（GBNF 语法 / 解析校验）。
-   * 原生 tools **声明**保持稳定：始终是全量内置工具（分层解锁照旧只以 Event 通知、由允许集把关），
-   * 请求前缀不随频道进出/界面切换变化；只有打开/关闭应用或电脑时，其动态工具才进出声明。
+   * 原生 tools 声明同步当前允许集；应用参数保留原始 schema。
    */
   private currentToolNames(): string[] {
     const names = [...this.layerNames("core")];
@@ -788,13 +787,15 @@ export class BotAgent {
             }
             const emphasis =
               this.parseFailures >= 3
-                ? "不要写正文或解释，先想清楚要调用哪个工具，然后通过工具调用接口调用它。"
+                ? (this.config.bot.nativeToolCalls
+                  ? "不要写正文或解释，通过 function calling 接口调用恰好一个工具。"
+                  : '只输出一个工具 JSON 对象，格式为 {"name":"工具名","arguments":{},"duration":0}；不要解释或代码围栏。')
                 : "";
             // 关键：不要把原始错误输出（尤其是模型自己拼的 <event>…</event>）回灌进上下文——
             // 那会污染意识流，让模型把它当成真实发生的事件并继续模仿。
             this.pushEvent(
               "system",
-              `（意识有些恍惚，刚才的想法没有成形。${emphasis}请重新输出一个合法的工具调用。）`,
+              `（本次输出未能解析为唯一有效的工具调用，没有执行操作。${emphasis}请重新输出一个合法的工具调用。）`,
             );
             continue;
           }
@@ -1277,12 +1278,12 @@ export class BotAgent {
         return this.dispatchLocal(call, async () => {
           const res = await this.computer?.open();
           if (!res) return "（这台电脑不可用。）";
-          if ("error" in res) return `（你走到桌前想打开电脑，但打不开：${res.error}）`;
+          if ("error" in res) return `（电脑会话未能打开：${res.error}）`;
           this.refreshToolGate();
           const lines = res.defs.length
-            ? res.defs.map((d) => `- ${d.signature}\n  ${d.description}`).join("\n")
+            ? renderToolsText(res.defs)
             : "（这台电脑没有提供任何操作。）";
-          return `${res.opening}\n接下来可以像普通能力一样调用（close_computer 关机后失效）：\n${lines}`;
+          return `${res.opening}\n接下来可以像普通能力一样调用（close_computer 结束会话后失效）：\n${lines}`;
         });
       case "close_computer":
         return this.dispatchLocal(call, async () => {
@@ -1852,7 +1853,7 @@ export class BotAgent {
         this.phoneUi = { chatOpen: false, channelKey: null, channelIsGroup: false, forwardStack: [] };
         this.refreshToolGate();
         const lines = defs.length
-          ? defs.map((d) => `- ${d.signature}\n  ${d.description}`).join("\n")
+          ? renderToolsText(defs)
           : "（这个应用没有提供任何操作。）";
         const closedNote = closed
           ? `（「${closed}」已被关掉）`
@@ -2517,20 +2518,7 @@ export class BotAgent {
     this.schedule(call, {
       executeAt: "expected",
       run: async () => {
-        const napWake = pickMeta(
-          [
-            "你小憩了一会儿，回过神来。",
-            "你打了个盹，慢慢醒转过来。",
-            "你眯了一小会儿，重新打起了精神。",
-            "你闭目养神片刻，又清醒了。",
-            "你短暂地歇了一下，慢慢回神。",
-            "你合眼打了个小盹，睡意消散了。",
-            "你歇了歇，精神头又回来了。",
-            "你小睡片刻，重新睁开了眼。",
-            "你打了个短短的盹，缓过来了。",
-            "你眯眼休息了一会儿，恢复了神采。",
-          ],
-        );
+        const napWake = `（休息计时结束，经过 ${n} TU。可继续观察或行动；身体状态以实际观测为准。）`;
         return { text: napWake, originEventIds: [] };
       },
     });

@@ -35,10 +35,51 @@
     function latency(entry) { var detail = parse(entry.detail); return entry.kind === 'llm.res' && !/·流式\s*\d/.test(entry.label) && Number.isFinite(detail.ms) ? detail.ms : null; }
     function source(entry) { if (entry.bus)
         return 'transaction'; var first = String(entry.kind || '').split('.')[0]; return ['bot', 'world', 'llm'].includes(first) ? first : 'system'; }
-    function lineChart(points, unit, onSelect, kind) {
+    // One scrollable viewport for mouse, touch and keyboard. Re-rendering retains inspection state.
+    function interactivePlot(chart, marks, state) {
+        state.zoom = state.zoom || 1;
+        var restoreScroll = state.scroll, restored = false;
+        var wrap = el('div', { cls: 'insight-interactive-plot' }), viewport = el('div', { cls: 'insight-plot-viewport', tabindex: '0', role: 'region', 'aria-label': '时间图表，可左右滑动或拖动，点击数据查看详情' });
+        var toolbar = el('div', { cls: 'insight-plot-controls' }), detail = el('div', { cls: 'insight-plot-detail', 'aria-live': 'polite' });
+        var earlier = btn('← 较早', function () { pan(-1); }), later = btn('较晚 →', function () { pan(1); }), latest = btn('最新', function () { viewport.scrollLeft = viewport.scrollWidth; });
+        var zoom = el('input', { type: 'range', min: '1', max: '4', step: '.5', value: state.zoom, 'aria-label': '图表缩放' });
+        toolbar.append(earlier, later, latest, el('label', { cls: 'insight-plot-zoom' }, [el('span', { text: '缩放' }), zoom]), el('span', { cls: 'insight-note', text: '滑动浏览 · 点按详情' }));
+        viewport.appendChild(chart); wrap.append(toolbar, viewport, detail);
+        var baseWidth = Number(chart.getAttribute('viewBox').split(' ')[2]);
+        function size() { chart.style.width = (baseWidth * state.zoom) + 'px'; chart.style.height = chart.getAttribute('viewBox').split(' ')[3] + 'px'; chart.setAttribute('preserveAspectRatio', 'none'); }
+        function pan(direction) { viewport.scrollBy({ left: direction * viewport.clientWidth * .7, behavior: 'smooth' }); }
+        function sync() { if (!viewport.isConnected || !restored) return; state.scroll = viewport.scrollLeft; earlier.disabled = viewport.scrollLeft < 1; later.disabled = viewport.scrollLeft + viewport.clientWidth >= viewport.scrollWidth - 1; latest.disabled = later.disabled; }
+        state.capture = function () { if (viewport.isConnected) state.scroll = viewport.scrollLeft; };
+        zoom.oninput = function () { var center = (viewport.scrollLeft + viewport.clientWidth / 2) / state.zoom; state.zoom = Number(zoom.value); size(); viewport.scrollLeft = center * state.zoom - viewport.clientWidth / 2; sync(); };
+        viewport.addEventListener('scroll', sync, { passive: true });
+        var drag = null, dragged = false;
+        viewport.addEventListener('pointerdown', function (event) { if (event.pointerType !== 'mouse' || event.button !== 0) return; drag = { x: event.clientX, scroll: viewport.scrollLeft, id: event.pointerId }; dragged = false; });
+        viewport.addEventListener('pointermove', function (event) { if (!drag) return; var dx = event.clientX - drag.x; if (Math.abs(dx) > 5) { dragged = true; viewport.setPointerCapture(drag.id); viewport.classList.add('dragging'); } if (dragged) { viewport.scrollLeft = drag.scroll - dx; event.preventDefault(); } });
+        function release(event) { if (drag && viewport.hasPointerCapture(drag.id)) viewport.releasePointerCapture(drag.id); drag = null; viewport.classList.remove('dragging'); if (event.type === 'pointercancel') dragged = false; }
+        viewport.addEventListener('pointerup', release); viewport.addEventListener('pointercancel', release);
+        viewport.addEventListener('click', function (event) { if (dragged) { dragged = false; event.preventDefault(); event.stopImmediatePropagation(); } }, true);
+        function choose(mark, focus) {
+            state.key = mark.key;
+            marks.forEach(function (item) { item.node.setAttribute('aria-pressed', String(item === mark)); item.node.classList.toggle('insight-plot-selected', item === mark); item.node.setAttribute('tabindex', item === mark ? '0' : '-1'); });
+            detail.replaceChildren(el('strong', { text: mark.title }), mark.detail());
+            if (focus) { mark.node.focus({ preventScroll: true }); var box = mark.node.getBoundingClientRect(), view = viewport.getBoundingClientRect(); if (box.left < view.left || box.right > view.right) viewport.scrollLeft += (box.left + box.right - view.left - view.right) / 2; }
+        }
+        marks.forEach(function (mark, index) {
+            mark.node.setAttribute('role', 'button'); mark.node.setAttribute('aria-label', mark.title); mark.node.setAttribute('tabindex', '-1'); mark.node.classList.add('insight-plot-mark'); mark.node.dataset.plotKey = mark.key;
+            mark.node.addEventListener('click', function () { choose(mark, false); });
+            mark.node.addEventListener('keydown', function (event) { var target = event.key === 'ArrowLeft' ? Math.max(0, index - 1) : event.key === 'ArrowRight' ? Math.min(marks.length - 1, index + 1) : event.key === 'Home' ? 0 : event.key === 'End' ? marks.length - 1 : index; if (['Enter', ' ', 'ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) { event.preventDefault(); event.stopPropagation(); choose(marks[target], true); } });
+        });
+        viewport.addEventListener('keydown', function (event) { if (event.target === viewport && ['ArrowLeft', 'ArrowRight'].includes(event.key)) { event.preventDefault(); pan(event.key === 'ArrowLeft' ? -1 : 1); } });
+        var chosen = marks.find(function (mark) { return mark.key === state.key; }) || marks.at(-1);
+        if (chosen) choose(chosen, false);
+        size();
+        requestAnimationFrame(function () { if (!viewport.isConnected) return; viewport.scrollLeft = restoreScroll == null ? viewport.scrollWidth : restoreScroll; restored = true; sync(); });
+        return wrap;
+    }
+    function lineChart(points, unit, onSelect, kind, state) {
         if (!points.length)
             return empty('还没有可绘制的数据', '收到实际请求或事件后，曲线会出现在这里。');
-        var width = 760, height = 205, left = 45, right = 20, top = 20, bottom = 35;
+        var width = Math.max(760, points.length * 48), height = 205, left = 45, right = 20, top = 20, bottom = 35;
         var minTime = Math.min.apply(null, points.map(function (p) { return p.ts; })), maxTime = Math.max.apply(null, points.map(function (p) { return p.ts; }));
         if (maxTime === minTime) {
             minTime -= 30000;
@@ -48,7 +89,7 @@
         maxValue = maxValue > 0 ? maxValue * 1.12 : 1;
         function x(ts) { return left + (ts - minTime) / (maxTime - minTime) * (width - left - right); }
         function y(value) { return height - bottom - value / maxValue * (height - top - bottom); }
-        var chart = svg('svg', { viewBox: '0 0 ' + width + ' ' + height, role: 'img', 'aria-label': '按真实时间绘制的' + unit + '图表', cls: 'insight-chart-svg' });
+        var chart = svg('svg', { viewBox: '0 0 ' + width + ' ' + height, role: 'group', 'aria-label': '按真实时间绘制的' + unit + '图表', cls: 'insight-chart-svg' });
         chart.appendChild(svg('text', { x: left, y: 10, fill: 'var(--fg-dim)', 'font-size': '9', text: unit }));
         for (var i = 0; i <= 3; i++) {
             var value = maxValue * i / 3, ordinate = y(value);
@@ -61,27 +102,27 @@
             var path = ordered.map(function (p, index) { return (index ? 'L' : 'M') + x(p.ts).toFixed(2) + ',' + y(p.value).toFixed(2); }).join(' ');
             chart.appendChild(svg('path', { d: path, fill: 'none', stroke: 'var(--accent)', 'stroke-width': '2', 'stroke-linejoin': 'round' }));
         }
+        var marks = [];
         ordered.forEach(function (point) {
-            var mark = kind === 'bars' ? svg('rect', { x: x(point.ts) - 5, y: y(point.value), width: 10, height: Math.max(1, y(0) - y(point.value)), rx: 2, fill: 'var(--accent)', opacity: '.8' }) : svg('circle', { cx: x(point.ts), cy: y(point.value), r: ordered.length > 100 ? 2.5 : 3.5, fill: 'var(--surface)', stroke: 'var(--accent)', 'stroke-width': '1.7' });
-            mark.appendChild(svg('title', { text: clock(point.ts, true) + ' · ' + fmt(point.value) + ' ' + unit + (point.label ? ' · ' + point.label : '') }));
-            if (onSelect && point.entry) {
-                mark.setAttribute('tabindex', '0');
-                mark.setAttribute('role', 'button');
-                mark.setAttribute('aria-label', point.label + '，' + fmt(point.value) + ' ' + unit);
-                mark.style.cursor = 'pointer';
-                mark.addEventListener('click', function () { onSelect(point.entry); });
-                mark.addEventListener('keydown', function (event) { if (event.key === 'Enter')
-                    onSelect(point.entry); });
-            }
-            chart.appendChild(mark);
+            var group = svg('g'), mark = kind === 'bars' ? svg('rect', { x: x(point.ts) - 12, y: y(point.value), width: 24, height: Math.max(2, y(0) - y(point.value)), rx: 3, fill: 'var(--accent)', opacity: '.85' }) : svg('circle', { cx: x(point.ts), cy: y(point.value), r: 4, fill: 'var(--surface)', stroke: 'var(--accent)', 'stroke-width': '2' });
+            group.append(svg('rect', { x: x(point.ts) - 22, y: top, width: 44, height: height - bottom - top, fill: 'transparent', cls: 'insight-plot-hit' }), mark);
+            chart.appendChild(group);
+            marks.push({ key: String(point.ts) + ':' + (point.entry ? point.entry.id : ''), node: group, title: clock(point.ts, true) + ' · ' + fmt(point.value) + ' ' + unit,
+                detail: function () { var content = el('div', { cls: 'insight-plot-values' }, [el('span', { text: point.label || '' })]);
+                    if (point.entry && onSelect) content.appendChild(btn('查看事件详情', function () { onSelect(point.entry); }, 'insight-outline'));
+                    if (point.entries) { content.appendChild(el('span', { text: '此时间段共 ' + point.entries.length + ' 条事件' })); point.entries.slice(0, 8).forEach(function (entry) { content.appendChild(btn(entry.label, function () { onSelect(entry); }, 'insight-outline')); }); }
+                    return content; }
+            });
         });
-        return chart;
+        return interactivePlot(chart, marks, state);
     }
-    Studio.register('debug', function (container) {
+
+    window.RuntimeInsights = { mount: function (container) {
+        var chartStates = {}, chartSignature = '';
         var alive = true, entries = new Map(), selected = null, sourceFilter = 'all', levelFilter = 'all', query = '', chartMode = 'latency', paused = false, frozen = [], waiting = 0, loading = true, error = '', timer, refreshing = false, renderTimer = null;
         var root = el('div', { cls: 'insight-page insight-debug' });
         container.appendChild(root);
-        var header = heading('每一次思考，都有迹可循。', '沿着请求、行动与世界事务，查看实际发生的过程。', 'OBSERVATORY / LIVE TRACE');
+        var header = el('div', { cls: 'insight-section-head' }, [el('h2', { text: '事件与图表' }), el('p', { text: '沿着请求、行动与世界事务，查看实际发生的过程。' })]);
         var controls = el('div', { cls: 'insight-header-actions' }), pauseButton = btn('暂停跟随', togglePause), exportButton = btn('导出当前筛选', exportData, 'insight-outline');
         controls.appendChild(pauseButton);
         controls.appendChild(exportButton);
@@ -127,10 +168,9 @@
             metricHolder.appendChild(metric('当前可见事件', fmt(data.length), '按来源、级别与搜索筛选'));
             metricHolder.appendChild(metric('响应耗时 · 中位数', ms === null ? '—' : (ms / 1000).toFixed(2) + ' s', responses.length ? responses.length + ' 条已完成 LLM 请求' : '尚未收到完成请求'));
             metricHolder.appendChild(metric('错误事件', fmt(failures), failures ? '点击级别筛选定位具体原因' : '当前记录中未发现错误', failures ? 'insight-metric-warn' : ''));
-            plotHolder.textContent = '';
             var tabs = el('div', { cls: 'insight-tabs' });
             [['latency', '响应耗时'], ['tokens', '请求 Token'], ['activity', '事件密度']].forEach(function (pair) { tabs.appendChild(btn(pair[1], function () { chartMode = pair[0]; render(); }, chartMode === pair[0] ? 'insight-active' : '')); });
-            plotHolder.appendChild(el('div', { cls: 'insight-panel-head' }, [el('div', {}, [el('h2', { text: chartMode === 'latency' ? '请求的节奏' : chartMode === 'tokens' ? '每次请求的消耗' : '世界的活动轨迹' }), el('p', { text: '横轴为真实时间 · ' + (chartMode === 'activity' ? '每个时间桶中的实际记录数量' : '点击数据点查看对应记录') })]), tabs]));
+            var plotHead = el('div', { cls: 'insight-panel-head' }, [el('div', {}, [el('h2', { text: chartMode === 'latency' ? '请求的节奏' : chartMode === 'tokens' ? '每次请求的消耗' : '世界的活动轨迹' }), el('p', { text: '横轴为真实时间 · ' + (chartMode === 'activity' ? '每个时间桶中的实际记录数量' : '点击数据点查看对应记录') })]), tabs]);
             var points = [], unit = '';
             if (chartMode === 'latency') {
                 unit = '毫秒';
@@ -143,10 +183,15 @@
             else if (data.length) {
                 unit = '条事件';
                 var from = Math.min.apply(null, data.map(function (entry) { return entry.ts; })), until = Math.max.apply(null, data.map(function (entry) { return entry.ts; })), step = Math.max(1000, Math.ceil((until - from + 1) / 24)), buckets = new Map();
-                data.forEach(function (entry) { var bucket = from + Math.floor((entry.ts - from) / step) * step; buckets.set(bucket, (buckets.get(bucket) || 0) + 1); });
-                buckets.forEach(function (count, ts) { points.push({ ts: ts, value: count, label: '时间桶 ' + (step / 1000).toFixed(1) + ' 秒' }); });
+                data.forEach(function (entry) { var bucket = from + Math.floor((entry.ts - from) / step) * step; if (!buckets.has(bucket)) buckets.set(bucket, []); buckets.get(bucket).push(entry); });
+                buckets.forEach(function (items, ts) { points.push({ ts: ts, value: items.length, entries: items, label: '时间桶 ' + (step / 1000).toFixed(1) + ' 秒' }); });
             }
-            plotHolder.appendChild(lineChart(points, unit, choose, chartMode === 'activity' ? 'bars' : 'line'));
+            var signature = chartMode + ':' + points.map(function (point) { return [point.ts, point.value, point.entry?.id, point.entries?.map(function (entry) { return entry.id; }).join(',')].join('/'); }).join('|');
+            if (signature !== chartSignature) {
+                chartSignature = signature;
+                Object.values(chartStates).forEach(function (state) { state.capture?.(); });
+                plotHolder.replaceChildren(plotHead, lineChart(points, unit, choose, chartMode === 'activity' ? 'bars' : 'line', chartStates[chartMode] || (chartStates[chartMode] = {})));
+            }
             statusHolder.textContent = error || (loading ? '正在读取调试记录…' : paused ? '跟随已暂停。新记录仍在接收，恢复后更新视图。' : '实时跟随 · 当前窗口 ' + fmt(data.length) + ' 条记录' + (isVisitor() ? '' : '，含已提交的世界事务'));
             statusHolder.classList.toggle('insight-error', !!error);
             renderList();
@@ -226,43 +271,39 @@
         refresh();
         timer = setInterval(refresh, 12000);
         return function () { alive = false; clearInterval(timer); clearTimeout(renderTimer); window.removeEventListener('studio:debug', onDebug); window.removeEventListener('studio:refresh', refresh); };
-    });
-    function stackedChart(buckets) {
-        if (!buckets.length || !buckets.some(function (bucket) { return bucket.totals.totalTokens > 0; }))
-            return empty('还没有 Token 用量', '这里会按实际请求展示输入、输出和缓存命中的变化。');
-        var W = 800, H = 245, L = 48, R = 15, T = 20, B = 38, max = Math.max.apply(null, buckets.map(function (bucket) { return bucket.totals.totalTokens || 0; })) * 1.12;
-        var chart = svg('svg', { viewBox: '0 0 ' + W + ' ' + H, cls: 'insight-chart-svg', role: 'img', 'aria-label': '按时间统计的输入、缓存命中与输出 Token 堆积柱状图' });
+    } };
+    function stackedChart(buckets, state) {
+        if (!buckets.length) return empty('还没有 Token 用量', '这里会按实际请求展示输入、输出和缓存命中的变化。');
+        var W = Math.max(800, buckets.length * 60 + 64), H = 245, L = 48, R = 16, T = 20, B = 38;
+        var max = Math.max(1, ...buckets.map(function (bucket) { return Math.max(bucket.totals.totalTokens || 0, (bucket.totals.promptTokens || 0) + (bucket.totals.completionTokens || 0)); })) * 1.12;
+        var chart = svg('svg', { viewBox: '0 0 ' + W + ' ' + H, cls: 'insight-chart-svg', role: 'group', 'aria-label': '按时间统计的 Token 柱状图，点击查看详情' }), marks = [];
         function y(value) { return H - B - value / max * (H - T - B); }
         for (var i = 0; i < 4; i++) {
             var value = max * i / 3;
-            chart.appendChild(svg('line', { x1: L, y1: y(value), x2: W - R, y2: y(value), stroke: 'var(--line)', 'stroke-dasharray': i ? '3 5' : '' }));
-            chart.appendChild(svg('text', { x: L - 8, y: y(value) + 3, 'text-anchor': 'end', 'font-size': '9', fill: 'var(--fg-dim)', text: compact(value) }));
+            chart.append(svg('line', { x1: L, y1: y(value), x2: W - R, y2: y(value), stroke: 'var(--line)', 'stroke-dasharray': i ? '3 5' : '' }), svg('text', { x: L - 8, y: y(value) + 3, 'text-anchor': 'end', 'font-size': '10', fill: 'var(--fg-dim)', text: compact(value) }));
         }
-        var minTime = buckets[0].ts, maxTime = buckets[buckets.length - 1].ts, minStep = Infinity;
-        for (var j = 1; j < buckets.length; j++)
-            if (buckets[j].ts > buckets[j - 1].ts)
-                minStep = Math.min(minStep, buckets[j].ts - buckets[j - 1].ts);
-        if (!Number.isFinite(minStep))
-            minStep = 3600000;
-        var span = Math.max(minStep, maxTime - minTime + minStep), barWidth = Math.max(2, Math.min(32, (W - L - R) * minStep / span * .61));
-        function x(ts) { return L + (ts - minTime + minStep / 2) / span * (W - L - R); }
+        var step = (W - L - R) / buckets.length;
         buckets.forEach(function (bucket, index) {
-            var totals = bucket.totals, cached = Math.min(totals.cachedTokens || 0, totals.promptTokens || 0), parts = [Math.max(0, (totals.promptTokens || 0) - cached), cached, totals.completionTokens || 0], offset = 0;
+            var cx = L + step * (index + .5), totals = bucket.totals, cached = Math.min(totals.cachedTokens || 0, totals.promptTokens || 0), parts = [Math.max(0, (totals.promptTokens || 0) - cached), cached, totals.completionTokens || 0], offset = 0, group = svg('g');
+            group.appendChild(svg('rect', { x: cx - step / 2 + 2, y: T, width: step - 4, height: H - B - T, rx: 4, fill: 'transparent', cls: 'insight-plot-hit' }));
             parts.forEach(function (amount, part) {
-                if (amount > 0) {
-                    var rect = svg('rect', { x: x(bucket.ts) - barWidth / 2, y: y(offset + amount), width: barWidth, height: y(offset) - y(offset + amount), rx: 1.5, fill: ['var(--accent)', 'var(--insight-cache)', 'var(--accent2)'][part] });
-                    rect.appendChild(svg('title', { text: (bucket.tooltipLabel || bucket.label) + ' · ' + ['未缓存输入', '缓存命中', '输出'][part] + ' ' + fmt(amount) + ' tokens · 总计 ' + fmt(totals.totalTokens) }));
-                    chart.appendChild(rect);
-                }
+                if (amount > 0) group.appendChild(svg('rect', { x: cx - 14, y: y(offset + amount), width: 28, height: Math.max(1, y(offset) - y(offset + amount)), rx: 2, fill: ['var(--accent)', 'var(--insight-cache)', 'var(--accent2)'][part] }));
                 offset += amount;
             });
-            if (index === 0 || index === buckets.length - 1 || index % Math.max(1, Math.ceil(buckets.length / 5)) === 0)
-                chart.appendChild(svg('text', { x: x(bucket.ts), y: H - 12, 'text-anchor': index === 0 ? 'start' : index === buckets.length - 1 ? 'end' : 'middle', 'font-size': '9', fill: 'var(--fg-dim)', text: bucket.label }));
+            if (!offset) group.appendChild(svg('line', { x1: cx - 14, x2: cx + 14, y1: y(0), y2: y(0), stroke: 'var(--fg-dim)', 'stroke-width': 2 }));
+            group.appendChild(svg('text', { x: cx, y: H - 12, 'text-anchor': 'middle', 'font-size': '10', fill: 'var(--fg-dim)', text: bucket.label }));
+            chart.appendChild(group);
+            marks.push({ key: String(bucket.ts), node: group, title: bucket.tooltipLabel || clock(bucket.ts, true), detail: function () {
+                var values = el('dl', { cls: 'insight-plot-values' });
+                [['请求', fmt(totals.requests || 0) + ' 次'], ['总 TOKEN', fmt(totals.totalTokens || 0)], ['输入（含缓存）', fmt(totals.promptTokens || 0)], ['输出', fmt(totals.completionTokens || 0)], ['已上报缓存', fmt(totals.cachedTokens || 0)], ['缓存未上报', fmt(totals.cacheMissRecords || 0) + ' 次']].forEach(function (pair) { values.appendChild(el('div', {}, [el('dt', { text: pair[0] }), el('dd', { text: pair[1] })])); });
+                return values;
+            } });
         });
-        return chart;
+        return interactivePlot(chart, marks, state);
     }
     function zeroTotals() { return { requests: 0, promptTokens: 0, completionTokens: 0, cachedTokens: 0, totalTokens: 0 }; }
     Studio.register('usage', function (container) {
+        var chartStates = {};
         var alive = true, data = null, range = 'hour', dimension = 'label', selected = '', filterType = '', error = '', loading = false, timer;
         var root = el('div', { cls: 'insight-page insight-usage' });
         container.appendChild(root);
@@ -288,6 +329,7 @@
                     map.set(stamp, zeroTotals());
                 var total = map.get(stamp);
                 total.requests++;
+                if (!entry.cacheReported) total.cacheMissRecords = (total.cacheMissRecords || 0) + 1;
                 ['promptTokens', 'completionTokens', 'cachedTokens', 'totalTokens'].forEach(function (key) { total[key] += Number(entry[key]) || 0; });
             });
             return Array.from(map.entries()).sort(function (a, b) { return a[0] - b[0]; }).map(function (pair) { return { ts: pair[0], label: new Date(pair[0]).toLocaleString('zh-CN', range === 'hour' ? { month: '2-digit', day: '2-digit', hour: '2-digit' } : { month: '2-digit', day: '2-digit' }), totals: pair[1] }; });
@@ -295,6 +337,7 @@
         function render() {
             if (!alive)
                 return;
+            Object.values(chartStates).forEach(function (state) { state.capture?.(); });
             body.textContent = '';
             if (!data) {
                 body.appendChild(empty(error ? '用量暂时不可用' : '正在读取用量', error || '读取真实请求记录与累计统计。'));
@@ -310,9 +353,9 @@
                 body.appendChild(el('div', { cls: 'insight-filter-banner' }, [el('span', { text: '正在查看 ' + (filterType === 'label' ? '来源' : '模型') + '：' + selected }), btn('清除筛选 ×', function () { selected = ''; filterType = ''; render(); }, 'insight-outline')]));
             var chart = el('section', { cls: 'insight-panel insight-usage-chart' });
             var tabs = el('div', { cls: 'insight-tabs' }, [btn('最近 48 小时', function () { range = 'hour'; render(); }, range === 'hour' ? 'insight-active' : ''), btn('按日', function () { range = 'day'; render(); }, range === 'day' ? 'insight-active' : '')]);
-            chart.appendChild(el('div', { cls: 'insight-panel-head' }, [el('div', {}, [el('h2', { text: '消耗随时间变化' }), el('p', { text: selected ? '筛选曲线仅来自最近 ' + data.entries.length + ' 条可用明细；累计卡片为全程统计。' : range === 'hour' ? '最近 48 小时 · 按真实请求明细统计' : '最近 14 个有记录的日期 · 累计日统计' })]), tabs]));
-            chart.appendChild(stackedChart(buckets()));
-            chart.appendChild(el('div', { cls: 'insight-legend' }, [['input', '未缓存输入'], ['cache', '缓存命中'], ['output', '输出']].map(function (pair) { return el('span', { cls: 'insight-legend-' + pair[0] }, [el('i'), el('span', { text: pair[1] })]); })));
+            chart.appendChild(el('div', { cls: 'insight-panel-head' }, [el('div', {}, [el('h2', { text: '消耗随时间变化' }), el('p', { text: selected ? '筛选曲线仅来自最近 ' + data.entries.length + ' 条可用明细；累计卡片为全程统计。' : range === 'hour' ? '最近 48 小时 · 按真实请求明细统计' : '最近 14 个有记录的日期 · 每柱对应一天，空白日期省略' })]), tabs]));
+            chart.appendChild(stackedChart(buckets(), chartStates[range + ':' + filterType + ':' + selected] || (chartStates[range + ':' + filterType + ':' + selected] = {})));
+            chart.appendChild(el('div', { cls: 'insight-legend' }, [['input', '输入（扣除已报缓存）'], ['cache', '缓存命中'], ['output', '输出']].map(function (pair) { return el('span', { cls: 'insight-legend-' + pair[0] }, [el('i'), el('span', { text: pair[1] })]); })));
             body.appendChild(chart);
             var lower = el('div', { cls: 'insight-usage-lower' });
             var breakdown = el('section', { cls: 'insight-panel insight-breakdown' });
