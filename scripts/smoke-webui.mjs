@@ -93,7 +93,7 @@ try {
   await wait("document.querySelector('.studio-avatar img')?.naturalWidth > 0");
   assert.ok(await evaluate("document.querySelector('.studio-avatar img').alt.includes('样本平台账号')"));
   const helpers = { evaluate, wait, assert, navigate, page };
-  const routes = ['overview', 'world', 'growth', 'devices', 'player', 'live', 'debug', 'usage', 'state', 'crossing', 'config', 'prompts', 'gallery', 'media', 'data', 'visitors', 'commands'];
+  const routes = ['overview', 'world', 'growth', 'devices', 'player', 'live', 'debug', 'usage', 'state', 'crossing', 'config', 'prompts', 'gallery', 'media', 'data', 'visitors'];
   for (const width of [1440, 768, 375]) {
     await page('Emulation.setDeviceMetricsOverride', { width, height: 1050, deviceScaleFactor: 1, mobile: width < 600 });
     for (const route of routes) {

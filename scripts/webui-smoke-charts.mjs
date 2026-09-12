@@ -9,7 +9,7 @@ export default async function smokeCharts({ evaluate, wait, assert, navigate, pa
   await evaluate("Array.from(document.querySelectorAll('.insight-tabs button')).find(b=>b.textContent==='事件密度').click()");
   await wait("document.querySelector('.insight-plot-detail').textContent.includes('条事件')");
   await evaluate("document.querySelector('.insight-plot-detail button').click()");
-  assert(await evaluate("document.querySelector('.insight-detail .insight-raw')?.textContent.length > 0"));
+  assert(await evaluate("document.querySelector('.insight-detail .readable-data')?.textContent.length > 0"));
   await evaluate("document.querySelector('.live-lane .live-link').click()");
   assert(await evaluate("!document.querySelector('#observatory-calls').hidden && document.querySelector('#observatory-events').hidden"));
   await evaluate("Studio.navigate('debug')");

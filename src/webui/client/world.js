@@ -16,7 +16,6 @@
         return n;
     }
     function short(value, n) { var s = String(value); return s.length > n ? s.slice(0, n - 1) + '…' : s; }
-    function valueText(value) { return typeof value === 'object' ? JSON.stringify(value, null, 2) : String(value); }
     function graphModel(entities) {
         var byId = new Map(entities.map(function (e) { return [e.id, e]; })), levels = new Map(), coords = new Map();
         function depth(e, seen) { if (!e.location || !byId.has(e.location) || seen.has(e.id))
@@ -84,7 +83,8 @@
         holder.appendChild(makeGraph(shown, { owner: false, select: Studio.inspectEntity }).svg);
     };
     Studio.register('world', function (holder) {
-        var alive = true, busy = false, data = null, selected = Studio.takeSelectedEntity(), query = '', filter = 'all', mode = 'graph', showLocation = true, showOwner = true, viewBox = null, chosenEvent = null, pendingFocus = null;
+        var alive = true, busy = false, data = null, selected = Studio.takeSelectedEntity(), query = '', filter = 'all', mode = 'graph', showLocation = true, showOwner = true, viewBox = null, chosenEvent = null, pendingFocus = null, readableStates = Object.create(null);
+        function readState(key) { return readableStates[key] || (readableStates[key] = {}); }
         var controls = el('div', { cls: 'world-controls' }), content = el('div'), actions = el('div', { cls: 'world-actions' }), eventsPanel = el('div', { cls: 'world-actions' });
         holder.append(Studio.title('THE SHAPE OF YOUR WORLD', '世界关系图', '连接地点、角色与物件。选择一个实体，查看它在哪里、属于谁，以及它的当前状态。', [Studio.button('刷新状态', 'refresh', refresh)]), controls, content, actions, eventsPanel);
         content.appendChild(el('div', { cls: 'studio-skeleton' }));
@@ -198,14 +198,13 @@
             var attrs = Object.entries(e.attributes || {});
             if (!attrs.length)
                 body.appendChild(el('p', { cls: 'studio-description', text: '尚未记录属性；未知信息保持未知。' }));
-            attrs.forEach(function (a) { body.appendChild(el('div', { cls: 'world-property' }, [el('div', { cls: 'world-property-head' }, [el('span', { text: a[0] }), el('span', { cls: 'world-visibility ' + a[1].visibility, text: { public: '公开', owner: '自身 / 所有者', hidden: '隐藏' }[a[1].visibility] || a[1].visibility })]), el('div', { cls: 'world-property-value', text: valueText(a[1].value) })])); });
+            attrs.forEach(function (a) { body.appendChild(el('div', { cls: 'world-property' }, [el('div', { cls: 'world-property-head' }, [el('span', { text: ReadableData.label(a[0]), title: a[0] }), el('span', { cls: 'world-visibility ' + a[1].visibility, text: { public: '公开', owner: '自身 / 所有者', hidden: '隐藏' }[a[1].visibility] || a[1].visibility })]), el('div', { cls: 'world-property-value' }, [ReadableData.render(a[1].value, { compact: true, state: readState(JSON.stringify([e.id, a[0]])) })])])); });
             var relevant = (data.events || []).filter(function (event) { return event.actorId === e.id || event.payload?.changedEntityIds?.includes(e.id) || event.payload?.entityIds?.includes(e.id); }).slice(-4).reverse();
             if (relevant.length) {
                 body.appendChild(el('h4', { text: '相关事件' }));
                 relevant.forEach(function (event) { body.appendChild(el('button', { cls: 'world-event-link', text: '#' + event.sequence + ' · ' + event.topic, onclick: function () { showEvent(event); } })); });
             }
-            var raw = el('details', { style: 'margin-top:18px' }, [el('summary', { text: '查看原始数据', style: 'font-size:10px;color:var(--fg-dim)' }), el('pre', { text: JSON.stringify(e, null, 2), style: 'margin-top:10px;max-height:330px;overflow:auto' })]);
-            body.appendChild(raw);
+            body.appendChild(ReadableData.raw(e, { state: readState('entity:' + e.id) }));
             inspector.appendChild(body);
         }
         function drawActions(snapshot) {
@@ -239,7 +238,7 @@
                 related.forEach(function (e) { links.appendChild(Studio.button('#' + e.sequence + ' ' + e.topic, 'link', function () { showEvent(e); })); });
                 if (chosenEvent.causationId && !related.some(function (e) { return e.id === chosenEvent.causationId; }))
                     box.appendChild(el('p', { cls: 'studio-description', text: '上游事件不在当前返回窗口中：' + chosenEvent.causationId }));
-                box.append(links, el('pre', { text: JSON.stringify(chosenEvent, null, 2) }));
+                box.append(links, ReadableData.render(chosenEvent, { state: readState('event:' + chosenEvent.id) }));
                 panel.appendChild(box);
             }
             eventsPanel.appendChild(panel);

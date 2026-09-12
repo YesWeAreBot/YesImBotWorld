@@ -24,7 +24,6 @@
         sessionStorage.setItem('studio.journey.' + key, JSON.stringify(session));
     }
     catch (_) { } }
-    function text(value) { return value == null ? '未知' : typeof value === 'boolean' ? value ? '是' : '否' : typeof value === 'object' ? JSON.stringify(value) : String(value); }
     var attributeNames = { posture: '姿态', hunger: '饥饿', health: '健康', energy: '精力', thirst: '口渴', temperature: '温度', lighting: '光线', material: '材质', open: '打开', filled: '装满', consciousness: '意识状态', injuries: '伤情', wetness: '湿润', powered: '电源' };
     function time(ts) { return new Date(ts).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' }); }
     function button(label, action, cls) { return el('button', { type: 'button', cls: 'journey-button ' + (cls || ''), text: label, onclick: action }); }
@@ -38,7 +37,8 @@
     Studio.register('player', function (container) {
         var key = scope(), state = getSession(key), destroyed = false, stream = null, busy = false, observeBusy = false, selectedTarget = '';
         var profile = { name: '', persona: '' }, resident = '', residentDefinition = '', errorText = '', route = state.takeover ? 'takeover' : 'cross', takeoverMode = state.mode === 'puppet' ? 'puppet' : 'avatar', cockpitDraft = {}, cockpit = { tools: [], pending: [] }, formDraft = { description: '', speech: '', duration: '0' };
-        var main = el('div', { cls: 'journey-page' });
+        var main = el('div', { cls: 'journey-page' }), readableStates = new WeakMap();
+        function readState(record, key) { var group = readableStates.get(record); if (!group) { group = Object.create(null); readableStates.set(record, group); } return group[key] || (group[key] = {}); }
         container.appendChild(main);
         var observerLabel = '', connectTimer = null, controlTimer = null, controlRefreshing = false, control = { synced: false, paused: false, busy: false };
         var allowed = !isVisitor() || visitorCanSee(['__player__']);
@@ -90,7 +90,7 @@
                         log(parsed.action.status === 'failed' ? 'failure' : 'result', actionText, { actionKey: actionKey });
                 }
             }
-            else if (typeof content === 'string' && !state.events.some(function (event) { return event.content === content && Date.now() - event.ts < 2500; }))
+            else if (!state.events.some(function (event) { return event.content === content && Date.now() - event.ts < 2500; }))
                 log(kind || 'world', content);
         }
         function toolResult(result) {
@@ -469,12 +469,13 @@
             card.appendChild(el('div', { cls: 'journey-entity-top' }, [el('span', { cls: 'journey-entity-symbol', 'aria-hidden': 'true', html: icon(entity.kind === 'place' ? 'world' : entity.kind === 'actor' ? 'user' : 'box') }), el('span', { cls: 'journey-tag', text: entity.self ? '自己' : ({ place: '地点', actor: '角色', object: '物件' }[entity.kind] || '实体') })]));
             card.appendChild(el('h3', { text: entity.name }));
             var facts = el('dl', { cls: 'journey-facts' });
-            attrs.slice(0, 6).forEach(function (entry) { facts.appendChild(el('div', {}, [el('dt', { text: attributeNames[entry[0]] || entry[0] }), el('dd', { text: text(entry[1]) })])); });
+            attrs.slice(0, 6).forEach(function (entry) { facts.appendChild(el('div', {}, [el('dt', { text: attributeNames[entry[0]] || entry[0], title: entry[0] }), el('dd', {}, [ReadableData.render(entry[1], { compact: true, state: readState(entity, entry[0]) })])])); });
             if (!attrs.length)
                 facts.appendChild(note('尚未观察到更多属性。'));
             card.appendChild(facts);
             if (attrs.length > 6)
-                card.appendChild(el('details', { cls: 'journey-more' }, [el('summary', { text: '另 ' + (attrs.length - 6) + ' 项属性' }), el('pre', { text: JSON.stringify(entity.attributes, null, 2) })]));
+                card.appendChild(el('details', { cls: 'journey-more' }, [el('summary', { text: '另 ' + (attrs.length - 6) + ' 项属性' }), ReadableData.render(Object.fromEntries(attrs.slice(6)), { compact: true, state: readState(entity, ':more') })]));
+            card.appendChild(ReadableData.raw(entity, { label: '观测依据与原始属性', state: readState(entity, ':raw') }));
             if (!entity.self)
                 card.appendChild(button(selectedTarget === entity.observedId ? '已选为目标' : '选择为行动目标', function () { selectedTarget = entity.observedId; redraw(); }, 'journey-entity-select'));
             return card;
@@ -522,7 +523,7 @@
                 var labels = { intent: '你的意图', observation: '世界观测', speech: event.speaker || '听到的声音', result: '行动回执', failure: '未完成', system: '会话', world: '世界' };
                 rows.appendChild(el('article', { cls: 'journey-feed-row journey-feed-' + event.kind }, [
                     el('div', { cls: 'journey-feed-meta' }, [el('strong', { text: labels[event.kind] || '世界' }), el('time', { text: time(event.ts), title: new Date(event.ts).toLocaleString() })]),
-                    el('p', { text: event.content }), event.speech ? el('blockquote', { text: event.speech }) : null,
+                    ReadableData.render(event.content, { compact: true, raw: event.kind === 'result' || event.kind === 'failure' || event.kind === 'world', state: readState(event, 'content') }), event.speech ? el('blockquote', { text: event.speech }) : null,
                     event.attachments ? el('div', { cls: 'cockpit-result-attachments' }, event.attachments.map(media)) : null,
                     event.sourceEventIds && event.sourceEventIds.length ? el('details', { cls: 'journey-provenance' }, [el('summary', { text: event.sourceEventIds.length + ' 个原始来源' }), el('code', { text: event.sourceEventIds.join('\n') })]) : null
                 ]));

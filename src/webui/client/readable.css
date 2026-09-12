@@ -1,0 +1,34 @@
+.readable-data { min-width: 0; max-width: 100%; font-size: 12px; line-height: 1.65; color: var(--fg); text-align: left; white-space: normal; }
+.readable-fields, .readable-array { margin: 0; padding: 0; list-style: none; min-width: 0; }
+.readable-fields > .readable-row { display: grid; grid-template-columns: minmax(90px, .65fr) minmax(0, 1.7fr); gap: 14px; padding: 10px 0; border-bottom: 1px solid var(--line); }
+.readable-fields > .readable-row:last-child { border-bottom: 0; }
+.readable-data .readable-row > dt, .readable-data .readable-row > dd { min-width: 0; max-width: none; margin: 0; text-align: left; }
+.readable-key { display: flex; align-items: baseline; flex-wrap: wrap; gap: 3px 6px; font-weight: 600; overflow-wrap: anywhere; }
+.readable-original-key { padding: 0; background: none; font-size: 10px; font-weight: 400; color: var(--fg-dim); overflow-wrap: anywhere; }
+.readable-long-text { min-width: 0; }
+.readable-data .readable-prose, .readable-data .readable-source, .readable-raw .readable-source { margin: 0; padding: 0; white-space: pre-wrap; overflow-wrap: anywhere; word-break: normal; background: none; border: 0; border-radius: 0; color: inherit; max-height: none; font: inherit; text-align: left; }
+.readable-scalar { overflow-wrap: anywhere; }
+.readable-boolean { color: var(--accent); }
+.readable-number { color: var(--accent2); font-variant-numeric: tabular-nums; }
+.readable-null { color: var(--fg-dim); font-size: 11px; }
+.readable-branch { min-width: 0; border-left: 2px solid var(--line); padding-left: 12px; }
+.readable-summary { cursor: pointer; color: var(--accent); padding: 3px 0; overflow-wrap: anywhere; }
+.readable-summary:focus-visible, .readable-raw > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 3px; }
+.readable-branch[open] > .readable-summary { margin-bottom: 8px; }
+.readable-branch .readable-fields > .readable-row { grid-template-columns: 1fr; gap: 4px; }
+.readable-array > .readable-row { display: grid; grid-template-columns: 26px minmax(0, 1fr); align-items: baseline; gap: 8px; padding: 10px 0; border-bottom: 1px solid var(--line); }
+.readable-index { color: var(--fg-dim); font-size: 10px; font-variant-numeric: tabular-nums; }
+.readable-data .readable-button, .readable-raw .readable-button { display: inline-flex; width: auto; min-height: 32px; height: auto; margin-top: 10px; padding: 5px 10px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface); color: var(--fg-dim); font-size: 10px; line-height: 1.5; white-space: normal; text-align: left; }
+.readable-data .readable-button:hover, .readable-raw .readable-button:hover { color: var(--accent); border-color: var(--accent); }
+.readable-data .readable-more { color: var(--accent); }
+.readable-raw { margin-top: 12px; min-width: 0; border-top: 1px solid var(--line); padding-top: 10px; }
+.readable-raw > summary { cursor: pointer; font-size: 10px; color: var(--fg-dim); }
+.readable-raw .readable-source { margin-top: 10px; font-family: var(--mono, monospace); font-size: 10px; }
+.readable-compact { font-size: inherit; }
+.readable-compact .readable-fields > .readable-row { grid-template-columns: 1fr; gap: 4px; padding: 6px 0; }
+.journey-facts > div > dd { min-width: 0; flex: 1; }
+.readable-copy-field { position: fixed; left: -10000px; top: 0; }
+@media (max-width: 600px) {
+  .readable-fields > .readable-row { grid-template-columns: 1fr; gap: 5px; }
+  .readable-data .readable-button, .readable-raw .readable-button { min-height: 40px; }
+}

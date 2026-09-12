@@ -2,7 +2,7 @@
 (function () {
     'use strict';
     var calls = new Map(), raw = new Map(), listeners = new Set(), request = null, error = '', connected = null, epoch = 0, refreshTimer = null;
-    var selection = { id: null, follow: true, tab: 'response', source: 'all', search: '', wrap: true }, detailFlight = new Map(), lastPull = 0, eventSerial = 0, eventSeen = new Map();
+    var selection = { id: null, follow: true, tab: 'response', format: 'readable', source: 'all', search: '', wrap: true }, detailFlight = new Map(), lastPull = 0, eventSerial = 0, eventSeen = new Map();
     function allowed() { return !isVisitor() || visitorCanSee(['debug']); }
     function active(call) { return call && !call.missing && (call.status === 'pending' || call.status === 'streaming'); }
     function ordered() { return Array.from(calls.values()).sort(function (a, b) { return a.startedAt - b.startedAt || a.callId.localeCompare(b.callId); }); }
@@ -137,11 +137,12 @@
         root.append(head, connection, lanes, notice);
         container.appendChild(root);
         var insightsCleanup = null, showCallPanel = null;
+        var reader = null, reading = null, readableButton = null, rawButton = null;
         var timeline = null, detail = null, requestButton = null, responseButton = null, followButton = null, code = null, detailMeta = null, rawNotice = null, copyButton = null, wrapButton = null, count = null;
         if (!compact) {
             var workspace = el('div', { id: 'observatory-calls', role: 'tabpanel', 'aria-labelledby': 'observatory-tab-calls' }), insightHost = el('div', { id: 'observatory-events', role: 'tabpanel', 'aria-labelledby': 'observatory-tab-events', hidden: true });
             var sectionTabs = el('div', { cls: 'observatory-tabs', role: 'tablist', 'aria-label': '运行洞察内容' });
-            var callTab = button('调用原文', function () { switchPanel(false); }), eventTab = button('事件与图表', function () { switchPanel(true); });
+            var callTab = button('调用详情', function () { switchPanel(false); }), eventTab = button('事件与图表', function () { switchPanel(true); });
             [callTab, eventTab].forEach(function (tab, i) { tab.id = 'observatory-tab-' + (i ? 'events' : 'calls'); tab.setAttribute('role', 'tab'); tab.setAttribute('aria-controls', i ? insightHost.id : workspace.id); tab.setAttribute('aria-selected', String(!i)); tab.tabIndex = i ? -1 : 0; tab.onkeydown = function (event) { if (['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) { event.preventDefault(); var next = event.key === 'Home' ? false : event.key === 'End' ? true : !i; switchPanel(next); (next ? eventTab : callTab).focus(); } }; });
             function switchPanel(events) { workspace.hidden = events; insightHost.hidden = !events; callTab.setAttribute('aria-selected', String(!events)); eventTab.setAttribute('aria-selected', String(events)); callTab.tabIndex = events ? -1 : 0; eventTab.tabIndex = events ? 0 : -1; if (events && !insightsCleanup) insightsCleanup = window.RuntimeInsights.mount(insightHost); }
             showCallPanel = function () { switchPanel(false); };
@@ -161,29 +162,39 @@
             history.append(count, timeline);
             detail = el('div', { cls: 'live-detail' });
             detailMeta = el('div', { cls: 'live-detail-meta' });
-            var tabs = el('div', { cls: 'live-raw-tabs', role: 'tablist', 'aria-label': '原始数据类型' });
-            requestButton = button('原始请求', function () { selection.tab = 'request'; render(); }, 'live-raw-tab');
-            responseButton = button('原始返回', function () { selection.tab = 'response'; render(); }, 'live-raw-tab');
+            var tabs = el('div', { cls: 'live-raw-tabs', role: 'tablist', 'aria-label': '调用内容类型' });
+            requestButton = button('请求', function () { selection.tab = 'request'; render(); }, 'live-raw-tab');
+            responseButton = button('返回', function () { selection.tab = 'response'; render(); }, 'live-raw-tab');
             [requestButton, responseButton].forEach(function (b) { b.setAttribute('role', 'tab'); });
-            copyButton = button('复制', async function () { var item = raw.get(selection.id), text = selection.tab === 'request' ? item?.request : item?.response; if (typeof text !== 'string')
+            copyButton = button('复制', async function () { var item = raw.get(selection.id), text = selection.format === 'readable' ? reader.text() : selection.tab === 'request' ? item?.request : item?.response; if (typeof text !== 'string')
                 return; try {
                 await navigator.clipboard.writeText(text);
-                toast('已复制' + (item.unavailable ? '本地已缓存部分' : '原始' + (selection.tab === 'request' ? '请求' : '返回')), 'ok');
+                toast(selection.format === 'readable' ? '已复制可读内容' : '已复制' + (item.unavailable ? '本地已缓存部分' : '原始' + (selection.tab === 'request' ? '请求' : '返回')), 'ok');
             }
             catch (err) {
                 toast('无法访问剪贴板，请在正文中选择并复制。', 'err');
             } }, 'live-button');
             wrapButton = button('自动折行', function () { selection.wrap = !selection.wrap; render(); }, 'live-button');
-            tabs.append(requestButton, responseButton, wrapButton, copyButton);
+            tabs.append(requestButton, responseButton);
+            var viewOptions = el('div', { cls: 'live-view-options', role: 'group', 'aria-label': '查看方式' });
+            readableButton = button('阅读视图', function () { selection.format = 'readable'; render(); }, 'live-button live-view-read');
+            rawButton = button('原始数据', function () { selection.format = 'raw'; render(); }, 'live-button live-view-raw');
+            viewOptions.append(readableButton, rawButton, wrapButton, copyButton);
             rawNotice = el('div', { cls: 'live-raw-notice', 'aria-live': 'polite' });
             code = el('pre', { cls: 'live-raw-code', tabindex: '0', 'aria-label': '调用原始数据' });
-            detail.append(detailMeta, tabs, rawNotice, code);
+            reading = el('div', { cls: 'live-reading', tabindex: '0', 'aria-label': '可读调用内容' });
+            reader = CallReader.create(reading);
+            detail.append(detailMeta, tabs, viewOptions, rawNotice, reading, code);
             grid.append(history, detail);
             workspace.append(grid, el('p', { cls: 'live-retention', text: '原始数据仅保存在服务端内存：最多 200 次调用、合计 32 MB、单次 8 MB。超限会明确显示不可用；普通调试摘要与事务可在本页「事件与图表」查看。' }));
             timeline.addEventListener('wheel', function () { if (selection.follow) {
                 selection.follow = false;
                 render();
             } }, { passive: true });
+        }
+        function readablePreview(value) {
+            if (!value) return '';
+            try { return ReadableData.text(JSON.parse(value)); } catch (_) { return value; }
         }
         function schedule() { if (!alive || scheduled)
             return; scheduled = setTimeout(function () { scheduled = null; render(); }, 100); }
@@ -198,7 +209,7 @@
                 lane.dataset.state = call?.status || 'empty';
                 lane.querySelector('.live-lane-state').textContent = call ? status(call) : '暂无调用';
                 lane.querySelector('.live-lane-model').textContent = call ? call.model + (pending > 1 ? ' · ' + pending + ' 个并发调用' : '') : who === 'Bot' ? '角色的判断与行动' : '环境的演化与裁定';
-                var preview = lane.querySelector('.live-lane-preview'), next = call ? (call.preview || (call.status === 'pending' ? '请求已发送，正在等待真实响应。' : call.status === 'streaming' ? '已收到原始响应片段；点击查看流内容。' : call.error || '本次调用没有可显示的正文。')) : '还没有收到 ' + who + ' 的调用事件。';
+                var preview = lane.querySelector('.live-lane-preview'), next = call ? (readablePreview(call.preview) || (call.status === 'pending' ? '请求已发送，正在等待真实响应。' : call.status === 'streaming' ? '已收到响应片段，内容正在生成。' : call.error || '本次调用没有可显示的正文。')) : '还没有收到 ' + who + ' 的调用事件。';
                 if (preview.textContent !== next) {
                     preview.textContent = next;
                     if (selection.follow)
@@ -221,6 +232,7 @@
             root.hidden = !allowed();
             if (!allowed()) {
                 code && (code.textContent = '');
+                reader && reader.clear();
                 return;
             }
             var list = ordered();
@@ -267,10 +279,15 @@
             requestButton.setAttribute('aria-selected', String(selection.tab === 'request'));
             responseButton.setAttribute('aria-selected', String(selection.tab === 'response'));
             wrapButton.setAttribute('aria-pressed', String(selection.wrap));
+            readableButton.setAttribute('aria-pressed', String(selection.format === 'readable'));
+            rawButton.setAttribute('aria-pressed', String(selection.format === 'raw'));
+            reading.hidden = selection.format !== 'readable'; code.hidden = selection.format !== 'raw'; wrapButton.hidden = selection.format !== 'raw';
+            copyButton.textContent = selection.format === 'readable' ? '复制内容' : '复制原文';
             code.classList.toggle('live-nowrap', !selection.wrap);
             if (!call) {
                 detailMeta.textContent = '选择一次调用';
-                rawNotice.textContent = '原始请求和返回将显示在这里。';
+                rawNotice.textContent = '请求消息和模型返回将显示在这里。';
+                reader.clear();
                 code.textContent = '';
                 copyButton.disabled = true;
                 return;
@@ -279,6 +296,15 @@
             var key = selection.id + ':' + selection.tab, text = selection.tab === 'request' ? item?.request : item?.response;
             if (typeof text !== 'string')
                 text = '';
+            var readingSelection = window.getSelection(), readingHeld = readingSelection && !readingSelection.isCollapsed && reading.contains(readingSelection.anchorNode), readingScroll = reading.scrollTop;
+            if (selection.tab === 'request') reader.request(text, key);
+            else {
+                var decoder = item && (item.decoder || (item.decoder = CallContent.createResponseDecoder()));
+                var awaitingRaw = !item || item.revision < call.revision;
+                reader.response(decoder ? decoder.update(text, call.responseFormat, active(call) || awaitingRaw) : { choices: [], warnings: [], pending: true }, key, { active: active(call), awaitingRaw: awaitingRaw, format: call.responseFormat });
+            }
+            if (selection.follow && !readingHeld && selection.tab === 'response') reading.scrollTop = reading.scrollHeight;
+            else reading.scrollTop = readingScroll;
             var selectionRange = window.getSelection(), holding = selectionRange && !selectionRange.isCollapsed && code.contains(selectionRange.anchorNode), scroll = code.scrollTop;
             if (key !== selectedKey || !text.startsWith(drawn)) {
                 code.textContent = text;
@@ -292,7 +318,7 @@
                 code.scrollTop = code.scrollHeight;
             else
                 code.scrollTop = scroll;
-            rawNotice.textContent = call.missing ? '调用已离开服务端缓存；当前显示浏览器已缓存的数据。' : item?.error ? '读取失败：' + item.error : item?.unavailable ? item.unavailable + (text ? ' · 当前仅显示已在浏览器缓存的部分。' : '') : !call.rawAvailable ? (call.rawUnavailableReason || '原始数据已不可用') : !item ? '正在读取原始数据…' : selection.tab === 'request' ? '实际发送的 JSON 请求体 · ' + bytes(call.requestBytes) + (call.unicodeRepairedStrings ? ' · 已修复 ' + call.unicodeRepairedStrings + ' 处非法 Unicode' : '') : active(call) ? '原始响应正在追加 · ' + bytes(call.responseBytes) + (call.responseFormat ? ' · ' + call.responseFormat : '') : '原始响应 · ' + bytes(call.responseBytes) + (call.responseFormat ? ' · ' + call.responseFormat : '') + (call.error ? ' · ' + call.error : '');
+            rawNotice.textContent = call.missing ? '调用已离开服务端缓存；当前显示浏览器已缓存的数据。' : item?.error ? '读取失败：' + item.error : item?.unavailable ? item.unavailable + (text ? ' · 当前仅显示已在浏览器缓存的部分。' : '') : !call.rawAvailable ? (call.rawUnavailableReason || '原始数据已不可用') : !item ? '正在读取原始数据…' : selection.tab === 'request' ? (selection.format === 'readable' ? '请求按消息与工具展开 · ' : '实际发送的 JSON 请求体 · ') + bytes(call.requestBytes) + (call.unicodeRepairedStrings ? ' · 已修复 ' + call.unicodeRepairedStrings + ' 处非法 Unicode' : '') : active(call) ? (selection.format === 'readable' ? '模型内容实时更新 · ' : '原始响应正在追加 · ') + bytes(call.responseBytes) + (call.responseFormat ? ' · ' + call.responseFormat : '') : (selection.format === 'readable' ? '模型返回 · ' : '原始响应 · ') + bytes(call.responseBytes) + (call.responseFormat ? ' · ' + call.responseFormat : '') + (call.error ? ' · ' + call.error : '');
             if (!call.missing && (!item || item.revision < call.revision) && (!item?.nextRetry || Date.now() >= item.nextRetry)) {
                 clearTimeout(detailTimer);
                 detailTimer = setTimeout(function () { if (alive)
@@ -302,8 +328,9 @@
         }
         var unwatch = watch(schedule), clockTimer = setInterval(function () { if (alive && !document.hidden && ordered().some(active))
             schedule(); }, 1000);
+        if (!compact) document.addEventListener('selectionchange', schedule);
         render();
-        return function () { alive = false; if (insightsCleanup) insightsCleanup(); unwatch(); clearTimeout(scheduled); clearTimeout(detailTimer); clearInterval(clockTimer); root.remove(); };
+        return function () { alive = false; if (insightsCleanup) insightsCleanup(); unwatch(); document.removeEventListener('selectionchange', schedule); clearTimeout(scheduled); clearTimeout(detailTimer); clearInterval(clockTimer); root.remove(); };
     }
     window.LiveCalls = { mount: mount, refresh: refresh };
     Studio.register('live', function (container) { return mount(container); });

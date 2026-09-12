@@ -16,7 +16,6 @@ var Studio = (function () {
         ['gallery', '相册', 'image', ['gallery']],
         ['data', '记事与存档', 'folder', ['notes', 'archive']],
         { group: '管理工作室' },
-        ['commands', '世界指令', 'sliders'],
         ['state', '世界设定', 'file', ['definitions', 'world_status', 'bot_status', 'news', 'facts']],
         ['crossing', '世界连接', 'portal', ['crossing']],
         ['prompts', '提示词', 'edit', ['prompts']],
@@ -45,12 +44,13 @@ var Studio = (function () {
         shield: svgIcon('<path d="m12 3 8 3v6c0 5-8 9-8 9s-8-4-8-9V6Z"/><path d="m8 12 3 3 5-6"/>')
     });
     NAV = routes;
-    function routeFor(name) { if (name === 'debug') name = 'live'; return routes.find(function (r) { return r[0] === name; }); }
+    function routeFor(name) { if (name === 'debug') name = 'live'; if (name === 'commands') name = 'overview'; return routes.find(function (r) { return r[0] === name; }); }
     function can(name) { var r = routeFor(name); return !!r && visitorCanSee(r[3]); }
     function firstRoute() { return (routes.find(function (r) { return !r.group && visitorCanSee(r[3]); }) || ['overview'])[0]; }
     function register(name, render) { views.set(name, render); }
     function navigate(name) {
         if (name === 'debug') name = 'live';
+        if (name === 'commands') name = 'overview';
         if (!can(name))
             name = firstRoute();
         if (cfgDirty && activeView === 'config' && name !== 'config' && !confirm('配置有未保存的修改，仍要离开吗？'))
@@ -241,7 +241,15 @@ var Studio = (function () {
         var alive = true, refreshing = false;
         var liveHost = can('live') && window.LiveCalls ? el('div', { cls: 'studio-live-overview' }) : null;
         var liveCleanup = liveHost ? window.LiveCalls.mount(liveHost, { compact: true }) : null;
-        holder.appendChild(el('div', { cls: 'studio-skeleton' }));
+        var commandHost = !isVisitor() && window.WorldCommands ? el('div', { cls: 'studio-overview-commands' }) : null;
+        var commandCleanup = commandHost ? window.WorldCommands.mount(commandHost) : null;
+        // Keep interactive hosts connected while the surrounding snapshot refreshes.
+        var headingHost = el('div'), heroHost = el('div'), bodyHost = el('div');
+        holder.append(headingHost, heroHost);
+        if (commandHost) holder.appendChild(commandHost);
+        if (liveHost) holder.appendChild(liveHost);
+        holder.appendChild(bodyHost);
+        bodyHost.appendChild(el('div', { cls: 'studio-skeleton' }));
         function refresh() {
             if (!alive || refreshing || document.hidden)
                 return;
@@ -250,12 +258,12 @@ var Studio = (function () {
             var growthPromise = can('growth') ? fetchGrowth().catch(function () { return []; }) : Promise.resolve([]);
             Promise.all([refreshOverview(false), worldPromise, growthPromise]).then(function (result) { if (alive)
                 draw(result[0], result[1], result[2]); }).catch(function (e) { if (alive)
-                error(holder, e, refresh); }).finally(function () { refreshing = false; });
+                error(bodyHost, e, refresh); }).finally(function () { refreshing = false; });
         }
         function draw(o, world, growth) {
             var snapshot = world?.snapshot, entities = Object.values(snapshot?.entities || {}), events = world?.events || [], bot = snapshot?.entities.bot;
             var running = Object.values(snapshot?.actions || {}).filter(function (a) { return a.status === 'pending'; });
-            holder.replaceChildren(title('YOUR WORLD, AT A GLANCE', '世界工作室', '看见世界如何变化，也参与角色的每一个当下。', [button('走进世界', 'door', function () { navigate('player'); }, true)].filter(function () { return can('player'); })));
+            headingHost.replaceChildren(title('YOUR WORLD, AT A GLANCE', '世界工作室', '看见世界如何变化，也参与角色的每一个当下。', [button('走进世界', 'door', function () { navigate('player'); }, true)].filter(function () { return can('player'); })));
             var hero = el('section', { cls: 'studio-hero' });
             var heroCopy = el('div', { cls: 'studio-hero-copy' }, [el('div', { cls: 'studio-eyebrow', text: o.initialized ? 'A WORLD IN PROGRESS' : 'THE FIRST CHAPTER' }), el('h2', { text: o.initialized ? '你好，欢迎回来。' : '从一个世界开始。' }), el('p', { text: !o.initialized ? '写下角色与世界设定，让第一组事实成为故事的起点。' : o.worldRunning ? '世界正在运转。观察发生了什么，或拿起设备，与角色共享此刻。' : '世界目前未运行。你可以先探索已有状态，再继续角色的生活。' })]);
             var actions = el('div', { cls: 'studio-hero-actions' });
@@ -277,9 +285,9 @@ var Studio = (function () {
                 actions.appendChild(button('打开设备', 'phone', function () { navigate('devices'); }));
             heroCopy.appendChild(actions);
             hero.append(heroCopy, el('div', { html: art() }), el('span', { cls: 'studio-hero-footnote', text: 'WORLD / STUDIO' }));
-            holder.appendChild(hero);
-            if (liveHost) holder.appendChild(liveHost);
-            holder.appendChild(el('div', { cls: 'studio-kpi-row' }, [
+            heroHost.replaceChildren(hero);
+            bodyHost.replaceChildren();
+            bodyHost.appendChild(el('div', { cls: 'studio-kpi-row' }, [
                 kpi('世界实体', snapshot ? entities.length : '—', snapshot ? entities.filter(function (e) { return e.kind === 'place'; }).length + ' 个地点 · ' + entities.filter(function (e) { return e.kind === 'object'; }).length + ' 件物品' : '完整世界仅管理员可见', 'world'),
                 kpi('正在行动', snapshot ? running.length : o.worldQueue, snapshot ? '已开始、尚未结束的动作' : '等待世界裁定的任务', 'activity'),
                 kpi('角色认识', can('growth') ? growth.length : '—', growth.filter(function (g) { return g.status === 'contested'; }).length + ' 条认识存在反证', 'growth'),
@@ -318,7 +326,7 @@ var Studio = (function () {
             character.appendChild(row('所在位置', bot?.location ? snapshot.entities[bot.location]?.name || bot.location : '未知'));
             character.appendChild(row('当前状态', o.bot?.waiting || (running[0]?.intent) || '暂无进行中的意图'));
             var attrs = Object.entries(bot?.attributes || {}).filter(function (a) { return ['posture', 'energy', 'hunger', 'health', 'consciousness'].includes(a[0]); }).slice(0, 3);
-            attrs.forEach(function (a) { character.appendChild(row({ posture: '姿态', energy: '精力', hunger: '饥饿', health: '健康', consciousness: '意识状态' }[a[0]], typeof a[1].value === 'object' ? JSON.stringify(a[1].value) : String(a[1].value))); });
+            attrs.forEach(function (a) { character.appendChild(row({ posture: '姿态', energy: '精力', hunger: '饥饿', health: '健康', consciousness: '意识状态' }[a[0]], ReadableData.text(a[1].value))); });
             if (can('growth'))
                 character.appendChild(button('查看角色成长', 'growth', function () { navigate('growth'); }));
             right.appendChild(character);
@@ -335,13 +343,13 @@ var Studio = (function () {
             shortcuts.appendChild(links);
             if (links.childElementCount)
                 left.appendChild(shortcuts);
-            holder.appendChild(el('div', { cls: 'studio-overview-grid' }, [left, right]));
+            bodyHost.appendChild(el('div', { cls: 'studio-overview-grid' }, [left, right]));
         }
         refresh();
         var timer = setInterval(refresh, 12000);
         var onRefresh = function () { refresh(); };
         window.addEventListener('studio:refresh', onRefresh);
-        return function () { alive = false; if (liveCleanup) liveCleanup(); clearInterval(timer); window.removeEventListener('studio:refresh', onRefresh); };
+        return function () { alive = false; if (liveCleanup) liveCleanup(); if (commandCleanup) commandCleanup(); clearInterval(timer); window.removeEventListener('studio:refresh', onRefresh); };
     }
     register('overview', renderOverviewView);
     // Definitions remain authored text; authoritative structured state lives in its own views.

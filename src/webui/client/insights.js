@@ -14,12 +14,6 @@
     catch (_) {
         return {};
     } }
-    function pretty(value) { try {
-        return JSON.stringify(typeof value === 'string' ? JSON.parse(value) : value, null, 2);
-    }
-    catch (_) {
-        return String(value);
-    } }
     function btn(label, click, cls) { return el('button', { type: 'button', cls: 'insight-button ' + (cls || ''), text: label, onclick: click }); }
     function empty(title, description) { return el('div', { cls: 'insight-empty' }, [svg('svg', { viewBox: '0 0 80 58', fill: 'none', 'aria-hidden': 'true' }, [svg('path', { d: 'M10 43H70M18 36V24M32 36V14M46 36V21M60 36V9', stroke: 'currentColor', 'stroke-width': '1.5', 'stroke-linecap': 'round' }), svg('circle', { cx: '60', cy: '9', r: '3', fill: 'var(--accent2)' })]), el('strong', { text: title }), el('p', { text: description })]); }
     function metric(label, value, note, cls) { return el('div', { cls: 'insight-metric ' + (cls || '') }, [el('span', { cls: 'insight-kicker', text: label }), el('strong', { text: value }), el('span', { cls: 'insight-metric-note', text: note })]); }
@@ -118,7 +112,7 @@
     }
 
     window.RuntimeInsights = { mount: function (container) {
-        var chartStates = {}, chartSignature = '';
+        var chartStates = {}, chartSignature = '', readableState = {}, readableId = null, detailSignature = '';
         var alive = true, entries = new Map(), selected = null, sourceFilter = 'all', levelFilter = 'all', query = '', chartMode = 'latency', paused = false, frozen = [], waiting = 0, loading = true, error = '', timer, refreshing = false, renderTimer = null;
         var root = el('div', { cls: 'insight-page insight-debug' });
         container.appendChild(root);
@@ -217,8 +211,12 @@
             list.scrollTop = scroll;
         }
         function renderDetails() {
-            detail.textContent = '';
             var entry = current().find(function (item) { return String(item.id) === selected; });
+            var bus = entry && entry.bus, linked = bus ? current().filter(function (candidate) { var other = candidate.bus; return other && other.id !== bus.id && (other.id === bus.causationId || other.causationId === bus.id || (bus.correlationId && other.correlationId === bus.correlationId)); }) : [];
+            var signature = JSON.stringify([entry || null, linked.map(function (candidate) { return [candidate.id, candidate.bus.topic]; })]);
+            if (signature === detailSignature) return;
+            detailSignature = signature;
+            detail.textContent = '';
             if (!entry) {
                 detail.appendChild(empty('把过程展开看', '选择一条事件，查看原始内容、时间与可追溯的因果关系。'));
                 return;
@@ -231,7 +229,6 @@
             [['记录 ID', entry.bus ? entry.bus.id : entry.id], ['级别', entry.level]].concat(refs).forEach(function (pair) { metadata.appendChild(el('div', {}, [el('dt', { text: pair[0] }), el('dd', { text: String(pair[1]) })])); });
             detail.appendChild(metadata);
             if (entry.bus) {
-                var bus = entry.bus, linked = current().filter(function (candidate) { var other = candidate.bus; return other && other.id !== bus.id && (other.id === bus.causationId || other.causationId === bus.id || (bus.correlationId && other.correlationId === bus.correlationId)); });
                 var links = el('div', { cls: 'insight-causal-links' }, [el('h3', { text: '因果轨迹' })]);
                 if (!linked.length)
                     links.appendChild(el('p', { cls: 'insight-note', text: '当前加载窗口中没有其他关联事件。' }));
@@ -239,10 +236,9 @@
                 links.appendChild(btn('在世界结构中查看 ↗', function () { Studio.navigate('world'); window.dispatchEvent(new CustomEvent('studio:focus-world-event', { detail: { eventId: bus.id, sequence: bus.sequence, actorId: bus.actorId } })); }, 'insight-world-link'));
                 detail.appendChild(links);
             }
-            var copy = btn('复制原始内容', function () { if (!navigator.clipboard)
-                return toast('当前浏览器不可使用剪贴板，请从下方选取文本。', 'warn'); navigator.clipboard.writeText(pretty(entry.bus || entry.detail)).then(function () { toast('已复制', 'ok'); }).catch(showErr); }, 'insight-outline');
-            detail.appendChild(el('div', { cls: 'insight-raw-head' }, [el('h3', { text: '原始记录' }), copy]));
-            detail.appendChild(el('pre', { cls: 'insight-raw', text: pretty(entry.bus || entry.detail), tabindex: '0' }));
+            detail.appendChild(el('div', { cls: 'insight-raw-head' }, [el('h3', { text: '记录内容' })]));
+            if (readableId !== String(entry.id)) { readableState = {}; readableId = String(entry.id); }
+            detail.appendChild(ReadableData.render(entry.bus || entry.detail, { state: readableState }));
         }
         function onDebug(event) { var entry = event.detail; if (!entry || entry.id === undefined)
             return; ingest([entry]); if (paused)

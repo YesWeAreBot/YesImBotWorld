@@ -149,7 +149,7 @@ export async function smokeJourney({ evaluate, wait, assert, navigate }) {
       row.click();
     });
     assert(await run(() => !!document.querySelector('.insight-causal-links') &&
-      !!document.querySelector('.insight-detail .insight-raw')),
+      !!document.querySelector('.insight-detail .readable-data')),
     'A world event opens its raw record and causal trace.');
     checks.push('debug token chart, search, source filter and causal detail');
 
