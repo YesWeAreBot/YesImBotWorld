@@ -57,6 +57,8 @@ flowchart LR
 
 ## 使用步骤
 
+运行 Koishi 的主机需要 Node.js 22.19.0 或更新版本，与插件的 HTTP 客户端依赖要求一致。
+
 1. 配置插件（两个模型的 API 地址）并启用；
 2. 编辑 `Bot_Definition.md` 与 `World_Definition.md`（首次启用后自动生成模板）；
 3. 执行指令 `world.init` —— World-LLM 提出初始实体，内核验证后生成 `world-transactions.jsonl`；
