@@ -62,6 +62,16 @@ async function main() {
   assert.equal(cls(prose, 'readable-prose')[0].textContent.length, 9800);
   while (cls(prose, 'readable-more').length) cls(prose, 'readable-more')[0].emit('click');
   assert.ok(prose.textContent.includes('完整末尾'));
+  cls(prose, 'readable-collapse')[0].emit('click');
+  assert.equal(cls(prose, 'readable-prose')[0].textContent.length, 1800, 'Complete text can be folded again');
+  prose = reader.render(long, { state: longState });
+  assert.equal(cls(prose, 'readable-prose')[0].textContent.length, 1800, 'Refresh preserves the folded state');
+  cls(prose, 'readable-more')[0].emit('click');
+  assert.equal(cls(prose, 'readable-prose')[0].textContent.length, 9800, 'Folded text can be expanded again');
+  cls(prose, 'readable-expand-all')[0].emit('click');
+  assert.equal(cls(prose, 'readable-prose')[0].textContent, long, 'An explicit expand-all reveals the full text at once');
+  cls(prose, 'readable-collapse')[0].emit('click');
+  assert.equal(cls(prose, 'readable-prose')[0].textContent.length, 1800);
   cls(prose, 'readable-button').find(node => node.textContent === '复制可读内容')!.emit('click');
   await Promise.resolve();
   assert.equal(copied.at(-1), long);

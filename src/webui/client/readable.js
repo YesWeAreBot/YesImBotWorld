@@ -63,15 +63,23 @@
     }
     function copyButton(title, getText) { var button = element('button', 'readable-button', title); button.type = 'button'; button.addEventListener('click', function () { copyText(getText(), button); }); return button; }
     function longText(value, cls, threshold, state) {
-        state = state || {};
-        var holder = element('div', 'readable-long-text'), node = element('pre', cls), shown = Math.min(value.length, state.shown || threshold || 1800);
-        node.textContent = value.slice(0, shown); holder.appendChild(node);
-        if (shown < value.length) {
-            var more = element('button', 'readable-button readable-more'); more.type = 'button';
-            function update() { more.textContent = '继续展开 · 还有 ' + (value.length - shown).toLocaleString('zh-CN') + ' 个字符'; }
-            more.addEventListener('click', function () { shown = Math.min(value.length, shown + 8000); state.shown = shown; node.textContent = value.slice(0, shown); if (shown === value.length) more.remove(); else update(); }); update(); holder.appendChild(more);
+        state = state || {}; threshold = threshold || 1800;
+        var holder = element('div', 'readable-long-text'), node = element('pre', cls), shown = Math.min(value.length, state.shown || threshold);
+        holder.appendChild(node);
+        var more = element('button', 'readable-button readable-more'), expandAll = element('button', 'readable-button readable-expand-all', '展开全文 · ' + value.length.toLocaleString('zh-CN') + ' 个字符'), collapse = element('button', 'readable-button readable-collapse', '收起长文本');
+        more.type = expandAll.type = collapse.type = 'button';
+        function update() {
+            node.textContent = value.slice(0, shown); state.shown = shown;
+            more.textContent = '继续展开 · 还有 ' + (value.length - shown).toLocaleString('zh-CN') + ' 个字符';
+            if (shown < value.length) holder.appendChild(more); else more.remove();
+            if (value.length - shown > 8000) holder.appendChild(expandAll); else expandAll.remove();
+            if (shown > threshold) holder.appendChild(collapse); else collapse.remove();
+            more.ariaExpanded = collapse.ariaExpanded = shown > threshold ? 'true' : 'false';
         }
-        return holder;
+        more.addEventListener('click', function () { shown = Math.min(value.length, shown + 8000); update(); });
+        expandAll.addEventListener('click', function () { shown = value.length; update(); });
+        collapse.addEventListener('click', function () { shown = Math.min(value.length, threshold); update(); });
+        update(); return holder;
     }
     function raw(value, options) {
         var state = options && options.state || {}, details = element('details', 'readable-raw'), summary = element('summary', '', options && options.label || '查看原始数据'), loaded = false;
@@ -98,6 +106,7 @@
     }
     function renderValue(original, depth, options, ancestors, path) {
         var value = decode(original), state = options.state[JSON.stringify(path)] || (options.state[JSON.stringify(path)] = {});
+        if (options.renderSpecial) { var special = options.renderSpecial(value, path); if (special) return special; }
         if (!value || typeof value !== 'object') {
             if (typeof value === 'string') return longText(value || '空文本', 'readable-prose', options.textLimit, state);
             return element('span', 'readable-scalar readable-' + (value == null ? 'null' : typeof value), scalar(value));

@@ -241,12 +241,32 @@ var Studio = (function () {
         var alive = true, refreshing = false;
         var liveHost = can('live') && window.LiveCalls ? el('div', { cls: 'studio-live-overview' }) : null;
         var liveCleanup = liveHost ? window.LiveCalls.mount(liveHost, { compact: true }) : null;
-        var commandHost = !isVisitor() && window.WorldCommands ? el('div', { cls: 'studio-overview-commands' }) : null;
-        var commandCleanup = commandHost ? window.WorldCommands.mount(commandHost) : null;
-        // Keep interactive hosts connected while the surrounding snapshot refreshes.
-        var headingHost = el('div'), heroHost = el('div'), bodyHost = el('div');
+        // Keep the welcome actions and their open popover connected during live refreshes.
+        var headingHost = el('div'), heroHost = el('div'), bodyHost = el('div'), currentOverview = null, worldActionPending = false;
+        var hero = el('section', { cls: 'studio-hero' }), eyebrow = el('div', { cls: 'studio-eyebrow' }), welcome = el('h2'), introduction = el('p');
+        var heroCopy = el('div', { cls: 'studio-hero-copy' }, [eyebrow, welcome, introduction]);
+        var actions = el('div', { cls: 'studio-hero-actions' });
+        var worldButton = !isVisitor() ? button('正在加载…', 'activity', function () {
+            var o = currentOverview;
+            if (!o || worldActionPending) return;
+            if (!o.initialized) { navigate('state'); return; }
+            worldActionPending = true; updateWorldButton();
+            api('POST', '/api/world/' + (o.worldRunning ? 'stop' : 'start'), {}).then(function (r) { toast(r.text || '已完成', 'ok'); refresh(); }).catch(showErr).finally(function () { worldActionPending = false; updateWorldButton(); });
+        }, true) : null;
+        if (worldButton) actions.appendChild(worldButton);
+        if (can('world')) actions.appendChild(button('探索关系图', 'arrow', function () { navigate('world'); }));
+        else if (can('devices')) actions.appendChild(button('打开设备', 'phone', function () { navigate('devices'); }));
+        var commandCleanup = !isVisitor() && window.WorldCommands ? window.WorldCommands.mount(actions) : null;
+        heroCopy.appendChild(actions);
+        hero.append(heroCopy, el('div', { html: art() }), el('span', { cls: 'studio-hero-footnote', text: 'WORLD / STUDIO' }));
         holder.append(headingHost, heroHost);
-        if (commandHost) holder.appendChild(commandHost);
+        function updateWorldButton() {
+            if (!worldButton || !currentOverview) return;
+            var o = currentOverview;
+            worldButton.disabled = worldActionPending;
+            worldButton.firstChild.innerHTML = icon(!o.initialized ? 'edit' : o.worldRunning ? 'pause' : 'play');
+            worldButton.lastChild.textContent = worldActionPending ? '正在处理…' : !o.initialized ? '准备世界设定' : o.worldRunning ? '暂停世界' : '继续世界';
+        }
         if (liveHost) holder.appendChild(liveHost);
         holder.appendChild(bodyHost);
         bodyHost.appendChild(el('div', { cls: 'studio-skeleton' }));
@@ -264,28 +284,12 @@ var Studio = (function () {
             var snapshot = world?.snapshot, entities = Object.values(snapshot?.entities || {}), events = world?.events || [], bot = snapshot?.entities.bot;
             var running = Object.values(snapshot?.actions || {}).filter(function (a) { return a.status === 'pending'; });
             headingHost.replaceChildren(title('YOUR WORLD, AT A GLANCE', '世界工作室', '看见世界如何变化，也参与角色的每一个当下。', [button('走进世界', 'door', function () { navigate('player'); }, true)].filter(function () { return can('player'); })));
-            var hero = el('section', { cls: 'studio-hero' });
-            var heroCopy = el('div', { cls: 'studio-hero-copy' }, [el('div', { cls: 'studio-eyebrow', text: o.initialized ? 'A WORLD IN PROGRESS' : 'THE FIRST CHAPTER' }), el('h2', { text: o.initialized ? '你好，欢迎回来。' : '从一个世界开始。' }), el('p', { text: !o.initialized ? '写下角色与世界设定，让第一组事实成为故事的起点。' : o.worldRunning ? '世界正在运转。观察发生了什么，或拿起设备，与角色共享此刻。' : '世界目前未运行。你可以先探索已有状态，再继续角色的生活。' })]);
-            var actions = el('div', { cls: 'studio-hero-actions' });
-            if (!isVisitor()) {
-                actions.appendChild(button(!o.initialized ? '准备世界设定' : o.worldRunning ? '暂停世界' : '继续世界', !o.initialized ? 'edit' : o.worldRunning ? 'pause' : 'play', function (e) {
-                    if (!o.initialized) {
-                        navigate('state');
-                        return;
-                    }
-                    var btn = e.currentTarget;
-                    btn.disabled = true;
-                    btn.textContent = '正在处理…';
-                    api('POST', '/api/world/' + (o.worldRunning ? 'stop' : 'start'), {}).then(function (r) { toast(r.text || '已完成', 'ok'); refresh(); }).catch(showErr).finally(function () { btn.disabled = false; });
-                }, true));
-            }
-            if (can('world'))
-                actions.appendChild(button('探索关系图', 'arrow', function () { navigate('world'); }));
-            else if (can('devices'))
-                actions.appendChild(button('打开设备', 'phone', function () { navigate('devices'); }));
-            heroCopy.appendChild(actions);
-            hero.append(heroCopy, el('div', { html: art() }), el('span', { cls: 'studio-hero-footnote', text: 'WORLD / STUDIO' }));
-            heroHost.replaceChildren(hero);
+            currentOverview = o;
+            eyebrow.textContent = o.initialized ? 'A WORLD IN PROGRESS' : 'THE FIRST CHAPTER';
+            welcome.textContent = o.initialized ? '你好，欢迎回来。' : '从一个世界开始。';
+            introduction.textContent = !o.initialized ? '写下角色与世界设定，让第一组事实成为故事的起点。' : o.worldRunning ? '世界正在运转。观察发生了什么，或拿起设备，与角色共享此刻。' : '世界目前未运行。你可以先探索已有状态，再继续角色的生活。';
+            updateWorldButton();
+            if (!heroHost.contains(hero)) heroHost.appendChild(hero);
             bodyHost.replaceChildren();
             bodyHost.appendChild(el('div', { cls: 'studio-kpi-row' }, [
                 kpi('世界实体', snapshot ? entities.length : '—', snapshot ? entities.filter(function (e) { return e.kind === 'place'; }).length + ' 个地点 · ' + entities.filter(function (e) { return e.kind === 'object'; }).length + ' 件物品' : '完整世界仅管理员可见', 'world'),

@@ -2,6 +2,7 @@
   color:var(--fg);
   min-width:0
 }
+.live-calls [hidden] { display:none!important }
 
 .live-page-heading h1 {
   font-size:30px;
@@ -459,6 +460,9 @@
   line-height:1.8;
   margin:15px 0
 }
+
+.live-raw-fold { align-self:flex-start; margin:10px 15px 0; font-size:11px; min-height:36px }
+.live-raw-fold[hidden] { display:none!important }
 
 .live-compact-heading {
   display:flex;

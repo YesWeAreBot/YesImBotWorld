@@ -1,7 +1,7 @@
 /* Long-lived metadata collection; mount/unmount only attaches or detaches readers. */
 (function () {
     'use strict';
-    var calls = new Map(), raw = new Map(), listeners = new Set(), request = null, error = '', connected = null, epoch = 0, refreshTimer = null;
+    var calls = new Map(), raw = new Map(), listeners = new Set(), request = null, error = '', connected = null, epoch = 0, refreshTimer = null, retention = null;
     var selection = { id: null, follow: true, tab: 'response', format: 'readable', source: 'all', search: '', wrap: true }, detailFlight = new Map(), lastPull = 0, eventSerial = 0, eventSeen = new Map();
     function allowed() { return !isVisitor() || visitorCanSee(['debug']); }
     function active(call) { return call && !call.missing && (call.status === 'pending' || call.status === 'streaming'); }
@@ -25,8 +25,9 @@
         if (previous && previous.revision > value.revision)
             return;
         calls.set(value.callId, value);
-        var list = ordered();
-        while (calls.size > 200 && list.length) {
+        var list = ordered().filter(function (call) { return !active(call); }).sort(function (a, b) { return (a.endedAt || a.updatedAt) - (b.endedAt || b.updatedAt); });
+        var completedLimit = retention && retention.maxCompletedCalls || 200;
+        while (list.length > completedLimit) {
             var oldest = list.shift();
             if (oldest.callId !== selection.id) {
                 calls.delete(oldest.callId);
@@ -37,7 +38,7 @@
         if (selection.follow && (!selection.id || !calls.has(selection.id) || value.startedAt >= (calls.get(selection.id).startedAt || 0)))
             selection.id = ordered().at(-1)?.callId || null;
     }
-    function forget() { epoch++; calls.clear(); raw.clear(); eventSeen.clear(); eventSerial = 0; detailFlight.clear(); request = null; selection.id = null; error = ''; }
+    function forget() { epoch++; calls.clear(); raw.clear(); eventSeen.clear(); eventSerial = 0; detailFlight.clear(); request = null; selection.id = null; error = ''; retention = null; }
     function refresh() {
         if (!allowed()) {
             forget();
@@ -48,7 +49,7 @@
             return request;
         var token = epoch, serial = eventSerial;
         request = api('GET', '/api/calls').then(function (result) { if (token !== epoch)
-            return; error = ''; var present = new Set((result.calls || []).map(function (c) { return c.callId; })); calls.forEach(function (c, id) { if (!present.has(id) && (eventSeen.get(id) || 0) <= serial)
+            return; error = ''; retention = result.retention || null; var present = new Set((result.calls || []).map(function (c) { return c.callId; })); calls.forEach(function (c, id) { if (!present.has(id) && (eventSeen.get(id) || 0) <= serial)
             c.missing = true; }); (result.calls || []).forEach(upsert); lastPull = Date.now(); emit(); }).catch(function (err) { if (token !== epoch)
             return; error = err.message || String(err); emit(); }).finally(function () { if (token === epoch)
             request = null; });
@@ -67,10 +68,10 @@
             return Promise.resolve();
         if (detailFlight.has(id))
             return detailFlight.get(id);
-        var cached = raw.get(id), meta = calls.get(id);
-        if (!force && cached && meta && cached.revision >= meta.revision)
+        var cached = raw.get(id), meta = calls.get(id), includeRequest = selection.id === id && selection.tab === 'request' && (!cached || cached.request === undefined);
+        if (!force && !includeRequest && cached && meta && cached.revision >= meta.revision)
             return Promise.resolve(cached);
-        var token = epoch, offset = cached && cached.response ? cached.response.length : 0, includeRequest = !cached || cached.request === undefined;
+        var token = epoch, offset = cached && cached.response ? cached.response.length : 0;
         var pending = api('GET', '/api/calls/' + encodeURIComponent(id) + '?after=' + offset + '&request=' + (includeRequest ? '1' : '0')).then(function (result) {
             if (token !== epoch)
                 return;
@@ -137,7 +138,7 @@
         root.append(head, connection, lanes, notice);
         container.appendChild(root);
         var insightsCleanup = null, showCallPanel = null;
-        var reader = null, reading = null, readableButton = null, rawButton = null;
+        var reader = null, reading = null, readableButton = null, rawButton = null, rawFold = null, rawExpanded = false, contentKey = '', retentionNotice = null;
         var timeline = null, detail = null, requestButton = null, responseButton = null, followButton = null, code = null, detailMeta = null, rawNotice = null, copyButton = null, wrapButton = null, count = null;
         if (!compact) {
             var workspace = el('div', { id: 'observatory-calls', role: 'tabpanel', 'aria-labelledby': 'observatory-tab-calls' }), insightHost = el('div', { id: 'observatory-events', role: 'tabpanel', 'aria-labelledby': 'observatory-tab-events', hidden: true });
@@ -182,11 +183,14 @@
             viewOptions.append(readableButton, rawButton, wrapButton, copyButton);
             rawNotice = el('div', { cls: 'live-raw-notice', 'aria-live': 'polite' });
             code = el('pre', { cls: 'live-raw-code', tabindex: '0', 'aria-label': '调用原始数据' });
+            rawFold = button('', function () { rawExpanded = !rawExpanded; render(); }, 'live-button live-raw-fold');
+            rawFold.hidden = true;
             reading = el('div', { cls: 'live-reading', tabindex: '0', 'aria-label': '可读调用内容' });
             reader = CallReader.create(reading);
-            detail.append(detailMeta, tabs, viewOptions, rawNotice, reading, code);
+            detail.append(detailMeta, tabs, viewOptions, rawNotice, reading, rawFold, code);
             grid.append(history, detail);
-            workspace.append(grid, el('p', { cls: 'live-retention', text: '原始数据仅保存在服务端内存：最多 200 次调用、合计 32 MB、单次 8 MB。超限会明确显示不可用；普通调试摘要与事务可在本页「事件与图表」查看。' }));
+            retentionNotice = el('p', { cls: 'live-retention' });
+            workspace.append(grid, retentionNotice);
             timeline.addEventListener('wheel', function () { if (selection.follow) {
                 selection.follow = false;
                 render();
@@ -242,6 +246,8 @@
             notice.textContent = error ? '读取调用失败：' + error : '';
             if (compact)
                 return;
+            retentionNotice.textContent = retention && retention.persistent ? '原始请求与返回保存在本机调用记录中，内存仅作缓存。保留最近 ' + retention.maxCalls + ' 次已结束调用；正在生成的调用继续保留。长内容可展开或收起。' : '原始请求与返回按需读取；长内容可以展开或收起。';
+            if (retention && retention.storageWarning) retentionNotice.textContent += ' ' + retention.storageWarning;
             followButton.textContent = selection.follow ? '暂停跟随' : '继续跟随';
             followButton.setAttribute('aria-pressed', String(selection.follow));
             var filtered = list.filter(function (c) { return (selection.source === 'all' || source(c) === selection.source) && (!selection.search || [c.source, c.model, c.callId, c.status, c.error || ''].join(' ').toLowerCase().includes(selection.search.toLowerCase())); });
@@ -289,11 +295,14 @@
                 rawNotice.textContent = '请求消息和模型返回将显示在这里。';
                 reader.clear();
                 code.textContent = '';
+                rawFold.hidden = true;
                 copyButton.disabled = true;
                 return;
             }
             detailMeta.replaceChildren(el('div', {}, [el('strong', { text: call.source + ' · ' + call.model }), badge(call)]), el('small', { text: '开始 ' + stamp(call.startedAt) + ' · ' + elapsed(call) + ' · ' + call.callId }), el('small', { text: call.url }));
             var key = selection.id + ':' + selection.tab, text = selection.tab === 'request' ? item?.request : item?.response;
+            var changedCall = key !== contentKey;
+            if (changedCall) { contentKey = key; rawExpanded = false; }
             if (typeof text !== 'string')
                 text = '';
             var readingSelection = window.getSelection(), readingHeld = readingSelection && !readingSelection.isCollapsed && reading.contains(readingSelection.anchorNode), readingScroll = reading.scrollTop;
@@ -303,23 +312,30 @@
                 var awaitingRaw = !item || item.revision < call.revision;
                 reader.response(decoder ? decoder.update(text, call.responseFormat, active(call) || awaitingRaw) : { choices: [], warnings: [], pending: true }, key, { active: active(call), awaitingRaw: awaitingRaw, format: call.responseFormat });
             }
-            if (selection.follow && !readingHeld && selection.tab === 'response') reading.scrollTop = reading.scrollHeight;
-            else reading.scrollTop = readingScroll;
+            if (selection.follow && active(call) && !readingHeld && selection.tab === 'response') reading.scrollTop = reading.scrollHeight;
+            else reading.scrollTop = changedCall ? 0 : readingScroll;
             var selectionRange = window.getSelection(), holding = selectionRange && !selectionRange.isCollapsed && code.contains(selectionRange.anchorNode), scroll = code.scrollTop;
-            if (key !== selectedKey || !text.startsWith(drawn)) {
-                code.textContent = text;
+            var longRequest = selection.tab === 'request' && text.length > 6000;
+            rawFold.hidden = selection.format !== 'raw' || !longRequest;
+            rawFold.textContent = rawExpanded ? '收起长请求' : '展开完整请求 · ' + text.length.toLocaleString('zh-CN') + ' 个字符';
+            rawFold.setAttribute('aria-expanded', String(rawExpanded));
+            // Keep large requests out of the DOM until the user explicitly opens the raw view.
+            var visibleText = selection.format !== 'raw' ? '' : longRequest && !rawExpanded ? text.slice(0, 6000) : text;
+            if (key !== selectedKey || !visibleText.startsWith(drawn)) {
+                code.textContent = visibleText;
                 selectedKey = key;
             }
-            else if (text.length > drawn.length)
-                code.appendChild(document.createTextNode(text.slice(drawn.length)));
-            drawn = text;
+            else if (visibleText.length > drawn.length)
+                code.appendChild(document.createTextNode(visibleText.slice(drawn.length)));
+            drawn = visibleText;
             copyButton.disabled = !item || typeof (selection.tab === 'request' ? item.request : item.response) !== 'string';
-            if (selection.follow && !holding && selection.tab === 'response')
+            if (selection.follow && active(call) && !holding && selection.tab === 'response')
                 code.scrollTop = code.scrollHeight;
             else
-                code.scrollTop = scroll;
-            rawNotice.textContent = call.missing ? '调用已离开服务端缓存；当前显示浏览器已缓存的数据。' : item?.error ? '读取失败：' + item.error : item?.unavailable ? item.unavailable + (text ? ' · 当前仅显示已在浏览器缓存的部分。' : '') : !call.rawAvailable ? (call.rawUnavailableReason || '原始数据已不可用') : !item ? '正在读取原始数据…' : selection.tab === 'request' ? (selection.format === 'readable' ? '请求按消息与工具展开 · ' : '实际发送的 JSON 请求体 · ') + bytes(call.requestBytes) + (call.unicodeRepairedStrings ? ' · 已修复 ' + call.unicodeRepairedStrings + ' 处非法 Unicode' : '') : active(call) ? (selection.format === 'readable' ? '模型内容实时更新 · ' : '原始响应正在追加 · ') + bytes(call.responseBytes) + (call.responseFormat ? ' · ' + call.responseFormat : '') : (selection.format === 'readable' ? '模型返回 · ' : '原始响应 · ') + bytes(call.responseBytes) + (call.responseFormat ? ' · ' + call.responseFormat : '') + (call.error ? ' · ' + call.error : '');
-            if (!call.missing && (!item || item.revision < call.revision) && (!item?.nextRetry || Date.now() >= item.nextRetry)) {
+                code.scrollTop = changedCall ? 0 : scroll;
+            rawNotice.textContent = call.missing ? '调用已离开服务端缓存；当前显示浏览器已缓存的数据。' : item?.error ? '读取失败：' + item.error : item?.unavailable ? item.unavailable + (text ? ' · 当前仅显示已在浏览器缓存的部分。' : '') : !call.rawAvailable ? (call.rawUnavailableReason || '原始数据已不可用') : !item || selection.tab === 'request' && item.request === undefined ? '正在读取请求与调用数据…' : selection.tab === 'request' ? (selection.format === 'readable' ? '请求按消息与工具展开 · ' : '实际发送的 JSON 请求体 · ') + bytes(call.requestBytes) + (call.unicodeRepairedStrings ? ' · 已修复 ' + call.unicodeRepairedStrings + ' 处非法 Unicode' : '') : active(call) ? (selection.format === 'readable' ? '模型内容实时更新 · ' : '原始响应正在追加 · ') + bytes(call.responseBytes) + (call.responseFormat ? ' · ' + call.responseFormat : '') : (selection.format === 'readable' ? '模型返回 · ' : '原始响应 · ') + bytes(call.responseBytes) + (call.responseFormat ? ' · ' + call.responseFormat : '') + (call.error ? ' · ' + call.error : '');
+            if (call.storageWarning) rawNotice.textContent += ' · ' + call.storageWarning;
+            if (!call.missing && (!item || item.revision < call.revision || selection.tab === 'request' && item.request === undefined) && (!item?.nextRetry || Date.now() >= item.nextRetry)) {
                 clearTimeout(detailTimer);
                 detailTimer = setTimeout(function () { if (alive)
                     fetchDetail(call.callId); }, 150);
@@ -330,7 +346,7 @@
             schedule(); }, 1000);
         if (!compact) document.addEventListener('selectionchange', schedule);
         render();
-        return function () { alive = false; if (insightsCleanup) insightsCleanup(); unwatch(); document.removeEventListener('selectionchange', schedule); clearTimeout(scheduled); clearTimeout(detailTimer); clearInterval(clockTimer); root.remove(); };
+        return function () { alive = false; if (reader) reader.clear(); if (insightsCleanup) insightsCleanup(); unwatch(); document.removeEventListener('selectionchange', schedule); clearTimeout(scheduled); clearTimeout(detailTimer); clearInterval(clockTimer); root.remove(); };
     }
     window.LiveCalls = { mount: mount, refresh: refresh };
     Studio.register('live', function (container) { return mount(container); });

@@ -1,6 +1,9 @@
 /** Raw calls use only a loopback HTTP fixture; no real model or running world. */
 import assert from "node:assert/strict";
 import http from "node:http";
+import { appendFileSync, closeSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { CallStore, callStore } from "../src/webui/calls.js";
 import { DebugBus, debug as globalDebug } from "../src/webui/debug.js";
 import { ChatClient } from "../src/llm/chat.js";
@@ -13,23 +16,135 @@ async function main() {
   debug.update(id, { detail: { content: "x".repeat(4000) } });
   assert.equal(JSON.parse(debug.recent(1)[0].detail).truncated, true);
 
-  const store = new CallStore(100, 90, 3);
-  const begin = (requestBody: string) => store.begin({ source: "Bot", model: "test", url: "http://local", requestBody });
-  const a = begin("a".repeat(40)), b = begin("b".repeat(40)); store.detail(a);
-  begin("c".repeat(40));
-  assert.equal(store.detail(b)?.call.rawAvailable, false, "least recently read raw body is evicted");
-  assert.equal(store.detail(a)?.requestBody, "a".repeat(40));
-  const huge = begin("z".repeat(120));
-  assert.equal(store.detail(huge)?.requestBody, null);
-  assert.match(store.detail(huge)!.call.rawUnavailableReason!, /单次/);
-  assert(store.retainedBytes <= 100); assert(store.recent().length <= 3);
-  const incremental = new CallStore();
-  const c = incremental.begin({ source:"World", model:"test", url:"http://local", requestBody:'{"original":true}' });
-  incremental.append(c, "first\r\n"); const first = incremental.detail(c)!;
-  incremental.append(c, "后半段😀"); const second = incremental.detail(c, first.nextOffset, false)!;
-  assert.equal(second.responseText, "后半段😀"); assert.equal(second.requestBody, undefined);
-  assert.equal(incremental.detail(c, 99999)!.reset, true);
-  incremental.update(c, { status:"cancelled", error:"stopped" }); assert.equal(incremental.detail(c)?.call.status,"cancelled");
+  const temporary = mkdtempSync(path.join(tmpdir(), "yesimbot-call-storage-test-"));
+  const stores: CallStore[] = [];
+  const createStore = (name: string, maxBytes = 100, maxCallBytes = 90, maxCalls = 3) => {
+    const store = new CallStore(maxBytes, maxCallBytes, maxCalls); stores.push(store);
+    store.init(path.join(temporary, name)); return store;
+  };
+  try {
+    const store = createStore("cache");
+    const begin = (requestBody: string) => store.begin({ source: "Bot", model: "test", url: "http://local", requestBody });
+    const a = begin("a".repeat(40)), b = begin("b".repeat(40)); store.detail(a);
+    begin("c".repeat(40));
+    assert.equal(store.detail(b)?.call.rawAvailable, true, "leaving the memory cache never removes the recording");
+    assert.equal(store.detail(a)?.requestBody, "a".repeat(40));
+    const hugeRequest = JSON.stringify({ messages: [{ role: "user", content: [{ type: "image_url", image_url: { url: "data:image/png;base64," + "a".repeat(9 * 1024 * 1024) } }] }] });
+    const huge = begin(hugeRequest);
+    assert.equal(store.detail(huge)?.requestBody, hugeRequest, "a request beyond the old 8 MB limit stays available");
+    assert.equal(store.retainedBytes <= 100, true);
+    assert.equal(store.recent().length, 4, "all active calls survive the completed-history count limit");
+    store.update(a, { status: "completed" });
+    const response = "header\r\n" + "后半段😀\n".repeat(40000);
+    for (let i = 0; i < response.length; i += 41) store.append(huge, response.slice(i, i + 41));
+    assert.equal(store.detail(huge)?.responseText, response, "many frames spill without losing split surrogate pairs");
+    const pair = response.indexOf("😀");
+    assert.equal(store.detail(huge, pair + 1, false)?.responseText, response.slice(pair + 1), "disk offsets use exact JavaScript UTF-16 units, including the middle of a surrogate pair");
+    assert.equal(store.detail(huge, 999999999)?.reset, true);
+    store.update(huge, { status: "completed" });
+    const files = path.join(temporary, "cache");
+    assert.equal(statSync(files).mode & 0o777, 0o700);
+    for (const suffix of [".request", ".response", ".json"]) assert.equal(statSync(path.join(files, huge + suffix)).mode & 0o777, 0o600);
+    assert.equal(store.retention.persistent, true); assert.equal(store.retention.cacheOnly, true);
+    store.dispose();
+    const restored = createStore("cache");
+    assert.equal(restored.detail(huge)?.requestBody, hugeRequest);
+    assert.equal(restored.detail(huge)?.responseText, response);
+    assert.equal(restored.detail(huge)?.call.status, "completed");
+    assert.equal(restored.recent().length, 3, "restored history keeps the newest completed records");
+    assert.equal(restored.detail(a), null);
+    assert.equal(restored.detail(b)?.call.status, "cancelled", "unfinished calls are marked interrupted on a restart");
+    restored.clear();
+    assert.equal(restored.recent().length, 0);
+
+    const incremental = createStore("incremental", 1000, 1000);
+    const c = incremental.begin({ source:"World", model:"test", url:"http://local", requestBody:'{"original":true}' });
+    incremental.append(c, "first\r\n"); const first = incremental.detail(c)!;
+    incremental.append(c, "后半段😀"); const second = incremental.detail(c, first.nextOffset, false)!;
+    assert.equal(second.responseText, "后半段😀"); assert.equal(second.requestBody, undefined);
+    assert.equal(incremental.detail(c, 99999)!.reset, true);
+    incremental.update(c, { status:"cancelled", error:"stopped" }); assert.equal(incremental.detail(c)?.call.status,"cancelled");
+
+    const realNow = Date.now;
+    let clock = realNow();
+    Date.now = () => ++clock;
+    try {
+      const retention = createStore("count", 1, 1, 2);
+      const ongoing = retention.begin({ source:"Bot", model:"test", url:"http://local", requestBody:"active request" });
+      const finished = [];
+      for (let i = 0; i < 8; i++) {
+        const id = retention.begin({ source:"World", model:"test", url:"http://local", requestBody:"finished request " + i });
+        retention.append(id, "response " + i); retention.update(id, { status:"completed" }); finished.push(id);
+      }
+      assert.equal(retention.recent().length, 3);
+      assert.equal(retention.detail(ongoing)?.requestBody, "active request");
+      assert.equal(retention.detail(finished[0]!), null);
+      retention.append(ongoing, "still recording");
+      assert.equal(retention.detail(ongoing)?.responseText, "still recording");
+      assert.deepEqual(retention.recent().slice(1).map(meta => meta.callId), finished.slice(-2));
+      retention.append(ongoing, " + final response");
+      retention.update(ongoing, {status:"completed"});
+      assert.equal(retention.detail(ongoing)?.responseText, "still recording + final response", "a long-running call survives completion after the history limit of newer short calls");
+      assert.equal(retention.detail(finished.at(-2)!), null, "completion time determines retention instead of start time");
+      assert.equal(retention.recent().length, 2);
+      retention.dispose();
+      const restoredCompletion = createStore("count", 1, 1, 2);
+      assert.equal(restoredCompletion.detail(ongoing)?.responseText, "still recording + final response", "the latest completion remains available after a restart");
+      assert.equal(restoredCompletion.detail(finished.at(-1)!)?.responseText, "response 7");
+    } finally { Date.now = realNow; }
+
+    // Model transport must continue if the target filesystem is unavailable.
+    const blockedDirectory = path.join(temporary, "blocked"); writeFileSync(blockedDirectory, "not a directory");
+    const blocked = createStore("blocked", 1, 1);
+    let unavailableId = "";
+    assert.doesNotThrow(() => {
+      unavailableId = blocked.begin({source:"Bot",model:"test",url:"http://local",requestBody:hugeRequest});
+      blocked.append(unavailableId, "stream survives 😀"); blocked.update(unavailableId, {status:"completed"});
+    });
+    assert.equal(blocked.detail(unavailableId)?.requestBody, hugeRequest);
+    assert.equal(blocked.detail(unavailableId)?.responseText, "stream survives 😀");
+    assert.match(blocked.detail(unavailableId)?.call.storageWarning || "", /保留在内存/);
+    assert.equal(blocked.retention.persistent, false);
+
+    const failedAppend = createStore("failed-append", 1, 1);
+    const failureId = failedAppend.begin({source:"Bot",model:"test",url:"http://local",requestBody:"disk request"});
+    failedAppend.append(failureId, "committed prefix");
+    const captured = (failedAppend as unknown as { calls: Map<string, { disk: { fd: number } }> }).calls.get(failureId)!;
+    closeSync(captured.disk.fd); // Simulate a descriptor failure after a call has left memory.
+    assert.doesNotThrow(() => failedAppend.append(failureId, " + fallback suffix😀"));
+    assert.equal(failedAppend.detail(failureId)?.requestBody, "disk request");
+    assert.equal(failedAppend.detail(failureId)?.responseText, "committed prefix + fallback suffix😀");
+    failedAppend.append(failureId, " + next frame");
+    assert.equal(failedAppend.detail(failureId)?.responseText, "committed prefix + fallback suffix😀 + next frame");
+
+    assert.equal(failedAppend.retention.persistent, false);
+    assert.equal(failedAppend.retention.storage, "memory");
+    assert.match(failedAppend.retention.storageWarning || "", /保留在内存/);
+    failedAppend.update(failureId, {status:"completed"});
+    assert.equal(failedAppend.retention.persistent, true, "recovered persistence is reflected by retention metadata");
+    assert.equal(failedAppend.retention.storage, "disk");
+    assert.equal(failedAppend.retention.storageWarning, undefined);
+    assert.equal(failedAppend.detail(failureId)?.call.storageWarning, undefined, "completion retries transient disk failures");
+    assert.equal(failedAppend.retainedBytes, 0);
+    failedAppend.dispose();
+    const recoveredAppend = createStore("failed-append", 1, 1);
+    assert.equal(recoveredAppend.detail(failureId)?.responseText, "committed prefix + fallback suffix😀 + next frame", "recovered data survives a restart");
+
+    const interrupted = createStore("interrupted", 1, 1);
+    const crashId = interrupted.begin({source:"World",model:"test",url:"http://local",requestBody:"{}"});
+    interrupted.append(crashId, "checkpoint");
+    interrupted.dispose();
+    const metadataPath = path.join(temporary, "interrupted", crashId + ".json");
+    const checkpoint = JSON.parse(readFileSync(metadataPath, "utf8"));
+    checkpoint.meta.status = "streaming"; delete checkpoint.meta.endedAt; writeFileSync(metadataPath, JSON.stringify(checkpoint));
+    appendFileSync(path.join(temporary, "interrupted", crashId + ".response"), " + uncheckpointed😀", "utf16le");
+    writeFileSync(path.join(temporary, "interrupted", "ffffffff-ffff-ffff-ffff-ffffffffffff.json"), "broken JSON");
+    const restart = createStore("interrupted", 1, 1);
+    assert.equal(restart.detail(crashId)?.responseText, "checkpoint + uncheckpointed😀");
+    assert.equal(restart.detail(crashId)?.call.responseBytes, Buffer.byteLength("checkpoint + uncheckpointed😀"));
+    assert.equal(restart.detail(crashId)?.call.status, "cancelled");
+    assert.equal(restart.recent().length, 1, "a corrupt unrelated record does not hide valid recordings");
+  } finally { for (const store of stores) store.dispose(); rmSync(temporary, {recursive:true,force:true}); }
 
   const resumed=callStore.begin({source:"Bot",model:"test",url:"http://local",requestBody:"{}"});
   const originalDebugId=globalDebug.recent(1)[0].id;
@@ -78,7 +193,7 @@ async function main() {
     aborter.abort();await aborted;const cancelled=callStore.recent().at(-1)!;
     assert.equal(cancelled.status,"cancelled");assert.match(callStore.detail(cancelled.callId)?.responseText || "",/partial/);
     assert(callStore.recent().every(m=>m.endedAt && m.revision>1));
-  } finally {server.closeAllConnections();await new Promise<void>(resolve=>server.close(()=>resolve()));callStore.clear();}
-  console.log("PASS bounded raw call storage, valid capped debug JSON, exact request/JSON/SSE capture, incremental reads and HTTP failure");
+  } finally {server.closeAllConnections();await new Promise<void>(resolve=>server.close(()=>resolve()));callStore.clear();callStore.dispose();}
+  console.log("PASS disk-backed raw call storage, large/base64 requests, private restart history, Unicode seek, streaming concurrency and nonfatal storage failures");
 }
 main().catch(error=>{console.error(error);process.exitCode=1;});

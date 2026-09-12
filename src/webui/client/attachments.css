@@ -1,0 +1,22 @@
+.call-attachment { display:flex; flex-wrap:wrap; align-items:center; gap:12px; padding:12px; margin:8px 0; border:1px solid var(--line); border-radius:12px; background:var(--panel); max-width:100%; overflow:hidden; }
+.call-attachment-main { display:grid; gap:4px; flex:1 1 180px; min-width:0; }
+.call-attachment-name,.call-attachment-meta,.call-attachment-status,.call-attachment-address { overflow-wrap:anywhere; }
+.call-attachment-meta,.call-attachment-status { color:var(--fg-dim); font-size:12px; }
+.call-attachment-status { margin:0; flex-basis:100%; }
+.call-attachment-status:empty { display:none; }
+.call-attachment-actions { display:flex; gap:6px; flex-wrap:wrap; }
+.call-attachment-button { display:inline-flex; justify-content:center; align-items:center; border:1px solid var(--line); padding:7px 11px; min-height:36px; border-radius:9px; color:var(--fg); background:var(--panel); text-decoration:none; cursor:pointer; font:inherit; font-size:12px; }
+.call-attachment-button:hover,.call-attachment-thumbnail:hover { border-color:var(--accent); }
+.call-attachment-thumbnail { width:88px; height:72px; flex:0 0 88px; padding:0; overflow:hidden; cursor:zoom-in; border:1px solid var(--line); border-radius:9px; background:var(--bg); }
+.call-attachment-thumbnail img { display:block; width:100%; height:100%; object-fit:contain; }
+.call-attachment-audio { max-width:100%; width:100%; height:38px; }
+.call-attachment-text,.call-attachment-address { flex-basis:100%; min-width:0; font-size:12px; }
+.call-attachment-text summary,.call-attachment-address summary { cursor:pointer; padding:5px 0; }
+.call-attachment-text pre { max-height:320px; overflow:auto; white-space:pre-wrap; overflow-wrap:anywhere; }
+.call-image-dialog { width:min(960px,94vw); max-height:92vh; box-sizing:border-box; color:var(--fg); background:var(--surface); border:1px solid var(--line); border-radius:16px; padding:16px; }
+.call-image-dialog::backdrop { background:rgba(10,16,28,.75); }
+.call-image-dialog[open] { display:flex; flex-wrap:wrap; align-items:center; gap:12px; }
+.call-image-dialog .call-image-title { flex:1; min-width:0; margin:0; overflow-wrap:anywhere; }
+.call-image-dialog img { display:block; width:100%; max-height:74vh; object-fit:contain; }
+.live-message-preview { overflow:hidden; text-overflow:ellipsis; }
+@media(max-width:560px) { .call-attachment { padding:10px; gap:9px; } .call-attachment-main { flex-basis:120px; } .call-attachment-thumbnail { width:70px; height:64px; flex-basis:70px; } .call-attachment-button { min-height:42px; } .call-image-dialog { padding:12px; } }

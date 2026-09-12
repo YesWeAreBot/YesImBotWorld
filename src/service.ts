@@ -1,6 +1,7 @@
 import { registerWorldCommands } from "./commands.js";
 import { GrowthLedger } from "./bot/growth.js";
 import { BotIdentityResolver } from "./webui/avatar.js";
+import { callStore } from "./webui/calls.js";
 import { promises as fs } from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
@@ -214,6 +215,7 @@ export class WorldService extends Service<Config> {
     const base = path.resolve(this.ctx.baseDir, this.config.basePath);
     this.files = new WorldFiles(base);
     await this.files.ensure();
+    callStore.init(path.join(this.webuiDir, "calls"));
     // 建好收藏夹分类目录（用户可直接把图丢进「未整理」，散落在根目录的文件也会被自动清扫进去）
     await this.gallery.ensureDirs();
 
@@ -294,6 +296,7 @@ export class WorldService extends Service<Config> {
       this.world?.setRemote(null);
       await client.leave().catch(() => {});
     }
+    callStore.dispose();
     // stopWorld(suspend) 保留离线期间持续流逝的世界时间。
   }
 

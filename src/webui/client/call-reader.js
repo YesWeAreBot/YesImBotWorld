@@ -1,9 +1,9 @@
 /* A reading view of captured model traffic. The exact transport remains available separately. */
 var CallReader = (function () {
     var roles = { system: '系统指令', developer: '开发者指令', user: '输入与观测', assistant: '模型', tool: '工具回执', function: '工具回执' };
-    function data(value, depth) { return ReadableData.render(value, { compact: true, raw: false, copy: false, openDepth: depth || 1 }); }
+    function renderData(value, depth, attachments) { return ReadableData.render(value, { compact: true, raw: false, copy: false, openDepth: depth || 1, renderSpecial: attachments && attachments.render }); }
     function title(value) { return el('h3', { cls: 'live-reading-title', text: value }); }
-    function plain(value) { return ReadableData.text(value); }
+    function plain(value) { return ReadableData.text(CallAttachments.redact(value)); }
     function appendText(node, value) {
         var old = node.textContent;
         if (old === value) return;
@@ -16,13 +16,13 @@ var CallReader = (function () {
         if (!/^[\[{]/.test(candidate) || !/[\]}]$/.test(candidate)) return null;
         try { return JSON.parse(candidate); } catch (_) { return null; }
     }
-    function setValue(node, value) {
+    function setValue(node, value, attachments) {
         if (node._readingValue === value && !node._deferredStructure) return;
         var selection = window.getSelection(), held = selection && !selection.isCollapsed && node.contains(selection.anchorNode);
         if (held && node.dataset.structured) { node._deferredStructure = true; return; }
         var structure = parsed(value);
         if (structure !== null && !held) {
-            node.replaceChildren(data(structure, 2));
+            node.replaceChildren(renderData(structure, 2, attachments));
             node.dataset.structured = 'true';
         } else {
             if (node.dataset.structured) { node.replaceChildren(); delete node.dataset.structured; }
@@ -31,45 +31,42 @@ var CallReader = (function () {
         node._deferredStructure = structure !== null && !!held;
         node._readingValue = value;
     }
-    function contentParts(value) {
+    function contentParts(value, attachments) {
         var holder = el('div', { cls: 'live-message-body' });
-        if (!Array.isArray(value)) { holder.appendChild(data(value == null ? '没有正文' : value)); return holder; }
-        value.forEach(function (part) {
-            if (part == null || typeof part !== 'object') { holder.appendChild(data(part)); return; }
-            if (typeof part === 'string' || part.type === 'text' || part.type === 'input_text' || part.type === 'output_text') holder.appendChild(data(typeof part === 'string' ? part : part.text));
-            else {
-                // Reading a request must not silently fetch its remote image/audio URLs.
-                var name = { image_url: '图片附件', input_image: '图片附件', input_audio: '音频附件', audio: '音频附件', file: '文件附件' }[part.type] || '消息附件';
-                var detail = el('details', { cls: 'live-attachment' }, [el('summary', { text: name + ' · 展开参数' })]);
-                detail.addEventListener('toggle', function () { if (detail.open && !detail.dataset.loaded) { detail.dataset.loaded = 'true'; detail.appendChild(data(part)); } });
-                holder.appendChild(detail);
-            }
-        });
+        function show(part) {
+            var attachment = attachments.render(part);
+            if (attachment) { holder.appendChild(attachment); return; }
+            if (part && typeof part === 'object' && ['text', 'input_text', 'output_text'].includes(part.type)) holder.appendChild(renderData(part.text, 1, attachments));
+            else holder.appendChild(renderData(part == null ? '没有正文' : part, 1, attachments));
+        }
+        if (Array.isArray(value)) value.forEach(show); else show(value);
         return holder;
     }
     function create(container) {
+        var attachments = CallAttachments.create();
+        function data(value, depth) { return renderData(value, depth, attachments); }
         var key = '', requestText = null, choices = new Map(), copy = '', warning = null, output = null, footer = null, footerSignature = '', placeholder = null;
         function clear(next) {
-            key = next; requestText = null; choices.clear(); container.replaceChildren(); copy = ''; warning = null; output = null; footer = null; footerSignature = ''; placeholder = null;
+            attachments.clear(); key = next; requestText = null; choices.clear(); container.replaceChildren(); copy = ''; warning = null; output = null; footer = null; footerSignature = ''; placeholder = null;
         }
         function request(raw, next) {
             if (key !== next) clear(next);
             if (raw === requestText) return;
             requestText = raw;
-            container.replaceChildren();
+            attachments.clear(); container.replaceChildren();
             if (!raw) { container.appendChild(el('p', { cls: 'live-reading-empty', text: '正在读取请求内容…' })); return; }
             var decoded = CallContent.request(raw), messages = decoded.messages || [], tools = decoded.tools || [];
-            if (decoded.error) { container.append(title('请求内容暂时无法解析'), data(raw)); copy = raw; return; }
+            if (decoded.error) { container.append(title('请求内容暂时无法解析'), data(raw)); copy = function () { return plain(raw); }; return; }
             container.appendChild(title('发送给模型的内容 · ' + messages.length + ' 条消息'));
             var list = el('div', { cls: 'live-messages' }), start = Math.max(0, messages.length - 20), earlier = el('button', { type: 'button', cls: 'live-button live-earlier', text: '显示更早的消息' });
             function messageCard(message, index) {
-                var name = roles[message.role] || message.role || '消息', preview = typeof message.content === 'string' ? message.content.replace(/\s+/g, ' ').slice(0, 90) : Array.isArray(message.content) ? message.content.length + ' 个内容片段' : '';
-                var card = el('details', { cls: 'live-message', open: index >= messages.length - 3 }, [el('summary', {}, [el('span', { cls: 'live-message-role', text: name }), el('small', { text: '#' + (index + 1) + (message.name ? ' · ' + message.name : '') }), el('span', { cls: 'live-message-preview', text: preview })])]);
+                var name = roles[message.role] || message.role || '消息', contentText = plain(message.content), preview = contentText.replace(/\s+/g, ' ').slice(0, 90), long = contentText.length > 4000;
+                var card = el('details', { cls: 'live-message', open: index >= messages.length - 3 && !long }, [el('summary', {}, [el('span', { cls: 'live-message-role', text: name }), el('small', { text: '#' + (index + 1) + (message.name ? ' · ' + message.name : '') + (long ? ' · 长消息，点击展开' : '') }), el('span', { cls: 'live-message-preview', text: preview })])]);
                 function fill() {
                     if (!card.open || card.dataset.loaded) return;
                     card.dataset.loaded = 'true';
                     if (message.toolCallId) card.appendChild(el('code', { cls: 'live-tool-ref', text: '对应调用：' + message.toolCallId }));
-                    card.appendChild(contentParts(message.content));
+                    card.appendChild(contentParts(message.content, attachments));
                     if (message.toolCalls && message.toolCalls.length) card.append(title('工具调用'), data(message.toolCalls));
                 }
                 card.addEventListener('toggle', fill); fill(); return card;
@@ -108,7 +105,7 @@ var CallReader = (function () {
                 }
                 nodes.heading.textContent = messages.length > 1 ? '候选回答 ' + (choice.index + 1) : '模型返回';
                 nodes.reasoning.hidden = !choice.reasoning; nodes.content.hidden = !choice.content;
-                appendText(nodes.reasoningText, choice.reasoning || ''); setValue(nodes.contentText, choice.content || '');
+                appendText(nodes.reasoningText, choice.reasoning || ''); setValue(nodes.contentText, choice.content || '', attachments);
                 var toolIds = new Set();
                 (choice.toolCalls || []).forEach(function (call) {
                     var id = call.index; toolIds.add(id);
@@ -119,7 +116,7 @@ var CallReader = (function () {
                     }
                     item.name.textContent = '调用工具 · ' + (call.name || '名称正在生成');
                     item.ref.textContent = call.id || ''; item.ref.hidden = !call.id;
-                    setValue(item.args, call.arguments || '参数正在生成…');
+                    setValue(item.args, call.arguments || '参数正在生成…', attachments);
                 });
                 nodes.toolNodes.forEach(function (item, id) { if (!toolIds.has(id)) { item.element.remove(); nodes.toolNodes.delete(id); } });
                 nodes.finish.textContent = choice.finishReason ? '结束原因 · ' + ({ stop: '正常结束', tool_calls: '交给工具执行', function_call: '交给工具执行', length: '达到生成长度限制', content_filter: '内容过滤' }[choice.finishReason] || choice.finishReason) : options.active ? '正在生成…' : '';

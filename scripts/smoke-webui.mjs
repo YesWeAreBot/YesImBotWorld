@@ -12,6 +12,7 @@ import smokeLive from './webui-smoke-live.mjs';
 import smokeCharts from './webui-smoke-charts.mjs';
 import smokeCockpit from './webui-smoke-cockpit.mjs';
 import smokeCommands from './webui-smoke-commands.mjs';
+import smokeAttachments from './webui-smoke-attachments.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const children = [];
@@ -126,6 +127,7 @@ try {
   await evaluate("document.querySelector('#btn-theme').click()");
   console.log('PASS login cancellation, command search and theme switch');
   console.log('PASS', await smokeLive(helpers));
+  console.log('PASS', await smokeAttachments(helpers));
   console.log('PASS', await smokeCharts(helpers));
   console.log('PASS', await smokeDevices(helpers));
   console.log('PASS', await smokeJourney(helpers));

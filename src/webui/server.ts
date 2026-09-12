@@ -1448,7 +1448,7 @@ export class WebUIServer {
 
     // ---------- 调试 ----------
     if (pathname === "/api/calls" && method === "GET") {
-      sendJSON(res, 200, { calls: callStore.recent(), retention: { maxCalls: 200, maxBytes: 32 * 1024 * 1024, maxCallBytes: 8 * 1024 * 1024, persistent: false } });
+      sendJSON(res, 200, { calls: callStore.recent(), retention: callStore.retention });
       return;
     }
     if (pathname.startsWith("/api/calls/") && method === "GET") {
