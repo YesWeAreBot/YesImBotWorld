@@ -12,6 +12,7 @@ import type { ChannelNameResolver } from "./names.js";
 import type { NotifyManager } from "./notify.js";
 import type { OwnSendTracker } from "./ownsends.js";
 import type { RequestStore } from "./requests.js";
+import { conversationKind, conversationLabel, describeConversation, type ConversationContext } from "./conversation.js";
 
 export interface GatewayCallbacks {
   /** 向 Bot-LLM 投递通知事件；wake 表示是否唤醒 wait() 中的 Bot */
@@ -362,17 +363,31 @@ export class Gateway {
     });
     if (!content.trim()) return;
 
+    const conversation = describeConversation(elements,
+      conversationKind(session.isDirect, session.channelId, session.guildId), isStickerElement,
+      session.quote ? {
+        ...(session.quote.id ? { messageId: String(session.quote.id) } : {}),
+        ...(session.quote.user?.id != null ? { userId: String(session.quote.user.id) } : {}),
+      } : undefined);
+    // Some adapters expose only a quoted message id. Resolve it locally and within this account/channel;
+    // a missing author is unknown, never evidence that the reply is addressed to the Bot.
+    if (conversation.reply?.messageId && !conversation.reply.userId) {
+      const original = await this.store.findByMessageId(session.platform ?? "unknown", session.channelId ?? "unknown", conversation.reply.messageId, selfId);
+      if (original?.userId) conversation.reply.userId = original.userId;
+    }
+
     // 引用回复：适配器会把被引用消息摘到 session.quote（不在 elements 里）。
     // 以标签形式前置：信息可读（谁、说了什么），且 Bot 照抄 <quote id="…"/> 即可自己引用回复。
     // 被引用的是 Bot 自己的消息时显式点破——账号昵称未必等于它的自我认知
     const quote = session.quote;
     if (quote && (quote.id || quote.content || quote.elements)) {
       const qUser = quote.user as { name?: string; nick?: string; id?: string } | undefined;
-      const isSelf = !!selfId && qUser?.id != null && String(qUser.id) === String(selfId);
+      const quoteUserId = conversation.reply?.userId;
+      const isSelf = !!selfId && quoteUserId === String(selfId);
       content =
         quoteTag({
           id: needsMsgIds(this.ops) && quote.id ? quote.id : undefined,
-          name: isSelf ? "你自己" : qUser?.nick || qUser?.name || qUser?.id || undefined,
+          name: isSelf ? "本账号" : qUser?.nick || qUser?.name || quoteUserId || undefined,
           text: truncate(plainText(quote.elements ?? h.parse(quote.content ?? "")), 40) || undefined,
         }) + ` ${content}`;
     }
@@ -389,6 +404,7 @@ export class Gateway {
       self: false,
       messageId: session.messageId ?? "",
       isDirect: session.isDirect,
+      conversation,
     });
 
     const key = channelKey(session.platform ?? "unknown", session.channelId ?? "unknown", session.selfId ?? session.bot?.selfId);
@@ -405,8 +421,8 @@ export class Gateway {
     }
 
     const notification = focused
-      ? await this.renderFocused(key, session, content)
-      : await this.renderNotification(key, session, content);
+      ? await this.renderFocused(key, session, content, conversation)
+      : await this.renderNotification(key, session, content, conversation);
     this.callbacks.notify(notification, focused ? true : this.cfg.wakeOnNotify);
   }
 
@@ -483,18 +499,15 @@ export class Gateway {
   }
 
   /** 关注中的频道：始终呈现完整内容（相当于强制 content 策略） */
-  private async renderFocused(key: string, session: Session, content: string): Promise<RichText> {
+  private async renderFocused(key: string, session: Session, content: string, conversation: ConversationContext): Promise<RichText> {
     const rendered = await this.renderer.render(content);
     const msgTag =
       needsMsgIds(this.ops) && session.messageId ? `(msg:${session.messageId}) ` : "";
-    return {
-      text: `你正留意着 ${await this.names.display(key)}，看到新消息——${msgTag}${session.username ?? session.userId}说：${rendered.text}`,
-      attachments: rendered.attachments,
-      parts: rendered.parts,
-    };
+    const header = `你正留意着 ${await this.names.display(key)}，看到新消息（${conversationLabel(conversation, session.selfId ?? session.bot?.selfId)}）——${msgTag}${session.username ?? session.userId}（账号 ${JSON.stringify(session.userId ?? "未知")}）说：`;
+    return prefixRichText(header, rendered);
   }
 
-  private async renderNotification(key: string, session: Session, content: string): Promise<RichText> {
+  private async renderNotification(key: string, session: Session, content: string, conversation: ConversationContext): Promise<RichText> {
     switch (this.cfg.notifyPolicy) {
       case "count":
         return { text: "手机响了一下：收到一条新消息。" };
@@ -502,14 +515,21 @@ export class Gateway {
         return { text: `手机响了一下：收到来自 ${await this.names.display(key)} 的消息。` };
       case "content": {
         const rendered = await this.renderer.render(content);
-        return {
-          text: `手机响了一下：收到来自 ${await this.names.display(key)} 的消息，${session.username ?? session.userId}说：${rendered.text}`,
-          attachments: rendered.attachments,
-          parts: rendered.parts,
-        };
+        const msgTag = needsMsgIds(this.ops) && session.messageId ? `(msg:${session.messageId}) ` : "";
+        const header = `手机响了一下：收到来自 ${await this.names.display(key)} 的消息（${conversationLabel(conversation, session.selfId ?? session.bot?.selfId)}），${msgTag}${session.username ?? session.userId}（账号 ${JSON.stringify(session.userId ?? "未知")}）说：`;
+        return prefixRichText(header, rendered);
       }
     }
   }
+}
+
+/** Both representations must retain sender/channel identity when BotContext uses ordered media parts. */
+function prefixRichText(prefix: string, rendered: RichText): RichText {
+  return {
+    ...rendered,
+    text: prefix + rendered.text,
+    parts: rendered.parts ? [{ kind: "text", text: prefix }, ...rendered.parts] : undefined,
+  };
 }
 
 /** 标签属性转义（与 Koishi 元素语法一致） */
@@ -526,7 +546,7 @@ function escAttr(s: string): string {
  * 无 subType 的兜底：QQ 表情商城成套表情（summary 有文案 + gif 文件）。
  * 与我们出站时附加的 STICKER_ATTRS（sub_type: 1）对应，据此识别。
  */
-function isStickerElement(el: h): boolean {
+export function isStickerElement(el: h): boolean {
   const st = el.attrs?.sub_type ?? el.attrs?.subType;
   if (st === 1 || st === "1" || st === 2 || st === "2" || st === true) return true;
   const summary = el.attrs?.summary;

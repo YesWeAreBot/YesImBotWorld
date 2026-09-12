@@ -17,7 +17,7 @@ import type { MediaStore } from "../media/store.js";
 import type { TtsClient } from "../media/tts.js";
 import type { MediaRef, MediaType, PickFailure, PickResult, RichText, RichTextPart } from "../types.js";
 import type { FocusManager } from "./focus.js";
-import { atTag, faceTag, formatBanDuration } from "./gateway.js";
+import { atTag, faceTag, formatBanDuration, isStickerElement } from "./gateway.js";
 import { needsMsgIds, type MessagingConfig, type PlatformOpsConfig } from "../config.js";
 import type { KnownChannel, MessageStore } from "./messages.js";
 import type { ChannelNameResolver } from "./names.js";
@@ -25,6 +25,7 @@ import type { NotifyManager } from "./notify.js";
 import type { OwnSendTracker } from "./ownsends.js";
 import type { RequestStore } from "./requests.js";
 import { channelKey as makeChannelKey, parseChannelKey } from "./channels.js";
+import { conversationKind, conversationLabel, describeConversation, type ConversationContext } from "./conversation.js";
 
 /** msg 中的内联媒体标记：Bot 会照抄事件里见到的 [图片#12]、[视频#3：描述] 等形式 */
 const INLINE_MEDIA = /\[(图片|视频|音频|语音)#(\d+)[^\]]*\]/g;
@@ -131,7 +132,8 @@ export class KoishiMessenger implements MessengerApi {
         const time = formatTime(latest.timestamp);
         const who = latest.self ? "你自己" : latest.username || latest.userId;
         // 预览只做轻量替换，不触发解释器
-        return `- ${await this.names.display(key)} [${time}] ${who}: ${truncate(stripPlaceholders(latest.content), 80)}`;
+        const kind = conversationKind(latest.isDirect, latest.channelId, latest.guildId);
+        return `- ${await this.names.display(key)}（${kind === "direct" ? "私聊" : kind === "group" ? "群聊" : "会话类型未知"}） [${time}] ${who}: ${truncate(stripPlaceholders(latest.content), 80)}`;
       }),
     );
     return { text: `你翻了翻手机，最近活跃的频道：\n${lines.join("\n")}` };
@@ -159,7 +161,8 @@ export class KoishiMessenger implements MessengerApi {
       const rendered = await this.renderer.render(row.content);
       if (rendered.attachments) attachments.push(...rendered.attachments);
       const msgTag = this.showMsgId && row.messageId ? ` (msg:${row.messageId})` : "";
-      const header = `[${formatTime(row.timestamp)}]${msgTag} ${who}: `;
+      const address = row.self ? "本账号发出的消息" : conversationLabel(row.conversation, selfId);
+      const header = `[${formatTime(row.timestamp)}]${msgTag} ${who}（账号 ${JSON.stringify(row.userId)}；${address}）: `;
       lines.push(header + rendered.text);
       // 行头作为 text 段，随后依序展开该消息的图文交错分段
       if (rendered.parts?.length) {
@@ -179,7 +182,7 @@ export class KoishiMessenger implements MessengerApi {
     }
     // 最后一条是自己发的：显式点破，防止 Bot 把自己的消息当成别人的来"接话"
     let tail = rows[rows.length - 1]?.self
-      ? "\n（最后一条是你自己发的，之后对方还没有新消息）"
+      ? "\n（最后一条来自本账号，之后还没有其他人的新消息；账号身份本身不证明是你亲自发送）"
       : "";
     // 打开群聊页时自查禁言状态（像 QQ 顶部的禁言横幅）：
     // 即使禁言发生在插件离线期间（notice 没被捕获），Bot 也能在这里发现
@@ -205,10 +208,13 @@ export class KoishiMessenger implements MessengerApi {
           `${display} 的最新进展（最近 ${rows.length} 条）`,
         ])
         : `你打开了 ${display} 的聊天记录（最近 ${rows.length} 条）`;
+    const channelKind = conversationKind(resolved.isDirect, channelId);
+    const channelNote = channelKind === "group" ? "群聊 · 这是多人对话，关注或收到通知只表示看见，不表示每条都在找你。" : "私聊";
+    const heading = `${intro}（${channelNote}）：\n`;
     return {
-      text: `${intro}：\n${lines.join("\n")}${tail}`,
+      text: `${heading}${lines.join("\n")}${tail}`,
       attachments: attachments.length ? attachments : undefined,
-      parts: parts.length ? parts : undefined,
+      parts: [{ kind: "text", text: heading }, ...parts, ...(tail ? [{ kind: "text" as const, text: tail }] : [])],
     };
   }
 
@@ -1773,7 +1779,7 @@ export class KoishiMessenger implements MessengerApi {
       const messages = (Array.isArray(data.messages) ? data.messages : []) as Record<string, unknown>[];
       if (!messages.length) break;
 
-      const rows: { timeMs: number; msgId: string; seq: number; self: boolean; userId: string; username: string; content: string }[] = [];
+      const rows: { timeMs: number; msgId: string; seq: number; self: boolean; userId: string; username: string; content: string; conversation?: ConversationContext }[] = [];
       let minSeq = Infinity;
       let anyOlderThanWatermark = false;
       for (const raw of messages) {
@@ -1790,21 +1796,28 @@ export class KoishiMessenger implements MessengerApi {
         const self = !!selfId && senderId === selfId;
         const username = self ? "（我）" : String(sender.card ?? sender.nickname ?? sender.user_id ?? "?");
         let content = "";
+        let conversation: ConversationContext | undefined;
         if (Array.isArray(raw.message)) {
           content = await this.serializeRawSegments(raw.message as Record<string, unknown>[]);
+          conversation = rawGroupConversation(raw.message as Record<string, unknown>[]);
         } else if (typeof raw.message === "string") {
           content = raw.message;
         } else if (Array.isArray(raw.content)) {
           content = await this.serializeRawSegments(raw.content as Record<string, unknown>[]);
+          conversation = rawGroupConversation(raw.content as Record<string, unknown>[]);
         } else if (typeof raw.content === "string") {
           content = raw.content;
         }
         if (!content.trim()) continue;
-        rows.push({ timeMs, msgId, seq, self, userId: senderId, username, content });
+        rows.push({ timeMs, msgId, seq, self, userId: senderId, username, content, conversation });
       }
 
       rows.sort((a, b) => a.timeMs - b.timeMs);
       for (const r of rows) {
+        if (r.conversation?.reply?.messageId) {
+          const original = await this.store.findByMessageId(platform, channelId, r.conversation.reply.messageId, bot.selfId);
+          if (original?.userId) r.conversation.reply.userId = original.userId;
+        }
         await this.store.store({
           platform,
           channelId,
@@ -1816,6 +1829,8 @@ export class KoishiMessenger implements MessengerApi {
           timestamp: new Date(r.timeMs),
           self: r.self,
           messageId: r.msgId,
+          isDirect: false,
+          conversation: r.conversation,
         });
         added++;
       }
@@ -2266,6 +2281,26 @@ function pickMeta(variants: string[], seed?: number): string {
 /** 轻量替换媒体占位符（不触发解释器，用于预览） */
 function stripPlaceholders(text: string): string {
   return text.replace(MEDIA_PLACEHOLDER, (_, _id, type) => `[${LABEL[type as keyof typeof LABEL]}]`);
+}
+
+/** Offline OneBot history carries structured segments too; preserve the same evidence as live sessions. */
+export function rawGroupConversation(segments: Record<string, unknown>[]): ConversationContext {
+  const elements = segments.map(segment => {
+    const data = (segment.data && typeof segment.data === "object" ? segment.data : {}) as Record<string, unknown>;
+    switch (segment.type) {
+      case "text": return h.text(String(data.text ?? ""));
+      case "at": return h("at", data.qq === "all" ? { type: "all" } : { id: data.qq });
+      case "reply": return h("quote", { id: data.id });
+      case "image": return h("img", data);
+      case "record": return h("audio", data);
+      case "video": return h("video", data);
+      case "face": return h("face", data);
+      case "forward":
+      case "node": return h("forward", {});
+      default: return h("unknown", {});
+    }
+  });
+  return describeConversation(elements, "group", isStickerElement);
 }
 
 function truncate(text: string, max: number): string {

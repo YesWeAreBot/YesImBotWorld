@@ -10,6 +10,8 @@ import smokeJourney from './webui-smoke-journey.mjs';
 import smokeDevices from './webui-smoke-devices.mjs';
 import smokeLive from './webui-smoke-live.mjs';
 import smokeCharts from './webui-smoke-charts.mjs';
+import smokeCockpit from './webui-smoke-cockpit.mjs';
+import smokeCommands from './webui-smoke-commands.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const children = [];
@@ -91,7 +93,7 @@ try {
   await wait("document.querySelector('.studio-avatar img')?.naturalWidth > 0");
   assert.ok(await evaluate("document.querySelector('.studio-avatar img').alt.includes('样本平台账号')"));
   const helpers = { evaluate, wait, assert, navigate, page };
-  const routes = ['overview', 'world', 'growth', 'devices', 'player', 'live', 'debug', 'usage', 'state', 'crossing', 'config', 'prompts', 'gallery', 'media', 'data', 'visitors'];
+  const routes = ['overview', 'world', 'growth', 'devices', 'player', 'live', 'debug', 'usage', 'state', 'crossing', 'config', 'prompts', 'gallery', 'media', 'data', 'visitors', 'commands'];
   for (const width of [1440, 768, 375]) {
     await page('Emulation.setDeviceMetricsOverride', { width, height: 1050, deviceScaleFactor: 1, mobile: width < 600 });
     for (const route of routes) {
@@ -127,6 +129,8 @@ try {
   console.log('PASS', await smokeCharts(helpers));
   console.log('PASS', await smokeDevices(helpers));
   console.log('PASS', await smokeJourney(helpers));
+  console.log('PASS', await smokeCockpit(helpers));
+  console.log('PASS', await smokeCommands(helpers));
   assert.deepEqual(errors, [], 'Browser exceptions or unexpected external requests');
   if (process.env.STUDIO_SCREENSHOT_DIR) {
     const output = resolve(process.env.STUDIO_SCREENSHOT_DIR); await mkdir(output, { recursive: true });

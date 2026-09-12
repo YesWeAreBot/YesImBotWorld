@@ -17,6 +17,12 @@ Bot 可以用核心只读工具 `observe_device(device:"phone"|"computer")` 主�
 
 偷偷模式可在手机已放下时操作应用，但不能代理角色的 `pick_up_phone/put_down_phone` 身体动作。发送必须明确确认，并在 `send` 中提供完整 `msg` 和可选 `media`；不接续 Bot 私有的 `pick_media`/`<img>` 多步草稿。强制接管保留原工具能力。
 
+## 角色接管时的设备语义
+
+管理员从「走进世界」接管常驻角色后，`control.residentMode` 为 `puppet` 或 `avatar`。设备调用自动继承该角色模式，客户端传入的 `mode` 不能覆盖它；`POST /api/device/control` 会拒绝单独暂停或恢复，需从角色驾驶舱归还控制。puppet 的设备操作作为非自主身体经历交付，Bot 意识继续运行；avatar 的操作作为角色自己的意图与实际经历保存。
+
+此时允许随身体控制拿起/放下手机；界面按 `busy` 等待在途操作，不要求 puppet 的 `paused` 为 true。回执保留真实副作用与媒体内容。角色连接跨 WebUI 路由维持，进入设备页不会触发离场计时；真正失联则由服务端收尾。
+
 ## 权限与接管
 
 `/api/device/*` 仅管理员可用，使用现有 WebUI `Authorization: Bearer <token>` 鉴权。若部署没有设置 `webui.token`，遵循现有无令牌管理员模式。普通查看者与玩家不能操作设备；拥有 `devices` 查看权限的访客可读取旧的 `/api/devices` 摘要和已连接电脑的 `/api/computer/screen`，不能获取完整设备会话、消息和工具列表。
@@ -39,7 +45,7 @@ GET 不打开应用、不连接 VNC、不调用模型、不刷新 Bot 观测或�
 ```json
 {
   "running": true,
-  "control": {"paused": false, "busy": true, "deviceBusy": false, "attention": "phone"},
+  "control": {"paused": false, "residentMode": null, "busy": true, "deviceBusy": false, "attention": "phone"},
   "devices": {
     "computer": {"mode": "remote_desktop", "effectiveMode": "remote_desktop", "on": "电脑", "docker": null, "remote": {"host": "configured-host", "port": 5900, "connected": true}},
     "phone": {"down": false, "appOpen": "聊天", "chatOpen": true, "channelKey": "onebot@account:channel", "channelIsGroup": false, "chatAppName": "聊天", "resolution": {"width": 390, "height": 844}}
@@ -106,7 +112,20 @@ y = (clientY - top)  / height * desktopHeight
 
 玩家 crossing 动作使用 `/api/player/task` 的 `taskId`，取消使用 `POST /api/player/cancel {token,taskId}`。取消返回的 `status` 与 `result` 原样来自 crossing；`too_late` 表示已提交或已有结果，不能显示为已撤销。断线后不能自动重发动作，原请求可能尚未到达服务器。
 
-管理员 `/api/player/tool` 直调工具没有 crossing `taskId`，不提供可撤销承诺。同名接管常驻 Bot 的入场响应可包含 `control`；自主生成已暂停但 `busy` 时，应等待已有回执。离场只有该有效接管会话会交还 Bot；普通独立角色离场不会释放设备页控制。已有操作未完时 `/api/player/leave` 返回 409 并保留会话，不能提前清除前端会话或显示交还成功。
+常驻角色入场使用 `/api/player/arrive` 的 `mode:"avatar"|"puppet"`，名字必须匹配常驻 Bot，权限必须是管理员，不创建副本。返回的 `token` 用于以下能力：
+
+| 请求 | 用途 |
+| --- | --- |
+| `GET /api/player/cockpit?ctoken=...` | 当前 mode、control、完整 tools Schema、pending 与 time 单位；只读，不消费观测 |
+| `POST /api/player/tool {token,name,arguments,duration?,confirmSend?}` | 通过真实 Bot 调用路径执行；来源由有效会话推导 |
+| `POST /api/player/tool/cancel {token,callId}` | 取消本会话尚未提交的调用；callId 从 pending 的 id 获取 |
+| `POST /api/player/leave {token}` | 等待工作完成后归还角色控制 |
+
+`/api/player/tool` 必须带有效接管 token，仅有管理员身份或同名字符串不足以代理角色。返回 `{ok,text,content?,callId?}`，发送工具的 `requiresSendConfirmation` 为 true 时需明确确认。`duration` 为 TU；wait 传 `arguments.n`，rest 传 `arguments.duration`，不要另给冲突的外层估时。puppet 不开放代替意识的 reflect/recall/wait/rest 等操作。
+
+常驻角色的观察必须走 `observe` 工具，确保它看到的世界也进入自身经历；入场和只读目录不会私自消费角色的台词游标。旧 `/api/player/task` 仅用于独立玩家，常驻角色的请求会被拒绝。
+
+入场响应中的 `control.busy` 表示需等待已有回执。取消不会回滚已提交的变化，网络异常也不会自动重放。已有操作未完时 `/api/player/leave` 返回 409 并保留会话；普通独立角色离场不会释放设备页控制。关闭页面或长期失联会取消未提交调用，并在已提交回执交付后恢复自主能力。控制来源另存于 `control-audit.jsonl`，不把接管凭据写入审计。
 
 ## 隔离样本与验证
 

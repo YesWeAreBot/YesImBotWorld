@@ -22,6 +22,8 @@ export interface ToolCallRecord extends ParsedToolCall {
   id: string;
   /** 此调用由谁触发（agent = Bot-LLM 自己生成，system = 运行时强制，如强制 rest） */
   role: ToolCallRole;
+  /** 管理员审计来源；不作为角色额外的心理或世界事实注入。 */
+  control?: { mode: "avatar" | "puppet"; sessionId: string };
   /** 生成时刻（Time Unit） */
   issuedAt: number;
   /** 期望完成时刻 = issuedAt + (duration ?? 0) */

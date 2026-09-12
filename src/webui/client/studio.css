@@ -97,7 +97,16 @@ button.danger {
 button svg {
   width:17px;
   height:17px;
+  display:block;
   flex:none
+}
+/* Icon wrappers must not inherit a text baseline or shrink beside the label. */
+button > span:has(> svg:only-child) {
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  flex-shrink:0;
+  line-height:0
 }
 .icon-button {
   width:38px;

@@ -16,6 +16,7 @@ var Studio = (function () {
         ['gallery', '相册', 'image', ['gallery']],
         ['data', '记事与存档', 'folder', ['notes', 'archive']],
         { group: '管理工作室' },
+        ['commands', '世界指令', 'sliders'],
         ['state', '世界设定', 'file', ['definitions', 'world_status', 'bot_status', 'news', 'facts']],
         ['crossing', '世界连接', 'portal', ['crossing']],
         ['prompts', '提示词', 'edit', ['prompts']],

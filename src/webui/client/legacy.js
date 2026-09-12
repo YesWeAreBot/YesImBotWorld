@@ -36,7 +36,7 @@ function el(tag, attrs, children){
     else if(k === 'text') n.textContent = attrs[k];
     else if(k.indexOf('on') === 0) n.addEventListener(k.slice(2), attrs[k]);
     // 布尔属性：用真实布尔赋值而非 setAttribute（HTML 里 checked/disabled/readonly 存在即真，值无所谓）
-    else if(k === 'checked' || k === 'disabled' || k === 'readonly' || k === 'selected' || k === 'multiple') n[k] = !!attrs[k];
+    else if(['checked','disabled','readonly','selected','multiple','open','hidden','required'].includes(k)) n[k === 'readonly' ? 'readOnly' : k] = !!attrs[k];
     else n.setAttribute(k, attrs[k]);
   }
   if(children){
@@ -1065,6 +1065,7 @@ function promptGroup(title, defaults, current, prefix){
 function descOf(key, prefix){
   var map = {
     bot: {
+      conversation: '私聊与群聊 · 对话对象、参与分寸与媒体理解',
       constitutionHead: '行为准则开头段（原生工具调用协议的前言）',
       outputFormatNative: '输出格式段 · 原生协议（function calling）',
       outputFormatText: '输出格式段 · 正文 JSON 协议（nativeToolCalls 关闭时）',

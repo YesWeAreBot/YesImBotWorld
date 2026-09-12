@@ -1,3 +1,4 @@
+import { registerWorldCommands } from "./commands.js";
 import { GrowthLedger } from "./bot/growth.js";
 import { BotIdentityResolver } from "./webui/avatar.js";
 import { promises as fs } from "node:fs";
@@ -72,6 +73,8 @@ function readPackageVersion(): string {
 
 export class WorldService extends Service<Config> {
   private botIdentityResolver = new BotIdentityResolver();
+  private residentSession: { token: string; id: string; mode: "avatar" | "puppet" } | null = null;
+  private residentTransition = false;
   // puppeteer 可选：未安装时浏览器 App 不提供截图（其余功能照常），安装后无需改动即可用
   static readonly inject = {
     database: { required: true },
@@ -254,6 +257,13 @@ export class WorldService extends Service<Config> {
           clock: () => this.clock ?? null,
           ready: () => this.worldActive && !!this.bot,
           notifyHostBot: (content) => this.bot?.pushEvent("world", content),
+          releaseResidentControl: async (id, cause) => {
+            await this.bot?.releaseResidentControl(id, true);
+            if (this.residentSession?.id === id) {
+              await this.remoteDesktopApp?.releaseInputs();
+              this.residentSession = null;
+            }
+          },
         });
         await this.crossingServer.start();
         this.logger.info(
@@ -272,6 +282,8 @@ export class WorldService extends Service<Config> {
   override async stop(): Promise<void> {
     await this.webui?.stop().catch(() => {});
     this.webui = null;
+    // 先退休 Bot 并刷新已完成但延迟投递的回执，再等待角色会话退出。
+    await this.stopWorld({ suspend: true });
     await this.crossingServer?.stop().catch(() => {});
     this.crossingServer = null;
     // 插件停止时若 Bot 在异世界：礼貌地离开（穿越状态不跨重启，重启后回到自己的世界）
@@ -282,8 +294,7 @@ export class WorldService extends Service<Config> {
       this.world?.setRemote(null);
       await client.leave().catch(() => {});
     }
-    // 插件停止（进程退出/重载）≠ 用户暂停世界：世界时间在离线期间继续流逝
-    await this.stopWorld({ suspend: true });
+    // stopWorld(suspend) 保留离线期间持续流逝的世界时间。
   }
 
   // ---------- 世界生命周期 ----------
@@ -743,15 +754,76 @@ export class WorldService extends Service<Config> {
     return this.crossingServer?.playerControlsBot(token) ?? false;
   }
 
-  /** WebUI：管理员代理 Bot 执行任意工具调用（手动驾驶） */
-  async botToolCall(name: string, args: Record<string, unknown>, duration?: number): Promise<ManualToolResult> {
+  /** 会话凭据只用于授权；审计中记录公开 session id，不记录 bearer token。 */
+  async acquirePlayerControl(token: string): Promise<DeviceControlResult> {
+    const session = this.crossingServer?.residentSession(token), bot = this.bot;
+    if (!session || !bot || !this.worldActive) return { ok: false, paused: false, busy: false, text: "常驻角色接管会话不存在或世界已停止。" };
+    if (this.residentSession && this.residentSession.id !== session.id) return { ok: false, paused: bot.manualMode, busy: true, text: "常驻角色正由另一个会话接管。" };
+    // 先使旧的设备输入排空，再改变角色控制归属。
     return this.withDeviceLock(async () => {
-      if (!this.worldActive || !this.bot) return { ok: false, text: "（Bot-LLM 当前未在运行。）" };
-      if (this.deviceToolDefs().some(tool => tool.name === name) && (!this.bot.manualMode || this.bot.manualBusy)) {
-        return { ok: false, text: "请先接管并等待设备空闲，再操作 Bot 的设备。" };
-      }
-      return this.bot.injectExternalToolCall(name, args, { duration });
+      if (this.residentTransition || this.crossingServer?.residentSession(token)?.id !== session.id || !this.worldActive || this.bot !== bot) return { ok: false, paused: bot.manualMode, busy: false, text: "角色会话在等待控制期间已结束。" };
+      this.residentTransition = true;
+      try {
+        const { busy } = await bot.acquireResidentControl(session.mode, session.id);
+        if (this.crossingServer?.residentSession(token)?.id !== session.id || !this.worldActive || this.bot !== bot) {
+          await bot.releaseResidentControl(session.id, true);
+          return { ok: false, paused: bot.manualMode, busy: false, text: "角色会话在建立期间已结束，控制已归还。" };
+        }
+        this.residentSession = { token, id: session.id, mode: session.mode };
+        if (!busy) await this.remoteDesktopApp?.releaseInputs();
+        return { ok: true, paused: bot.manualMode, busy, text: busy ? "角色控制已建立，等待此前已提交操作的真实回执。" : session.mode === "avatar" ? "已完全入替角色，自主生成暂停。" : "已接管身体，角色的自主意识继续运行。" };
+      } catch (error) {
+        await bot.releaseResidentControl(session.id, true);
+        if (this.residentSession?.id === session.id) this.residentSession = null;
+        return { ok: false, paused: bot.manualMode, busy: false, text: (error as Error).message };
+      } finally { this.residentTransition = false; }
     });
+  }
+
+  async releasePlayerControl(token: string): Promise<DeviceControlResult> {
+    const session = this.crossingServer?.residentSession(token), bot = this.bot;
+    if (!session || this.residentSession?.id !== session.id || !bot) return { ok: false, paused: bot?.manualMode ?? false, busy: false, text: "角色接管会话不存在或已改变。" };
+    if (this.devicePending > 0 || bot.residentBusy) return { ok: false, paused: bot.manualMode, busy: true, text: "还有操作未完成；可以取消尚未提交的调用，已提交操作需等待真实回执。" };
+    if (this.residentTransition) return { ok: false, paused: bot.manualMode, busy: true, text: "角色控制正在切换。" };
+    this.residentTransition = true;
+    try {
+      await this.remoteDesktopApp?.releaseInputs();
+      const { busy } = await bot.releaseResidentControl(session.id);
+      if (!busy && this.residentSession?.id === session.id) this.residentSession = null;
+      return { ok: !busy, paused: bot.manualMode, busy, text: busy ? "操作尚未完成。" : "已归还角色，自主运行恢复。" };
+    } finally { this.residentTransition = false; }
+  }
+
+  async playerCockpit(token: string) {
+    const session = this.crossingServer?.residentSession(token), bot = this.bot;
+    if (!session || !bot || this.residentSession?.id !== session.id) throw new Error("常驻角色接管会话不存在或已结束");
+    return {
+      mode: session.mode, running: this.worldActive && bot.status().running,
+      control: { paused: bot.manualMode, busy: this.devicePending > 0 || bot.residentBusy },
+      tools: bot.manualTools(session.mode).map(tool => {
+        const device = this.deviceToolDefs().find(candidate => candidate.name === tool.name);
+        return { ...tool, ...(device ? { device: device.device, effect: device.effect } : {}), requiresSendConfirmation: device?.effect === "send" };
+      }), pending: bot.pendingManualCalls(),
+      time: { unitWorldSeconds: this.clock?.unitWorldSeconds ?? 1, unitRealSeconds: this.clock?.unitRealSeconds ?? 1 },
+    };
+  }
+
+  cancelPlayerTool(token: string, callId: string) {
+    const session = this.crossingServer?.residentSession(token);
+    if (!session || !this.bot || this.residentSession?.id !== session.id) return { ok: false, status: "not_found", text: "角色接管会话不存在。" };
+    return this.bot.cancelExternalTool(callId, session.id);
+  }
+
+  /** 人类驾驶舱与 Bot-LLM 共用真实 dispatch；来源语义由有效会话决定。 */
+  async botToolCall(name: string, args: Record<string, unknown>, duration?: number, token?: string, confirmSend = false): Promise<ManualToolResult> {
+    const session = token ? this.crossingServer?.residentSession(token) : null, bot = this.bot;
+    if (!this.worldActive || !bot) return { ok: false, text: "（Bot-LLM 当前未在运行。）" };
+    if (!session || this.residentSession?.id !== session.id) return { ok: false, text: "请先建立常驻角色接管会话，再从驾驶舱操作。" };
+    if (this.residentTransition) return { ok: false, text: "角色控制正在切换，此调用没有执行。" };
+    if (bot.residentBusy && name !== "cancel") return { ok: false, text: "已有动作尚未完成，请等待真实回执或取消尚未提交的调用。" };
+    if (name === "cancel") return this.cancelPlayerTool(token!, String(args.id ?? args.toolcall_id ?? ""));
+    if (this.deviceToolDefs().some(tool => tool.name === name && tool.effect === "send") && !confirmSend) return { ok: false, text: "发送需由用户明确点击发送（confirmSend=true）。" };
+    return bot.injectExternalToolCall(name, args, { duration, control: { mode: session.mode, sessionId: session.id } });
   }
 
   /** WebUI：管理员接管 Bot 时暂停/恢复其自主生成 */
@@ -774,6 +846,7 @@ export class WorldService extends Service<Config> {
     return this.withDeviceLock(async () => {
       const bot = this.bot;
       if (!this.worldActive || !bot) return { ok: false, paused: false, busy: false, text: "世界尚未运行，无法接管设备。" };
+      if (this.residentSession) return { ok: false, paused: bot.manualMode, busy: bot.residentBusy, text: "角色接管期间设备随角色模式运行；请从驾驶舱归还角色后再单独控制设备。" };
       if (paused) {
         const { busy } = await bot.acquireManualControl();
         if (!busy) await this.remoteDesktopApp?.releaseInputs();
@@ -791,14 +864,19 @@ export class WorldService extends Service<Config> {
       const bot = this.bot;
       if (!this.worldActive || !bot) return { ok: false, text: "世界尚未运行。" };
       if (mode !== "stealth" && mode !== "takeover") return { ok: false, text: "未知设备操作模式。" };
-      if (mode === "takeover" && (!bot.manualMode || bot.manualBusy)) return { ok: false, text: "请先强制接管并等待现有操作完成。" };
-      if (mode === "stealth" && (name === "pick_up_phone" || name === "put_down_phone")) return { ok: false, text: "偷偷操作改变设备界面，不代替角色拿起或放下手机。" };
+      if (this.residentTransition) return { ok: false, text: "角色控制正在切换，此设备操作没有执行。" };
+      const resident = this.residentSession;
+      if (resident && (!this.crossingServer?.residentSession(resident.token) || bot.residentBusy)) return { ok: false, text: "角色会话正在结束或仍有动作待回执。" };
+      if (!resident && mode === "takeover" && (!bot.manualMode || bot.manualBusy)) return { ok: false, text: "请先强制接管并等待现有操作完成。" };
+      if (!resident && mode === "stealth" && (name === "pick_up_phone" || name === "put_down_phone")) return { ok: false, text: "偷偷操作改变设备界面，不代替角色拿起或放下手机。" };
       const tool = this.deviceToolDefs().find(tool => tool.name === name);
       if (!tool) return { ok: false, text: "此设备工具当前不可用，请先打开对应应用或进入频道。" };
       if (tool.effect === "send" && !confirmSend) return { ok: false, text: "发送需由用户明确点击发送（confirmSend=true）。" };
       if (!args || typeof args !== "object" || Array.isArray(args)) return { ok: false, text: "args 必须为 JSON 对象。" };
       if (duration !== undefined && (!Number.isFinite(duration) || duration < 0)) return { ok: false, text: "duration 必须为有限非负数。" };
-      return bot.injectExternalToolCall(name, args, { duration, stealth: mode === "stealth" });
+      return bot.injectExternalToolCall(name, args, resident
+        ? { duration, control: { mode: resident.mode, sessionId: resident.id } }
+        : { duration, stealth: mode === "stealth" });
     });
   }
 
@@ -811,7 +889,7 @@ export class WorldService extends Service<Config> {
     const messages = parsed && !parsed.error ? await this.store.channelMessages(parsed.platform, parsed.channelId, 100, parsed.selfId) : [];
     return {
       running: this.worldActive && !!this.bot?.status().running,
-      control: { paused: this.bot?.manualMode ?? false, busy: this.devicePending > 0 || !!this.bot?.manualBusy, deviceBusy: this.devicePending > 0 || !!this.bot?.deviceBusy, attention: this.bot?.deviceAttention ?? null },
+      control: { paused: this.bot?.manualMode ?? false, residentMode: this.bot?.residentMode ?? null, busy: this.devicePending > 0 || !!(this.residentSession ? this.bot?.residentBusy : this.bot?.manualBusy), deviceBusy: this.devicePending > 0 || !!this.bot?.deviceBusy, attention: this.bot?.deviceAttention ?? null },
       devices,
       apps: (this.appManager?.installedApps() ?? []).map(app => ({ ...app, active: app.kind === "chat" ? devices.phone.chatOpen : app.active })),
       tools: this.deviceToolDefs(),
@@ -1291,112 +1369,6 @@ export class WorldService extends Service<Config> {
   }
 
   private registerCommands(ctx: Context): void {
-    // 注意：koishi 校验整条父链的权限，父指令必须保持低权限，
-    // 管控在各子指令上单独声明（.status 对普通用户开放）
-    const cmd = ctx.command("world", "YesImBot World 虚拟世界");
-
-    cmd
-      .subcommand(".init", "初始化（创世）：由 World-LLM 根据定义生成初始状态", { authority: 3 })
-      .option("force", "-f 强制重新创世（归档并清空当前世界）")
-      .action(async ({ session, options }) => {
-        if (this.notReady()) return this.notReady()!;
-        try {
-          // 创世要跑多次 World-LLM 调用，耗时可能数分钟：先给出即时反馈
-          if ((await this.files.isInitialized()) ? !!options?.force : true) {
-            await session?.send("开始创世：World-LLM 正在依据定义生成世界（判定世界性质、历法与初始状态），可能需要几分钟，请稍候……");
-          }
-          return await this.initWorld(!!options?.force);
-        } catch (err) {
-          return `创世失败：${(err as Error).message ?? err}`;
-        }
-      });
-
-    cmd.subcommand(".start", "让世界开始/恢复运转", { authority: 3 }).action(async () => {
-      if (this.notReady()) return this.notReady()!;
-      try {
-        return await this.startWorld();
-      } catch (err) {
-        return `启动失败：${(err as Error).message ?? err}`;
-      }
-    });
-
-    cmd.subcommand(".stop", "暂停世界（时间静止）", { authority: 3 }).action(async () => {
-      if (this.notReady()) return this.notReady()!;
-      return this.stopWorld();
-    });
-
-    cmd.subcommand(".status", "查看世界与 Bot 的运行状态", { authority: 1 }).action(async () => {
-      if (this.notReady()) return this.notReady()!;
-      return this.statusText();
-    });
-
-    cmd
-      .subcommand(".webui", "查看运维 WebUI 的访问地址（若已启用）", { authority: 1 })
-      .action(async () => {
-        if (this.notReady()) return this.notReady()!;
-        const webui = this.config.webui;
-        if (!webui.enabled || !this.webui) {
-          return "WebUI 未启用。在配置中开启 webui.enabled 并重启插件后可用。";
-        }
-        const base = webui.token ? `地址：http://${webui.host}:${webui.port}/ 访问令牌：${webui.token}` : `地址：http://${webui.host}:${webui.port}/`;
-        return `运维 WebUI 已启动。${base}`;
-      });
-
-    cmd
-      .subcommand(".reload", "用户修改定义文件后：让世界调整状态并（以世界观内方式）告知 Bot", { authority: 3 })
-      .action(async ({ session }) => {
-        if (this.notReady()) return this.notReady()!;
-        if (!(await this.files.isInitialized())) return "世界尚未初始化。";
-        await session?.send("正在重载定义：World-LLM 正在调整世界状态，请稍候……");
-        const { botDef, worldDef } = await this.files.readDefinitions();
-        await this.world.reconcileDefinitions(botDef, worldDef, (content) => {
-          this.bot?.pushEvent("world", content);
-        });
-        return "定义已重新载入，世界状态已调整。";
-      });
-
-    cmd
-      .subcommand(".clearmsg", "清空 Bot 的聊天消息记录（不影响世界状态与定义）", { authority: 4 })
-      .action(async () => {
-        if (this.notReady()) return this.notReady()!;
-        await this.store.clear();
-        return "聊天消息记录已清空（媒体缓存与世界状态不受影响）。";
-      });
-
-    cmd
-      .subcommand(".inject <text:text>", "以系统事件形式向 Bot 的意识流注入一条内容（调试用）", { authority: 3 })
-      .action(async (_, text) => {
-        if (!this.worldActive || !this.bot) return "世界未在运行。";
-        if (!text?.trim()) return "内容不能为空。";
-        this.bot.pushEvent("system", text.trim(), { wake: true });
-        return "已注入。";
-      });
-
-    cmd
-      .subcommand(".travel <name:text>", "穿越：把 Bot 强制送往指定的异世界（填 home 送回自己的世界）", { authority: 3 })
-      .action(async (_, name) => {
-        const target = (name ?? "").trim();
-        if (!target) {
-          const worlds = this.config.crossing.worlds.filter((w) => w.name.trim() && w.url.trim());
-          return worlds.length
-            ? `用法：world.travel <世界名|home>。已配置的世界：${worlds.map((w) => `「${w.name.trim()}」${w.allowVoluntary ? "" : "（仅强制）"}`).join("、")}` +
-                (this.crossingLocation ? `\nBot 当前在「${this.crossingLocation}」。` : "")
-            : "还没有配置任何可去的世界（crossing.worlds）。";
-        }
-        return this.crossingForce(target);
-      });
-
-    cmd
-      .subcommand(".reset", "重置世界：归档并清空全部运行时状态（保留定义文件）", { authority: 4 })
-      .action(async () => {
-        if (this.notReady()) return this.notReady()!;
-        await this.stopWorld();
-        await this.files.reset();
-        await this.clock.reset();
-        await this.focus.clear();
-        await this.notifyMgr.reset();
-        this.phoneStatus.down = false;
-        return "世界已重置。定义文件保留，可重新 world.init。";
-      });
+    registerWorldCommands(ctx, this);
   }
 }

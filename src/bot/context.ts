@@ -248,12 +248,14 @@ export class BotContext {
     return [
       ...(original ? ["# 最初的你\n" + original] : []),
       "# 你是谁\n" + (this.pinned.persona.trim() || "（角色设定缺失）"),
-      ...(botName ? [`# 你的名字\n你叫「${botName}」——这就是你，别人这样称呼你、@ 你时就是在跟你说话。`] : []),
+      ...(botName ? [`# 你的名字\n你叫「${botName}」。群里仅提到同名不证明在和你说话，结合 @ 的账号、引用对象与上下文判断。`] : []),
       c.constitutionHead +
         "\n\n" +
         (nativeToolCalls ? c.outputFormatNative : c.outputFormatText) +
         "\n" +
         c.constitution +
+        "\n" +
+        c.conversation +
         "\n" +
         (this.waitRemoved ? c.lifestyleNoWait : c.lifestyleWithWait),
       ...(accounts
@@ -261,7 +263,7 @@ export class BotContext {
             "# 你的聊天账号\n" +
               accounts +
               (botName
-                ? `\n消息里的 <at id=\"…\"/> 指向这些 id 时，那是别人在 @ 你、在叫「${botName}」（你的名字）——那就是在跟你说话；说话人标为「你自己」的消息来自你的账号，不一定由你亲自发送；不要当成他人新消息或自动纳入自己的经历。`
+                ? `\n消息里的 <at id=\"…\"/> 指向这些 id 时，那是别人在 @ 你、在叫「${botName}」（你的名字）——这是直接提及本账号的信号，是否需要回应仍看语境；说话人标为「你自己」的消息来自你的账号，不一定由你亲自发送；不要当成他人新消息或自动纳入自己的经历。`
                 : `\n消息里的 <at id=\"…\"/> 指向这些 id、或说话人标为「你自己」时，那都是你——被 @ 是别人在叫你，「你自己」只标识账号，不证明你亲自说过这些话。`),
           ]
         : []),

@@ -35,6 +35,21 @@ export interface ScheduleOptions {
 /** Execution and delivery are separate; cancellation must never hide a committed action. */
 export class Scheduler {
   private tasks = new Map<string, ScheduledTask>();
+  private idleWaiters = new Set<() => void>();
+
+  private notifyIdle(): void {
+    if (this.tasks.size) return;
+    for (const resolve of this.idleWaiters) resolve();
+    this.idleWaiters.clear();
+  }
+
+  whenIdle(): Promise<void> {
+    return this.tasks.size ? new Promise(resolve => this.idleWaiters.add(resolve)) : Promise.resolve();
+  }
+
+  pending(): { id: string; name: string; issuedAt: number; expectedAt: number; committed: boolean; control?: ToolCallRecord["control"] }[] {
+    return [...this.tasks.values()].map(({ call, committed }) => ({ id: call.id, name: call.name, issuedAt: call.issuedAt, expectedAt: call.expectedAt, committed, ...(call.control ? { control: call.control } : {}) }));
+  }
   private serialQueues = new Map<string, Promise<void>>();
 
   constructor(private clock: WorldClock, private deliver: DeliverFn, private logger: Logger) {}
@@ -58,6 +73,7 @@ export class Scheduler {
       if (task.abort.signal.aborted || task.delivered) return;
       task.delivered = true;
       this.tasks.delete(call.id);
+      this.notifyIdle();
       if (result !== null) this.deliver(result, call.id, { ok });
     };
     const atExpected = (fn: () => void) => {
@@ -108,6 +124,7 @@ export class Scheduler {
     task.abort.abort();
     if (task.timer) clearTimeout(task.timer);
     this.tasks.delete(id);
+    this.notifyIdle();
     return "cancelled";
   }
 
@@ -138,5 +155,6 @@ export class Scheduler {
       if (task.timer) clearTimeout(task.timer);
       this.tasks.delete(id);
     }
+    this.notifyIdle();
   }
 }

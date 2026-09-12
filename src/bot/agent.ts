@@ -1,5 +1,7 @@
 import type { Logger } from "koishi";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { appendFile } from "node:fs/promises";
+import path from "node:path";
 import type { ComputerDevice } from "../apps/computerDevice.js";
 import type { AppManager } from "../apps/manager.js";
 import type { WorldClock } from "../clock.js";
@@ -27,6 +29,7 @@ import { sliceText } from "../text.js";
 /** 代理执行单个工具调用的回传结果（管理员「手动驾驶」Bot） */
 export interface ManualToolResult {
   ok: boolean;
+  callId?: string;
   /** 工具结果 / 校验拒绝原因 */
   text: string;
   content?: RichText;
@@ -204,6 +207,12 @@ export class BotAgent {
    * 处理外部注入的工具调用，不再自主 generate；「操纵（puppet）」不暂停。
    */
   private manualPaused = false;
+  private residentControl: { mode: "avatar" | "puppet"; sessionId: string } | null = null;
+  private residentClosing = false;
+  private residentAdmissions = 0;
+  private residentAdmissionWaiters = new Set<() => void>();
+  private puppetCalls = new Set<string>();
+  private controlAuditTail: Promise<void> = Promise.resolve();
   private autonomousDispatch: Promise<void> | null = null;
   private deviceExecution = new AsyncLocalStorage<{ stealth: boolean }>();
   private stealthCalls = new Set<string>();
@@ -296,6 +305,8 @@ export class BotAgent {
           this.stealthCalls.delete(ref);
           return;
         }
+        // Preserve non-voluntary provenance before a retired agent persists a late receipt.
+        content = this.puppetReceipt(content, ref);
         if (this.retired) {
           if (ref) {
             this.externalToolResults.get(ref)?.resolve({ ok: outcome?.ok ?? true, text: toPlainText(content), ...(typeof content === "string" ? {} : { content }) });
@@ -316,6 +327,7 @@ export class BotAgent {
           }
         }
         this.pushEvent("tool", gated, { ref });
+        if (ref) this.puppetCalls.delete(ref);
       },
       logger,
     );
@@ -364,7 +376,7 @@ export class BotAgent {
     appDefs = [...appDefs.filter(def => !hidden(def.name)), ...this.perceivedAppDefs.filter(def => hidden(def.name))];
     this.perceivedToolNames = [...allowed];
     this.perceivedAppDefs = [...appDefs];
-    this.backend.setToolNames(allowed);
+    this.backend.setToolNames(this.residentControl?.mode === "puppet" ? allowed.filter(name => this.autonomousDuringPuppet(name)) : allowed);
     this.backend.setToolDefs?.([...this.toolDefs, ...appDefs]);
   }
 
@@ -498,7 +510,8 @@ export class BotAgent {
     content: string | RichText,
     opts: { ref?: string; wake?: boolean; originEventIds?: string[] } = {},
   ): void {
-    const rich: RichText = typeof content === "string" ? { text: content } : content;
+    const rich = this.puppetReceipt(content, opts.ref);
+    const puppetResult = source === "tool" && !!opts.ref && this.puppetCalls.has(opts.ref);
     // 手动驾驶（管理员代理）结果回传：捕获被校验拒绝时的 system 提示（source=system 且 ref 命中）。
     // 真正执行结果由 scheduler deliver 通道回传，不在此处理。
     if (opts.ref && source === "system") {
@@ -509,18 +522,28 @@ export class BotAgent {
     const isWaitResult = this.waiting !== null && opts.ref === this.waiting.callId;
     // 唤醒规则：等待中的工具结果必定唤醒；wake 事件可以提前唤醒 wait（等待本来就是"直到有事发生"）。
     // act 不再阻塞生成（blockingAct 只管住下一个 act），因此没有"专注做事顾不上别的"的暂停态。
-    const shouldWake = this.waiting !== null && (isWaitResult || opts.wake === true);
+    const shouldWake = this.waiting !== null && (isWaitResult || opts.wake === true || puppetResult);
 
     if (shouldWake && !isWaitResult) {
       // 提前唤醒 wait/小憩：取消到期任务，并在事件前插入打断说明
       const { callId, kind, startedTU } = this.waiting!;
-      this.scheduler.cancel(callId);
+      const timer = this.scheduler.pending().find(task => task.id === callId);
+      const cancellation = this.scheduler.cancel(callId);
+      if (cancellation === "cancelled") {
+        const elapsed = Math.max(0, this.clock.now() - (startedTU ?? timer?.issuedAt ?? this.clock.now()));
+        this.externalToolResults.get(callId)?.resolve({ ok: false, callId, text: `（${kind === "nap" ? "休息" : "等待"}被新动静打断，实际经过 ${elapsed.toFixed(1)} TU；未继续等待到原定时刻。）` });
+        this.externalToolResults.delete(callId);
+        this.puppetCalls.delete(callId);
+        this.stealthCalls.delete(callId);
+      }
       // 被打断的等待按实际时长计入等待占比（小憩不算 wait）
       if (kind !== "nap" && startedTU !== undefined) this.recordWait(startedTU);
       this.mailbox.push({
         source: "system",
         content:
-          kind === "nap"
+          this.residentControl?.mode === "puppet"
+            ? "外部动静打断了你的安静等待；你可以继续感知，身体动作仍由外部操纵。"
+            : kind === "nap"
             ? pickMeta([
                 "动静把你从小憩中弄醒了。",
                 "一点动静把你从浅睡里惊醒了。",
@@ -572,6 +595,19 @@ export class BotAgent {
       this.waiting = null;
       this.wakeFn?.();
     }
+  }
+
+  /** Text and ordered multimodal parts carry the same agency attribution, including after restart. */
+  private puppetReceipt(content: string | RichText, ref?: string): RichText {
+    const rich: RichText = typeof content === "string" ? { text: content } : content;
+    if (!ref || !this.puppetCalls.has(ref)) return rich;
+    const prefix = "（以下是外部操纵你身体/设备产生的回执，并非你自主选择的行动；保留实际结果，不据此推定你的意愿或感受。）\n";
+    const first = rich.parts?.[0];
+    return {
+      ...rich,
+      text: rich.text.startsWith(prefix) ? rich.text : prefix + rich.text,
+      ...(rich.parts ? { parts: first?.kind === "text" && first.text.startsWith(prefix) ? rich.parts : [{ kind: "text", text: prefix }, ...rich.parts] } : {}),
+    };
   }
 
   /**
@@ -634,11 +670,88 @@ export class BotAgent {
   get deviceBusy(): boolean { return this.deviceOperations > 0; }
   get deviceAttention(): DeviceKind | null { return this.attention === "phone" && this.phone.down && !this.observingPlacedPhone ? null : this.attention; }
 
+  get residentMode(): "avatar" | "puppet" | null { return this.residentControl?.mode ?? null; }
+
+  /** 身体受控不等于意识被替代；未知扩展工具按可能有副作用处理。 */
+  private autonomousDuringPuppet(name: string): boolean {
+    return ["observe", "observe_device", "check_status", "check_time", "reflect", "recall_growth", "recall", "wait", "rest"].includes(name);
+  }
+
+  private puppetToolAllowed(name: string): boolean {
+    return !["reflect", "recall_growth", "recall", "wait", "rest"].includes(name);
+  }
+
+  async acquireResidentControl(mode: "avatar" | "puppet", sessionId: string): Promise<{ busy: boolean }> {
+    if (this.residentControl) {
+      if (this.residentControl.sessionId !== sessionId || this.residentControl.mode !== mode || this.residentClosing) throw new Error("常驻角色正在由其他会话控制或正在交还");
+      return { busy: this.residentBusy };
+    }
+    const control = { mode, sessionId };
+    this.residentControl = control;
+    this.residentClosing = false;
+    const result = await this.acquireManualControl();
+    if (this.residentControl !== control || this.residentClosing) throw new Error("角色控制在建立期间已结束");
+    if (mode === "puppet") this.setManualPaused(false);
+    this.refreshToolGate();
+    if (mode === "puppet") this.pushEvent("system", "（你的身体与设备动作现由外部操纵；你的意识持续存在，能观察实际发生的动作，也能独立思考、回忆和等待。非自主动作不等于你的愿望；如何理解和感受由你自己决定。）", { wake: true });
+    await this.auditControl({ phase: "enter", ...control });
+    return result;
+  }
+
+  async releaseResidentControl(sessionId: string, lost = false): Promise<{ busy: boolean }> {
+    const control = this.residentControl;
+    if (!control || control.sessionId !== sessionId) return { busy: false };
+    if (!lost && this.residentBusy) return { busy: true };
+    // 同步关闭准入，含正在审计/写入上下文但尚未进入 scheduler 的调用。
+    this.residentClosing = true;
+    if (lost) {
+      for (const task of this.scheduler.pending()) if (task.control?.sessionId === sessionId) this.cancelExternalTool(task.id, sessionId);
+      if (this.residentAdmissions) await new Promise<void>(resolve => this.residentAdmissionWaiters.add(resolve));
+      if (control.mode === "avatar") await this.scheduler.whenIdle();
+    }
+    if (this.residentControl !== control) return { busy: false };
+    this.residentControl = null;
+    this.residentClosing = false;
+    this.setManualPaused(false);
+    this.refreshToolGate();
+    if (control.mode === "puppet") this.pushEvent("system", "（外部对身体与设备的操纵结束，你恢复自主行动能力。操纵期间感知到的实际经历仍然保留；你的意识在这期间一直存在。）", { wake: true });
+    // avatar 的代理调用已作为该角色的选择写入意识流；不伪造“醒来”或被附身的经历。
+    await this.auditControl({ phase: "leave", ...control, lost });
+    return { busy: false };
+  }
+
+  get residentBusy(): boolean {
+    return this.residentAdmissions > 0 || this.autonomousDispatch !== null || this.scheduler.pending().some(task => !this.residentControl || task.control?.sessionId === this.residentControl.sessionId || !this.autonomousDuringPuppet(task.name));
+  }
+
+  pendingManualCalls() { return this.scheduler.pending().filter(task => task.control?.sessionId === this.residentControl?.sessionId && task.control); }
+
+  cancelExternalTool(id: string, sessionId: string): ManualToolResult & { status: string } {
+    const task = this.scheduler.pending().find(task => task.id === id);
+    if (!task || task.control?.sessionId !== sessionId) return { ok: false, status: "not_found", text: "此会话没有该待处理调用。" };
+    const status = this.scheduler.cancel(id);
+    const text = status === "cancelled" ? "尚未提交的调用已取消。" : "调用已开始提交，无法撤销；请等待真实回执。";
+    if (status === "cancelled") {
+      this.externalToolResults.get(id)?.resolve({ ok: false, text, callId: id });
+      this.externalToolResults.delete(id);
+      this.pushEvent("system", text, { ref: id });
+      this.puppetCalls.delete(id);
+      if (this.waiting?.callId === id) { this.waiting = null; this.wakeFn?.(); }
+    }
+    return { ok: status === "cancelled", status, text, callId: id };
+  }
+
+  private auditControl(record: Record<string, unknown>): Promise<void> {
+    const write = this.controlAuditTail.then(() => appendFile(path.join(this.files.base, "control-audit.jsonl"), JSON.stringify({ at: Date.now(), worldTime: this.clock.now(), ...record }) + "\n", "utf8"));
+    this.controlAuditTail = write.catch(error => this.logger.error("角色控制审计写入失败：%s", error));
+    return write;
+  }
+
   /** 当前分层真正允许的工具与原始应用 schema；读取无副作用。 */
-  manualTools(): AppToolDef[] {
+  manualTools(mode?: "avatar" | "puppet"): AppToolDef[] {
     const allowed = new Set(this.currentToolNames());
     return [...this.toolDefs, ...(this.apps?.activeToolDefs() ?? []), ...(this.computer?.activeToolDefs() ?? [])]
-      .filter(def => allowed.has(def.name))
+      .filter(def => allowed.has(def.name) && (mode !== "puppet" || this.puppetToolAllowed(def.name)))
       .map(def => {
         const params = signatureParams(def.signature);
         return { ...def, inputSchema: structuredClone((def as AppToolDef).inputSchema ?? {
@@ -661,11 +774,30 @@ export class BotAgent {
   async injectExternalToolCall(
     name: string,
     args: Record<string, unknown> = {},
-    opts: { duration?: number; stealth?: boolean } = {},
+    opts: { duration?: number; stealth?: boolean; control?: { mode: "avatar" | "puppet"; sessionId: string } } = {},
+  ): Promise<ManualToolResult> {
+    if (!opts.control) return this.executeExternalToolCall(name, args, opts);
+    if (this.residentClosing || this.residentControl?.sessionId !== opts.control.sessionId || this.residentControl.mode !== opts.control.mode) return { ok: false, text: "角色接管会话已结束或正在交还。" };
+    if (this.residentAdmissions) return { ok: false, text: "上一条代理调用仍在处理，请等待回执。" };
+    this.residentAdmissions++;
+    try { return await this.executeExternalToolCall(name, args, opts); }
+    finally {
+      this.residentAdmissions--;
+      if (!this.residentAdmissions) { for (const resolve of this.residentAdmissionWaiters) resolve(); this.residentAdmissionWaiters.clear(); }
+    }
+  }
+
+  private async executeExternalToolCall(
+    name: string,
+    args: Record<string, unknown> = {},
+    opts: { duration?: number; stealth?: boolean; control?: { mode: "avatar" | "puppet"; sessionId: string } } = {},
   ): Promise<ManualToolResult> {
     if (!this.running) {
       return { ok: false, text: "（Bot-LLM 当前未在运行，无法代理其工具调用。）" };
     }
+    if (opts.control && (this.residentClosing || this.residentControl?.sessionId !== opts.control.sessionId || this.residentControl.mode !== opts.control.mode)) return { ok: false, text: "角色接管会话已改变，此调用没有执行。" };
+    if (opts.control?.mode === "puppet" && !this.puppetToolAllowed(name)) return { ok: false, text: "身体操纵不能代替角色思考、反思或休息；请使用观察与身体/设备能力。" };
+    if (!args || typeof args !== "object" || Array.isArray(args) || (opts.duration !== undefined && (!Number.isFinite(opts.duration) || opts.duration < 0))) return { ok: false, text: "工具参数必须为对象，duration 必须为有限非负数。" };
     if (!this.currentToolNames().includes(name)) return { ok: false, text: `（${name} 此刻不可用，请先打开对应应用或进入频道。）` };
     if (opts.stealth && (!this.classifyDevice(name) || name === "pick_up_phone" || name === "put_down_phone")) return { ok: false, text: "偷偷操作只能改变设备界面，不能代替角色拿起或放下手机。" };
     if (opts.stealth && (name === "pick_media" || (name === "send" && this.countImgPlaceholders(String(args.msg ?? ""))))) return { ok: false, text: "偷偷发送请在 send 中提供完整 msg 和 media，不能接续角色尚未完成的选图草稿。" };
@@ -679,14 +811,20 @@ export class BotAgent {
     if (duration && duration > 0) duration = Math.max(0, duration);
     const call: ToolCallRecord = {
       id: this.context.nextToolId(),
-      role: "system", // 运行时强制（管理员代理），非 Bot 自主生成
+      role: "system", // 管理员代理；avatar 的角色意图与模型自主生成可审计区分
+      ...(opts.control ? { control: { ...opts.control } } : {}),
       name,
       arguments: args,
       ...(duration && duration > 0 ? { duration } : {}),
       issuedAt,
       expectedAt: issuedAt + (duration && duration > 0 ? duration : 0),
     };
+    if (opts.control) {
+      await this.auditControl({ phase: "call", call });
+      if (!this.running || this.residentClosing || this.residentControl?.sessionId !== opts.control.sessionId) return { ok: false, callId: call.id, text: "角色接管会话在开始执行前已结束，此调用没有执行。" };
+    }
     if (opts.stealth) this.stealthCalls.add(call.id);
+    else if (opts.control?.mode === "puppet") this.puppetCalls.add(call.id);
     else await this.context.appendToolCall(call);
     debug.emit("bot.tool", `${call.id} ${call.name}`, {
       id: call.id,
@@ -695,7 +833,8 @@ export class BotAgent {
       duration: call.duration,
       issuedAt: call.issuedAt,
       expectedAt: call.expectedAt,
-      source: opts.stealth ? "device-stealth" : "manual",
+      source: opts.control ? "resident-" + opts.control.mode : opts.stealth ? "device-stealth" : "manual",
+      ...(opts.control ? { control: opts.control } : {}),
     });
     this.logger.info(
       "[tool:manual] %s %s(%s)",
@@ -705,13 +844,17 @@ export class BotAgent {
     );
 
     const resultPromise = new Promise<ManualToolResult>((resolve) => {
-      this.externalToolResults.set(call.id, { resolve, systemText: null });
+      this.externalToolResults.set(call.id, { resolve: result => {
+        resolve({ ...result, callId: call.id });
+      }, systemText: null });
     });
 
-    if (!this.running) {
+    if (!this.running || (opts.control && (this.residentClosing || this.residentControl?.sessionId !== opts.control.sessionId))) {
       this.externalToolResults.delete(call.id);
       this.stealthCalls.delete(call.id);
-      return { ok: false, text: "（Bot 已停止，此调用没有开始。）" };
+      this.puppetCalls.delete(call.id);
+      this.pushEvent("system", "（运行或控制会话已结束，此调用没有开始。）", { ref: call.id });
+      return { ok: false, callId: call.id, text: "（运行或控制会话已结束，此调用没有开始。）" };
     }
     await this.deviceExecution.run({ stealth: !!opts.stealth }, () => this.dispatch(call));
 
@@ -723,7 +866,10 @@ export class BotAgent {
       this.stealthCalls.delete(call.id);
       entry.resolve({ ok: false, text: entry.systemText ?? `（${name} 未被接受。）` });
     }
-    return resultPromise;
+    const result = await resultPromise;
+    this.puppetCalls.delete(call.id);
+    if (opts.control) await this.auditControl({ phase: "receipt", callId: call.id, control: opts.control, ok: result.ok, text: result.text }).catch(() => {});
+    return result;
   }
 
   // ---------- 主循环 ----------
@@ -988,7 +1134,15 @@ export class BotAgent {
   // ---------- 工具派发 ----------
 
   private async dispatch(call: ToolCallRecord): Promise<void> {
-    if (call.role === "agent" && (["act", "rest", "nap", "travel", "go_home"].includes(call.name) ||
+    if (call.control && (this.residentClosing || this.residentControl?.sessionId !== call.control.sessionId || this.residentControl.mode !== call.control.mode)) {
+      this.pushEvent("system", "（角色接管会话已结束，此调用没有执行。）", { ref: call.id });
+      return;
+    }
+    if (call.role === "agent" && this.residentControl?.mode === "puppet" && !this.autonomousDuringPuppet(call.name)) {
+      this.pushEvent("system", "（身体与设备当前受外部操纵，这次自主动作没有执行。你仍能观察、思考、回忆或等待。）", { ref: call.id });
+      return;
+    }
+    if ((call.role === "agent" || call.control) && (["act", "rest", "nap", "travel", "go_home"].includes(call.name) ||
       (call.name === "observe" && call.arguments.target !== "self" && call.arguments.modality !== "self"))) {
       this.attention = null;
       this.observingPlacedPhone = false;
@@ -1351,9 +1505,11 @@ export class BotAgent {
             depth > 1
               ? `你点开了里面嵌套的聊天记录（第 ${depth} 层）——以下是它的内容，不是当前聊天：`
               : `你点开了这份聊天记录——以下是它的内容，**不是**当前聊天窗口里的消息：`;
+          const tail = `\n（看完用 exit_forward 返回${depth > 1 ? "上一层" : "聊天窗口"}）`;
           return {
             ...rich,
-            text: `${header}\n${rich.text}\n（看完用 exit_forward 返回${depth > 1 ? "上一层" : "聊天窗口"}）`,
+            text: `${header}\n${rich.text}${tail}`,
+            parts: rich.parts ? [{ kind: "text", text: header + "\n" }, ...rich.parts, { kind: "text", text: tail }] : undefined,
           };
         });
       }
@@ -1693,7 +1849,7 @@ export class BotAgent {
     // 按时长不按次数：少量多次的短等是正常的，要治的是「几乎全部时间都在干等」
     const threshold = this.config.bot.waitRateThreshold;
     const windowTU = this.config.bot.waitRateWindow;
-    if (threshold > 0 && windowTU > 0) {
+    if (threshold > 0 && windowTU > 0 && this.residentControl?.mode !== "puppet") {
       const nowTU = this.clock.now();
       const waited = this.waitedWithin(nowTU - windowTU, nowTU);
       const rate = Math.round((waited / windowTU) * 100);
@@ -1895,7 +2051,9 @@ export class BotAgent {
       ...opts, serialKey: "devices",
       beforeStart: () => {
         if (!this.running) throw new Error("设备所属世界已停止，此操作没有执行");
-        if (call.role === "agent") {
+        if (call.control && (this.residentClosing || this.residentControl?.sessionId !== call.control.sessionId)) throw new Error("角色接管会话已结束，此设备操作没有执行");
+        if (call.role === "agent" && this.residentControl?.mode === "puppet" && !this.autonomousDuringPuppet(call.name)) throw new Error("身体与设备正受外部操纵，此自主操作没有执行");
+        if (call.role === "agent" || call.control) {
           revealOnAttention = this.concealedDevices.has(kind);
           this.attention = kind;
           if (call.name === "observe_device") this.observingPlacedPhone = kind === "phone";
@@ -1912,7 +2070,7 @@ export class BotAgent {
         this.deviceOperations++;
         try {
           const result = await opts.run(task);
-          if (call.role === "agent" && (call.name === "put_down_phone" || call.name === "close_computer")) {
+          if ((call.role === "agent" || call.control) && (call.name === "put_down_phone" || call.name === "close_computer")) {
             this.attention = null;
             this.observingPlacedPhone = false;
           }
@@ -2427,6 +2585,10 @@ export class BotAgent {
     // 撤回成功后，重发相同内容是合理操作，不应再被重复拦截——清空近期发送窗口
     if (result === "cancelled") {
       this.recentSendSigs = [];
+      this.externalToolResults.get(target)?.resolve({ ok: false, callId: target, text: "（尚未提交的调用已取消，没有继续执行。）" });
+      this.externalToolResults.delete(target);
+      this.puppetCalls.delete(target);
+      this.stealthCalls.delete(target);
       if (this.waiting?.callId === target) {
         this.waiting = null;
         this.wakeFn?.();

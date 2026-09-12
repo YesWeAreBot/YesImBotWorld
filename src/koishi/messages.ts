@@ -1,5 +1,6 @@
 import type { Context } from "koishi";
 import { channelKey } from "./channels.js";
+import type { ConversationContext } from "./conversation.js";
 
 declare module "koishi" {
   interface Tables {
@@ -36,6 +37,8 @@ export interface WorldMessageRow {
    * 旧数据/历史拉取可能缺失，读取方以 undefined/null 为"未知"，回退 channelId 的 private: 前缀。
    */
   isDirect?: boolean;
+  /** 入站消息的会话类型、真实 @ / 引用对象与媒体形态；旧记录为未知。 */
+  conversation?: ConversationContext | null;
 }
 
 /**
@@ -59,6 +62,7 @@ export class MessageStore {
         self: "boolean",
         messageId: { type: "string", length: 255, initial: "" },
         isDirect: { type: "boolean", nullable: true },
+        conversation: { type: "json", nullable: true },
       },
       { autoInc: true, primary: "id" },
     );

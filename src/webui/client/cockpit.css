@@ -1,0 +1,37 @@
+.journey-takeover-modes { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin:0 0 24px }
+.journey-takeover-mode { display:flex; flex-direction:column; align-items:flex-start; text-align:left; white-space:normal; padding:16px; gap:8px }
+.journey-takeover-mode span { font-size:12px; line-height:1.7; font-weight:400; color:var(--fg-dim) }
+.journey-takeover-mode[aria-pressed=true] { border-color:var(--accent); background:var(--panel2) }
+.cockpit { margin:24px 0; scroll-margin-top:90px }
+.cockpit-links { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:24px }
+.cockpit-layout { display:grid; grid-template-columns:minmax(180px, .7fr) minmax(0, 2fr); gap:28px; align-items:start }
+.cockpit-tool-list { display:grid; gap:7px; max-height:750px; overflow:auto; padding:3px }
+.cockpit-tool-list h3 { font-size:12px; margin:14px 0 3px; color:var(--fg-dim) }
+.cockpit-tool { display:flex; align-items:flex-start; flex-direction:column; text-align:left; min-width:0; white-space:normal; overflow-wrap:anywhere }
+.cockpit-tool small { font:10px var(--mono); color:var(--fg-dim) }
+.cockpit-tool.selected { background:var(--panel2); border-color:var(--accent) }
+.cockpit-form { min-width:0; padding:22px; border:1px solid var(--line); border-radius:12px; background:var(--bg) }
+.cockpit-form>code { overflow-wrap:anywhere; color:var(--fg-dim) }
+.cockpit-form .journey-field { margin-top:16px }
+.cockpit-form textarea { resize:vertical }
+.cockpit-schema { margin:18px 0; font-size:12px }
+.cockpit-schema summary { cursor:pointer; padding:8px 0 }
+.cockpit-schema pre { max-height:220px; overflow:auto; white-space:pre-wrap; overflow-wrap:anywhere; font-size:11px }
+.cockpit-json { font:12px var(--mono); width:100% }
+.cockpit-confirm { display:flex; align-items:center; gap:10px; margin:18px 0; font-size:12px }
+.cockpit-confirm input { min-height:18px; width:18px; height:18px; flex:none }
+.cockpit-queue { margin:20px 0 }
+.cockpit-pending { display:flex; align-items:center; gap:12px; padding:14px; border:1px solid var(--line); border-radius:10px }
+.cockpit-pending>div { flex:1; min-width:0; overflow-wrap:anywhere }
+.cockpit-pending p { margin:3px 0 0 }
+.cockpit-result-attachments { display:flex; gap:10px; flex-wrap:wrap }
+.cockpit-result-media { display:block; max-width:100% }
+.cockpit-result-media img { display:block; max-width:100%; max-height:400px; border:1px solid var(--line); border-radius:10px }
+@media(max-width:650px) {
+  .journey-takeover-modes,.cockpit-layout { grid-template-columns:1fr }
+  .cockpit-tool-list { display:flex; overflow-x:auto; max-height:none; padding:4px; scroll-snap-type:x proximity }
+  .cockpit-tool-list h3 { display:none }
+  .cockpit-tool { min-width:145px; flex-shrink:0; scroll-snap-align:start }
+  .cockpit-form { padding:16px }
+  .cockpit-layout { gap:15px }
+}

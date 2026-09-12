@@ -14,8 +14,8 @@ const require = createRequire(import.meta.url);
 const { build } = require(require.resolve('esbuild', { paths: [dirname(require.resolve('pkgroll/package.json'))] }));
 const temporary = await mkdtemp(join(tmpdir(), 'world-studio-preview-'));
 const configModule = join(temporary, 'config.cjs');
-await build({ stdin: { contents: 'export { Config } from "./src/config.ts"; export { introspect } from "./src/webui/schema.ts";', resolveDir: root, loader: 'ts' }, outfile: configModule, bundle: true, platform: 'node', format: 'cjs', packages: 'external', alias: { koishi: require.resolve('koishi') }, logLevel: 'warning' });
-const { Config, introspect } = require(configModule);
+await build({ stdin: { contents: 'export { Config } from "./src/config.ts"; export { introspect } from "./src/webui/schema.ts"; export { WebCommandRunner } from "./src/webui/commands.ts";', resolveDir: root, loader: 'ts' }, outfile: configModule, bundle: true, platform: 'node', format: 'cjs', packages: 'external', alias: { koishi: require.resolve('koishi') }, logLevel: 'warning' });
+const { Config, introspect, WebCommandRunner } = require(configModule);
 let config = Config({ autoStart: false });
 const fixture = createDeviceFixture();
 const debugStreams = new Set();
@@ -57,7 +57,20 @@ const usageEntries = Array.from({ length: 70 }, (_, i) => ({ id: i+1, ts: now - 
 const total = rows => rows.reduce((t,r)=>({requests:t.requests+1,promptTokens:t.promptTokens+r.promptTokens,completionTokens:t.completionTokens+r.completionTokens,totalTokens:t.totalTokens+r.totalTokens,cachedTokens:t.cachedTokens+r.cachedTokens,cacheReportedPromptTokens:t.cacheReportedPromptTokens+(r.cacheReported?r.promptTokens:0),cacheMissRecords:t.cacheMissRecords+(r.cacheReported?0:1)}),{requests:0,promptTokens:0,completionTokens:0,totalTokens:0,cachedTokens:0,cacheReportedPromptTokens:0,cacheMissRecords:0});
 const summary = { totals: total(usageEntries), byLabel: Object.fromEntries(['Bot','World'].map(k=>[k,total(usageEntries.filter(r=>r.label===k))])), byModel: Object.fromEntries(['bot-model','world-model'].map(k=>[k,total(usageEntries.filter(r=>r.model===k))])), byHour: Array.from({length:24},(_,i)=>{const ts=now-(23-i)*3600000;return {ts,hour:new Date(ts).toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit'}),totals:total(usageEntries.filter(r=>r.ts>=ts&&r.ts<ts+3600000))};}), byDay:[{day:new Date(now).toISOString().slice(0,10),totals:total(usageEntries)}] };
 let running = true, profile = { name: '林岚', persona: '喜欢观察植物与记录日常的旅人。' }, player = null;
-const streams = new Set(), receipts = new Map();
+const commandFixture = new WebCommandRunner({
+ get config(){return config;},getClock:()=>({}),isInitialized:async()=>true,
+ statusText:async()=>`开发样本世界：${running?'运行中':'已暂停'}\n此指令直接返回网页，没有发送聊天消息。`,
+ startWorld:async()=>{running=true;return '开发样本世界已启动。';},stopWorld:async()=>{running=false;return '开发样本世界已暂停。';},
+ initWorld:async()=>{await new Promise(resolve=>setTimeout(resolve,650));return '开发样本创世完成。没有访问真实模型或世界。';},
+ reloadWorld:async()=>{await new Promise(resolve=>setTimeout(resolve,650));return '开发样本定义已重载。';},
+ resetWorld:async()=>{running=false;return '开发样本世界已重置。';},clearMsg:async()=> '开发样本聊天记录已清空。',
+ injectEvent:async text=>'开发样本已接收事件：'+text,crossingForce:async name=>'开发样本穿越目标：'+name
+});
+const streams = new Set(), receipts = new Map(), cockpitCalls = new Map();
+function cockpitTools() {
+ const tool=(name,description,properties={},required=[])=>({name,description,inputSchema:{type:'object',properties,required}});
+ return [tool('observe','观察当前可见的世界',{modality:{type:'string',enum:['all','sight','self']}}),tool('act','尝试身体动作',{description:{type:'string'},speech:{type:'string'}},['description']),tool('check_time','查看可见时间'),tool('observe_device','只读查看设备画面',{device:{type:'string',enum:['phone','computer']}},['device']),...(player?.mode==='avatar'?[tool('recall_growth','回顾自己的认识',{keyword:{type:'string'}}),tool('wait','等待指定 TU',{n:{type:'number'}},['n']),tool('rest','休息指定 TU',{duration:{type:'number'}})]:[]),...fixture.session().tools.map(t=>({...t,requiresSendConfirmation:t.effect==='send'}))];
+}
 function observation() { return { observationId:'obs_preview',actorId:player?.takeover?'bot':'player_fixture',worldSequence:28,observedAt:at,sourceEventIds:['event_12'],entities:[{observedId:'seen_self',kind:'actor',name:player?.takeover?'小澈':profile.name,revision:1,self:true,attributes:{posture:'站在窗边'}},{observedId:'seen_studio',kind:'place',name:'窗边工作室',revision:3,self:false,attributes:{light:'soft'}},{observedId:'seen_cup',kind:'object',name:'温热的茶',revision:3,self:false,locationObservedId:'seen_studio',attributes:{temperature:52}}],utterances:[]}; }
 function playerEvent(value){for(const res of streams)res.write('data: '+JSON.stringify(value)+'\n\n');}
 const port=Number(process.env.STUDIO_PREVIEW_PORT||18131);
@@ -73,7 +86,9 @@ const server=http.createServer(async(req,res)=>{
   if(path==='/api/player/events'){res.writeHead(200,{'content-type':'text/event-stream','cache-control':'no-cache'});streams.add(res);res.write('data: '+JSON.stringify({type:'hello',worldName:'林间小屋',unitWorldSeconds:1,timeLine:'09:41 · 初秋的清晨'})+'\n\n');const timer=setInterval(()=>res.write(': keepalive\n\n'),15000);req.on('close',()=>{streams.delete(res);clearInterval(timer);});return;}
   let body={};if(!['GET','HEAD'].includes(req.method)){const chunks=[];let size=0;for await(const chunk of req){size+=chunk.length;if(size>1000000)throw Error('body too large');chunks.push(chunk);}const raw=Buffer.concat(chunks).toString('utf8');if(raw)body=JSON.parse(raw);}
   if(path==='/api/health')return json({ok:true,preview:true});
-  if(path==='/fixture-avatar.svg'){res.writeHead(200,{'content-type':'image/svg+xml'});res.end('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 80 80"><rect width="80" height="80" fill="#b5d0b6"/><path d="M16 80V62c0-27 48-27 48 0v18" fill="#41634e"/><circle cx="40" cy="31" r="19" fill="#edd0aa"/><path d="M21 30C14 2 67 0 60 31L48 17 21 30" fill="#394b3e"/><circle cx="33" cy="31" r="2" fill="#394b3e"/><circle cx="47" cy="31" r="2" fill="#394b3e"/><path d="M36 40h8" stroke="#b68263" stroke-width="2"/></svg>');return;}
+  if(path==='/api/commands'){if(req.method==='GET')return json(commandFixture.catalog());if(req.method==='POST'){try{const run=commandFixture.start(body);return json({instanceId:commandFixture.instanceId,run},run.status==='running'?202:200);}catch(error){return json({error:error.message},error.status||400);}}}
+  if(path.startsWith('/api/commands/') && req.method==='GET'){const run=commandFixture.get(path.slice('/api/commands/'.length));return run?json({instanceId:commandFixture.instanceId,run}):json({error:'找不到此执行记录'},404);}
+  if(path==='/fixture-avatar.svg'||path==='/api/media/file'){res.writeHead(200,{'content-type':'image/svg+xml'});res.end('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 80 80"><rect width="80" height="80" fill="#b5d0b6"/><path d="M16 80V62c0-27 48-27 48 0v18" fill="#41634e"/><circle cx="40" cy="31" r="19" fill="#edd0aa"/><path d="M21 30C14 2 67 0 60 31L48 17 21 30" fill="#394b3e"/><circle cx="33" cy="31" r="2" fill="#394b3e"/><circle cx="47" cy="31" r="2" fill="#394b3e"/><path d="M36 40h8" stroke="#b68263" stroke-width="2"/></svg>');return;}
   if(path==='/api/overview'){const s=fixture.session();return json({botIdentity:{platform:'preview',selfId:'fixture',name:'样本平台账号',avatar:'http://127.0.0.1:'+server.address().port+'/fixture-avatar.svg'},version:'0.2.1-preview',initialized:true,worldRunning:running,worldQueue:0,clock:{syncRealTime:false,timeLine:'09:41 · 初秋的清晨',unitRealSeconds:1,unitWorldSeconds:1},bot:{running:running,paused:s.control.paused,waiting:null,streamLength:48,approxChars:16400,pendingTasks:1},appOpen:s.devices.phone.appOpen,computerOn:s.devices.computer.on,phoneDown:false,focusChannels:[],news:[],facts:[],galleryCounts:[],crossing:{location:null,serverEnabled:true,visitors:[],worlds:[]},tokenSet:false,addresses:[]});}
   if(path==='/api/world/state')return json({state:{snapshot,events}});
   if(path==='/api/bot/growth')return json({growth});
@@ -84,20 +99,32 @@ const server=http.createServer(async(req,res)=>{
   if(path==='/api/usage')return json({summary,entries:usageEntries,snapshot:70});
   if(path==='/api/state')return json({initialized:true,botDef:'小澈，住在林间小屋，喜欢阅读、植物与安静的午后。她会根据自己的经历，慢慢形成判断。',worldDef:'一间光线柔和的工作室，窗外是一座小花园。周围的事物遵循稳定的空间与物理规则。',botStatus:'开发预览：只读的角色状态投影。',worldStatus:'开发预览：小澈在窗边的工作室。',meta:{botName:'小澈',realWorld:false},news:[],facts:[],phoneShell:''});
   if(path==='/api/device/session')return json(fixture.session());
-  if(path==='/api/device/control')return json(fixture.control(body));
+  if(path==='/api/device/control')return player?.takeover?json({error:'请从角色驾驶舱归还控制。'},409):json(fixture.control(body));
   if(path==='/api/device/tool')return json(await fixture.tool(body));
   if(path==='/api/devices')return json(fixture.session().devices);
   if(path==='/api/computer/screen')return json({error:'开发样本的电脑为终端模式，没有远程桌面画面。'},503);
   if(path==='/api/notes')return json(fixture.notes());
   if(path==='/api/player/profile'){if(req.method==='PUT')profile=body;return json({profile,botName:'小澈'});}
-  if(path==='/api/player/arrive'){player={token:'preview-player',takeover:body.mode==='avatar'};if(body.name)profile={name:body.name,persona:body.persona||''};const control=player.takeover?fixture.control({paused:true}):undefined;return json({ok:true,control,token:player.token,worldName:'林间小屋',timeLine:'09:41 · 初秋的清晨',botName:'小澈',takeover:player.takeover,isAdmin:true});}
+  if(path==='/api/player/arrive'){player={token:'preview-player',mode:body.mode,takeover:['avatar','puppet'].includes(body.mode)};if(body.name)profile={name:body.name,persona:body.persona||''};const control=player.takeover?fixture.resident(player.mode):undefined;return json({ok:true,control,token:player.token,worldName:'林间小屋',timeLine:'09:41 · 初秋的清晨',botName:'小澈',takeover:player.takeover,isAdmin:true});}
   if(path==='/api/player/task'){
    if(receipts.has(body.taskId)){setTimeout(()=>playerEvent(receipts.get(body.taskId)),40);return json({ok:true,accepted:true,taskId:body.taskId});}
    const result={type:'task_result',taskId:body.taskId,ok:true,content:JSON.stringify(body.kind==='observe'?observation():{observation:observation(),action:{id:body.taskId,status:'completed'}})};receipts.set(body.taskId,result);setTimeout(()=>playerEvent(result),150);return json({ok:true,accepted:true,taskId:body.taskId});
   }
-  if(path==='/api/player/tool')return json({ok:true,text:JSON.stringify({observation:observation(),action:{status:'completed'}})});
+  if(path==='/api/preview/player/connection')return json({connected:streams.size});
+  if(path==='/api/player/cockpit')return player?.takeover&&url.searchParams.get('ctoken')===player.token?json({mode:player.mode,running:true,control:fixture.session().control,tools:cockpitTools(),pending:[...cockpitCalls.values()].map(c=>c.call),time:{unitWorldSeconds:2,unitRealSeconds:1}}):json({error:'接管会话不存在。'},403);
+  if(path==='/api/player/tool'){
+   if(!player?.takeover||body.token!==player.token)return json({error:'需要接管会话。'},403);
+   const tool=cockpitTools().find(t=>t.name===body.name);if(!tool)return json({ok:false,text:'当前能力不可用。'});
+   if(tool.requiresSendConfirmation&&!body.confirmSend)return json({ok:false,text:'请确认发送。'});
+   const id='fixture_call_'+Date.now(),call={id,name:body.name,committed:false};
+   if(body.name==='act')return void await new Promise(resolve=>{const finish=(ok)=>{clearTimeout(timer);cockpitCalls.delete(id);json({ok,callId:id,text:ok?JSON.stringify({observation:observation(),action:{status:'completed'}}):'尚未提交的调用已取消。'});resolve();};const timer=setTimeout(()=>finish(true),body.duration?2500:100);cockpitCalls.set(id,{call,cancel:()=>finish(false)});});
+   if(body.name==='observe_device')return json({ok:true,text:'开发样本 · 设备画面',content:{text:'开发样本 · 设备画面',attachments:[{id:1,type:'image',mime:'image/svg+xml',file:'/fixture-only'}]}});
+   if(fixture.session().tools.some(t=>t.name===body.name))return json({...await fixture.tool({name:body.name,args:body.arguments,mode:'takeover',confirmSend:body.confirmSend}),callId:id});
+   return json({ok:true,callId:id,text:body.name==='observe'?JSON.stringify(observation()):'开发样本 · '+body.name+' 已返回。'});
+  }
+  if(path==='/api/player/tool/cancel'){if(body.token!==player?.token)return json({error:'需要接管会话。'},403);const call=cockpitCalls.get(body.callId);call?.cancel();return json({ok:!!call,text:'取消请求已处理。'});}
   if(path==='/api/player/cancel')return json(receipts.has(body.taskId)?{ok:false,status:'too_late',result:receipts.get(body.taskId)}:{ok:true,status:'cancelled'});
-  if(path==='/api/player/leave'){if(player?.takeover)fixture.control({paused:false});player=null;return json({ok:true});}
+  if(path==='/api/player/leave'){if(player?.takeover)fixture.resident(null);player=null;return json({ok:true});}
   if(path==='/api/config'){if(req.method==='POST')config=body.config||body;return json({value:config,schema:introspect(Config),port,version:'preview'});}
   if(path==='/api/crossing')return json({location:null,visitors:[],worlds:[],serverEnabled:true,server:{enabled:true,port:0},invites:[]});
   if(path==='/api/visitors')return json({visitors:[]});

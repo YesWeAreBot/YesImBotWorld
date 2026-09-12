@@ -101,6 +101,8 @@ export interface CrossingServerHost {
   ready: () => boolean;
   /** 向本世界的常驻 Bot 注入事件（访客到达/离开的感知） */
   notifyHostBot: (content: string) => void;
+  /** 常驻角色会话结束（包括断线超时）后释放角色控制，等待已提交回执。 */
+  releaseResidentControl?: (sessionId: string, cause: "returned" | "lost") => Promise<void>;
 }
 
 export class CrossingServer {
@@ -176,8 +178,12 @@ export class CrossingServer {
   }
 
   /** 只查询仍有效的接管会话；过期 token 不得交还后来建立的设备控制。 */
-  playerControlsBot(token: string): boolean {
-    return this.sessions.get(token)?.residentControl ?? false;
+  playerControlsBot(token: string): boolean { return this.residentSession(token) !== null; }
+
+  residentSession(token: string): { id: string; name: string; mode: "avatar" | "puppet" } | null {
+    const session = this.sessions.get(token);
+    if (!session?.residentControl || session.closed || (session.mode !== "avatar" && session.mode !== "puppet")) return null;
+    return { id: session.id, name: session.name, mode: session.mode };
   }
 
   /**
@@ -401,7 +407,7 @@ export class CrossingServer {
   private async initializeSession(session: VisitorSession): Promise<boolean> {
     try {
       if (session.residentControl) {
-        this.pushEvent(session, JSON.stringify(await this.host.world.structured.observe("bot")));
+        this.pushEvent(session, "常驻角色控制通道已连接。请通过驾驶舱 observe 查看角色实际可感知的内容；观察与结果会进入角色的经历。");
         return !session.closed;
       }
       await this.host.world.wakeDormant();
@@ -532,13 +538,7 @@ export class CrossingServer {
       if (session.live && !session.closed) this.pushEvent(session, content);
     };
     let ok = false;
-    if (session.residentControl) {
-      if (kind === "act" || kind === "wait") throw new Error("请通过管理员 Bot 工具代理操控常驻 Bot");
-      parts.push(JSON.stringify(await this.host.world.structured.observe("bot", { target: payload.target, modality: payload.modality })));
-      task.result = { type: "task_result", taskId, ok: true, content: parts.join("\n") };
-      if (!session.closed) this.push(session, task.result);
-      return;
-    }
+    if (session.residentControl) throw new Error("常驻角色的能力与观察请通过已授权的驾驶舱工具调用");
     if (kind === "act") {
       ok = await this.host.world.visitorAct(session, clip(payload.desc), this.taskDuration(payload.durationWorldSeconds, payload.duration), deliver, task.abort.signal, taskId, {
         ...(payload.speech ? { speech: clip(payload.speech) } : {}),
@@ -585,16 +585,17 @@ export class CrossingServer {
     if (!session.residentControl) {
       this.host.world.cancelPending("visitor:" + session.id);
     }
-    this.trackCleanup(session, !session.residentControl);
+    this.trackCleanup(session, !session.residentControl, cause);
     // 最后一位访客离开且常驻 Bot 也在外：世界重新进入沉睡
     if (this.sessions.size === 0) this.host.world.notePresenceChange();
   }
 
-  private trackCleanup(session: VisitorSession, leave: boolean): void {
+  private trackCleanup(session: VisitorSession, leave: boolean, cause: "returned" | "lost" = "lost"): void {
     const cleanup = (async () => {
       await session.ready;
       await Promise.all([...session.tasks.values()].map((task) => task.promise));
       if (leave) await this.host.world.visitorLeave(session);
+      else if (session.residentControl) await this.host.releaseResidentControl?.(session.id, cause);
     })();
     this.pendingCleanups.add(cleanup);
     // 拒绝的清理保留在集合中，让后续 disconnect 明确失败，避免覆盖新世界。

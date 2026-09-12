@@ -11,7 +11,7 @@ export interface DeviceTool extends AppToolDef {
 }
 export interface DeviceSession {
   running: boolean;
-  control: { paused: boolean; busy: boolean; deviceBusy?: boolean; attention?: "phone" | "computer" | null };
+  control: { paused: boolean; busy: boolean; residentMode?: "avatar" | "puppet" | null; deviceBusy?: boolean; attention?: "phone" | "computer" | null };
   devices: DevicesInfo;
   apps: { id: string; name: string; description: string; kind: "chat" | "app"; active: boolean }[];
   tools: DeviceTool[];

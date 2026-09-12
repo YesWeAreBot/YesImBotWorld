@@ -55,9 +55,10 @@
         header.appendChild(switches);
         root.append(header, control, status, workspace);
         function computerMode() { var computer = session && session.devices && session.devices.computer || {}; return computer.effectiveMode || computer.mode || 'off'; }
-        function controlled() { return !!(synced && session && session.running && session.control && !isVisitor() && (operationMode === 'stealth' || session.control.paused && !session.control.busy)); }
+        function residentMode() { return session && session.control && session.control.residentMode; }
+        function controlled() { return !!(synced && session && session.running && session.control && !isVisitor() && (residentMode() ? !session.control.busy : operationMode === 'stealth' || session.control.paused && !session.control.busy)); }
         function toolDef(name, device) { device = device || (['mouse', 'keyboard', 'screen', 'run_command', 'open_computer', 'close_computer'].includes(name) ? 'computer' : 'phone'); var tools = (session && session.tools || []).filter(function (t) { return t.device === device; }); return tools.find(function (t) { return t.name === name; }) || tools.find(function (t) { return t.name.endsWith('.' + name); }); }
-        function available(name, device) { return !(operationMode === 'stealth' && ['pick_up_phone', 'put_down_phone', 'pick_media'].includes(name)) && !!toolDef(name, device); }
+        function available(name, device) { return !(!residentMode() && operationMode === 'stealth' && ['pick_up_phone', 'put_down_phone', 'pick_media'].includes(name)) && !!toolDef(name, device); }
         function report(err) { if (!live)
             return; status.textContent = err && err.message || String(err); status.classList.add('device-status-error'); toast(status.textContent, 'err'); }
         function setBusy(delta) { busy = Math.max(0, busy + delta); updateControls(); }
@@ -80,6 +81,13 @@
             if (!session)
                 return;
             var c = session.control || {}, paused = !!c.paused, waiting = !!c.busy;
+            if (residentMode() && !isVisitor()) {
+                var puppet = residentMode() === 'puppet';
+                control.appendChild(el('div', { cls: 'device-control-copy' }, [el('span', { cls: 'device-presence device-presence-human' }), el('div', {}, [el('strong', { text: puppet ? '角色身体接管中 · Bot 保留意识' : '完全入替中 · 你正在使用自己的设备' }), el('p', { text: waiting ? '此前的操作正在完成，请等待真实回执。' : puppet ? '设备操作随身体控制：Bot 能体验到自己并未决定的操作。结束接管请返回角色驾驶舱。' : '这里的操作会成为角色自己的意图和经历。结束入替请返回角色驾驶舱。' })])]));
+                control.appendChild(button('返回角色驾驶舱', function () { Studio.navigate('player'); }, 'device-button', 'hand'));
+                updateControls();
+                return;
+            }
             var title = isVisitor() ? '访客只读' : paused ? 'Bot 自主操作已暂停' : operationMode === 'stealth' ? '偷偷操作 · Bot 仍在自主行动' : '等待强制接管';
             var hint = isVisitor() ? '可查看开放的设备信息。' : operationMode === 'stealth'
                 ? (paused ? '偷偷操作不会改变暂停状态；点击交还才能恢复 Bot。' : '双方共享设备，操作会依次执行，界面可能随时被切换。Bot 关注设备时能看到变化。')
@@ -131,7 +139,9 @@
                 if (!live)
                     return;
                 synced = true;
+                var previousMode = residentMode();
                 session = isVisitor() ? { devices: data, control: { paused: false, busy: false }, apps: [], tools: [] } : data;
+                if (residentMode() !== previousMode) { inputEpoch++; viewKey = ''; }
                 if (!session.devices)
                     session.devices = { phone: {}, computer: { mode: 'off' } };
                 var appSnapshot = session.appView, appStamp = JSON.stringify(appSnapshot), computerSnapshot = session.computerView, computerStamp = JSON.stringify(computerSnapshot);
@@ -304,7 +314,7 @@
             var physical = el('div', { cls: 'device-facts' });
             physical.append(el('span', { text: '设备状态' }), el('strong', { text: session.devices.phone.down ? '已放下' : '已拿起' }));
             rail.append(physical);
-            if (operationMode === 'takeover') rail.append(phoneAction(session.devices.phone.down ? '拿起手机' : '放下手机', session.devices.phone.down ? 'pick_up_phone' : 'put_down_phone', {}, 'device-button device-button-soft', 'phone'));
+            if (residentMode() || operationMode === 'takeover') rail.append(phoneAction(session.devices.phone.down ? '拿起手机' : '放下手机', session.devices.phone.down ? 'pick_up_phone' : 'put_down_phone', {}, 'device-button device-button-soft', 'phone'));
             if (session.devices.phone.appOpen || session.devices.phone.chatOpen)
                 rail.append(phoneAction('关闭当前应用', 'close_app', {}, 'device-button', 'close'));
             if (!selected) {

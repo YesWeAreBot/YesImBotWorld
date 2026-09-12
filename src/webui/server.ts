@@ -36,6 +36,7 @@ import type { PlayerMode } from "../crossing/protocol.js";
 import type { ManualToolResult } from "../bot/agent.js";
 import type { DeviceSession, DeviceControlResult, DeviceOperationMode } from "./device.js";
 import type { BotIdentity } from "./avatar.js";
+import { CommandRequestError, WebCommandRunner } from "./commands.js";
 
 export interface BotStatusSummary {
   running: boolean;
@@ -110,6 +111,7 @@ export interface WebUIHost {
   reloadWorld(): Promise<string>;
   resetWorld(): Promise<string>;
   clearMsg(): Promise<string>;
+  statusText(): Promise<string>;
   /** 用户手动设置常驻 Bot 名字（写 meta.json + 刷新内存，立即生效） */
   setBotName(name: string): Promise<void>;
   injectEvent(text: string): Promise<string>;
@@ -140,7 +142,11 @@ export interface WebUIHost {
   /** 玩家入世界（同部署真人玩家，不走邀请码）：到达返回 crossing token */
   arrivePlayer(name: string, persona: string, mode?: PlayerMode): { ok: true; token: string; worldName: string; timeLine: string } | { ok: false; error: string };
   /** 管理员代理 Bot 执行任意工具调用（手动驾驶） */
-  botToolCall(name: string, args: Record<string, unknown>, duration?: number): Promise<{ ok: boolean; text: string }>;
+  botToolCall(name: string, args: Record<string, unknown>, duration?: number, token?: string, confirmSend?: boolean): Promise<ManualToolResult>;
+  acquirePlayerControl(token: string): Promise<DeviceControlResult>;
+  releasePlayerControl(token: string): Promise<DeviceControlResult>;
+  playerCockpit(token: string): Promise<unknown>;
+  cancelPlayerTool(token: string, callId: string): ManualToolResult & { status: string };
   /** 管理员接管 Bot 时暂停/恢复其自主生成（扮演=暂停；操纵/交还=恢复） */
   botSetManualPaused(paused: boolean): void | DeviceControlResult | Promise<void | DeviceControlResult>;
   /** 当前有效 crossing 会话是否为管理员同名接管常驻 Bot。 */
@@ -199,10 +205,12 @@ export class WebUIServer {
   private debounce = new Map<string, NodeJS.Timeout>();
   private readonly cfg: WebUIConfig;
   private readonly visitors: VisitorStore;
+  private readonly commands: WebCommandRunner;
 
   constructor(private host: WebUIHost) {
     this.cfg = host.config.webui;
     this.visitors = new VisitorStore(path.join(host.webuiDir, "visitors.json"));
+    this.commands = new WebCommandRunner(host);
   }
 
   async start(): Promise<void> {
@@ -577,8 +585,8 @@ export class WebUIServer {
       const botName = this.host.residentBotName().trim();
       let control: void | DeviceControlResult = undefined;
       if (isAdmin && botName && name === botName && (mode === "avatar" || mode === "puppet")) {
-        control = await this.host.botSetManualPaused(mode === "avatar");
-        if (control && !control.ok && !(mode === "avatar" && control.paused)) {
+        control = await this.host.acquirePlayerControl(r.token);
+        if (control && !control.ok) {
           await this.crossingPost("/crossing/leave", { token: r.token });
           return void sendJSON(res, 409, { error: control.text, control });
         }
@@ -586,19 +594,37 @@ export class WebUIServer {
       return void sendJSON(res, 200, { ok: true, token: r.token, worldName: r.worldName, timeLine: r.timeLine, mode, botName, ...(control ? { control } : {}) });
     }
 
+    if (pathname === "/api/player/cockpit" && method === "GET") {
+      if (!isAdmin) return void sendJSON(res, 403, { error: "驾驶舱仅供管理员接管常驻角色时使用" });
+      const token = String(url.searchParams.get("ctoken") ?? "");
+      if (!token || !this.host.playerControlsBot?.(token)) return void sendJSON(res, 403, { error: "接管会话不存在或已结束" });
+      try { return void sendJSON(res, 200, await this.host.playerCockpit(token)); }
+      catch (error) { return void sendJSON(res, 409, { error: (error as Error).message }); }
+    }
+
+    if (pathname === "/api/player/tool/cancel" && method === "POST") {
+      if (!isAdmin) return void sendJSON(res, 403, { error: "只有管理员可取消代理调用" });
+      const body = await readJson(req, 64 * 1024).catch(() => null);
+      if (!body || typeof body.token !== "string" || typeof body.callId !== "string" || !body.callId || body.callId.length > 64) return void sendJSON(res, 400, { error: "需要有效 token 与 callId" });
+      if (!this.host.playerControlsBot?.(body.token)) return void sendJSON(res, 403, { error: "接管会话不存在或已结束" });
+      return void sendJSON(res, 200, this.host.cancelPlayerTool(body.token, body.callId));
+    }
+
     // 代理 Bot 工具调用（管理员手动驾驶）：管理员接管 Bot 时经此真正执行任意 Bot 工具
     if (pathname === "/api/player/tool" && method === "POST") {
       if (!isAdmin) return void sendJSON(res, 403, { error: "仅管理员可代理 Bot 工具调用" });
       const body = await readJson(req, 1024 * 1024).catch(() => null);
       if (!body) return void sendJSON(res, 400, { error: "请求体不是合法 JSON" });
+      if (typeof body.token !== "string" || !this.host.playerControlsBot?.(body.token)) return void sendJSON(res, 403, { error: "需要有效的常驻角色接管会话 token" });
       const name = String(body.name ?? "").trim();
       if (!name) return void sendJSON(res, 400, { error: "缺少工具名 name" });
       const args = (body.arguments ?? body.args ?? {}) as Record<string, unknown>;
       if (!args || typeof args !== "object" || Array.isArray(args)) {
         return void sendJSON(res, 400, { error: "arguments 必须是 JSON 对象" });
       }
-      const duration = body.duration != null ? Number(body.duration) : undefined;
-      const r = await this.host.botToolCall(name, args, Number.isFinite(duration) ? duration : undefined);
+      const duration = body.duration;
+      if (duration !== undefined && (typeof duration !== "number" || !Number.isFinite(duration) || duration < 0)) return void sendJSON(res, 400, { error: "duration 必须为有限非负数（单位 TU）" });
+      const r = await this.host.botToolCall(name, args, duration, body.token, body.confirmSend === true);
       return void sendJSON(res, 200, r);
     }
 
@@ -608,17 +634,8 @@ export class WebUIServer {
       if (!body) return void sendJSON(res, 400, { error: "请求体不是合法 JSON" });
       const kind = String(body.kind ?? "");
       const payload = (body.payload ?? {}) as Record<string, unknown>;
-      // 管理员接管 Bot（同名）时，act 交由 BotAgent.dispatchAct → world.adjudicateAct（它就是常驻 Bot，应走 Bot 通道）
-      if (isAdmin && kind === "act") {
-        const botName = this.host.residentBotName().trim();
-        const actorName = String(body.actorName ?? "").trim();
-        if (botName && actorName === botName) {
-          const desc = String(payload.desc ?? "").trim();
-          if (!desc) return void sendJSON(res, 400, { error: "缺少行动描述 desc" });
-          const r = await this.host.botToolCall("act", { description: desc, ...(payload.duration ? { duration: Number(payload.duration) } : {}) });
-          return void sendJSON(res, 200, { ok: r.ok, text: r.text });
-        }
-      }
+      // 常驻角色必须使用已授权的驾驶舱；actorName 不是身份凭据。
+      if (this.host.playerControlsBot?.(String(body.token ?? ""))) return void sendJSON(res, 400, { error: "请通过常驻角色驾驶舱提交工具调用" });
       const r = await this.crossingPost("/crossing/task", body);
       if (!r.ok) return void sendJSON(res, 400, { error: String(r.error ?? "任务被拒绝") });
       return void sendJSON(res, 200, { ok: true });
@@ -640,7 +657,7 @@ export class WebUIServer {
       if (!body || typeof body.token !== "string" || !body.token) return void sendJSON(res, 400, { error: "需要 crossing 会话 token" });
       // 只有有效的常驻角色接管会话才交还 Bot；独立访客离开不影响设备页的接管。
       if (isAdmin && this.host.playerControlsBot?.(body.token)) {
-        const control = await this.host.botSetManualPaused(false);
+        const control = await this.host.releasePlayerControl(body.token);
         if (control && !control.ok) return void sendJSON(res, 409, { error: control.text, control });
       }
       const r = await this.crossingPost("/crossing/leave", body);
@@ -780,6 +797,26 @@ export class WebUIServer {
   ): Promise<void> {
     const host = this.host;
     const q = url.searchParams;
+
+    // The entire catalogue and execution history are administrator-only, including GETs.
+    if (pathname === "/api/commands" || pathname.startsWith("/api/commands/")) {
+      if (access.kind !== "admin") return void sendJSON(res, 403, { error: "仅管理员可使用工作室指令。" });
+      if (pathname === "/api/commands" && method === "GET") return void sendJSON(res, 200, this.commands.catalog());
+      if (pathname === "/api/commands" && method === "POST") {
+        try {
+          const body = await readJson(req, 32 * 1024);
+          const run = this.commands.start(body);
+          return void sendJSON(res, run.status === "running" ? 202 : 200, { instanceId: this.commands.instanceId, run });
+        } catch (error) {
+          return void sendJSON(res, error instanceof CommandRequestError ? error.status : 400, { error: String((error as Error).message ?? error) });
+        }
+      }
+      if (method === "GET" && pathname.startsWith("/api/commands/")) {
+        const run = this.commands.get(pathname.slice("/api/commands/".length));
+        return void sendJSON(res, run ? 200 : 404, run ? { instanceId: this.commands.instanceId, run } : { error: "找不到此执行记录，服务可能已经重启。请检查世界状态，勿重复执行不确定的操作。" });
+      }
+      return void sendJSON(res, 405, { error: "不支持的方法" });
+    }
 
     // 访客分级过滤：按端点映射到数据块，无授权则 403
     if (access.kind === "visitor") {

@@ -206,7 +206,7 @@ async function httpPolicy(dir: string) {
   assert.equal((await request("POST", "/api/player/cancel", { taskId: "manual-call" })).status, 400);
   let leaves = 0, releases = 0, blocked = true;
   server.host.playerControlsBot = (token: string) => token === "resident-control";
-  server.host.botSetManualPaused = async () => { releases++; return { ok: !blocked, paused: blocked, busy: blocked, text: blocked ? "committed operation pending" : "released" }; };
+  server.host.releasePlayerControl = async () => { releases++; return { ok: !blocked, paused: blocked, busy: blocked, text: blocked ? "committed operation pending" : "released" }; };
   server.crossingPost = async (route: string) => { assert.equal(route, "/crossing/leave"); leaves++; return { ok: true }; };
   assert.equal((await request("POST", "/api/player/leave", { token: "independent" })).status, 200);
   assert.equal(releases, 0, "independent crossing cannot release device takeover");

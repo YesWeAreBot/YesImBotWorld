@@ -1,5 +1,6 @@
 /** Local, memory-only UI fixtures. Never invokes the world, a platform, a shell, or a network API. */
 export function createDeviceFixture() {
+  let residentMode = null;
   let paused = false, app = null, phoneDown = false, computerOn = false, channelKey = null;
   let appView = null, computerView = null, nextId = 3;
   const clone = value => JSON.parse(JSON.stringify(value));
@@ -42,7 +43,7 @@ export function createDeviceFixture() {
     return core.concat(byApp[app] || []);
   }
   function snapshot() {
-    return clone({running:true,control:{paused,busy:false,deviceBusy:false,attention:null},devices:{computer:{effectiveMode:'docker',mode:'docker',on:computerOn?'开发终端':null,docker:{exists:true,running:computerOn,status:computerOn?'running':'stopped',name:'开发预览 · 内存模拟',image:'仅布局测试 / 不创建 Docker 容器'},remote:null},phone:{down:phoneDown,appOpen:app && app!=='chat'?apps.find(a=>a.id===app)?.name:null,chatOpen:app==='chat',channelKey,channelIsGroup:channelKey==='fixture:studio',chatAppName:'消息',resolution:{width:390,height:754}}},apps:apps.map(a=>({...a,active:a.id===app})),tools:tools(),appView,computerView,chat:{channelKey,channels:channels.map(c=>({...c,latest:messages.filter(m=>m.channelKey===c.key).at(-1)})),messages:messages.filter(m=>m.channelKey===channelKey)}});
+    return clone({running:true,control:{paused,residentMode,busy:false,deviceBusy:false,attention:null},devices:{computer:{effectiveMode:'docker',mode:'docker',on:computerOn?'开发终端':null,docker:{exists:true,running:computerOn,status:computerOn?'running':'stopped',name:'开发预览 · 内存模拟',image:'仅布局测试 / 不创建 Docker 容器'},remote:null},phone:{down:phoneDown,appOpen:app && app!=='chat'?apps.find(a=>a.id===app)?.name:null,chatOpen:app==='chat',channelKey,channelIsGroup:channelKey==='fixture:studio',chatAppName:'消息',resolution:{width:390,height:754}}},apps:apps.map(a=>({...a,active:a.id===app})),tools:tools(),appView,computerView,chat:{channelKey,channels:channels.map(c=>({...c,latest:messages.filter(m=>m.channelKey===c.key).at(-1)})),messages:messages.filter(m=>m.channelKey===channelKey)}});
   }
   const headlines = '开发样本 · 本地预览资讯\n\n[1] 设备工作台界面进入交互验证\n暖白工作室、手机应用与终端布局现在可以在本地预览。\n\n[2] 所有样本工具只在内存中运行\n这个测试不会启动模型，也不会向外部发送消息。';
   function result(text, name) {
@@ -52,13 +53,14 @@ export function createDeviceFixture() {
   }
   return {
     session:snapshot,
+    resident:mode => { residentMode=mode; paused=mode === "avatar"; return snapshot().control; },
     notes:() => ({notes:clone(notes)}),
     control:body => {paused=!!body.paused;return {ok:true,paused,busy:false,text:paused?'已接管本地开发样本设备。':'已交还本地开发样本设备。'};},
     async tool(body) {
       const mode = body.mode ?? 'takeover';
       if (!['stealth','takeover'].includes(mode)) return {ok:false,text:'未知设备操作模式。'};
-      if (mode === 'takeover' && !paused) return {ok:false,text:'请先强制接管本地预览设备。'};
-      if (mode === 'stealth' && ['pick_up_phone','put_down_phone','pick_media'].includes(body.name)) return {ok:false,text:'偷偷操作不能代替角色身体动作或接续其草稿。'};
+      if (!residentMode && mode === 'takeover' && !paused) return {ok:false,text:'请先强制接管本地预览设备。'};
+      if (!residentMode && mode === 'stealth' && ['pick_up_phone','put_down_phone','pick_media'].includes(body.name)) return {ok:false,text:'偷偷操作不能代替角色身体动作或接续其草稿。'};
       const name=body.name,args=body.args || {};
       if (!tools().some(t=>t.name===name)) return {ok:false,text:'当前工具不可用。'};
       if (name==='send' && !body.confirmSend) return {ok:false,text:'请明确点击发送。'};
