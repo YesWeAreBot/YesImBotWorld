@@ -5,7 +5,7 @@ var Studio = (function () {
     var oldSwitch = switchView;
     var routes = [
         { group: '探索世界' },
-        ['overview', '工作室总览', 'gauge', ['overview']],
+        ['overview', '世界总览', 'gauge', ['overview']],
         ['world', '世界关系图', 'world'],
         ['growth', '角色与成长', 'growth', ['notes']],
         ['devices', '设备工作台', 'monitor', ['devices']],
@@ -15,7 +15,7 @@ var Studio = (function () {
         ['usage', '模型用量', 'chart', ['usage']],
         ['gallery', '相册', 'image', ['gallery']],
         ['data', '记事与存档', 'folder', ['notes', 'archive']],
-        { group: '管理工作室' },
+        { group: '世界管理' },
         ['state', '世界设定', 'file', ['definitions', 'world_status', 'bot_status', 'news', 'facts']],
         ['crossing', '世界连接', 'portal', ['crossing']],
         ['prompts', '提示词', 'edit', ['prompts']],
@@ -26,7 +26,7 @@ var Studio = (function () {
     Object.assign(ICONS, {
         layers: svgIcon('<path d="m12 3 9 5-9 5-9-5Zm-9 9 9 5 9-5M3 16l9 5 9-5"/>'),
         message: svgIcon('<path d="M20 15a3 3 0 0 1-3 3H8l-5 3V6a3 3 0 0 1 3-3h11a3 3 0 0 1 3 3Z"/><path d="M7 8h9M7 12h6"/>'),
-        world: svgIcon('<path d="m12 3 9 5v8l-9 5-9-5V8Z"/><path d="m3 8 9 5 9-5M12 13v8"/><path d="m7.5 5.5 9 5"/>'),
+        world: svgIcon('<path d="M16 3.8A9 9 0 1 0 20.6 15M5.5 15.5C10 15 13 10 14 6M7 18c6 0 10-4 14-9"/><circle cx="19.5" cy="4.5" r="1.5"/>'),
         growth: svgIcon('<path d="M12 21V10M12 15C5 15 3 10 3 6c6 0 9 3 9 9ZM12 11c0-6 4-8 9-8 0 5-3 8-9 8Z"/>'),
         search: svgIcon('<circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/>'),
         arrow: svgIcon('<path d="M5 12h14m-5-5 5 5-5 5"/>'),
@@ -71,7 +71,7 @@ var Studio = (function () {
         if (location.hash !== '#' + name)
             history.pushState(null, '', '#' + name);
         buildNav();
-        $('#route-title').textContent = (routeFor(name) || ['', '工作室'])[1];
+        $('#route-title').textContent = (routeFor(name) || ['', '世界总览'])[1];
         document.title = $('#route-title').textContent + ' · YesImBot World';
         var main = $('#main');
         main.replaceChildren();
@@ -121,7 +121,7 @@ var Studio = (function () {
             var r = routeFor(name);
             mobile.appendChild(el('a', { href: '#' + name, cls: activeView === name ? 'active' : '', 'aria-current': activeView === name ? 'page' : 'false', onclick: function (e) { e.preventDefault(); navigate(name); } }, [el('span', { html: icon(r[2]) }), el('span', { text: { overview: '总览', world: '世界', devices: '设备', player: '入世界', live: '洞察', debug: '洞察' }[name] })]));
         });
-        $('#account-name').textContent = isVisitor() ? (VISITOR_PRESET === 'player' ? '世界中的旅人' : '工作室访客') : '工作室管理员';
+        $('#account-name').textContent = isVisitor() ? (VISITOR_PRESET === 'player' ? '世界中的旅人' : '世界访客') : '世界管理员';
         $('#account-role').textContent = isVisitor() ? (VISITOR_PRESET === 'player' ? '体验与互动' : '按授权范围观测') : '管理与观测';
         document.body.classList.toggle('visitor-readonly', isVisitor());
     };
@@ -187,7 +187,7 @@ var Studio = (function () {
     }
     function button(text, image, action, primary) { return el('button', { cls: primary ? 'primary' : '', onclick: action }, [image ? el('span', { html: icon(image) }) : null, el('span', { text: text })]); }
     function empty(name, description, action) {
-        return el('div', { cls: 'studio-empty' }, [el('div', { html: '<svg viewBox="0 0 80 80" fill="none" aria-hidden="true"><path d="m40 10 25 14v29L40 68 15 53V24Z" stroke="currentColor"/><path d="m15 24 25 15 25-15M40 39v29" stroke="currentColor"/><circle cx="58" cy="15" r="5" fill="currentColor" opacity=".45"/><path d="m28 29 12 7 12-7" stroke="currentColor"/></svg>' }), el('strong', { text: name }), el('p', { text: description }), action || null]);
+        return el('div', { cls: 'studio-empty' }, [el('div', { html: worldArt.empty({ decorative: true }) }), el('strong', { text: name }), el('p', { text: description }), action || null]);
     }
     function error(holder, e, retry) { holder.replaceChildren(el('div', { cls: 'studio-error' }, [el('strong', { text: '暂时无法读取这部分内容' }), el('p', { text: e.message || String(e) }), retry ? button('重新加载', 'refresh', retry) : null])); }
     function section(name, note, action) { return el('div', { cls: 'studio-section-title' }, [el('h3', { text: name }), action || el('small', { text: note || '' })]); }
@@ -218,10 +218,8 @@ var Studio = (function () {
         showModal('快速前往', holder);
         input.focus();
     }
-    function art() {
-        return '<svg class="studio-hero-art" viewBox="0 0 440 280" fill="none" aria-label="手绘的虚拟世界微缩工作室" role="img"><ellipse cx="237" cy="235" rx="162" ry="28" fill="#bcccad" opacity=".3"/><path d="m70 165 159-87 145 83-158 91Z" fill="#ccd7bd"/><path d="m70 165 146 85v10L70 175Z" fill="#aabca0"/><path d="m216 250 158-89v10l-158 89Z" fill="#b8c9ab"/><path d="M94 159V75l129-71v84Z" fill="#eaf0e1" stroke="#c5d1b8"/><path d="m223 4 121 69v84L223 88Z" fill="#d9e4cc" stroke="#c5d1b8"/><path d="m241 37 61 34v51l-61-34Z" fill="#b5c8ab"/><path d="m247 43 49 28v41l-49-28Z" fill="#f8fbef"/><path d="m270 57 1 41m-24-33 49 28" stroke="#c5d4b9" stroke-width="3"/><path d="m110 94 64-35v41l-64 35Z" fill="#73946d"/><path d="m117 98 47-26m-47 37 28-15m-28 25 40-22" stroke="#aac69d" stroke-width="2"/><path d="m163 164 91-51 59 34-91 52Z" fill="#c2a985"/><path d="M174 171v35m39-12v37m88-80v34" stroke="#7b856a" stroke-width="6"/><path d="m163 164 59 34v7l-59-34Z" fill="#a89475"/><path d="m222 198 91-51v7l-91 51Z" fill="#b5a17d"/><path d="m216 136 36-20 27 15-36 21Z" fill="#809678"/><path d="m224 140-5-32 39-22 5 32Z" fill="#436857"/><path d="m226 132-3-21 32-18 3 23Z" fill="#c7dfbc"/><path d="m232 112 15-8m-14 14 21-12" stroke="#89ad80" stroke-width="2"/><path d="m261 158 15-8 15 9-15 8Z" fill="#f8f6e6"/><path d="m192 152 13-7 10 6-13 7Z" fill="#dedbc4"/><path d="M190 202v-21l-22-12-14 8v22l23 13Z" fill="#6e8b67"/><ellipse cx="173" cy="158" rx="15" ry="9" fill="#e8c2a4"/><path d="M158 157v-13c0-20 30-20 30 0v13" fill="#454d3e"/><path d="M156 175c2-14 29-14 33 0v19l-14 8-19-11Z" fill="#efe7cf"/><path d="m181 176 15-10m-34 10 7 14" stroke="#e6ba97" stroke-width="7" stroke-linecap="round"/><path d="m170 204-4 14m16-8 1 12" stroke="#637260" stroke-width="7" stroke-linecap="round"/><path d="M320 169c-1-17 7-33 16-46m-15 34c-16-7-18-19-15-28m16 12c-1-16 7-29 16-35" stroke="#6e9465" stroke-width="3"/><ellipse cx="311" cy="136" rx="7" ry="15" transform="rotate(-36 311 136)" fill="#a4bf90"/><ellipse cx="333" cy="131" rx="7" ry="16" transform="rotate(38 333 131)" fill="#90af7e"/><ellipse cx="332" cy="113" rx="6" ry="13" transform="rotate(34 332 113)" fill="#b4c99d"/><path d="m310 163 25 1-5 25h-16Z" fill="#bd8c67"/><ellipse cx="322" cy="164" rx="12" ry="4" fill="#947454"/><path d="m110 164 27-15 24 14-27 15Z" fill="#eff3e3"/><path d="m110 164 24 14v6l-24-14Z" fill="#b7caaa"/><path d="m134 178 27-15v6l-27 15Z" fill="#ccdaba"/><path d="M372 75v12m-6-6h12M77 108v8m-4-4h8" stroke="#a3b896" stroke-width="1.5"/><circle cx="359" cy="116" r="3" fill="#e0b488"/></svg>';
-    }
-    function avatar() { return '<svg viewBox="0 0 60 70" fill="none" aria-hidden="true"><path d="M12 70V51c0-17 36-17 36 0v19Z" fill="#6c886b"/><path d="M17 38V24c0-19 26-19 26 0v14Z" fill="#465647"/><ellipse cx="30" cy="30" rx="13" ry="16" fill="#e9bc9b"/><path d="M17 28V18c3-14 25-12 27 2l-1 10-8-13-18 11Z" fill="#465647"/><circle cx="25" cy="29" r="1" fill="#556044"/><circle cx="36" cy="29" r="1" fill="#556044"/><path d="M28 36c2 1 4 1 6-1" stroke="#ac755d" stroke-linecap="round"/><path d="m24 46 6 8 7-8" stroke="#c8d3b1" stroke-width="2"/></svg>'; }
+    function art() { return worldArt.hero(); }
+    function avatar() { return '<svg viewBox="0 0 60 70" fill="none" aria-hidden="true"><path d="M12 70V51c0-17 36-17 36 0v19Z" fill="#3c847e"/><path d="M17 38V24c0-19 26-19 26 0v14Z" fill="#253b50"/><ellipse cx="30" cy="30" rx="13" ry="16" fill="#e9bc9b"/><path d="M17 28V18c3-14 25-12 27 2l-1 10-8-13-18 11Z" fill="#253b50"/><circle cx="25" cy="29" r="1" fill="#253b50"/><circle cx="36" cy="29" r="1" fill="#253b50"/><path d="M28 36c2 1 4 1 6-1" stroke="#ac755d" stroke-linecap="round"/><path d="m24 46 6 8 7-8" stroke="#9aebd8" stroke-width="2"/></svg>'; }
     function botAvatar(identity) {
         var holder = el('div', { cls: 'studio-avatar', html: avatar() });
         if (!identity?.avatar) return holder;
@@ -258,7 +256,7 @@ var Studio = (function () {
         else if (can('devices')) actions.appendChild(button('打开设备', 'phone', function () { navigate('devices'); }));
         var commandCleanup = !isVisitor() && window.WorldCommands ? window.WorldCommands.mount(actions) : null;
         heroCopy.appendChild(actions);
-        hero.append(heroCopy, el('div', { html: art() }), el('span', { cls: 'studio-hero-footnote', text: 'WORLD / STUDIO' }));
+        hero.append(heroCopy, el('div', { cls: 'studio-hero-visual', html: art() }), el('span', { cls: 'studio-hero-footnote', text: 'POSSIBILITIES / UNFOLDING' }));
         holder.append(headingHost, heroHost);
         function updateWorldButton() {
             if (!worldButton || !currentOverview) return;
@@ -283,9 +281,9 @@ var Studio = (function () {
         function draw(o, world, growth) {
             var snapshot = world?.snapshot, entities = Object.values(snapshot?.entities || {}), events = world?.events || [], bot = snapshot?.entities.bot;
             var running = Object.values(snapshot?.actions || {}).filter(function (a) { return a.status === 'pending'; });
-            headingHost.replaceChildren(title('YOUR WORLD, AT A GLANCE', '世界工作室', '看见世界如何变化，也参与角色的每一个当下。', [button('走进世界', 'door', function () { navigate('player'); }, true)].filter(function () { return can('player'); })));
+            headingHost.replaceChildren(title('AN OPEN WORLD, ALWAYS BECOMING', '世界总览', '看见世界如何变化，也参与角色的每一个当下。', [button('走进世界', 'door', function () { navigate('player'); }, true)].filter(function () { return can('player'); })));
             currentOverview = o;
-            eyebrow.textContent = o.initialized ? 'A WORLD IN PROGRESS' : 'THE FIRST CHAPTER';
+            eyebrow.textContent = o.initialized ? 'OPEN WORLDS / 无界的可能' : 'OPEN WORLDS / 从此刻生长';
             welcome.textContent = o.initialized ? '你好，欢迎回来。' : '从一个世界开始。';
             introduction.textContent = !o.initialized ? '写下角色与世界设定，让第一组事实成为故事的起点。' : o.worldRunning ? '世界正在运转。观察发生了什么，或拿起设备，与角色共享此刻。' : '世界目前未运行。你可以先探索已有状态，再继续角色的生活。';
             updateWorldButton();
@@ -396,7 +394,7 @@ var Studio = (function () {
             navigate(firstRoute());
             refreshOverview(false).catch(showErr);
         } }); })); if (isVisitor())
-            holder.appendChild(button('修改密码', 'sliders', openChangePassword)); holder.appendChild(button('切换深浅主题', 'sun', function () { $('#btn-theme').click(); })); showModal('工作室账号', holder); };
+            holder.appendChild(button('修改密码', 'sliders', openChangePassword)); holder.appendChild(button('切换深浅主题', 'sun', function () { $('#btn-theme').click(); })); showModal('世界账号', holder); };
         var focusBefore = null;
         var show = showModal;
         var hide = hideModal;

@@ -55,24 +55,60 @@
 }
 
 .live-lane {
+  --live-signal:var(--fg-dim);
   border:1px solid var(--line);
   border-radius:17px;
   background:var(--surface);
   padding:17px 18px;
   min-width:0;
   position:relative;
-  overflow:hidden
+  overflow:hidden;
+  isolation:isolate
 }
 
-.live-lane[data-state=streaming],.live-lane[data-state=pending] {
-  border-color:var(--accent);
-  box-shadow:inset 3px 0 0 var(--accent)
+@property --live-orbit {
+  syntax:'<angle>';
+  initial-value:0deg;
+  inherits:false
 }
 
-.live-lane[data-state=error] {
-  border-color:var(--err);
-  box-shadow:inset 3px 0 0 var(--err)
+.live-lane[data-state=pending],.live-detail[data-state=pending] { --live-signal:var(--warn,#b27932) }
+.live-lane[data-state=streaming],.live-detail[data-state=streaming] { --live-signal:var(--accent,#199982) }
+.live-lane[data-state=completed],.live-detail[data-state=completed] { --live-signal:var(--ok,#199982) }
+.live-lane[data-state=error],.live-detail[data-state=error] { --live-signal:var(--err,#cf665f) }
+.live-lane[data-state=cancelled],.live-detail[data-state=cancelled] { --live-signal:var(--accent-blue,#718fe4) }
+
+.live-lane[data-state=pending],.live-lane[data-state=streaming],.live-lane[data-state=error] {
+  border-color:color-mix(in srgb,var(--live-signal) 45%,var(--line))
 }
+
+.live-lane:before,.live-detail:before {
+  content:'';
+  position:absolute;
+  inset:0;
+  border-radius:inherit;
+  padding:1.5px;
+  pointer-events:none;
+  z-index:2;
+  opacity:0;
+  background:conic-gradient(from var(--live-orbit),transparent 0deg,transparent 135deg,var(--live-signal) 205deg,transparent 265deg,transparent 360deg);
+  -webkit-mask:linear-gradient(#fff 0 0) content-box,linear-gradient(#fff 0 0);
+  -webkit-mask-composite:xor;
+  mask:linear-gradient(#fff 0 0) content-box,linear-gradient(#fff 0 0);
+  mask-composite:exclude
+}
+.live-lane[data-state=pending]:before,.live-detail[data-state=pending]:before {
+  opacity:.8;
+  animation:live-orbit 9s linear infinite
+}
+.live-lane[data-state=streaming]:before,.live-detail[data-state=streaming]:before {
+  opacity:1;
+  background:conic-gradient(from var(--live-orbit),transparent 0deg,transparent 65deg,var(--accent-blue,#718fe4) 130deg,var(--live-signal) 205deg,transparent 265deg,transparent 360deg);
+  animation:live-orbit 5s linear infinite
+}
+
+@keyframes live-orbit { to { --live-orbit:360deg } }
+@keyframes live-breathe { 0%,100% { opacity:.45; box-shadow:0 0 0 0 color-mix(in srgb,var(--live-signal) 20%,transparent) } 50% { opacity:1; box-shadow:0 0 0 4px color-mix(in srgb,var(--live-signal) 10%,transparent) } }
 
 .live-lane-heading {
   display:flex;
@@ -98,14 +134,27 @@
 }
 
 .live-lane-state {
+  display:inline-flex;
+  align-items:center;
+  gap:7px;
   font-size:11px;
   margin-left:auto;
-  color:var(--fg-dim)
+  color:var(--live-signal);
+  white-space:nowrap
 }
 
-.live-lane[data-state=streaming] .live-lane-state {
-  color:var(--accent)
+.live-lane-state:before {
+  content:'';
+  width:6px;
+  height:6px;
+  flex:0 0 6px;
+  border-radius:50%;
+  background:currentColor
 }
+.live-lane[data-state=empty] .live-lane-state:before { background:transparent; box-shadow:inset 0 0 0 1px currentColor }
+.live-lane[data-state=pending] .live-lane-state:before { animation:live-breathe 3s ease-in-out infinite }
+.live-lane[data-state=streaming] .live-lane-state:before { animation:live-breathe 2s ease-in-out infinite }
+.live-lane-preview-kind { font:9px var(--mono); letter-spacing:.07em; margin:1px 0 6px; color:var(--fg-dim) }
 
 .live-lane-model {
   font-size:10px;
@@ -138,6 +187,7 @@
 .live-reading[hidden],.live-raw-code[hidden],.live-view-options [hidden] { display:none!important }
 .live-reading-title { font-size:13px; font-weight:600; margin:0 0 12px; color:var(--fg) }
 .live-reading-empty { color:var(--fg-dim); padding:24px 0 }
+.live-awaiting-content .live-reading-empty { display:none }
 .live-message { border:1px solid var(--line); border-radius:10px; margin:10px 0; overflow:hidden }
 .live-message>summary { display:flex; align-items:center; flex-wrap:wrap; gap:8px; cursor:pointer; padding:11px 13px; background:var(--bg) }
 .live-message>summary:before { content:'›'; color:var(--accent) }
@@ -183,6 +233,7 @@
   font:10px var(--mono);
   color:var(--fg-dim)
 }
+.live-lane-links { display:flex; align-items:center; justify-content:flex-end; gap:12px; flex-wrap:wrap }
 
 .live-link {
   background:transparent!important;
@@ -317,10 +368,11 @@
   font-weight:450
 }
 
-.live-status-streaming,.live-status-pending {
+.live-status-streaming,.live-status-completed {
   color:var(--accent);
-  background:#56866515
+  background:color-mix(in srgb,var(--accent) 8%,transparent)
 }
+.live-status-pending { color:var(--warn); background:color-mix(in srgb,var(--warn) 8%,transparent) }
 
 .live-status-error {
   color:var(--err);
@@ -328,10 +380,13 @@
 }
 
 .live-status-cancelled {
-  color:var(--warn)
+  color:var(--accent-blue,#718fe4)
 }
 
 .live-detail {
+  --live-signal:var(--fg-dim);
+  position:relative;
+  isolation:isolate;
   border:1px solid var(--line);
   border-radius:15px;
   background:var(--surface);
@@ -340,6 +395,9 @@
   display:flex;
   flex-direction:column
 }
+.live-detail .live-status:before { content:''; width:5px; height:5px; border-radius:50%; background:currentColor; margin-right:6px }
+.live-detail[data-state=pending] .live-status:before { animation:live-breathe 3s ease-in-out infinite }
+.live-detail[data-state=streaming] .live-status:before { animation:live-breathe 2s ease-in-out infinite }
 
 .live-detail-meta {
   padding:15px 17px 12px;
@@ -391,6 +449,7 @@
   border-bottom:2px solid var(--accent)!important;
   color:var(--accent)!important
 }
+.live-response-available:after { content:''; display:inline-block; width:5px; height:5px; border-radius:50%; background:var(--accent); margin-left:6px; vertical-align:middle }
 
 .live-raw-tabs .live-button {
   font-size:10px;
@@ -516,6 +575,11 @@
 
 .live-compact .live-lane-model {
   font-size:9px
+}
+
+@media(prefers-reduced-motion:reduce) {
+  .live-lane:before,.live-detail:before,.live-lane-state:before,.live-detail .live-status:before { animation:none!important }
+  .live-lane[data-state=pending]:before,.live-detail[data-state=pending]:before,.live-lane[data-state=streaming]:before,.live-detail[data-state=streaming]:before { opacity:.65; background:var(--live-signal) }
 }
 
 @media(max-width:1100px) {

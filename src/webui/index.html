@@ -4,8 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="color-scheme" content="light dark">
-<meta name="theme-color" content="#f5f6f1">
-<title>YesImBot World · 世界工作室</title>
+<meta name="theme-color" content="#0b1725">
+<title>YesImBot World · 开放世界</title>
 <style>
 /* @include client/legacy.css */
 /* @include client/studio.css */
@@ -25,19 +25,20 @@
 <div id="app">
   <aside id="sidebar" aria-label="主导航">
     <a class="brand" href="#overview" aria-label="YesImBot World 首页">
-      <svg class="brand-mark" viewBox="0 0 40 40" fill="none" aria-hidden="true"><path d="M20 3 36 12v16L20 37 4 28V12Z" fill="#254e45"/><path d="m4 12 16 9 16-9M20 21v16" stroke="#f7fbf3" stroke-width="1.5"/><path d="m12 12 8-4 8 4-8 5Z" fill="#cee7ba"/><circle cx="27" cy="27" r="3" fill="#efa174"/></svg>
-      <span><span class="t1">YesImBot <b>World</b></span><span class="t2">世界工作室</span></span>
+      <span class="brand-mark" id="brand-art"></span>
+      <span><span class="t1">YesImBot <b>World</b></span><span class="t2">开放世界 · 无限可能</span></span>
     </a>
     <button id="studio-command" class="search-launch" aria-label="搜索页面和实体"><span class="search-glyph"></span><span>快速前往</span><kbd>⌘ K</kbd></button>
     <nav id="nav"></nav>
-    <div class="sidebar-world"><span class="world-orbit"></span><span><strong>一个持续发生的世界</strong><small id="side-ver">World Studio</small></span></div>
-    <button id="studio-account" class="account-button"><span class="account-avatar">W</span><span><strong id="account-name">工作室管理员</strong><small id="account-role">管理与观测</small></span><span class="account-more">···</span></button>
+    <div class="sidebar-world"><span class="world-orbit" id="orbit-art"></span><span><strong>每个当下，新的可能</strong><small id="side-ver">OPEN WORLDS</small></span></div>
+    <button id="studio-account" class="account-button"><span class="account-avatar">W</span><span><strong id="account-name">世界管理员</strong><small id="account-role">管理与观测</small></span><span class="account-more">···</span></button>
   </aside>
   <div id="backdrop"></div>
   <div id="content">
     <header id="topbar">
       <button id="btn-menu" class="icon-button" aria-label="打开导航菜单"></button>
-      <div class="breadcrumb"><span>工作室</span><span class="breadcrumb-sep">/</span><strong id="route-title">总览</strong></div>
+      <span class="header-mark" id="header-art" aria-hidden="true"></span>
+      <div class="breadcrumb"><span>WORLD</span><span class="breadcrumb-sep">/</span><strong id="route-title">总览</strong></div>
       <span id="tb-clock"></span><span class="header-spacer"></span>
       <span id="world-pill" class="pill off">连接中</span>
       <span id="tb-extra" class="sr-only"></span>
@@ -46,7 +47,7 @@
       <button id="btn-refresh" class="icon-button" aria-label="刷新当前视图"></button>
     </header>
     <main id="main" tabindex="-1" aria-live="polite"></main>
-    <footer class="studio-footer"><span>YESIMBOT WORLD</span><span>世界有状态，角色有经历。</span><span id="footer-sync">等待连接</span></footer>
+    <footer class="studio-footer"><span>YESIMBOT WORLD / OPEN ENDED</span><span>世界在展开，故事在发生。</span><span id="footer-sync">等待连接</span></footer>
   </div>
 </div>
 <nav id="mobile-nav" aria-label="快捷导航"></nav>
@@ -58,6 +59,7 @@
 /* @include client/attachments.js */
 /* @include client/call-content.js */
 /* @include client/call-reader.js */
+/* @include client/world-art.js */
 /* @include client/studio.js */
 /* @include client/world.js */
 /* @include client/devices.js */
@@ -66,6 +68,13 @@
 /* @include client/commands.js */
 /* @include client/insights.js */
 /* @include client/live.js */
+document.getElementById('brand-art').innerHTML = worldArt.logo({ decorative: true });
+document.getElementById('header-art').innerHTML = worldArt.logo({ decorative: true });
+document.getElementById('orbit-art').innerHTML = worldArt.orbit({ decorative: true });
+var worldFavicon = document.createElement('link');
+worldFavicon.rel = 'icon'; worldFavicon.type = 'image/svg+xml';
+worldFavicon.href = 'data:image/svg+xml,' + encodeURIComponent(worldArt.logo({ decorative: true }));
+document.head.appendChild(worldFavicon);
 Studio.start();
 </script>
 </body>

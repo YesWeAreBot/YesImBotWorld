@@ -1,5 +1,5 @@
 /** Dynamic call-view regression against the isolated preview's explicit SSE fixture. */
-export default async function smokeLive({evaluate,wait,assert,navigate}) {
+export default async function smokeLive({evaluate,wait,assert,navigate,page}) {
   const target=await evaluate('({hostname:location.hostname,port:location.port})');
   assert(['127.0.0.1','localhost','[::1]'].includes(target.hostname)&&target.port!=='18111','Live smoke requires an isolated loopback preview');
   assert(await evaluate("fetch('/api/health').then(r=>r.json()).then(r=>r.preview===true)"),'Live smoke requires preview marker');
@@ -19,10 +19,15 @@ export default async function smokeLive({evaluate,wait,assert,navigate}) {
   await evaluate("window.__liveOriginalFetch=window.fetch;window.__liveDetailReads=[];window.fetch=function(input,options){var url=typeof input==='string'?input:input.url;if(url.includes('/api/calls/'))window.__liveDetailReads.push(url);return window.__liveOriginalFetch.apply(this,arguments)}");
   await step({id,action:'begin',source:'World',requestBody:request});
   await wait(`document.querySelector('.live-call-selected')?.dataset.callId===${q(id)}`);
-  await wait(`window.__liveDetailReads.some(url=>url.includes(${q(id)})&&url.includes('request=0'))`);
-  assert(await evaluate(`!window.__liveDetailReads.some(url=>url.includes(${q(id)})&&url.includes('request=1'))`),'Viewing a response does not download the long request');
-  await evaluate("document.querySelectorAll('.live-raw-tab')[0].click()");
   await wait("document.querySelectorAll('.live-message').length===3");
+  assert(await evaluate("document.querySelectorAll('.live-raw-tab')[0].getAttribute('aria-selected')==='true' && !document.querySelector('.live-calls').textContent.includes('请求已发送，正在等待真实响应')"),'A pending call immediately opens its sent request rather than a waiting placeholder');
+  assert(await evaluate("document.querySelector('[data-live-source=World] .live-lane-preview').textContent.includes('输入与观测') && document.querySelector('[data-live-source=World] .live-lane-request').textContent==='查看请求'"),'Pending lane displays a sent-message excerpt and direct request access');
+  assert(await evaluate("getComputedStyle(document.querySelector('[data-live-source=World]'),'::before').animationName==='live-orbit' && getComputedStyle(document.querySelector('[data-live-source=World] .live-lane-state'),'::before').animationName==='live-breathe'"),'Pending state uses a nonblocking flowing border and breathing lamp');
+  await evaluate("window.__livePendingColor=getComputedStyle(document.querySelector('[data-live-source=World] .live-lane-state')).color");
+  await page('Emulation.setEmulatedMedia',{features:[{name:'prefers-reduced-motion',value:'reduce'}]});
+  assert(await evaluate("getComputedStyle(document.querySelector('[data-live-source=World]'),'::before').animationName==='none' && getComputedStyle(document.querySelector('[data-live-source=World] .live-lane-state'),'::before').animationName==='none'"),'Reduced motion keeps static state indicators');
+  await page('Emulation.setEmulatedMedia',{features:[]});
+  await evaluate("document.querySelectorAll('.live-raw-tab')[0].click()");
   assert(await evaluate("getComputedStyle(document.querySelector('.live-earlier')).display==='none'"),'The earlier-message button is hidden when all messages are loaded');
   assert(await evaluate("!document.querySelector('.live-message').open"),'Long request messages default to collapsed');
   await evaluate("document.querySelector('.live-message').open=true");
@@ -41,8 +46,12 @@ export default async function smokeLive({evaluate,wait,assert,navigate}) {
   assert(await evaluate("document.querySelector('.live-raw-code').textContent.length>40000"),'Full request survives the old debug truncation boundary');
   await evaluate("document.querySelector('.live-raw-fold').click()");
   assert(await evaluate("document.querySelector('.live-raw-code').textContent.length===6000"),'An expanded raw request can be collapsed again');
-  await evaluate("document.querySelectorAll('.live-raw-tab')[1].click()");
   await step({id,action:'append',text:first,preview:'第一段😀'});
+  await wait("document.querySelector('.live-detail').dataset.state==='streaming'");
+  assert(await evaluate("document.querySelectorAll('.live-raw-tab')[0].getAttribute('aria-selected')==='true' && document.querySelectorAll('.live-raw-tab')[1].classList.contains('live-response-available')"),'First response marks the return tab without taking away a manually opened request');
+  assert(await evaluate("getComputedStyle(document.querySelector('[data-live-source=World]'),'::before').animationDuration==='5s'"),'Streaming changes the flow speed with its state');
+  assert(await evaluate("getComputedStyle(document.querySelector('[data-live-source=World] .live-lane-state')).color!==window.__livePendingColor"),'Waiting and streaming are visually distinct as well as labelled');
+  await evaluate("document.querySelectorAll('.live-raw-tab')[1].click()");
   await wait(`document.querySelector('.live-raw-code').textContent===${q(first)}`);
   await evaluate("window.__liveSmokeRow=document.querySelector('.live-call-selected');window.__liveSmokeText=document.querySelector('.live-raw-code').firstChild;document.querySelector('.live-follow').click()");
   await step({id:other,action:'begin',source:'Bot',requestBody:'{"parallel":true}'});
@@ -50,20 +59,24 @@ export default async function smokeLive({evaluate,wait,assert,navigate}) {
   await wait(`document.querySelector('.live-raw-code').textContent===${q(first+second)}`);
   assert(await evaluate(`document.querySelector('.live-call-selected').dataset.callId===${q(id)} && document.querySelector('.live-call-selected')===window.__liveSmokeRow && document.querySelector('.live-raw-code').firstChild===window.__liveSmokeText`),'Paused follow preserves selected call, row and existing text nodes while real output appends');
   assert(await evaluate(`document.querySelectorAll('[data-call-id="${id}"]').length===1`),'Streaming updates do not duplicate timeline entries');
+  assert(await evaluate(`!window.__liveDetailReads.some(url=>url.includes(${q(other)}))`),'Other active lanes do not download requests or response bodies in the background');
   await navigate('world');await step({id,action:'append',text:'data: [DONE]\n\n',preview:'第一段😀第二段'});await step({id,action:'finish'});
   await navigate('live');
   await wait(`document.querySelector('.live-call-selected')?.dataset.callId===${q(id)} && document.querySelector('.live-raw-code').textContent===${q(first+second+'data: [DONE]\n\n')}`);
   assert(await evaluate("document.querySelector('.live-detail-meta .live-status').textContent==='已完成'"),'Switching routes retains selection and retrieves the completed raw stream');
+  assert(await evaluate("document.querySelector('.live-detail').dataset.state==='completed' && getComputedStyle(document.querySelector('.live-detail'),'::before').animationName==='none'"),'Completed calls stop animating and retain a labelled steady status');
   await step({id:other,action:'error',error:'开发样本 HTTP 400'});
   await evaluate(`document.querySelector('[data-call-id="${other}"]').click()`);
   await wait("document.querySelector('.live-detail-meta .live-status')?.textContent==='失败'");
+  await wait(`window.__liveDetailReads.some(url=>url.includes(${q(other)})&&url.includes('request=0'))`);
+  assert(await evaluate(`!window.__liveDetailReads.some(url=>url.includes(${q(other)})&&url.includes('request=1'))`),'Opening a completed response does not download its request');
   await step({id:other,action:'unavailable'});
   await wait("document.querySelector('.live-raw-notice').textContent.includes('不可读')");
   assert(await evaluate("document.querySelector('.live-raw-notice').textContent.includes('不可读')"),'An actual record read failure is explicitly identified');
   const toolId=id+'_tools',frame=delta=>'data: '+JSON.stringify({choices:[{index:0,delta}]})+'\n\n';
   await step({id:toolId,action:'begin',source:'Bot'});
   await wait(`document.querySelector('[data-call-id="${toolId}"]')`);
-  await evaluate(`document.querySelector('[data-call-id="${toolId}"]').click();document.querySelector('.live-view-read').click()`);
+  await evaluate(`document.querySelector('[data-call-id="${toolId}"]').click();document.querySelector('.live-view-read').click();document.querySelectorAll('.live-raw-tab')[1].click()`);
   const toolsFirst=frame({reasoning_content:'先确认频道。',tool_calls:[{index:0,id:'call_a',type:'function',function:{name:'select_channel',arguments:'{"id":"group-1","note":"你好'}}]});
   await step({id:toolId,action:'append',text:toolsFirst});
   await wait("document.querySelector('.live-reasoning-text')?.textContent==='先确认频道。' && document.querySelector('.live-tool-arguments')?.textContent.includes('你好')");
@@ -84,9 +97,14 @@ export default async function smokeLive({evaluate,wait,assert,navigate}) {
   await evaluate(`document.querySelector('[data-call-id="${textId}"]').click()`);
   await step({id:textId,action:'append',text:frame({content:'{"name":"select_channel",'})});
   await wait("document.querySelector('.live-answer-text')?.textContent.includes('select_channel')");
+  assert(await evaluate("document.querySelectorAll('.live-raw-tab')[1].getAttribute('aria-selected')==='true'"),'An untouched automatic request view follows the first model content');
   await step({id:textId,action:'append',text:frame({content:'"arguments":{"id":"group-2"}}'})+'data: [DONE]\n\n'});await step({id:textId,action:'finish'});
   await wait("document.querySelector('.live-answer-text .readable-data')?.textContent.includes('group-2')");
   assert(await evaluate("!document.querySelector('.live-reading').hidden && !document.querySelector('.live-answer-text').textContent.includes('data:')"),'Text-protocol JSON is shown as fields rather than chunk envelopes');
-  await evaluate("window.fetch=window.__liveOriginalFetch;delete window.__liveOriginalFetch;delete window.__liveDetailReads;delete window.__liveSmokeRow;delete window.__liveSmokeText;delete window.__liveSmokeRequest");
-  return 'live calls: lazy request loading, reversible long-request folds, readable streaming, retained selections, exact original data and explicit storage errors';
+  const cancelledId=id+'_cancelled';
+  await step({id:cancelledId,action:'begin',source:'World'});await step({id:cancelledId,action:'cancel'});
+  await wait("document.querySelector('[data-live-source=World]').dataset.state==='cancelled'");
+  assert(await evaluate("document.querySelector('[data-live-source=World] .live-lane-state').textContent==='已取消' && getComputedStyle(document.querySelector('[data-live-source=World]'),'::before').animationName==='none'"),'Cancelled calls have a distinct labelled resting state');
+  await evaluate("window.fetch=window.__liveOriginalFetch;delete window.__liveOriginalFetch;delete window.__liveDetailReads;delete window.__liveSmokeRow;delete window.__liveSmokeText;delete window.__liveSmokeRequest;delete window.__livePendingColor");
+  return 'live calls: pending request visibility, accessible animated status, reduced motion, lazy background reads, reversible folds, readable streaming, retained selections and exact originals';
 }

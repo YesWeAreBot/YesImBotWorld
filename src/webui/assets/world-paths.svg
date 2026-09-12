@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" class="world-art world-art-orbit" viewBox="0 0 40 40" fill="none" role="img" aria-labelledby="world-art-orbit-4-title"><title id="world-art-orbit-4-title">正在延伸的世界轨迹</title>
+          <path d="M31 11A15 15 0 1 0 35 23" stroke="#67d9c0" stroke-opacity=".48" stroke-width="1.3" stroke-linecap="round"/>
+          <path d="M8 25c8-1 14-8 18-15M10 29c13 0 21-5 28-14" stroke="#67d9c0" stroke-opacity=".65" stroke-width="1.3" stroke-linecap="round"/>
+          <circle cx="28" cy="6" r="2.5" fill="#f1c38b"/><circle cx="36" cy="12" r="2.5" fill="#67d9c0"/>
+        </svg>

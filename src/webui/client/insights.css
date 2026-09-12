@@ -1,5 +1,5 @@
 .insight-page {
-  --insight-cache:#aabbaa;
+  --insight-cache:var(--info);
   color:var(--fg);
   max-width:1500px;
   margin:0 auto
@@ -92,6 +92,7 @@
 }
 .insight-metric-primary {
   background:var(--accent);
+  background-image:radial-gradient(ellipse at 95% 0%,color-mix(in srgb,var(--surface) 15%,transparent),transparent 65%);
   color:var(--surface);
   border-color:var(--accent)
 }
@@ -159,7 +160,7 @@
 .insight-tabs .insight-button.insight-active {
   background:var(--surface);
   color:var(--accent);
-  box-shadow:0 1px 4px #24352d0d;
+  box-shadow:0 1px 4px color-mix(in srgb,var(--fg) 6%,transparent);
   border-color:var(--line)
 }
 .insight-chart-svg {
@@ -299,7 +300,7 @@
   background:var(--bg)
 }
 .insight-event-row.selected {
-  background:var(--panel2)
+  background:color-mix(in srgb,var(--accent) 7%,var(--surface))
 }
 .insight-event-row.selected:before {
   content:'';
@@ -315,15 +316,17 @@
   height:7px;
   border-radius:50%;
   background:var(--accent);
-  opacity:.7;
+  box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 9%,transparent);
   margin-top:5px;
   flex-shrink:0
 }
 .insight-level-warn .insight-event-dot {
-  background:var(--warn)
+  background:var(--warn);
+  box-shadow:0 0 0 3px color-mix(in srgb,var(--warn) 9%,transparent)
 }
 .insight-level-error .insight-event-dot {
-  background:var(--err)
+  background:var(--err);
+  box-shadow:0 0 0 3px color-mix(in srgb,var(--err) 9%,transparent)
 }
 .insight-event-body {
   min-width:0;
@@ -800,13 +803,13 @@
 .insight-plot-controls button { min-height:40px; }
 .insight-plot-zoom { display:flex; align-items:center; gap:8px; color:var(--fg-dim); font-size:12px; }
 .insight-plot-zoom input { width:100px; min-height:32px; accent-color:var(--accent); }
-.insight-plot-viewport { width:100%; overflow:auto; overscroll-behavior-x:contain; touch-action:pan-x pan-y; cursor:grab; scrollbar-width:thin; border:1px solid var(--line); border-radius:12px; }
+.insight-plot-viewport { width:100%; overflow:auto; overscroll-behavior-x:contain; touch-action:pan-x pan-y; cursor:grab; scrollbar-width:thin; scrollbar-color:var(--line2) transparent; border:1px solid var(--line); border-radius:12px; background:linear-gradient(180deg,color-mix(in srgb,var(--info) 4%,var(--surface)),var(--surface)); }
 .insight-plot-viewport.dragging { cursor:grabbing; user-select:none; }
 .insight-plot-viewport .insight-chart-svg { display:block; max-width:none; height:auto; min-width:100%; }
 .insight-plot-mark { cursor:pointer; outline:none; }
 .insight-plot-mark:hover .insight-plot-hit, .insight-plot-mark:focus .insight-plot-hit { fill:var(--accent); fill-opacity:.08; }
-.insight-plot-mark.insight-plot-selected .insight-plot-hit { fill:var(--accent); fill-opacity:.1; stroke:var(--accent); stroke-width:1; stroke-dasharray:3 3; }
-.insight-plot-detail { margin-top:14px; border:1px solid var(--line); border-radius:12px; padding:16px; background:var(--surface); }
+.insight-plot-mark.insight-plot-selected .insight-plot-hit { fill:var(--accent); fill-opacity:.12; stroke:var(--accent); stroke-width:1.5; stroke-dasharray:3 3; }
+.insight-plot-detail { margin-top:14px; border:1px solid var(--line); border-left:3px solid var(--accent); border-radius:12px; padding:16px; background:linear-gradient(100deg,color-mix(in srgb,var(--accent) 4%,var(--surface)),var(--surface)); }
 .insight-plot-detail > strong { display:block; font-size:13px; margin-bottom:12px; }
 .insight-plot-values { display:flex; flex-wrap:wrap; gap:12px 24px; margin:0; align-items:center; }
 .insight-plot-values dt { color:var(--fg-dim); font-size:11px; }

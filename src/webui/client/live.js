@@ -2,7 +2,7 @@
 (function () {
     'use strict';
     var calls = new Map(), raw = new Map(), listeners = new Set(), request = null, error = '', connected = null, epoch = 0, refreshTimer = null, retention = null;
-    var selection = { id: null, follow: true, tab: 'response', format: 'readable', source: 'all', search: '', wrap: true }, detailFlight = new Map(), lastPull = 0, eventSerial = 0, eventSeen = new Map();
+    var selection = { id: null, follow: true, tab: 'response', manualTabFor: null, format: 'readable', source: 'all', search: '', wrap: true }, detailFlight = new Map(), lastPull = 0, eventSerial = 0, eventSeen = new Map();
     function allowed() { return !isVisitor() || visitorCanSee(['debug']); }
     function active(call) { return call && !call.missing && (call.status === 'pending' || call.status === 'streaming'); }
     function ordered() { return Array.from(calls.values()).sort(function (a, b) { return a.startedAt - b.startedAt || a.callId.localeCompare(b.callId); }); }
@@ -38,7 +38,22 @@
         if (selection.follow && (!selection.id || !calls.has(selection.id) || value.startedAt >= (calls.get(selection.id).startedAt || 0)))
             selection.id = ordered().at(-1)?.callId || null;
     }
-    function forget() { epoch++; calls.clear(); raw.clear(); eventSeen.clear(); eventSerial = 0; detailFlight.clear(); request = null; selection.id = null; error = ''; retention = null; }
+    function forget() { epoch++; calls.clear(); raw.clear(); eventSeen.clear(); eventSerial = 0; detailFlight.clear(); request = null; selection.id = null; selection.manualTabFor = null; error = ''; retention = null; }
+    function selectCall(id, tab) {
+        if (selection.id !== id) selection.manualTabFor = null;
+        selection.id = id;
+        selection.follow = false;
+        if (tab) { selection.tab = tab; selection.manualTabFor = id; }
+    }
+    function requestPreview(item) {
+        if (!item || typeof item.request !== 'string') return '';
+        if (item.requestPreview !== undefined) return item.requestPreview;
+        var decoded = CallContent.request(item.request), roles = { system: '系统', developer: '开发者', user: '输入与观测', assistant: '模型', tool: '工具回执' };
+        item.requestPreview = decoded.error ? '' : (decoded.messages || []).slice(-2).map(function (message) {
+            return (roles[message.role] || message.role || '消息') + ' · ' + ReadableData.text(CallAttachments.redact(message.content)).replace(/\s+/g, ' ').slice(0, 240);
+        }).join('\n');
+        return item.requestPreview;
+    }
     function refresh() {
         if (!allowed()) {
             forget();
@@ -164,8 +179,8 @@
             detail = el('div', { cls: 'live-detail' });
             detailMeta = el('div', { cls: 'live-detail-meta' });
             var tabs = el('div', { cls: 'live-raw-tabs', role: 'tablist', 'aria-label': '调用内容类型' });
-            requestButton = button('请求', function () { selection.tab = 'request'; render(); }, 'live-raw-tab');
-            responseButton = button('返回', function () { selection.tab = 'response'; render(); }, 'live-raw-tab');
+            requestButton = button('请求', function () { selection.tab = 'request'; selection.manualTabFor = selection.id; render(); }, 'live-raw-tab');
+            responseButton = button('返回', function () { selection.tab = 'response'; selection.manualTabFor = selection.id; render(); }, 'live-raw-tab');
             [requestButton, responseButton].forEach(function (b) { b.setAttribute('role', 'tab'); });
             copyButton = button('复制', async function () { var item = raw.get(selection.id), text = selection.format === 'readable' ? reader.text() : selection.tab === 'request' ? item?.request : item?.response; if (typeof text !== 'string')
                 return; try {
@@ -178,14 +193,22 @@
             wrapButton = button('自动折行', function () { selection.wrap = !selection.wrap; render(); }, 'live-button');
             tabs.append(requestButton, responseButton);
             var viewOptions = el('div', { cls: 'live-view-options', role: 'group', 'aria-label': '查看方式' });
-            readableButton = button('阅读视图', function () { selection.format = 'readable'; render(); }, 'live-button live-view-read');
-            rawButton = button('原始数据', function () { selection.format = 'raw'; render(); }, 'live-button live-view-raw');
+            readableButton = button('阅读视图', function () { keepRequest(); selection.format = 'readable'; render(); }, 'live-button live-view-read');
+            rawButton = button('原始数据', function () { keepRequest(); selection.format = 'raw'; render(); }, 'live-button live-view-raw');
             viewOptions.append(readableButton, rawButton, wrapButton, copyButton);
             rawNotice = el('div', { cls: 'live-raw-notice', 'aria-live': 'polite' });
             code = el('pre', { cls: 'live-raw-code', tabindex: '0', 'aria-label': '调用原始数据' });
-            rawFold = button('', function () { rawExpanded = !rawExpanded; render(); }, 'live-button live-raw-fold');
+            rawFold = button('', function () { keepRequest(); rawExpanded = !rawExpanded; render(); }, 'live-button live-raw-fold');
             rawFold.hidden = true;
             reading = el('div', { cls: 'live-reading', tabindex: '0', 'aria-label': '可读调用内容' });
+            // Reading or opening a request is intentional: a first response must not take it away.
+            function keepRequest() { if (selection.tab === 'request') selection.manualTabFor = selection.id; }
+            reading.addEventListener('pointerdown', keepRequest);
+            reading.addEventListener('keydown', keepRequest);
+            reading.addEventListener('wheel', keepRequest, { passive: true });
+            code.addEventListener('pointerdown', keepRequest);
+            code.addEventListener('keydown', keepRequest);
+            code.addEventListener('wheel', keepRequest, { passive: true });
             reader = CallReader.create(reading);
             detail.append(detailMeta, tabs, viewOptions, rawNotice, reading, rawFold, code);
             grid.append(history, detail);
@@ -206,14 +229,19 @@
             ['Bot', 'World'].forEach(function (who) {
                 var lane = lanes.querySelector('[data-live-source="' + who + '"]');
                 if (!lane) {
-                    lane = el('article', { cls: 'live-lane', 'data-live-source': who }, [el('div', { cls: 'live-lane-heading' }, [el('span', { cls: 'live-source-mark', text: who === 'Bot' ? 'B' : 'W' }), el('strong', { text: who }), el('span', { cls: 'live-lane-state' })]), el('div', { cls: 'live-lane-model' }), el('pre', { cls: 'live-lane-preview' }), el('div', { cls: 'live-lane-footer' })]);
+                    lane = el('article', { cls: 'live-lane', 'data-live-source': who }, [el('div', { cls: 'live-lane-heading' }, [el('span', { cls: 'live-source-mark', text: who === 'Bot' ? 'B' : 'W' }), el('strong', { text: who + ' LLM' }), el('span', { cls: 'live-lane-state', role: 'status' })]), el('div', { cls: 'live-lane-model' }), el('div', { cls: 'live-lane-preview-kind' }), el('pre', { cls: 'live-lane-preview' }), el('div', { cls: 'live-lane-footer' })]);
                     lanes.appendChild(lane);
                 }
                 var matching = list.filter(function (c) { return source(c) === who; }), call = matching.filter(active).at(-1) || matching.at(-1), pending = matching.filter(active).length;
                 lane.dataset.state = call?.status || 'empty';
+                lane.setAttribute('aria-label', who + ' LLM · ' + (call ? status(call) : '暂无调用'));
                 lane.querySelector('.live-lane-state').textContent = call ? status(call) : '暂无调用';
                 lane.querySelector('.live-lane-model').textContent = call ? call.model + (pending > 1 ? ' · ' + pending + ' 个并发调用' : '') : who === 'Bot' ? '角色的判断与行动' : '环境的演化与裁定';
-                var preview = lane.querySelector('.live-lane-preview'), next = call ? (readablePreview(call.preview) || (call.status === 'pending' ? '请求已发送，正在等待真实响应。' : call.status === 'streaming' ? '已收到响应片段，内容正在生成。' : call.error || '本次调用没有可显示的正文。')) : '还没有收到 ' + who + ' 的调用事件。';
+                var preview = lane.querySelector('.live-lane-preview'), showingRequest = !!call && !call.preview && active(call), next = call ? (readablePreview(call.preview) || (showingRequest ? requestPreview(raw.get(call.callId)) : call.error || '本次调用没有可显示的正文。')) : '';
+                var previewKind = lane.querySelector('.live-lane-preview-kind');
+                previewKind.textContent = next ? (showingRequest ? '已发送的请求' : '最新返回') : '';
+                previewKind.hidden = !next;
+                preview.hidden = !next;
                 if (preview.textContent !== next) {
                     preview.textContent = next;
                     if (selection.follow)
@@ -222,11 +250,13 @@
                 var footer = lane.querySelector('.live-lane-footer');
                 footer.replaceChildren();
                 if (call) {
-                    footer.append(el('span', { text: (call.httpStatus ? 'HTTP ' + call.httpStatus + ' · ' : '') + elapsed(call) + ' · ' + bytes(call.responseBytes) }), button('查看', function () { selection.id = call.callId; selection.follow = false; if (compact)
-                        Studio.navigate('live');
-                    else {
-                        showCallPanel(); render();
-                    } }, 'live-link'));
+                    var links = el('div', { cls: 'live-lane-links' });
+                    function open(tab) { selectCall(call.callId, tab); if (compact) Studio.navigate('live'); else { showCallPanel(); render(); } }
+                    links.appendChild(button('查看请求', function () { open('request'); }, 'live-link live-lane-request'));
+                    if (call.responseBytes || !active(call)) links.appendChild(button('查看返回', function () { open('response'); }, 'live-link live-lane-response'));
+                    footer.append(el('span', { text: (call.httpStatus ? 'HTTP ' + call.httpStatus + ' · ' : '') + elapsed(call) + ' · ' + bytes(call.responseBytes) }), links);
+                } else {
+                    footer.appendChild(el('span', { text: who === 'Bot' ? '等待角色开始行动' : '等待世界发生变化' }));
                 }
             });
         }
@@ -261,7 +291,7 @@
             filtered.forEach(function (call) {
                 var row = rowNodes.get(call.callId);
                 if (!row) {
-                    row = el('button', { type: 'button', cls: 'live-call-row', role: 'listitem', 'data-call-id': call.callId, onclick: function () { selection.id = call.callId; selection.follow = false; render(); } }, [el('div', { cls: 'live-call-top' }), el('strong', { cls: 'live-call-model' }), el('div', { cls: 'live-call-bottom' })]);
+                    row = el('button', { type: 'button', cls: 'live-call-row', role: 'listitem', 'data-call-id': call.callId, onclick: function () { selectCall(call.callId); render(); } }, [el('div', { cls: 'live-call-top' }), el('strong', { cls: 'live-call-model' }), el('div', { cls: 'live-call-bottom' })]);
                     rowNodes.set(call.callId, row);
                     timeline.appendChild(row);
                 }
@@ -282,12 +312,17 @@
         }
         function renderDetail() {
             var call = calls.get(selection.id), item = raw.get(selection.id);
+            if (call && selection.manualTabFor !== call.callId) selection.tab = active(call) && !call.preview ? 'request' : 'response';
+            detail.dataset.state = call?.status || 'empty';
+            responseButton.classList.toggle('live-response-available', !!call?.responseBytes && selection.tab === 'request');
+            responseButton.setAttribute('aria-label', call?.responseBytes && selection.tab === 'request' ? '返回 · 已有模型内容' : '返回');
             requestButton.setAttribute('aria-selected', String(selection.tab === 'request'));
             responseButton.setAttribute('aria-selected', String(selection.tab === 'response'));
             wrapButton.setAttribute('aria-pressed', String(selection.wrap));
             readableButton.setAttribute('aria-pressed', String(selection.format === 'readable'));
             rawButton.setAttribute('aria-pressed', String(selection.format === 'raw'));
             reading.hidden = selection.format !== 'readable'; code.hidden = selection.format !== 'raw'; wrapButton.hidden = selection.format !== 'raw';
+            reading.classList.toggle('live-awaiting-content', !!call && active(call) && selection.tab === 'response');
             copyButton.textContent = selection.format === 'readable' ? '复制内容' : '复制原文';
             code.classList.toggle('live-nowrap', !selection.wrap);
             if (!call) {

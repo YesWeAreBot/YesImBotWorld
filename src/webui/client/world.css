@@ -28,7 +28,7 @@
 }
 .world-filter-group button.active {
   background:var(--surface);
-  box-shadow:0 2px 5px #14321d08;
+  box-shadow:0 2px 5px color-mix(in srgb,var(--fg) 6%,transparent);
   color:var(--accent)
 }
 .world-view-toggle {
@@ -57,7 +57,8 @@
   padding:16px 20px;
   border-bottom:1px solid var(--line);
   gap:10px;
-  font-size:11px
+  font-size:11px;
+  background:linear-gradient(100deg,var(--surface),color-mix(in srgb,var(--info) 5%,var(--surface)))
 }
 .world-canvas-head strong {
   font-weight:550
@@ -72,8 +73,10 @@
   overflow:hidden;
   position:relative;
   touch-action:none;
-  background:radial-gradient(circle,var(--line) .8px,transparent .8px);
-  background-size:18px 18px;
+  background-color:var(--bg);
+  background-image:radial-gradient(ellipse at 50% 0%,color-mix(in srgb,var(--info) 10%,transparent),transparent 65%),linear-gradient(color-mix(in srgb,var(--line) 55%,transparent) 1px,transparent 1px),linear-gradient(90deg,color-mix(in srgb,var(--line) 55%,transparent) 1px,transparent 1px),radial-gradient(circle,var(--line2) .7px,transparent .7px);
+  background-size:100% 100%,96px 96px,96px 96px,24px 24px;
+  background-position:center,center,center,center;
   cursor:grab
 }
 .world-canvas:active {
@@ -87,11 +90,11 @@
 }
 .world-edge {
   fill:none;
-  stroke:#bccbbb;
+  stroke:var(--line2);
   stroke-width:1.6
 }
 .world-edge.owner {
-  stroke:#cfa783;
+  stroke:var(--accent2);
   stroke-dasharray:5 5
 }
 .world-edge.faded {
@@ -105,26 +108,27 @@
   fill:var(--surface);
   stroke:var(--line2);
   stroke-width:1;
-  transition:stroke .15s,filter .15s
+  transition:stroke .15s,fill .15s,filter .15s
 }
 .world-node:hover>rect,.world-node:focus>rect {
   stroke:var(--accent);
   stroke-width:2;
-  filter:drop-shadow(0 5px 5px #284c3412)
+  filter:drop-shadow(0 5px 5px color-mix(in srgb,var(--fg) 10%,transparent))
 }
 .world-node.selected>rect {
   stroke:var(--accent);
-  stroke-width:2.5
+  stroke-width:2.5;
+  fill:color-mix(in srgb,var(--accent) 8%,var(--surface))
 }
 .world-node .node-icon-bg {
   fill:var(--panel2);
   stroke:none
 }
 .world-node.actor .node-icon-bg {
-  fill:#f6e8d5
+  fill:color-mix(in srgb,var(--accent2) 14%,var(--surface))
 }
 .world-node.object .node-icon-bg {
-  fill:#e8eff4
+  fill:color-mix(in srgb,var(--info) 14%,var(--surface))
 }
 .world-node .node-label {
   font-size:12px;
@@ -147,10 +151,10 @@
   fill:none
 }
 .world-node.actor .node-icon {
-  stroke:#b67f4c
+  stroke:var(--accent2)
 }
 .world-node.object .node-icon {
-  stroke:#648ba1
+  stroke:var(--info)
 }
 .world-node.faded {
   opacity:.32
@@ -183,7 +187,10 @@
   left:17px;
   bottom:19px;
   font-size:9px;
-  color:var(--fg-dark);
+  color:var(--fg-dim);
+  padding:3px 7px;
+  border-radius:5px;
+  background:color-mix(in srgb,var(--bg) 90%,transparent);
   pointer-events:none
 }
 .world-canvas-footer {
@@ -211,12 +218,12 @@
 .world-line-key {
   display:inline-block;
   width:20px;
-  border-top:1px solid #b2c2ae;
+  border-top:1px solid var(--line2);
   vertical-align:middle;
   margin:0 5px
 }
 .world-line-key.owner {
-  border-top:1px dashed #cda079
+  border-top:1px dashed var(--accent2)
 }
 .world-inspector {
   background:var(--surface);
@@ -228,7 +235,8 @@
 }
 .world-inspector-header {
   padding:20px;
-  border-bottom:1px solid var(--line)
+  border-bottom:1px solid var(--line);
+  background:linear-gradient(135deg,color-mix(in srgb,var(--accent) 5%,var(--surface)),var(--surface))
 }
 .world-inspector-kind {
   display:flex;
@@ -361,7 +369,8 @@
   background:none
 }
 .world-entity-row.selected {
-  background:var(--panel2)
+  background:color-mix(in srgb,var(--accent) 7%,var(--surface));
+  box-shadow:inset 2px 0 0 var(--accent)
 }
 .world-entity-row .name {
   font-size:12px;
@@ -538,8 +547,9 @@
 .growth-evidence-map {
   height:235px;
   border-radius:12px;
-  background:radial-gradient(circle,var(--line) .8px,transparent .8px);
-  background-size:17px 17px;
+  background-color:var(--bg);
+  background-image:radial-gradient(ellipse at 30% 50%,color-mix(in srgb,var(--info) 7%,transparent),transparent 65%),radial-gradient(circle,var(--line2) .7px,transparent .7px);
+  background-size:100% 100%,24px 24px;
   border:1px solid var(--line);
   margin:18px 0;
   overflow:auto
@@ -583,8 +593,8 @@
   color:var(--accent)
 }
 .growth-record-icon.counter {
-  background:#f8ebe1;
-  color:#b37549
+  background:color-mix(in srgb,var(--accent2) 12%,var(--surface));
+  color:var(--accent2)
 }
 .growth-record-head {
   display:flex;
@@ -655,6 +665,11 @@
 }
 .growth-evidence-detail .studio-link {
   font-size:10px
+}
+@media(prefers-reduced-motion:reduce) {
+  .world-node>rect {
+    transition:none
+  }
 }
 @media(max-width:1200px) {
   .world-workspace {

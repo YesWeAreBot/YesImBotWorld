@@ -298,7 +298,7 @@
             var shown = evidence.slice(0, 8), h = Math.max(220, shown.length * 51 + 20), svg = sv('svg', { viewBox: '0 0 590 ' + h, role: 'img', 'aria-label': '认识与观测证据的联系，选择证据查看原文' });
             shown.forEach(function (e, i) {
                 var y = 18 + i * 51, counter = records.some(function (r) { return r.relation === 'counter' && r.evidenceIds.includes(e.eventId); });
-                svg.appendChild(sv('path', { d: 'M215,' + (h / 2) + 'C280,' + (h / 2) + ' 260,' + (y + 18) + ' 326,' + (y + 18), fill: 'none', stroke: counter ? '#c69a77' : '#abc2aa', 'stroke-width': 1.5, 'stroke-dasharray': counter ? '5 4' : '' }));
+                svg.appendChild(sv('path', { d: 'M215,' + (h / 2) + 'C280,' + (h / 2) + ' 260,' + (y + 18) + ' 326,' + (y + 18), fill: 'none', stroke: counter ? 'var(--accent2)' : 'var(--accent)', 'stroke-width': 1.5, 'stroke-dasharray': counter ? '5 4' : '' }));
                 var node = sv('g', { transform: 'translate(326 ' + y + ')', class: 'growth-evidence-node', role: 'button', tabindex: 0, 'aria-label': '查看证据 ' + e.eventId });
                 node.appendChild(sv('rect', { width: 234, height: 38, rx: 8, fill: 'var(--surface)', stroke: 'var(--line2)' }));
                 node.appendChild(sv('text', { x: 12, y: 16, fill: 'var(--fg)', 'font-size': 10 }, short(e.text, 21)));
