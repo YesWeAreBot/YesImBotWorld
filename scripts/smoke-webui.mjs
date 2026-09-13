@@ -110,19 +110,17 @@ try {
     console.log(`PASS all ${routes.length} pages at ${width}px`);
   }
   await navigate('world');
-  await evaluate(`document.querySelector('[data-entity-id="bot"]').dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true}))`);
-  assert.equal(await evaluate("document.querySelector('.world-inspector h2')?.textContent"), '小澈');
-  await evaluate(`document.querySelector('.world-relation').click()`);
-  assert.equal(await evaluate("document.querySelector('.world-inspector h2')?.textContent"), '窗边工作室');
-  await evaluate(`var s=document.querySelector('[aria-label="搜索实体"]');s.value='温热';s.dispatchEvent(new Event('input'));`);
-  assert.equal(await evaluate("document.querySelectorAll('.world-node').length"), 1);
+  assert.equal(await evaluate("!!document.querySelector('.world-controls,.world-canvas,.world-inspector')"), false, 'Retired entity controls are removed, not hidden');
+  await evaluate(`document.querySelector('#studio-command').click();var s=document.querySelector('.studio-search-input');s.value='小澈';s.dispatchEvent(new Event('input'));document.querySelector('.studio-search-result').click();`);
+  await wait(`document.activeElement?.dataset.worldActor==='bot'`);
+  assert.equal(await evaluate("document.querySelector('[data-world-actor=bot] h3')?.textContent"), '小澈');
   // A debug-to-world event can arrive before its first fetch finishes.
-  await evaluate(`Studio.navigate('world');window.dispatchEvent(new CustomEvent('studio:focus-world-event',{detail:{actorId:'bot',eventId:'event_12'}}));`);
-  await wait("document.querySelector('.world-event-detail pre')?.textContent.includes('event_12')");
+  await evaluate(`Studio.navigate('world');window.dispatchEvent(new CustomEvent('studio:focus-world-event',{detail:{actorId:'bot',eventId:'narrative_start'}}));`);
+  await wait("document.querySelector('.world-event-detail')?.textContent.includes('narrative_start')");
   await navigate('growth');
   await evaluate("document.querySelector('.growth-evidence-node').dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true}))");
   assert.ok(await evaluate("document.querySelector('.growth-evidence-detail')?.textContent.includes('observed_1')"));
-  console.log('PASS graph navigation, early event focus and growth evidence');
+  console.log('PASS actor navigation, early event focus and growth evidence');
   await evaluate("promptAuth();document.querySelector('#modal-x').click()");
   assert.equal(await evaluate('authPromise'), null, 'Closing login must settle the pending request');
   await evaluate("document.querySelector('#studio-command').click()");

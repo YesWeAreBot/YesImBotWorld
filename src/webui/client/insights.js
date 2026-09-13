@@ -233,7 +233,7 @@
                 if (!linked.length)
                     links.appendChild(el('p', { cls: 'insight-note', text: '当前加载窗口中没有其他关联事件。' }));
                 linked.slice(0, 15).forEach(function (other) { links.appendChild(btn((other.bus.id === bus.causationId ? '上游 → ' : other.bus.causationId === bus.id ? '下游 ← ' : '同一链路 · ') + other.bus.topic, function () { choose(other); }, 'insight-causal-link')); });
-                links.appendChild(btn('在世界结构中查看 ↗', function () { Studio.navigate('world'); window.dispatchEvent(new CustomEvent('studio:focus-world-event', { detail: { eventId: bus.id, sequence: bus.sequence, actorId: bus.actorId } })); }, 'insight-world-link'));
+                links.appendChild(btn('在世界实况中查看 ↗', function () { Studio.navigate('world'); window.dispatchEvent(new CustomEvent('studio:focus-world-event', { detail: { eventId: bus.id, sequence: bus.sequence, actorId: bus.actorId } })); }, 'insight-world-link'));
                 detail.appendChild(links);
             }
             detail.appendChild(el('div', { cls: 'insight-raw-head' }, [el('h3', { text: '记录内容' })]));

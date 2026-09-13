@@ -47,22 +47,25 @@ export default async function smokeLayout({ evaluate, wait, assert, navigate, pa
     for (const [width, height] of [[375, 740], [320, 480], [430, 540]]) {
       await metrics(width, height);
       await navigate('overview');
-      await wait("document.querySelector('.studio-topology-preview svg') && parseFloat(document.documentElement.style.getPropertyValue('--mobile-nav-height'))>0");
+      await wait("document.querySelector('.world-narrative-preview .readable-prose') && parseFloat(document.documentElement.style.getPropertyValue('--mobile-nav-height'))>0");
       await mobileBounds(width, `overview ${width}px`);
-      // Exercise the real graph renderer with long identifiers, then a wide SVG viewBox.
-      // Its intrinsic ratio must never become the min-content width of the page grid.
+      // Long scenes, unbroken words and character names must wrap within the
+      // overview columns without widening the mobile layout or moving navigation.
       await evaluate(`(()=>{
-        const name='连续的长世界名称与标识'.repeat(40), entities={place:{id:'place',name,kind:'place',revision:1},bot:{id:'bot',name,kind:'actor',location:'place',revision:1}};
-        for(let i=0;i<5;i++)entities['object_'+i]={id:'object_'+i,name:name+i,kind:'object',location:'bot',owner:'bot',revision:1};
-        const holder=document.querySelector('.studio-topology-preview');holder.replaceChildren();Studio.drawWorldPreview(holder,{entities});holder.querySelector('svg').setAttribute('viewBox','0 0 4096 280');
+        const name='名字很长的世界旅人'.repeat(40);
+        const text='窗外的风吹动树叶，桌上的茶已经变温。她还记得下午的约定，想先读完这一页，再决定午饭去哪里。'.repeat(20)+'LongUnbrokenWorldWord'.repeat(30);
+        const holder=document.querySelector('.world-narrative-preview');holder.replaceChildren(ReadableData.render(text,{raw:false,textLimit:5000}));
         document.querySelector('.studio-bot-card h3').textContent=name;
-        // Real speech can be much longer than a graph node label. Its ellipsis must
-        // stay inside the activity column instead of pushing the timestamp/page out.
+        // The activity excerpt also needs to leave room for its timestamp.
         document.querySelector('.studio-activity-item p').textContent='窗外的风把树叶吹得沙沙响，我想先整理一下今天的想法，再去看看这个世界还有哪些新的地方可以探索。';
       })()`);
       await settle();
-      await mobileBounds(width, `wide relationship graph ${width}px`);
-      await evaluate("document.querySelector('.studio-topology-preview').scrollIntoView({block:'center',behavior:'instant'})");
+      await mobileBounds(width, `long narrative and character name ${width}px`);
+      // Restore the original content before testing refresh at a fixed reading
+      // position; this next check is about unchanged content, not a shorter story.
+      await evaluate("window.__layoutOverview=document.querySelector('.studio-kpi-row');window.dispatchEvent(new CustomEvent('studio:refresh'))");
+      await wait("document.querySelector('.studio-kpi-row')!==window.__layoutOverview");
+      await evaluate("document.querySelector('.world-narrative-preview').scrollIntoView({block:'center',behavior:'instant'})");
       await settle();
       await mobileBounds(width, `scrolled overview ${width}px`);
       await evaluate("window.__layoutScrollY=scrollY;window.__layoutOverview=document.querySelector('.studio-kpi-row');window.dispatchEvent(new CustomEvent('studio:refresh'))");
@@ -99,7 +102,7 @@ export default async function smokeLayout({ evaluate, wait, assert, navigate, pa
       await wait('!cfgDirty && document.querySelectorAll(".cfg-savebar button").length===1');
     }
     assert.equal(await evaluate('window.__layoutConfigPosts'), 0, 'Layout checks edit only a local draft and never save configuration');
-    return 'consistent theme backgrounds, device-width graph containment, five touchable navigation items through scroll/refresh, dirty config clearance across safe-area/nav resizing and desktop return';
+    return 'consistent theme backgrounds, device-width narrative containment, five touchable navigation items through scroll/refresh, dirty config clearance across safe-area/nav resizing and desktop return';
   } finally {
     await evaluate(`window.fetch=window.__layoutFetch;document.querySelector('#mobile-nav').style.removeProperty('padding-bottom');if(document.body.dataset.theme!==${JSON.stringify(originalTheme)})document.querySelector('#btn-theme').click();delete window.__layoutFetch;delete window.__layoutConfigPosts;delete window.__layoutScrollY;delete window.__layoutOverview;`);
     await metrics(375, 1050);

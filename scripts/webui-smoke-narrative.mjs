@@ -12,7 +12,24 @@ export default async function smokeNarrative({ evaluate, wait, assert, navigate,
       assert(await run(()=>document.querySelector('main').textContent.includes('身体没有不适')&&!document.querySelector('main').textContent.includes('暂时没有结构化状态')&&document.documentElement.scrollWidth<=innerWidth),'Overview reads world and actor prose without an empty-entity error or overflow');
       await navigate('world');
       await wait(`!!document.querySelector('[data-world-mode="narrative"]')`);
-      assert(await run(()=>document.querySelector('.world-controls').hidden&&document.querySelector('.world-current-scene').textContent.includes('出发前还要确认时间')&&document.querySelector('[data-world-actor="bot"]').textContent.includes('还没有吃午饭')&&document.querySelector('.world-event-list').textContent.includes('下午一起走走')&&!document.querySelector('.world-node')&&document.documentElement.scrollWidth<=innerWidth),'World view displays persistent context, actor situation and narrative events without inventing entity nodes');
+      assert(await run(()=>!document.querySelector('.world-controls,.world-view-toggle,.world-canvas,.world-inspector')&&document.querySelector('.world-current-scene').textContent.includes('出发前还要确认时间')&&document.querySelector('[data-world-actor="bot"]').textContent.includes('还没有吃午饭')&&document.querySelector('.world-event-list').textContent.includes('下午一起走走')&&!document.querySelector('.world-node')&&document.documentElement.scrollWidth<=innerWidth),'World view removes retired entity UI and displays persistent context, actor situation and narrative events');
+      assert(await run(()=>{const prose=document.querySelector('.world-event-prose .readable-prose'),row=prose.closest('.world-event-item'),header=row.querySelector('.world-event-header');return prose.getBoundingClientRect().width>=row.getBoundingClientRect().width*.98&&prose.getBoundingClientRect().top>=header.getBoundingClientRect().bottom;}),'Recent event prose uses its own full-width row at '+width+'px');
+      // Exercise a long event through the page renderer, including a live refresh while expanded.
+      await run(()=>{
+        window.__worldWidthFetch=Studio.fetchWorld;
+        let revision=0;
+        Studio.fetchWorld=async()=>{const state=structuredClone(await window.__worldWidthFetch());state.snapshot.sequence+=++revision;state.events[0].payload.text='风掠过纸页，阿青继续讲述下午的打算。'.repeat(160)+' END_OF_EVENT';return state;};
+      });
+      try {
+        await navigate('world');
+        await run(()=>document.querySelector('.world-event-prose .readable-more').click());
+        await wait(`document.querySelector('.world-event-prose .readable-prose').textContent.includes('END_OF_EVENT')`);
+        await run(()=>{window.__worldWidthNode=document.querySelector('.world-event-prose');window.dispatchEvent(new CustomEvent('studio:refresh'));});
+        await wait(`document.querySelector('.world-event-prose')!==window.__worldWidthNode`);
+        assert(await run(()=>{const prose=document.querySelector('.world-event-prose .readable-prose');return prose.textContent.includes('END_OF_EVENT')&&prose.getBoundingClientRect().width>=prose.closest('.world-event-item').getBoundingClientRect().width*.98&&document.documentElement.scrollWidth<=innerWidth;}),'Expanded event keeps full width and expansion after refresh at '+width+'px');
+        await run(()=>document.querySelector('.world-event-prose .readable-collapse').click());
+        assert(await run(()=>!document.querySelector('.world-event-prose .readable-prose').textContent.includes('END_OF_EVENT')),'Long event can be collapsed again');
+      } finally { await run(()=>{Studio.fetchWorld=window.__worldWidthFetch;delete window.__worldWidthFetch;delete window.__worldWidthNode;}); }
     }
     await page('Emulation.setDeviceMetricsOverride',{width:375,height:1050,deviceScaleFactor:1,mobile:true});
     for(const mode of ['cross','puppet','avatar']) {
@@ -56,6 +73,6 @@ export default async function smokeNarrative({ evaluate, wait, assert, navigate,
       await click(mode==='cross'?'离开世界':'归还控制并离场');
       await wait(`!!document.querySelector('.journey-identity')`);
     }
-    return ['natural world/actor/event prose at desktop and phone sizes','zero-entity act/observe in cross, puppet and avatar modes','direct narrative decision handoff, agency and stable IME inputs'];
+    return ['natural world/actor/event prose without retired controls; full-width short and long events, reversible folds and refresh persistence','zero-entity act/observe in cross, puppet and avatar modes','direct narrative decision handoff, agency and stable IME inputs'];
   } finally {await run(async()=>{await api('POST','/api/preview/narrative',{enabled:false});});}
 }
