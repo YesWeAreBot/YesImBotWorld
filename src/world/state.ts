@@ -25,7 +25,7 @@ export interface ActionInput {
   requestFingerprint?: string;
 }
 export interface WorldAction extends ActionInput {
-  status: "pending" | "completed" | "cancelled" | "failed";
+  status: "pending" | "completed" | "cancelled" | "failed" | "needs_input";
   startedAt: number;
   finishedAt?: number;
   reason?: string;
@@ -37,7 +37,7 @@ export type WorldOperation =
   | { op: "update"; id: string; changes: { name?: string; controller?: string | null; attributes?: Record<string, WorldAttribute | null> } }
   | { op: "move"; id: string; location: string | null; owner?: string | null }
   | { op: "action.start"; action: ActionInput }
-  | { op: "action.finish"; id: string; status: "completed" | "cancelled" | "failed"; reason?: string }
+  | { op: "action.finish"; id: string; status: "completed" | "cancelled" | "failed" | "needs_input"; reason?: string }
   | { op: "say"; actorId: string; text: string; audience?: string[] };
 export interface TransactionProposal {
   idempotencyKey: string;
@@ -70,6 +70,19 @@ export interface ObservedEntity {
   locationObservedId?: string;
   ownerObservedId?: string;
 }
+/** An actor-scoped account of a committed transition, never a diff of ephemeral observed handles. */
+export interface WorldExperience {
+  eventId: string;
+  worldSequence: number;
+  worldTime: number;
+  /** Stable per-actor order inside one transaction; absent in older journal entries. */
+  order?: number;
+  kind: "movement" | "appearance" | "change" | "speech" | "action";
+  text: string;
+  sourceEventIds: string[];
+  correlationId?: string;
+  details?: Record<string, JsonValue>;
+}
 export interface WorldObservation {
   observationId: string;
   actorId: string;
@@ -79,6 +92,8 @@ export interface WorldObservation {
   sourceEventIds: string[];
   entities: ObservedEntity[];
   utterances: { eventId: string; speakerName: string; speakerObservedId?: string; text: string; spokenAt: number }[];
+  /** Historical journals may omit this field; missing history is never reconstructed as fact. */
+  experiences?: WorldExperience[];
 }
 export interface ObserveRequest { target?: string; sinceSequence?: number; consume?: boolean; publicOnly?: boolean; selfOnly?: boolean; includeSpeech?: boolean }
 /** Machine-readable graph errors: all references are checked against the complete candidate transaction. */

@@ -1,4 +1,5 @@
 /** Resident control is exercised only against the isolated preview API. */
+import smokeExperiences from './webui-smoke-experiences.mjs';
 export default async function smokeCockpit({ evaluate, wait, assert, navigate, page }) {
   const run = (fn, arg) => evaluate(`(${fn.toString()})(${JSON.stringify(arg) ?? 'undefined'})`);
   assert(await run(async () => location.port !== '18111' && ['127.0.0.1','localhost'].includes(location.hostname) && (await (await fetch('/api/health')).json()).preview), 'Cockpit test requires an isolated fixture');
@@ -147,6 +148,8 @@ export default async function smokeCockpit({ evaluate, wait, assert, navigate, p
       await wait(`!!document.querySelector('.cockpit-result-media img')`);
       await run(()=>document.querySelector('.cockpit-result-media img').scrollIntoView({behavior:'instant',block:'center'}));
       await wait(`document.querySelector('.cockpit-result-media img').naturalWidth > 0`);
+      await choose('act');
+      await smokeExperiences({evaluate,wait,assert,navigate},{resident:true,mode});
       await click('归还控制并离场');
       await wait(`!!document.querySelector('.journey-identity')`);
       assert(await run(async()=>{const d=await api('GET','/api/device/session');return d.control.residentMode===null&&!d.control.paused;}), 'Leave returns device and resident autonomy together');
@@ -181,6 +184,6 @@ export default async function smokeCockpit({ evaluate, wait, assert, navigate, p
     });
     assert(await run(()=>window.__cockpitSmoke.evidenceInitiallyEmpty&&window.__cockpitSmoke.evidenceDraft.isConnected&&document.activeElement===window.__cockpitSmoke.evidenceDraft&&window.__cockpitSmoke.evidenceDraft.value==='这件事值得记住'&&window.__cockpitSmoke.evidenceSubmission.args.event_ids[0]==='perceived-exact-id'),'Evidence choices can arrive later without manual IDs, draft replacement or focus changes');
     await run(()=>document.querySelector('[data-cockpit-test]').remove());
-    return ['stopped-world entry guidance, preserved identity drafts and automatic start recovery in both modes','puppet/avatar mode selection, authorized observation and schema-driven tools','real pending call cancellation, TU conversion and dynamic app capabilities','resident-aware devices, mobile dock safe area and persistent IME inputs','name-based application choices and nested typed forms'];
+    return ['stopped-world entry guidance, preserved identity drafts and automatic start recovery in both modes','puppet/avatar mode selection, authorized observation and schema-driven tools','action-linked facts, NPC response, needs_input handoff and appended scenes','stable replay, chronological groups and ambient resident perception','real pending call cancellation, TU conversion and dynamic app capabilities','resident-aware devices, mobile dock safe area and persistent IME inputs','name-based application choices and nested typed forms'];
   } finally { await run(()=>{api=window.__cockpitSmoke.original;delete window.__cockpitSmoke;}); }
 }

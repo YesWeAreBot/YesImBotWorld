@@ -26,7 +26,7 @@ import { WorldClock } from "./clock.js";
 import { BotComputer } from "./computer.js";
 import { Config, needsMsgIds, type ModalitySupport } from "./config.js";
 import { CrossingClient } from "./crossing/client.js";
-import type { PlayerMode } from "./crossing/protocol.js";
+import type { CrossingPerceptionEvent, PlayerMode } from "./crossing/protocol.js";
 import { CrossingServer } from "./crossing/server.js";
 import { WorldFiles } from "./files.js";
 import { resolvePhoneResolution } from "./phone.js";
@@ -77,7 +77,7 @@ function readPackageVersion(): string {
 
 export class WorldService extends Service<Config> {
   private botIdentityResolver = new BotIdentityResolver();
-  private residentSession: { token: string; id: string; mode: "avatar" | "puppet" } | null = null;
+  private residentSession: { token: string; id: string; mode: "avatar" | "puppet"; perceptionStart: number } | null = null;
   private residentTransition = false;
   // puppeteer 可选：未安装时浏览器 App 不提供截图（其余功能照常），安装后无需改动即可用
   static readonly inject = {
@@ -262,6 +262,7 @@ export class WorldService extends Service<Config> {
           clock: () => this.clock ?? null,
           ready: () => this.worldActive && !!this.bot,
           notifyHostBot: (content) => this.bot?.pushEvent("world", content),
+          subscribeResidentPerceptions: (id, deliver) => this.subscribeResidentPerceptions(id, deliver),
           releaseResidentControl: async (id, cause) => {
             await this.bot?.releaseResidentControl(id, true);
             if (this.residentSession?.id === id) {
@@ -609,6 +610,7 @@ export class WorldService extends Service<Config> {
   async stopWorld(opts: { suspend?: boolean } = {}): Promise<string> {
     const wasActive = this.worldActive;
     this.worldActive = false;
+    this.crossingServer?.stopResidentPerceptions?.();
     this.world.stop();
     this.tingle?.stop();
     this.tingle = null;
@@ -773,6 +775,42 @@ export class WorldService extends Service<Config> {
     return this.crossingServer?.playerControlsBot(token) ?? false;
   }
 
+  /** Mirror only the exact Bot instance's durable perceptions during this authorized control session. */
+  private subscribeResidentPerceptions(sessionId: string, deliver: (event: CrossingPerceptionEvent) => void): () => void {
+    const session = this.residentSession, bot = this.bot;
+    const valid = () => {
+      const authorized = session && this.crossingServer?.residentSession(session.token);
+      return !!session && this.residentSession === session && this.worldActive && this.bot === bot &&
+        bot?.residentMode === session.mode && authorized?.id === sessionId && authorized.mode === session.mode;
+    };
+    if (!bot || !session || session.id !== sessionId || !valid()) return () => {};
+    let active = true;
+    const unsubscribe = bot.subscribePerceptions(({ event }) => {
+      if (!active || !valid()) return;
+      const packet: CrossingPerceptionEvent = {
+        type: "event", content: event.content, eventId: event.id, worldTime: event.worldTime,
+        timeLine: this.clock?.timeLine(event.worldTime), source: event.source,
+        refToolCallId: event.refToolCallId, sourceEventIds: event.originEventIds?.slice(),
+      };
+      // Puppet receipts keep their agency explanation verbatim, with the structured body on the next line.
+      const body = event.content.startsWith("（以下是外部操纵你身体/设备产生的回执，")
+        ? event.content.slice(event.content.indexOf("\n") + 1) : event.content;
+      if (event.source === "world" || event.source === "tool") try {
+        const parsed = JSON.parse(body);
+        const scene = parsed.scene, observation = parsed.observation ?? parsed;
+        const metadata = scene ?? observation;
+        if (typeof metadata.actorId === "string") packet.actorId = metadata.actorId;
+        if (typeof metadata.worldSequence === "number") packet.worldSequence = metadata.worldSequence;
+        if (typeof scene?.actionId === "string") packet.actionId = scene.actionId;
+        if (Array.isArray(metadata.sourceEventIds)) packet.sourceEventIds = [...new Set([
+          ...(packet.sourceEventIds ?? []), ...metadata.sourceEventIds.filter((id: unknown): id is string => typeof id === "string"),
+        ])];
+      } catch { /* Ordinary sensory text is already the authorized content; never replace it with world state. */ }
+      deliver(packet);
+    }, session.perceptionStart);
+    return () => { active = false; unsubscribe(); };
+  }
+
   /** 会话凭据只用于授权；审计中记录公开 session id，不记录 bearer token。 */
   async acquirePlayerControl(token: string): Promise<DeviceControlResult> {
     const session = this.crossingServer?.residentSession(token), bot = this.bot;
@@ -783,13 +821,15 @@ export class WorldService extends Service<Config> {
       if (this.residentTransition || this.crossingServer?.residentSession(token)?.id !== session.id || !this.worldActive || this.bot !== bot) return { ok: false, paused: bot.manualMode, busy: false, text: "角色会话在等待控制期间已结束。" };
       this.residentTransition = true;
       try {
+        const perceptionStart = this.residentSession?.id === session.id ? this.residentSession.perceptionStart : bot.perceptionCursor();
         const { busy } = await bot.acquireResidentControl(session.mode, session.id);
         if (this.crossingServer?.residentSession(token)?.id !== session.id || !this.worldActive || this.bot !== bot) {
           await bot.releaseResidentControl(session.id, true);
           return { ok: false, paused: bot.manualMode, busy: false, text: "角色会话在建立期间已结束，控制已归还。" };
         }
-        this.residentSession = { token, id: session.id, mode: session.mode };
+        this.residentSession = { token, id: session.id, mode: session.mode, perceptionStart };
         if (!busy) await this.remoteDesktopApp?.releaseInputs();
+        this.crossingServer?.refreshResidentPerceptions?.(token);
         return { ok: true, paused: bot.manualMode, busy, text: busy ? "角色控制已建立，等待此前已提交操作的真实回执。" : session.mode === "avatar" ? "已完全入替角色，自主生成暂停。" : "已接管身体，角色的自主意识继续运行。" };
       } catch (error) {
         await bot.releaseResidentControl(session.id, true);
@@ -805,12 +845,16 @@ export class WorldService extends Service<Config> {
     if (this.devicePending > 0 || bot.residentBusy) return { ok: false, paused: bot.manualMode, busy: true, text: "还有操作未完成；可以取消尚未提交的调用，已提交操作需等待真实回执。" };
     if (this.residentTransition) return { ok: false, paused: bot.manualMode, busy: true, text: "角色控制正在切换。" };
     this.residentTransition = true;
+    this.crossingServer?.stopResidentPerceptions?.(token);
     try {
       await this.remoteDesktopApp?.releaseInputs();
       const { busy } = await bot.releaseResidentControl(session.id);
       if (!busy && this.residentSession?.id === session.id) this.residentSession = null;
       return { ok: !busy, paused: bot.manualMode, busy, text: busy ? "操作尚未完成。" : "已归还角色，自主运行恢复。" };
-    } finally { this.residentTransition = false; }
+    } finally {
+      this.residentTransition = false;
+      if (this.residentSession?.id === session.id && this.worldActive && this.bot === bot) this.crossingServer?.refreshResidentPerceptions?.(token);
+    }
   }
 
   async playerCockpit(token: string) {

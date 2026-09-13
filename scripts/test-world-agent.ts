@@ -13,7 +13,7 @@ import type { EntityInput, WorldOperation } from "../src/world/state.js";
 const logger = { info() {}, warn() {}, error() {} } as any;
 const dirs: string[] = [];
 const plain = (content: string): ChatResult => ({ content, toolCalls: [] } as ChatResult);
-const proposal = (operations: WorldOperation[], outcome?: { status: "completed" | "failed"; reason?: string }): ChatResult => ({ content: "", toolCalls: [{ id: randomUUID(), type: "function", function: { name: "propose_world", arguments: JSON.stringify({ operations, ...(outcome ? { outcome } : {}) }) } }] } as ChatResult);
+const proposal = (operations: WorldOperation[], outcome?: { status: "completed" | "failed" | "needs_input"; reason?: string; speechAfter?: number | null }): ChatResult => ({ content: "", toolCalls: [{ id: randomUUID(), type: "function", function: { name: "propose_world", arguments: JSON.stringify({ operations, ...(outcome ? { outcome } : {}) }) } }] } as ChatResult);
 const seed: EntityInput[] = [
   { id: "room", kind: "place", name: "客厅", location: null },
   { id: "outside", kind: "place", name: "隔壁", location: null },

@@ -60,12 +60,13 @@ export function worldProposalTool(initializing: boolean): ChatToolDef {
     name: "propose_world",
     description: initializing
       ? "提交完整的结构化初始世界，全部实体在同一批create中定义。operations必须是JSON数组，不要序列化成字符串。所有引用闭合且验证通过才整体提交。"
-      : "提出一笔原子世界事务。无变化可提交空operations。行动裁定必须另外给outcome。",
+      : "按发生顺序提出一笔原子世界事务，保留移动、操作和NPC回应的经过。无变化可提交空operations。行动裁定必须另外给outcome；已推进但遇到新的角色决定时用needs_input。",
     parameters: { type: "object", required: ["operations"], additionalProperties: false, properties: {
       operations: { type: "array", maxItems: 200, ...(initializing ? { minItems: 2 } : {}),
         items: initializing ? create : { anyOf: [create, move, update, say] } },
       ...(initializing ? {} : { outcome: { type: "object", required: ["status"], additionalProperties: false,
-        properties: { status: { type: "string", enum: ["completed", "failed"] }, reason: { type: "string", description: "失败原因或无状态变化时的简短解释" } } } }),
+        properties: { status: { type: "string", enum: ["completed", "failed", "needs_input"], description: "completed=意图完成；failed=未能完成；needs_input=已推进到新的决定点，本次行动停止，等待角色下一次意图" }, reason: { type: "string", description: "裁定诊断或决策边界说明（可能包含隐藏事实，不直接交付角色）。角色可感知的经过与NPC回应必须用operations表达。" },
+          speechAfter: { type: ["integer", "null"], minimum: 0, description: "请求含speech时必填。0表示在operations之前说出原话，n表示在前n个operations后说出，最大为operations.length；null表示尚未说出。不能用say替受控角色改写原话。" } } } }),
     } },
   } };
 }
@@ -78,4 +79,3 @@ export const INITIALIZATION_RULES = `初始化/迁移必须输出完整、引用
 - 每个属性都必须是{value:实际JSON值,visibility:"public"|"owner"|"hidden"}，不是直接字符串。
 格式示例（仅展示契约，id、名字与事实请依据本次资料选择）：
 {"operations":[{"op":"create","entity":{"id":"room","kind":"place","name":"房间","location":null}},{"op":"create","entity":{"id":"bot","kind":"actor","name":"角色名","controller":"bot","location":"room","attributes":{"posture":{"value":"sitting","visibility":"public"}}}},{"op":"create","entity":{"id":"cup","kind":"object","name":"杯子","location":"room","owner":"bot"}}]}`;
-

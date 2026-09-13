@@ -21,6 +21,7 @@ import { debug } from "../webui/debug.js";
 import {
   CROSSING_LIMITS,
   type CrossingSseMsg,
+  type CrossingPerceptionEvent,
   type CrossingTaskKind,
   type CrossingTaskPayload,
   type PlayerMode,
@@ -83,6 +84,9 @@ interface VisitorSession extends VisitorInfo {
   closed: boolean;
   tasks: Map<string, SessionTask>;
   cancelledTaskIds: Set<string>;
+  perceptionUnsubscribe?: () => void;
+  perceptionBinding?: object;
+  perceptionReplay?: Map<string, CrossingPerceptionEvent>;
 }
 
 interface SessionTask {
@@ -103,6 +107,8 @@ export interface CrossingServerHost {
   notifyHostBot: (content: string) => void;
   /** 常驻角色会话结束（包括断线超时）后释放角色控制，等待已提交回执。 */
   releaseResidentControl?: (sessionId: string, cause: "returned" | "lost") => Promise<void>;
+  /** Already delivered Bot perceptions only; must not observe the world or consume its cursor. */
+  subscribeResidentPerceptions?: (sessionId: string, deliver: (event: CrossingPerceptionEvent) => void) => () => void;
 }
 
 export class CrossingServer {
@@ -115,6 +121,47 @@ export class CrossingServer {
   private stopping = false;
 
   constructor(private host: CrossingServerHost) {}
+
+  /** Control may finish being acquired after its SSE transport has connected. */
+  refreshResidentPerceptions(token: string): void {
+    const session = this.sessions.get(token);
+    if (session?.residentControl && session.res && !session.closed) this.attachPerceptions(session);
+  }
+
+  stopResidentPerceptions(token?: string): void {
+    for (const session of this.sessions.values()) {
+      if (session.residentControl && (!token || session.token === token)) this.detachPerceptions(session);
+    }
+  }
+
+  private detachPerceptions(session: VisitorSession): void {
+    session.perceptionBinding = undefined;
+    const unsubscribe = session.perceptionUnsubscribe;
+    session.perceptionUnsubscribe = undefined;
+    try { unsubscribe?.(); } catch { /* observer teardown cannot keep a session alive */ }
+  }
+
+  private attachPerceptions(session: VisitorSession): void {
+    this.detachPerceptions(session);
+    const res = session.res;
+    if (!res || !session.residentControl || session.closed || !this.host.ready()) return;
+    const binding = session.perceptionBinding = {};
+    const replay = session.perceptionReplay ??= new Map();
+    let unsubscribe: (() => void) | undefined;
+    try { unsubscribe = this.host.subscribeResidentPerceptions?.(session.id, event => {
+      if (session.closed || session.res !== res || session.perceptionBinding !== binding || !this.host.ready()) return;
+      if (!event.eventId || replay.has(event.eventId)) return;
+      replay.set(event.eventId, event);
+      if (replay.size > 256) replay.delete(replay.keys().next().value!);
+      this.push(session, event);
+    }); } catch {
+      // A display subscriber is optional: its failure must never revoke an acquired role or repeat an action.
+      this.detachPerceptions(session);
+      return;
+    }
+    if (session.perceptionBinding === binding && session.res === res) session.perceptionUnsubscribe = unsubscribe;
+    else { try { unsubscribe?.(); } catch { /* isolated observer teardown */ } }
+  }
 
   get worldName(): string {
     return this.host.cfg.worldName.trim() || "未命名世界";
@@ -265,7 +312,9 @@ export class CrossingServer {
         try {
           s.res?.write(": ping\n\n");
         } catch {
-          /* ignore */
+          this.detachPerceptions(s);
+          s.res = null;
+          this.armAbsence(s);
         }
       }
     }, HEARTBEAT_MS);
@@ -290,6 +339,7 @@ export class CrossingServer {
   /** 等待所有旧世界工作收尾；保留监听器，供暂停后恢复/切换存档继续使用。 */
   disconnectVisitors(reason: string): Promise<void> {
     if (this.disconnecting) return this.disconnecting;
+    this.stopResidentPerceptions();
     const drain = Promise.resolve().then(async () => {
       for (const session of [...this.sessions.values()]) {
         this.push(session, { type: "farewell", reason });
@@ -407,7 +457,7 @@ export class CrossingServer {
   private async initializeSession(session: VisitorSession): Promise<boolean> {
     try {
       if (session.residentControl) {
-        this.pushEvent(session, "常驻角色控制通道已连接。请通过驾驶舱 observe 查看角色实际可感知的内容；观察与结果会进入角色的经历。");
+        this.pushEvent(session, "常驻角色控制通道已连接。角色实际收到的感知与行动结果会持续同步到这里；主动观察仍使用驾驶舱的 observe 能力。");
         return !session.closed;
       }
       await this.host.world.wakeDormant();
@@ -430,7 +480,8 @@ export class CrossingServer {
       connection: "keep-alive",
       "x-accel-buffering": "no",
     });
-    // 顶掉旧连接（重连场景）
+    // 顶掉旧连接（重连场景）并使旧监听器失效，迟到事件不能写入新连接。
+    this.detachPerceptions(session);
     try {
       session.res?.end();
     } catch {
@@ -441,10 +492,18 @@ export class CrossingServer {
     session.absenceTimer = null;
     const timeLine = this.host.clock()?.timeLine() ?? "";
     res.write(sseFrame({ type: "hello", worldName: this.worldName, timeLine, visitorId: session.id, ...this.timeUnits() }));
+    if (session.residentControl) {
+      const replay = [...(session.perceptionReplay?.values() ?? [])];
+      const cursor = String(req.headers["last-event-id"] ?? url.searchParams.get("lastEventId") ?? "");
+      const index = cursor ? replay.findIndex(event => event.eventId === cursor) : -1;
+      for (const event of replay.slice(index + 1)) res.write(sseFrame(event));
+    }
     // 补发离线期间暂存的消息
     for (const msg of session.outbox.splice(0)) res.write(sseFrame(msg));
+    this.attachPerceptions(session);
     req.on("close", () => {
       if (session.res === res) {
+        this.detachPerceptions(session);
         session.res = null;
         this.armAbsence(session);
       }
@@ -611,20 +670,26 @@ export class CrossingServer {
   }
 
   private push(session: VisitorSession, msg: CrossingSseMsg): void {
+    if (session.closed) return;
     if (session.res) {
       try {
         session.res.write(sseFrame(msg));
         return;
       } catch {
+        this.detachPerceptions(session);
         session.res = null;
+        this.armAbsence(session);
       }
     }
+    // Durable resident perceptions already have a replay entry; do not queue the same ID twice.
+    if (session.residentControl && msg.type === "event" && msg.eventId && session.perceptionReplay?.has(msg.eventId)) return;
     session.outbox.push(msg);
     if (session.outbox.length > 100) session.outbox.splice(0, session.outbox.length - 100);
   }
 
   private closeSession(session: VisitorSession): void {
     session.closed = true;
+    this.detachPerceptions(session);
     session.arrivalAbort.abort();
     for (const task of session.tasks.values()) if (!task.result) task.abort.abort();
     if (session.absenceTimer) clearTimeout(session.absenceTimer);
@@ -728,7 +793,8 @@ function escapeHtml(s: string): string {
 // ---------- 辅助 ----------
 
 function sseFrame(msg: CrossingSseMsg): string {
-  return `data: ${JSON.stringify(msg)}\n\n`;
+  const id = msg.type === "event" && msg.eventId && !/[\r\n\0]/.test(msg.eventId) ? `id: ${msg.eventId}\n` : "";
+  return `${id}data: ${JSON.stringify(msg)}\n\n`;
 }
 
 function sendJSON(res: http.ServerResponse, status: number, obj: unknown): void {

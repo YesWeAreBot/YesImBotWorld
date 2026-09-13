@@ -42,10 +42,25 @@ export interface CrossingTimeUnits {
   unitRealSeconds: number;
 }
 
+/** Authorized role perceptions. Identifiers are stable across SSE reconnects; never include session credentials. */
+export interface CrossingPerceptionEvent {
+  type: "event";
+  content: string;
+  timeLine?: string;
+  eventId?: string;
+  worldTime?: number;
+  source?: string;
+  refToolCallId?: string;
+  sourceEventIds?: string[];
+  actorId?: string;
+  worldSequence?: number;
+  actionId?: string;
+}
+
 /** SSE 推送给访客的消息 */
 export type CrossingSseMsg =
   | ({ type: "hello"; worldName: string; timeLine: string; visitorId?: string } & Partial<CrossingTimeUnits>)
-  | { type: "event"; content: string; timeLine?: string }
+  | CrossingPerceptionEvent
   | { type: "task_result"; taskId: string; ok: boolean; content: string }
   /** 主世界对访客的状态描述，只作为体验事件；不可覆盖访客自己的持久人设。 */
   | { type: "status_update"; content: string }

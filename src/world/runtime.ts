@@ -7,11 +7,12 @@ import { Prompts } from "../prompts.js";
 import { debug } from "../webui/debug.js";
 import { WorldKernel } from "./kernel.js";
 import { INITIALIZATION_RULES, worldProposalTool } from "./proposal.js";
+import { compareExperiences, presentObservation, renderScene, type PerceivedAction } from "./scene.js";
 import { KernelError, type WorldOperation, type WorldSnapshot, type TransactionProposal, type WorldObservation } from "./state.js";
 
 
 type Infer = (messages: ChatMessage[], tools: ChatToolDef[], signal?: AbortSignal) => Promise<ChatResult>;
-type Outcome = { status: "completed" | "failed"; reason?: string };
+type Outcome = { status: "completed" | "failed" | "needs_input"; reason?: string; speechAfter?: number | null };
 type Finish = { id: string; speech?: string };
 
 /** The model proposes; controller authorization and durable lifecycle remain outside it. */
@@ -33,7 +34,8 @@ export class StructuredWorld {
   }
   private async recoverInterrupted(k: WorldKernel): Promise<void> {
     const pending = Object.values(k.snapshot().actions).filter(action => action.status === "pending");
-    if (pending.length) await k.commit({ idempotencyKey: `recovery:${randomUUID()}`, source: "recovery", operations: pending.map(action => ({ op: "action.finish", id: action.id, status: "failed", reason: "执行进程中断，未提交动作结果。" })) });
+    for (const action of pending) await k.commit({ idempotencyKey: `recovery:${action.id}`, source: "recovery", correlationId: action.id,
+      operations: [{ op: "action.finish", id: action.id, status: "failed", reason: "执行进程中断，未提交动作结果。" }] });
   }
   resume(): void { if (this.lifetime.signal.aborted) this.lifetime = new AbortController(); }
   stop(): void { this.epoch++; this.lifetime.abort(); for (const c of this.controllers.values()) c.abort(); }
@@ -68,11 +70,11 @@ export class StructuredWorld {
   async observe(actorId = "bot", args: { target?: string; modality?: string } = {}): Promise<WorldObservation> {
     await this.ensure();
     if (args.modality && !["sight", "all", "self"].includes(args.modality)) throw new Error("Unsupported observation modality");
-    return (await this.kernel()).observe(actorId, {
+    return presentObservation(await (await this.kernel()).observe(actorId, {
       ...(args.target ? { target: args.target } : {}),
       ...(args.modality === "self" ? { selfOnly: true, consume: false } : {}),
       ...(args.modality === "sight" ? { includeSpeech: false, consume: false } : {}),
-    });
+    }));
   }
   async query(actorId: string, task: string): Promise<string> {
     await this.ensure();
@@ -94,7 +96,17 @@ export class StructuredWorld {
       if (epoch !== this.epoch) return completed;
       const k = await this.kernel(); const action = k.snapshot().actions[id];
       const observation = await k.observe(actorId);
-      if (epoch === this.epoch) deliver(JSON.stringify({ observation, action: { id, intent: call.arguments.description, status: action?.status, ...(action?.status === "failed" ? { reason: "动作未完成，请依据当前观测重新判断条件。" } : action?.status === "cancelled" ? { reason: "动作已取消。" } : {}) } }));
+      // A heartbeat may have observed the commit first. Recover this action's exact, actor-scoped
+      // experiences independently of the observation cursor, without manufacturing new evidence.
+      observation.experiences = [...new Map([...(observation.experiences ?? []), ...k.actionExperiences(actorId, id)].map(item => [item.eventId, item])).values()].sort(compareExperiences);
+      observation.sourceEventIds = [...new Set([...observation.sourceEventIds, ...observation.experiences.flatMap(item => item.sourceEventIds)])];
+      const receipt: PerceivedAction = { id, intent: action?.intent ?? String(call.arguments.description ?? ""), status: action?.status ?? "failed",
+        ...(action ? { startedAt: action.startedAt, finishedAt: action.finishedAt } : {}),
+        ...(action?.status === "failed" ? { reason: "动作未完成，请依据已发生的经过和当前观测判断下一步。" }
+          : action?.status === "cancelled" ? { reason: "动作已取消。" }
+          : action?.status === "needs_input" ? { reason: "行动已推进到新的决定点，请依据当前情境给出下一步意图。" } : {}) };
+      const scene = renderScene(observation, receipt);
+      if (epoch === this.epoch) deliver(JSON.stringify({ observation, action: receipt, ...(scene ? { scene } : {}) }));
       return completed;
     });
   }
@@ -111,9 +123,9 @@ export class StructuredWorld {
       if (existing) {
         if (existing.requestFingerprint !== fingerprint) throw new Error("动作ID已被不同请求使用");
         if (existing.status === "pending") throw new Error("已有未恢复的同名动作");
-        return existing.status === "completed";
+        return existing.status === "completed" || existing.status === "needs_input";
       }
-      const intent = String(call.arguments.description ?? call.arguments.str ?? "").trim();
+      const intent = String(call.arguments.description ?? "").trim();
       if (!intent) throw new Error("动作意图不能为空");
       if (!Number.isFinite(call.expectedAt) || call.expectedAt < 0) throw new Error("动作完成时间必须非负且有限");
       if (call.arguments.speech !== undefined && (typeof call.arguments.speech !== "string" || !call.arguments.speech.trim())) throw new Error("speech必须是角色本人提供的非空原文");
@@ -128,9 +140,9 @@ export class StructuredWorld {
         id, actorId, intent, targetIds, expectedEnd: Math.max(call.expectedAt, this.clock.now()), basedOnObservationId: observationId, requestFingerprint: fingerprint,
       } }] }, { signal: c.signal });
       await this.until(call.expectedAt, c.signal);
-      const outcome = await this.serial(() => this.change(`裁定行动者${actorId}本次意图。只结算这一动作，不续写后续选择。条件不满足则outcome.status=failed。\n${JSON.stringify({ intent, targetIds, ...(speech ? { speech } : {}) })}`,
+      const outcome = await this.serial(() => this.change(`裁定行动者${actorId}本次意图，按实际先后提交完成这一意图所需的合理过程及环境/NPC回应。遇到新的实质选择就停在该处并返回outcome.status=needs_input，不替角色续选；确实完成本次意图才返回completed，条件阻止推进则failed。\n${JSON.stringify({ intent, targetIds, ...(speech ? { speech } : {}) })}`,
         "action", actorId, { id, ...(speech ? { speech } : {}) }, c.signal, false, beforeCommit, id), c.signal);
-      return outcome?.status === "completed";
+      return outcome?.status === "completed" || outcome?.status === "needs_input";
     } catch (error) {
       const pending = k?.snapshot().actions[id];
       if (k && pending?.status === "pending") await k.commit({ idempotencyKey: `${id}:end`, source: "action", correlationId: id,
@@ -190,15 +202,21 @@ export class StructuredWorld {
         const input = JSON.parse(call.function.arguments) as { operations?: unknown; outcome?: Outcome };
         const ops = parseOperations(input?.operations);
         const outcome = input.outcome;
-        if (finish && (!outcome || !["completed", "failed"].includes(outcome.status) || (outcome.reason !== undefined && typeof outcome.reason !== "string"))) throw new Error("Action requires an explicit completed/failed outcome");
-        if (finish && !ops.length && !outcome?.reason) throw new Error("An action with no state changes must explain its outcome");
+        if (finish && (!outcome || !["completed", "failed", "needs_input"].includes(outcome.status) || (outcome.reason !== undefined && typeof outcome.reason !== "string"))) throw new Error("Action requires an explicit completed/failed/needs_input outcome");
+        if (finish && !ops.length && !outcome?.reason && !(finish.speech && outcome?.speechAfter === 0)) throw new Error("An action with no state changes must explain its outcome");
         if (!finish && !ops.length && !initializing) return undefined;
-        const literalSpeech: WorldOperation[] = finish?.speech && outcome?.status === "completed" ? [{ op: "say", actorId: actorId!, text: finish.speech }] : [];
+        if (finish?.speech && outcome?.speechAfter === undefined) throw new Error("Provided speech requires outcome.speechAfter: integer 0..operations.length selects when the exact words are spoken; null means they were not spoken. Do not invent controlled speech with say.");
+        if (!finish?.speech && outcome?.speechAfter !== undefined) throw new Error("speechAfter is only valid when the request supplies speech");
+        if (outcome?.speechAfter !== undefined && outcome.speechAfter !== null && (!finish?.speech || !Number.isInteger(outcome.speechAfter) || outcome.speechAfter < 0 || outcome.speechAfter > ops.length)) throw new Error("speechAfter must identify a valid operation boundary for the supplied speech");
+        const literalSpeech: WorldOperation[] = finish?.speech && typeof outcome?.speechAfter === "number" ? [{ op: "say", actorId: actorId!, text: finish.speech }] : [];
+        const ordered = [...ops];
+        if (literalSpeech.length) ordered.splice(outcome!.speechAfter!, 0, ...literalSpeech);
         const terminal: WorldOperation[] = finish ? [{ op: "action.finish", id: finish.id, status: outcome!.status, ...(outcome?.reason ? { reason: outcome.reason } : {}) }] : [];
         const proposal: TransactionProposal = { idempotencyKey: `${correlationId}:commit`, source, correlationId, ...(actorId ? { actorId } : {}),
-          expectedVersions: Object.fromEntries(Object.values(snapshot.entities).map(entity => [entity.id, entity.revision])), operations: [...literalSpeech, ...ops, ...terminal] };
+          expectedVersions: Object.fromEntries(Object.values(snapshot.entities).map(entity => [entity.id, entity.revision])), operations: [...ordered, ...terminal] };
         const prepared = k.propose(proposal);
         this.authorize(ops, snapshot, actorId, initializing);
+        if (outcome?.status === "needs_input" && actorId && !k.hasPerceptibleProgress(prepared, actorId)) throw new Error("needs_input must advance to an actor-perceptible change or response; unchanged values, hidden changes and action markers do not count");
         await k.commit(prepared, { signal, beforeCommit, ...(literalSpeech.length ? { speakerId: actorId } : {}) });
         return outcome;
       } catch (error) {

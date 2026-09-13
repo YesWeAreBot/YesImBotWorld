@@ -9,7 +9,7 @@ import type { ChatMessage, ChatResult } from "../src/llm/chat.js";
 import type { ToolCallRecord } from "../src/types.js";
 import type { WorldOperation } from "../src/world/state.js";
 
-function response(operations: WorldOperation[], outcome?: { status: "completed" | "failed"; reason?: string }): ChatResult {
+function response(operations: WorldOperation[], outcome?: { status: "completed" | "failed" | "needs_input"; reason?: string; speechAfter?: number | null }): ChatResult {
   return { content: "", toolCalls: [{ id: "proposal", type: "function", function: { name: "propose_world", arguments: JSON.stringify({ operations, ...(outcome ? { outcome } : {}) }) } }] };
 }
 const creation: WorldOperation[] = [
@@ -48,7 +48,7 @@ async function main(): Promise<void> {
     assert.deepEqual(kernel.snapshot(), beforeNoop);
     pass("a quiet heartbeat is a valid no-op and creates no invented event");
 
-    infer = async () => response([], { status: "completed", reason: "The requested words were spoken." });
+    infer = async () => response([], { status: "completed", reason: "The requested words were spoken.", speechAfter: 0 });
     let delivered = "";
     assert(await runtime.act("bot", call("speech", { speech: "Only my exact words." }), text => { delivered = text; }));
     assert.equal(JSON.parse(delivered).action.status, "completed");

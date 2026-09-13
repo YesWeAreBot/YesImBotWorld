@@ -36,6 +36,12 @@ export interface ManualToolResult {
   content?: RichText;
 }
 
+/** A read-only copy of a perception already persisted in the Bot's context; no local media files. */
+export interface BotPerception {
+  sequence: number;
+  event: Pick<BotEvent, "id" | "source" | "content" | "worldTime" | "refToolCallId" | "originEventIds">;
+}
+
 /** 穿越能力（前往异世界作客），由 service 层实现注入 */
 export interface BotCrossingApi {
   /** 当前所在的异世界名；null = 在自己的世界 */
@@ -214,6 +220,9 @@ export class BotAgent {
    */
   private manualPaused = false;
   private residentControl: { mode: "avatar" | "puppet"; sessionId: string } | null = null;
+  private perceptionSequence = 0;
+  private deliveredPerceptions: BotPerception[] = [];
+  private perceptionListeners = new Set<(perception: BotPerception) => void>();
   private residentClosing = false;
   private residentAdmissions = 0;
   private residentAdmissionWaiters = new Set<() => void>();
@@ -498,6 +507,7 @@ export class BotAgent {
 
   async stop(): Promise<void> {
     this.retired = true;
+    this.perceptionListeners.clear();
     this.receipts.deactivate();
     if (!this.running && !this.loopPromise) { this.scheduler.stopAll(); await this.receipts.settled(); return; }
     this.running = false;
@@ -517,6 +527,32 @@ export class BotAgent {
       this.externalToolResults.delete(id);
       this.stealthCalls.delete(id);
     }
+  }
+
+  /** Capture this before acquiring control: earlier private history is never replayed to a new session. */
+  perceptionCursor(): number { return this.perceptionSequence; }
+
+  subscribePerceptions(listener: (perception: BotPerception) => void, afterSequence: number): () => void {
+    if (this.retired) return () => {};
+    let active = true;
+    const deliver = (perception: BotPerception) => {
+      if (!active || this.retired || perception.sequence <= afterSequence) return;
+      // Observers must neither mutate durable input nor delay/fail its processing.
+      try { void Promise.resolve(listener(structuredClone(perception))).catch(() => {}); } catch { /* isolated observer */ }
+    };
+    this.perceptionListeners.add(deliver);
+    for (const perception of this.deliveredPerceptions) deliver(perception);
+    return () => { active = false; this.perceptionListeners.delete(deliver); };
+  }
+
+  private publishPerception(event: BotEvent): void {
+    if (this.retired || this.deliveredPerceptions.some(item => item.event.id === event.id)) return;
+    const { id, source, content, worldTime, refToolCallId, originEventIds } = event;
+    const perception: BotPerception = { sequence: ++this.perceptionSequence,
+      event: { id, source, content, worldTime, refToolCallId, originEventIds: originEventIds?.slice() } };
+    this.deliveredPerceptions.push(perception);
+    if (this.deliveredPerceptions.length > 256) this.deliveredPerceptions.shift();
+    for (const listener of [...this.perceptionListeners]) listener(perception);
   }
 
   status(): {
@@ -1091,6 +1127,7 @@ export class BotAgent {
     if (this.running) await this.receipts.drain(async (event) => {
       // If a process died after append but before removing the inbox file, replay the same ID once.
       await this.context.appendEvent(event);
+      this.publishPerception(event);
       await this.growth.perceive(event, event.originEventIds ?? [event.id]);
       debug.emit("bot.event", `[tool receipt] ${event.id}`, { ...event, recovered: true });
     });
@@ -1130,6 +1167,7 @@ export class BotAgent {
         statusEcho: item.statusEcho,
       };
       await this.context.appendEvent(event);
+      this.publishPerception(event);
       const originCall = event.refToolCallId
         ? this.context.stream.find((entry) => entry.kind === "tool_call" && entry.call.id === event.refToolCallId)
         : undefined;
@@ -1184,6 +1222,7 @@ export class BotAgent {
     const pending = this.reflectionPending;
     if (!pending.appended) {
       await this.context.appendEvent(pending.event);
+      this.publishPerception(pending.event);
       pending.appended = true;
       debug.emit("bot.event", `[growth review] ${pending.event.id}`, pending.event);
     }
@@ -2775,14 +2814,23 @@ export class BotAgent {
 
 }
 
-/** Parse provenance only from a typed actor observation delivered by the world boundary. */
+/** The reading scene is derived from committed perceptions; retain every original observation root. */
 function observationOrigins(text: string): string[] | undefined {
   try {
-    const parsed = JSON.parse(text) as Partial<WorldObservation> & { observation?: Partial<WorldObservation> };
+    if (text.startsWith("（以下是外部操纵你身体/设备产生的回执，")) text = text.slice(text.indexOf("\n") + 1);
+    const parsed = JSON.parse(text) as Partial<WorldObservation> & { observation?: Partial<WorldObservation>;
+      scene?: { eventId?: string; actorId?: string; sourceEventIds?: string[] } };
+    const scene = parsed.scene;
     const data = parsed.observation ?? parsed;
     // A remote actor uses visitor:<session>, bound by the authenticated WorldAgent connection.
-    if (typeof data.actorId !== "string" || !data.actorId || typeof data.observationId !== "string" || !Array.isArray(data.sourceEventIds)) return undefined;
-    return [...new Set(data.sourceEventIds.filter((id): id is string => typeof id === "string" && !!id))];
+    const observationRoots = data && typeof data.actorId === "string" && !!data.actorId && typeof data.observationId === "string" && Array.isArray(data.sourceEventIds)
+      ? data.sourceEventIds : undefined;
+    const sceneRoots = scene && typeof scene.eventId === "string" && typeof scene.actorId === "string" && !!scene.actorId && Array.isArray(scene.sourceEventIds)
+      ? scene.sourceEventIds : undefined;
+    if (!observationRoots && !sceneRoots) return undefined;
+    // A compact scene can omit facts present in the full observation. Its ID and the wrapping
+    // BotEvent ID are never new causes, including when a valid scene has no source roots.
+    return [...new Set([...(observationRoots ?? []), ...(sceneRoots ?? [])].filter((id): id is string => typeof id === "string" && !!id))];
   } catch { return undefined; }
 }
 

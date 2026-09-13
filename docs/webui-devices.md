@@ -117,15 +117,26 @@ y = (clientY - top)  / height * desktopHeight
 | 请求 | 用途 |
 | --- | --- |
 | `GET /api/player/cockpit?ctoken=...` | 当前 mode、control、完整 tools Schema、pending 与 time 单位，以及完全入替时可选择的证据和认识；只读，不消费观测 |
+| `GET /api/player/events?ctoken=...&lastEventId=...` | 角色事件 SSE；常驻接管会话镜像 Bot 已持久交付的感知，按稳定事件 ID 恢复最近回放 |
 | `POST /api/player/tool {token,name,arguments,duration?,confirmSend?}` | 通过真实 Bot 调用路径执行；来源由有效会话推导 |
 | `POST /api/player/tool/cancel {token,callId}` | 取消本会话尚未提交的调用；callId 从 pending 的 id 获取 |
 | `POST /api/player/leave {token}` | 等待工作完成后归还角色控制 |
 
 `/api/player/tool` 必须带有效接管 token，仅有管理员身份或同名字符串不足以代理角色。返回 `{ok,text,content?,callId?}`，发送工具的 `requiresSendConfirmation` 为 true 时需明确确认。`duration` 为 TU；wait 传 `arguments.n`，rest 传 `arguments.duration`，不要另给冲突的外层估时。puppet 不开放代替意识的 reflect/recall_growth/wait/rest 等操作。
 
-驾驶舱与独立玩家页面保留固定、可收起的操作台。状态流更新不重建当前输入节点；应用、会话、消息、媒体与观测目标按名称或摘要点选。目标选择携带对应的 `observationId`，观测过期时需重新选择。下方以最新在前的顺序展示可读回执，有权限时展示两个 LLM 的实时输出；原始复杂参数和回执保留在折叠视图中。
+驾驶舱与独立玩家页面保留固定、可收起的操作台。状态流更新不重建当前输入节点；应用、会话、消息、媒体与观测目标按名称或摘要点选。目标选择携带对应的 `observationId`，观测过期时需重新选择。下方的行动组按最新在前排列，组内按实际发生顺序展示意图、场景、经过和结果；场景短文直接可读，逐项经过、复杂参数和完整回执可以展开。有权限时同时展示两个 LLM 的实时输出。
 
 常驻角色的观察必须走 `observe` 工具，确保它看到的世界也进入自身经历；入场和只读目录不会私自消费角色的台词游标。旧 `/api/player/task` 仅用于独立玩家，常驻角色的请求会被拒绝。
+
+常驻驾驶舱的事件来自同一个 Bot 实例已持久交付的感知流，服务端持续校验控制会话、角色模式与世界生命周期；不会为浏览器额外 `observe`，也不把全局世界日志直接交给角色。镜像仅从本次授权接管开始，保留 puppet 回执的非自主语义。会话 SSE 保留最近 256 条镜像用于重连，通过 `Last-Event-ID` 或 `lastEventId` 恢复，服务端和前端按稳定事件 ID 去重。该回放缓冲是内存中的有界窗口，不保证跨服务重启或补齐超出窗口的全部历史；断线恢复事件不会重新执行工具。世界经历本身的持久记录仍在世界事务日志中。
+
+世界观测的 `experiences` 来自内核对每一步操作前后可见状态的投影，保留 `eventId`、`worldSequence`、`worldTime`、事务内的角色顺序 `order`、`sourceEventIds` 和可选动作 `correlationId`。同一事务的中间移动、属性变化与 NPC 原话都可展示；前端依赖这些稳定标识排序和去重，不用每次变化的 `observedId` 猜测新经历。`hidden`、他人的私有属性和当时不可见的远处信息不会进入经历。动作回执可取回该动作的原始经历，即使普通观察已提前消费游标。旧日志没有的经历不补造，旧记录缺少 `order` 时兼容原有记录顺序；reset 后不混入上个世界的经历。
+
+`act` 可以包含完成意图所需的合理过程和 NPC 回应；探索尚未确定的区域时，World-LLM 可依据世界规则提出新地点、物件与 NPC，必须提交后才算事实。`needs_input` 表示已经推进到新的决定点，本次动作已停止并释放占用，界面显示“等你决定”；它不代表整体目标完成，也不是仍在后台续行的任务。用户选择下一步后再提交新的 `act`。原地移动、同值更新和纯隐藏变化不能单独构成这种推进。
+
+说话仍由 Bot 或用户填写 `speech` 原文；裁定模型在 `outcome.speechAfter` 指定插入位置（前 `n` 个操作之后，`0` 为开头，`null` 为尚未说出），由运行时原样插入，按开口当时的位置决定听众。驾驶舱不要求用户填写该索引，World 也不能自行改写受控角色原话。`outcome.reason` 属于裁定诊断，可能包含隐藏信息，不直接展示给角色。
+
+响应中的 `scene` 是 `scene.ts` 对已提交可感知经历的确定性只读投影，以短段落展示，不调用额外 LLM，不补写角色心理或自由发挥小说。常见属性名会转换为中文，数值不自行补充单位或程度解释；复杂值展示有界短摘，完整 `details` 可展开。场景与明细共享原始来源，不创造额外证据，也不会反写权威结构状态。
 
 入场响应中的 `control.busy` 表示需等待已有回执。取消不会回滚已提交的变化，网络异常也不会自动重放。已有操作未完时 `/api/player/leave` 返回 409 并保留会话；普通独立角色离场不会释放设备页控制。关闭页面或长期失联会取消未提交调用，并在已提交回执交付后恢复自主能力。控制来源另存于 `control-audit.jsonl`，不把接管凭据写入审计。
 
@@ -134,3 +145,5 @@ y = (clientY - top)  / height * desktopHeight
 `node scripts/preview-webui.mjs` 在 `127.0.0.1:18131` 提供生成后的页面与固定样本 API，`STUDIO_PREVIEW_PORT` 可选择其他本地端口。其设备、聊天、天气、新闻、MCP 与玩家回执由内存 fixture 提供；操作只改变样本内存，重启即恢复。它不连接运行中的 `18111`、真实平台、模型、Docker 或 VNC，页面应始终标明开发样本。
 
 预览可验证布局与交互，不证明真实外部设备已连通。`scripts/test-device-api.ts` 使用真实服务/工具分发逻辑和本地 stub 验证鉴权、工具状态、发送确认、互斥队列、接管/关闭、原始坐标尺寸、取消回执及有效电脑模式。`scripts/test-device-stealth.ts` 验证自主与人为竞争、旧工具执行前重新校验、不取消 Bot 意图、关注与未关注的感知边界、秘密调用回执隔离。运行 `npm test` 执行隔离套件；测试不需要线上实例或真实凭据。
+
+`scripts/test-world-experiences.ts` 覆盖逐步感知、来源、顺序、只读预演和日志兼容；`scripts/test-world-scenes.ts` 覆盖行动推进、原话时序与场景回执；`scripts/test-resident-perceptions.ts` 覆盖授权感知镜像、重连去重和会话隔离。

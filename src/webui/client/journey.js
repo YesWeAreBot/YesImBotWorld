@@ -38,6 +38,7 @@
         var key = scope(), state = getSession(key), destroyed = false, stream = null, busy = false, observeBusy = false, selectedTarget = state.selectedTarget || '';
         var profile = { name: '', persona: '' }, resident = '', residentDefinition = '', errorText = '', route = state.takeover ? 'takeover' : 'cross', takeoverMode = state.mode === 'puppet' ? 'puppet' : 'avatar', cockpitDraft = state.cockpitDraft || (state.cockpitDraft = {}), cockpit = { tools: [], pending: [] }, formDraft = state.actionDraft || (state.actionDraft = { description: '', speech: '', duration: '0' });
         var worldRunning = lastOverview && typeof lastOverview.worldRunning === 'boolean' ? lastOverview.worldRunning : null;
+        state.actionAliases = state.actionAliases || {};
         var main = el('div', { cls: 'journey-page' }), readableStates = new WeakMap(), shellKey = '', shell = null, liveCleanup = null, dockObserver = null, deviceSession = null, deviceRefreshing = false, profileEdited = false, pickerChoices = {}, pickerFlights = {}, lastViewportHeight = 0;
         function readState(record, key) { var group = readableStates.get(record); if (!group) { group = Object.create(null); readableStates.set(record, group); } return group[key] || (group[key] = {}); }
         container.appendChild(main);
@@ -97,45 +98,79 @@
         }
         function fail(error) { errorText = error && error.message ? error.message : String(error); redraw(); }
         function log(kind, content, extra) {
-            state.events.push(Object.assign({ kind: kind, content: content, ts: Date.now(), timeLine: state.lastTimeLine }, extra || {}));
-            if (state.events.length > 80)
-                state.events.splice(0, state.events.length - 80);
+            var previous = extra && extra.eventId && state.events.find(function (event) { return event.eventId === extra.eventId; });
+            if (previous) {
+                // Replayed observations carry the same experiences. A later scene
+                // revision may extend its prose, without replacing factual receipts.
+                if (extra.revision != null && previous.revision != null && extra.revision < previous.revision) return previous;
+                if (previous.controlNote && !extra.controlNote) { extra.controlNote = previous.controlNote; extra.raw = previous.raw; }
+                Object.assign(previous, { kind: kind, content: content }, extra);
+                return previous;
+            }
+            var entry = Object.assign({ kind: kind, content: content, ts: Date.now(), timeLine: state.lastTimeLine }, extra || {});
+            state.events.push(entry);
+            if (state.events.length > 240) state.events.splice(0, state.events.length - 240);
+            return entry;
         }
-        function absorb(content, kind) {
+        function linkAction(actionId, requestId) { if (actionId && requestId && actionId !== requestId) state.actionAliases[actionId] = requestId; }
+        function groupId(id) { var seen = new Set(); while (id && state.actionAliases[id] && !seen.has(id)) { seen.add(id); id = state.actionAliases[id]; } return id; }
+        function absorb(content, kind, metadata) {
             if (!content)
                 return;
-            var parsed = null;
+            var meta = metadata || {};
+            var parsed = null, prefix = '';
             try {
                 parsed = typeof content === 'string' ? JSON.parse(content) : content;
             }
-            catch (_) { }
+            catch (_) {
+                // Puppet deliveries retain the explicit non-voluntary-action
+                // notice before their structured receipt. Keep both parts.
+                var boundary = typeof content === 'string' ? content.search(/\n\s*\{/) : -1;
+                if (boundary >= 0) try { parsed = JSON.parse(content.slice(boundary).trim()); prefix = content.slice(0, boundary).trim(); } catch (_) {}
+            }
+            var scene = parsed && parsed.scene;
+            if (scene && typeof scene.text === 'string') {
+                var sceneObservation = parsed.observation || (parsed.observationId ? parsed : null), observedExperiences = sceneObservation && sceneObservation.experiences;
+                var sceneSources = new Set(scene.sourceEventIds || []), sceneGroups = new Set((Array.isArray(observedExperiences) ? observedExperiences : []).filter(function (experience) { return experience && experience.correlationId && Array.isArray(experience.sourceEventIds) && experience.sourceEventIds.some(function (id) { return sceneSources.has(id); }); }).map(function (experience) { return experience.correlationId; }));
+                log('scene', scene.text, { eventId: scene.eventId || meta.eventId, groupId: scene.actionId || scene.correlationId || meta.actionId || meta.correlationId || (sceneGroups.size === 1 ? [...sceneGroups][0] : undefined), worldSequence: scene.worldSequence, worldTime: scene.worldTime, sourceEventIds: scene.sourceEventIds || [], revision: scene.revision, phase: scene.phase, raw: prefix ? content : { scene: scene }, controlNote: prefix });
+                if (!parsed.observation && !parsed.observationId && !parsed.action) return;
+            }
+            var action = parsed && parsed.action, actionId = action && action.id || meta.actionId;
+            if (actionId) linkAction(actionId, meta.requestId);
+            var related = actionId || meta.requestId || meta.correlationId;
             var observation = parsed && (parsed.observation || (parsed.observationId ? parsed : null));
             if (observation && Array.isArray(observation.entities)) {
-                var duplicate = state.events.some(function (event) { return event.observationId === observation.observationId; });
-                state.observation = observation;
-                observerLabel = '最新观测';
-                if (!observation.entities.some(function (entity) { return entity.observedId === selectedTarget; }))
-                    selectedTarget = '';
-                if (!duplicate) {
-                    log('observation', '看到 ' + observation.entities.length + ' 个实体', { observationId: observation.observationId, sourceEventIds: observation.sourceEventIds || [] });
-                    (observation.utterances || []).forEach(function (utterance) {
-                        if (!state.events.some(function (event) { return event.eventId === utterance.eventId; }))
-                            log('speech', utterance.text, { speaker: utterance.speakerName, eventId: utterance.eventId });
-                    });
+                // Reconnects and a delayed HTTP response may replay an older
+                // observation. Keep its history, but never roll back current handles.
+                if (!state.observation || !Number.isFinite(observation.worldSequence) || !Number.isFinite(state.observation.worldSequence) || observation.worldSequence >= state.observation.worldSequence) {
+                    state.observation = observation;
+                    observerLabel = '最新观测';
+                    if (!observation.entities.some(function (entity) { return entity.observedId === selectedTarget; })) selectedTarget = '';
                 }
-                if (parsed.action) {
-                    var actionKey = parsed.action.id ? parsed.action.id + ':' + parsed.action.status : '', actionText = parsed.action.reason || (parsed.action.status === 'completed' ? '世界已返回行动结果。' : '行动状态：' + parsed.action.status);
-                    if (!state.events.some(function (event) { return actionKey ? event.actionKey === actionKey : event.content === actionText && Date.now() - event.ts < 2500; }))
-                        log(parsed.action.status === 'failed' ? 'failure' : 'result', actionText, { actionKey: actionKey });
-                }
+                var experiences = Array.isArray(observation.experiences) ? observation.experiences : [];
+                experiences.forEach(function (experience) {
+                    if (!experience || !experience.eventId || typeof experience.text !== 'string') return;
+                    log('experience', experience.text, { eventId: experience.eventId, experienceKind: experience.kind, groupId: experience.correlationId, worldSequence: experience.worldSequence, worldTime: experience.worldTime, order: experience.order, sourceEventIds: experience.sourceEventIds || [], raw: experience });
+                });
+                (observation.utterances || []).forEach(function (utterance) {
+                    if (state.events.some(function (event) { return event.eventId === utterance.eventId || event.kind === 'experience' && event.experienceKind === 'speech' && (event.sourceEventIds || []).includes(utterance.eventId); })) return;
+                    log('speech', utterance.text, { speaker: utterance.speakerName, eventId: utterance.eventId, groupId: related, worldTime: utterance.spokenAt, worldSequence: observation.worldSequence, sourceEventIds: [utterance.eventId], raw: utterance });
+                });
+                log('observation', '当前所见已更新', { eventId: 'observation:' + observation.observationId, observationId: observation.observationId, groupId: related, auxiliary: !!action || experiences.length > 0, worldSequence: observation.worldSequence, worldTime: observation.observedAt, sourceEventIds: observation.sourceEventIds || [], raw: observation });
             }
-            else if (!state.events.some(function (event) { return event.content === content && Date.now() - event.ts < 2500; }))
-                log(kind || 'world', content);
+            if (action) {
+                log(action.status === 'failed' || action.status === 'cancelled' ? 'failure' : 'result', action.reason || ({ completed: '这次行动已完成。', needs_input: '行动已推进，现在由你决定下一步。', failed: '这次行动未完成。', cancelled: '这次行动已取消。', pending: '行动正在进行。' }[action.status] || '行动状态已更新。'), {
+                    eventId: 'action:' + (action.id || related || meta.eventId || digest(content)) + ':' + action.status, groupId: related, action: action, status: action.status, worldSequence: observation && observation.worldSequence || meta.worldSequence, worldTime: observation && observation.observedAt != null ? observation.observedAt : meta.worldTime, raw: prefix ? content : parsed, controlNote: prefix, sourceEventIds: observation && observation.sourceEventIds || []
+                });
+            } else if (!observation && !state.events.some(function (event) { return !meta.eventId && event.content === content && Date.now() - event.ts < 2500; })) {
+                log(kind || 'world', content, { eventId: meta.eventId, groupId: related, worldSequence: meta.worldSequence, worldTime: meta.worldTime, raw: parsed || content, status: meta.status });
+            }
         }
-        function toolResult(result) {
-            absorb(result.text || (result.content && result.content.text), result.ok ? 'result' : 'failure');
+        function toolResult(result, pending) {
+            if (pending && result.callId) linkAction(result.callId, pending.id);
+            absorb(result.text || (result.content && result.content.text), result.ok ? 'result' : 'failure', { requestId: pending && pending.id, eventId: result.callId && 'tool:' + result.callId, status: result.ok ? 'completed' : 'failed' });
             var attachments = result.content && result.content.attachments;
-            if (attachments && attachments.length) log(result.ok ? 'result' : 'failure', '工具返回的媒体', { attachments: attachments });
+            if (attachments && attachments.length) log(result.ok ? 'result' : 'failure', '工具返回的媒体', { eventId: result.callId && 'media:' + result.callId, groupId: pending && pending.id, attachments: attachments });
         }
         function media(ref) {
             var source = ref.id != null ? '/api/media/file?id=' + encodeURIComponent(ref.id) : ref.url;
@@ -186,7 +221,7 @@
             refreshControl();
             redraw();
             var capturedToken = state.token;
-            stream = new EventSource(withToken('/api/player/events?ctoken=' + encodeURIComponent(capturedToken)));
+            stream = new EventSource(withToken('/api/player/events?ctoken=' + encodeURIComponent(capturedToken) + (state.lastEventId ? '&lastEventId=' + encodeURIComponent(state.lastEventId) : '')));
             connections[key] = stream;
             var capturedStream = stream;
             stream.onopen = function () { if (capturedToken !== state.token)
@@ -204,6 +239,7 @@
                 catch (_) {
                     return;
                 }
+                if (message.eventId || event.lastEventId) state.lastEventId = message.eventId || event.lastEventId;
                 if (message.type === 'hello') {
                     state.connection = 'connected';
                     state.worldName = message.worldName || state.worldName;
@@ -213,10 +249,10 @@
                 }
                 else if (message.type === 'event' || message.type === 'status_update') {
                     state.lastTimeLine = message.timeLine || state.lastTimeLine;
-                    absorb(message.content);
+                    absorb(message.content, undefined, { eventId: message.eventId || event.lastEventId, requestId: message.taskId || message.refToolCallId, actionId: message.actionId, correlationId: message.correlationId, worldSequence: message.worldSequence, worldTime: message.worldTime });
                 }
                 else if (message.type === 'task_result') {
-                    absorb(message.content, message.ok ? 'result' : 'failure');
+                    absorb(message.content, message.ok ? 'result' : 'failure', { eventId: message.eventId || event.lastEventId, requestId: message.taskId, worldSequence: message.worldSequence, worldTime: message.worldTime, status: message.ok ? 'completed' : 'failed' });
                     if (state.pending && state.pending.id === message.taskId)
                         state.pending = null;
                     if (message.taskId && message.taskId.indexOf('observe_') === 0)
@@ -277,6 +313,9 @@
                 state.mode = state.takeover ? takeoverMode : 'cross';
                 state.actorName = profile.name;
                 state.events = [];
+                state.actionAliases = {};
+                state.lastEventId = '';
+                state.observationOpen = false;
                 cockpitDraft = state.cockpitDraft = {};
                 formDraft = state.actionDraft = { description: '', speech: '', duration: '0', revision: 0 };
                 selectedTarget = state.selectedTarget = '';
@@ -294,6 +333,8 @@
         function observe() {
             if (observeBusy || !state.token)
                 return;
+            state.observationOpen = true;
+            if (shell && shell.observationDetails) shell.observationDetails.open = true;
             if (state.takeover) { callTool('observe', {}, 0); return; }
             observeBusy = true;
             errorText = '';
@@ -348,7 +389,7 @@
                 pending.body = body;
             state.pending = pending;
             errorText = '';
-            log('intent', description, { speech: speech, duration: duration });
+            log('intent', description, { eventId: 'intent:' + id, groupId: id, speech: speech, duration: duration, tool: 'act' });
             changed();
             redraw();
             var request = state.takeover ? api('POST', '/api/player/tool', { token: requestToken, name: 'act', arguments: args, duration: duration / state.unitWorldSeconds }) : api('POST', '/api/player/task', body);
@@ -356,7 +397,7 @@
                 if (state.token !== requestToken)
                     return;
                 if (pending.takeover) {
-                    toolResult(result);
+                    toolResult(result, pending);
                     if (state.pending === pending)
                         state.pending = null;
                     refreshControl();
@@ -391,7 +432,7 @@
                 if (state.token !== requestToken)
                     return;
                 if (result.result) {
-                    absorb(result.result.content, result.result.ok ? 'result' : 'failure');
+                    absorb(result.result.content, result.result.ok ? 'result' : 'failure', { requestId: pending.id, status: result.result.ok ? 'completed' : 'failed' });
                     if (state.pending === pending)
                         state.pending = null;
                 }
@@ -452,16 +493,16 @@
             var token = state.token, pending = { id: 'tool_' + Date.now().toString(36), takeover: true, description: name, status: 'submitting', startedAt: Date.now() };
             state.pending = pending; errorText = '';
             var intention = args.description || args.msg || args.text || args.statement;
-            log('intent', WorldCockpit.label({ name: name }) + (typeof intention === 'string' ? ' · ' + intention : ''), { tool: name, arguments: args }); changed(); redraw();
+            log('intent', typeof intention === 'string' ? intention : WorldCockpit.label({ name: name }), { eventId: 'intent:' + pending.id, groupId: pending.id, tool: name, arguments: args, speech: args.speech }); changed(); redraw();
             api('POST', '/api/player/tool', { token: token, name: name, arguments: args, duration: duration, confirmSend: !!confirmSend }).then(function (result) {
                 if (token !== state.token) return;
-                toolResult(result);
+                toolResult(result, pending);
                 if (state.pending === pending) state.pending = null;
                 changed(); refreshControl(); redraw();
             }).catch(function (error) {
                 if (token !== state.token) return;
                 pending.status = 'unknown';
-                log('system', '请求结果未确认，不会自动重发。请查看执行中的工具或重新观察。');
+                log('system', '请求结果未确认，不会自动重发。请查看执行中的工具或重新观察。', { groupId: pending.id });
                 changed(); refreshControl(); fail(error);
             });
             setTimeout(refreshControl, 150);
@@ -570,6 +611,7 @@
             form.update(); return form;
         }
         function eventBody(event) {
+            if (event.action || event.kind === 'scene' || event.kind === 'experience' || event.kind === 'observation') return ReadableData.render(event.content, { compact: true, raw: false, textLimit: event.kind === 'scene' ? 1600 : 700, state: readState(event, 'prose') });
             var value = event.content, lead = '', tail = '';
             try { for (var i = 0; i < 3 && typeof value === 'string' && /^[\s]*[\[{"]/.test(value); i++) value = JSON.parse(value); } catch (_) {}
             if (typeof value === 'string') {
@@ -589,24 +631,100 @@
             if (tail) body.appendChild(el('p', { cls: 'journey-event-prose', text: tail }));
             return body;
         }
-        function feed() {
-            var rows = el('div', { cls: 'journey-feed' });
-            state.events.slice(-60).reverse().forEach(function (event) {
-                var labels = { intent: '你的意图', observation: '世界观测', speech: event.speaker || '听到的声音', result: '行动回执', failure: '未完成', system: '会话', world: '世界' };
-                rows.appendChild(el('article', { cls: 'journey-feed-row journey-feed-' + event.kind }, [
-                    el('div', { cls: 'journey-feed-meta' }, [el('strong', { text: labels[event.kind] || '世界' }), el('time', { text: time(event.ts), title: new Date(event.ts).toLocaleString() })]),
-                    eventBody(event), event.speech ? el('blockquote', { text: event.speech }) : null,
-                    event.attachments ? el('div', { cls: 'cockpit-result-attachments' }, event.attachments.map(media)) : null,
-                    event.sourceEventIds && event.sourceEventIds.length ? el('details', { cls: 'journey-provenance' }, [el('summary', { text: event.sourceEventIds.length + ' 个原始来源' }), el('code', { text: event.sourceEventIds.join('\n') })]) : null
-                ]));
+        function eventTime(event) { return Number.isFinite(event.worldTime) ? '世界 T=' + Number(event.worldTime.toFixed(1)) : time(event.ts); }
+        function eventOrder(a, b) {
+            if (Number.isFinite(a.worldSequence) && Number.isFinite(b.worldSequence) && a.worldSequence !== b.worldSequence) return a.worldSequence - b.worldSequence;
+            if (a.worldSequence === b.worldSequence && Number.isFinite(a.order) && Number.isFinite(b.order) && a.order !== b.order) return a.order - b.order;
+            if (Number.isFinite(a.worldTime) && Number.isFinite(b.worldTime) && a.worldTime !== b.worldTime) return a.worldTime - b.worldTime;
+            if (a.kind === 'scene' && b.kind !== 'scene') return 1;
+            if (b.kind === 'scene' && a.kind !== 'scene') return -1;
+            return a.ts - b.ts;
+        }
+        function eventRow(event) {
+            var labels = { experience: { movement: '走动与位置', appearance: '眼前出现', change: '发生的变化', speech: '听到的回应', action: '行动进展' }[event.experienceKind] || '实际经过', scene: '这一刻', observation: '观察', speech: event.speaker || '听到的声音', result: event.status === 'needs_input' ? '等你决定' : '行动结果', failure: event.status === 'cancelled' ? '已取消' : '遇到的阻碍', system: '会话', world: '世界' };
+            return el('div', { cls: 'journey-feed-row journey-feed-' + event.kind, 'data-journey-event': event.eventId || '' }, [
+                el('div', { cls: 'journey-feed-meta' }, [el('strong', { text: labels[event.kind] || '世界' }), el('time', { text: eventTime(event), title: new Date(event.ts).toLocaleString() })]),
+                event.controlNote ? note(event.controlNote, 'journey-control-notice') : null, eventBody(event), event.speech ? el('blockquote', { text: event.speech }) : null,
+                event.attachments ? el('div', { cls: 'cockpit-result-attachments' }, event.attachments.map(media)) : null
+            ]);
+        }
+        function historyGroups() {
+            var groups = new Map(), coveredSpeech = new Set();
+            state.events.forEach(function (event) { if (event.kind === 'experience' && event.experienceKind === 'speech') (event.sourceEventIds || []).forEach(function (id) { coveredSpeech.add(id); }); });
+            state.events.forEach(function (event, index) {
+                if (event.kind === 'speech' && coveredSpeech.has(event.eventId)) return;
+                var id = groupId(event.groupId) || (event.kind === 'experience' || event.kind === 'scene' ? 'world:' + event.worldSequence : event.eventId || 'local:' + event.ts + ':' + index);
+                var group = groups.get(id);
+                if (!group) { group = { id: id, events: [], ts: event.ts }; groups.set(id, group); }
+                group.events.push(event); group.ts = Math.min(group.ts, event.ts);
+                if (event.kind === 'intent') group.intent = event;
+                if (event.action && (!group.action || group.action.action.status === 'pending' || event.action.status !== 'pending' && eventOrder(group.action, event) <= 0)) group.action = event;
+                if (Number.isFinite(event.worldSequence)) group.worldSequence = Math.min(group.worldSequence == null ? Infinity : group.worldSequence, event.worldSequence);
             });
-            if (!state.events.length)
-                rows.appendChild(note('还没有收到事件。主动观察，或提交你的第一步。'));
-            return el('section', { cls: 'journey-card journey-history' }, [el('div', { cls: 'journey-section-kicker', text: '经历 / RECENT' }), el('h2', { text: '刚刚发生的事' }), rows]);
+            return [...groups.values()].filter(function (group) { return group.events.some(function (event) { return !event.auxiliary; }); }).sort(function (a, b) {
+                // A late narrative stays with its original action instead of
+                // jumping above a newer decision. Pending intentions remain first.
+                if (state.pending) { var pending = groupId(state.pending.id); if ((a.id === pending) !== (b.id === pending)) return a.id === pending ? -1 : 1; }
+                return Number.isFinite(a.worldSequence) && Number.isFinite(b.worldSequence) && a.worldSequence !== b.worldSequence ? b.worldSequence - a.worldSequence : b.ts - a.ts;
+            }).slice(0, 40);
+        }
+        function actionCard(group) {
+            var intent = group.intent, action = group.action && group.action.action, anchor = intent || group.action || group.events[0], pending = state.pending && groupId(state.pending.id) === group.id;
+            var status = action && action.status || (pending ? state.pending.status === 'unknown' ? 'unknown' : 'pending' : group.events.some(function (event) { return event.kind === 'failure'; }) ? 'failed' : intent ? group.events.some(function (event) { return event.kind === 'result' || event.kind === 'observation'; }) ? 'completed' : 'unknown' : 'world');
+            var states = { pending: '进行中', unknown: '结果未确认', completed: '已完成', needs_input: '等你决定', failed: '未完成', cancelled: '已取消', world: '周围的动静' };
+            var title = intent && intent.content || action && action.intent || (group.events.some(function (event) { return event.kind === 'observation'; }) ? '看看此刻的世界' : group.events.every(function (event) { return event.kind === 'system'; }) ? '会话记录' : '世界正在发生的事');
+            var card = el('article', { cls: 'journey-action-card', 'data-journey-group': group.id, 'data-action-status': status }, [
+                el('header', { cls: 'journey-action-heading' }, [el('span', { cls: 'journey-section-kicker', text: intent ? WorldCockpit.label({ name: intent.tool || 'act' }) : action ? '角色行动' : '世界 / EXPERIENCE' }), el('span', { cls: 'journey-action-state journey-state-' + status, text: states[status] || status })]),
+                el('h3', { cls: 'journey-action-title', text: title }), intent && intent.speech ? el('blockquote', { cls: 'journey-intent-speech', text: intent.speech }) : null
+            ]);
+            if (intent) card.appendChild(el('div', { cls: 'journey-intent-meta', text: '你的意图 · ' + eventTime(intent) }));
+            var steps = el('div', { cls: 'journey-action-steps' });
+            var scenes = group.events.filter(function (event) { return event.kind === 'scene'; }).sort(eventOrder), facts = group.events.filter(function (event) { return event.kind === 'experience' || event.kind === 'speech'; }).sort(eventOrder);
+            var factsState = readState(anchor, 'facts');
+            if (factsState.open == null && facts.length) factsState.open = !scenes.length;
+            if (scenes.length && facts.length) {
+                scenes.forEach(function (event) { steps.appendChild(eventRow(event)); });
+                var detail = el('details', { cls: 'journey-experience-details', open: factsState.open }, [el('summary', { text: '实际经过与回应 · ' + facts.length + ' 项' }), el('div', {}, facts.map(eventRow))]);
+                detail.addEventListener('toggle', function () { if (detail.isConnected) factsState.open = detail.open; });
+                steps.appendChild(detail);
+            } else facts.concat(scenes).sort(eventOrder).forEach(function (event) { steps.appendChild(eventRow(event)); });
+            group.events.filter(function (event) { return !['intent', 'result', 'failure', 'scene', 'experience', 'speech'].includes(event.kind) && !event.auxiliary; }).sort(eventOrder).forEach(function (event) { steps.appendChild(eventRow(event)); });
+            group.events.filter(function (event) { return event.kind === 'result' || event.kind === 'failure'; }).sort(eventOrder).forEach(function (event) { steps.appendChild(eventRow(event)); });
+            if (pending && !steps.childElementCount) steps.appendChild(note('正在尝试，世界的回应会出现在这里。'));
+            if (steps.childElementCount) card.appendChild(steps);
+            var records = group.events.filter(function (event) { return (event.raw != null || event.arguments) && !(event.kind === 'observation' && action); }).sort(function (a, b) { return Number(!!b.action) - Number(!!a.action); });
+            if (records.length) card.appendChild(ReadableData.raw(records.map(function (event) { return event.raw != null ? event.raw : { intent: event.content, arguments: event.arguments }; }), { label: '展开原始回执与依据 · ' + records.length + ' 份', state: readState(anchor, 'receipts') }));
+            return card;
+        }
+        function updateFeed() {
+            var groups = historyGroups(), active = new Set();
+            groups.forEach(function (group) {
+                active.add(group.id);
+                var stamp = JSON.stringify([group.events, state.pending && groupId(state.pending.id) === group.id && state.pending.status]), cached = shell.cards.get(group.id);
+                if (!cached || cached.stamp !== stamp) {
+                    var card = actionCard(group);
+                    if (cached) cached.node.replaceWith(card);
+                    cached = { stamp: stamp, node: card }; shell.cards.set(group.id, cached);
+                }
+            });
+            shell.cards.forEach(function (cached, id) { if (!active.has(id)) { cached.node.remove(); shell.cards.delete(id); } });
+            groups.forEach(function (group, index) { var node = shell.cards.get(group.id).node, current = shell.feed.children[index]; if (current !== node) shell.feed.insertBefore(node, current || null); });
+            shell.feedEmpty.hidden = groups.length > 0;
         }
         function cockpitData() { return { tools: cockpit.tools, pending: cockpit.pending, choices: Object.assign({}, pickerChoices, cockpit.choices || {}), observation: state.observation, deviceSession: deviceSession, synced: control.synced, mode: state.mode, unitWorldSeconds: state.unitWorldSeconds, blocked: control.busy || state.mode !== 'puppet' && !control.paused, blockedReason: control.busy ? '此前操作正在完成，等待真实回执。' : '控制权已在其他界面归还，请离场后重新接管。', submitting: !!state.pending, uncertain: !!state.pending && state.pending.status === 'unknown' }; }
         function inside() {
             shell = { session: el('div', { cls: 'journey-session-host' }), observations: el('section', { cls: 'journey-observations' }), live: el('section', { cls: 'journey-live-status', 'aria-label': 'World 与 Bot 实时状态' }), history: el('div', { cls: 'journey-history-host' }), dock: el('div', { cls: 'journey-dock', 'aria-label': '悬浮操作台' }), collapsed: !!state.operatorCollapsed, sessionStamp: '', observationStamp: '', eventStamp: '' };
+            shell.cards = new Map();
+            shell.feed = el('div', { cls: 'journey-feed' });
+            shell.feedEmpty = note('还没有收到事件。主动观察，或提交你的第一步。');
+            shell.historyError = el('div', { cls: 'journey-error', role: 'alert', hidden: true });
+            shell.history.append(shell.historyError, el('section', { cls: 'journey-card journey-history' }, [el('div', { cls: 'journey-section-kicker', text: '经历 / RECENT' }), el('h2', { text: '刚刚发生的事' }), note('新的行动排在前面，每次行动从意图读到结果。'), shell.feedEmpty, shell.feed]));
+            shell.observationHead = el('div', { cls: 'journey-observation-head' });
+            shell.observationSummary = el('summary', { cls: 'journey-state-summary' });
+            shell.observationBody = el('div', { cls: 'journey-state-body' });
+            shell.observationDetails = el('details', { cls: 'journey-state-details', open: !!state.observationOpen }, [shell.observationSummary, shell.observationBody]);
+            shell.observationDetails.addEventListener('toggle', function () { if (!shell) return; state.observationOpen = shell.observationDetails.open; saveDrafts(); });
+            shell.observations.append(shell.observationHead, shell.observationDetails);
             var links = el('div', { cls: 'journey-session-shortcuts' });
             if (state.takeover) links.appendChild(button('操作手机与电脑 ↗', function () { Studio.navigate('devices'); }, 'journey-subtle'));
             if (!isVisitor() || visitorCanSee(['debug'])) links.appendChild(button('查看实时思考与调用 ↗', function () { Studio.navigate('live'); }, 'journey-subtle'));
@@ -638,14 +756,18 @@
             if (observationStamp !== shell.observationStamp) {
                 shell.observationStamp = observationStamp;
                 var observeButton = button(observeBusy ? '正在观察…' : '重新观察', observe, 'journey-subtle'); observeButton.disabled = observeBusy || state.connection !== 'connected' || state.takeover && (!control.synced || !!state.pending || control.busy || state.mode !== 'puppet' && !control.paused || !cockpit.tools.some(function (tool) { return tool.name === 'observe'; }));
-                shell.observations.replaceChildren(el('div', { cls: 'journey-observation-head' }, [el('div', {}, [el('div', { cls: 'journey-section-kicker', text: '眼前的世界' }), el('h2', { text: state.observation ? '点选身边的目标' : '等待第一份观测' })]), observeButton]));
-                if (state.observation) { var entities = el('div', { cls: 'journey-entities' }); state.observation.entities.forEach(function (entity) { entities.appendChild(entityCard(entity)); }); shell.observations.appendChild(entities); }
-                else shell.observations.appendChild(el('div', { cls: 'journey-waiting-scene' }, [el('h3', { text: '先看看自己身处何处。' }), note('连接完成后，可以主动观察。')]));
+                shell.observationHead.replaceChildren(el('div', {}, [el('div', { cls: 'journey-section-kicker', text: '眼前的世界' }), el('h2', { text: '当前状态与目标' })]), observeButton);
+                shell.observationDetails.dataset.journeyObservation = state.observation && state.observation.observationId || '';
+                shell.observationSummary.replaceChildren(el('strong', { text: state.observation ? state.observation.entities.length + ' 个可见实体 · 点选或查看' : '等待第一份观测' }), el('span', { text: state.observation && Number.isFinite(state.observation.observedAt) ? '世界 T=' + Number(state.observation.observedAt.toFixed(1)) : '展开查看' }));
+                if (state.observation) {
+                    var entities = el('div', { cls: 'journey-entities' }); state.observation.entities.forEach(function (entity) { entities.appendChild(entityCard(entity)); });
+                    shell.observationBody.replaceChildren(entities, ReadableData.raw(state.observation, { label: '完整观测与依据', state: readState(state.observation, ':full') }));
+                } else shell.observationBody.replaceChildren(el('div', { cls: 'journey-waiting-scene' }, [el('h3', { text: '先看看自己身处何处。' }), note('连接完成后，可以主动观察。')]));
             }
-            var eventStamp = JSON.stringify([state.events, errorText, state.pending && state.pending.status]);
+            var eventStamp = JSON.stringify([state.events, state.actionAliases, errorText, state.pending && state.pending.status]);
             if (eventStamp !== shell.eventStamp) {
-                shell.eventStamp = eventStamp; shell.history.replaceChildren(feed());
-                if (errorText) shell.history.prepend(el('div', { cls: 'journey-error', role: 'alert', text: errorText }));
+                shell.eventStamp = eventStamp; updateFeed();
+                shell.historyError.hidden = !errorText; shell.historyError.textContent = errorText;
             }
             shell.controller.update(state.takeover ? cockpitData() : undefined); resizeDock();
         }

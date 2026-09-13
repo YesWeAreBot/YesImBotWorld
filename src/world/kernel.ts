@@ -4,8 +4,8 @@ import { createHash, randomUUID } from "node:crypto";
 import { WorldBus, envelope, type BusEnvelope, type BusListener } from "./bus.js";
 import {
   KernelError, assertJson, assertSafeKey, clone, emptyWorld,
-  type EntityInput, type KernelDiagnostic, type ObserveRequest, type PreparedProposal, type TransactionProposal,
-  type WorldAction, type WorldAttribute, type WorldEntity, type WorldObservation,
+  type EntityInput, type JsonValue, type KernelDiagnostic, type ObserveRequest, type PreparedProposal, type TransactionProposal,
+  type WorldAction, type WorldAttribute, type WorldEntity, type WorldExperience, type WorldObservation,
   type WorldOperation, type WorldSnapshot,
 } from "./state.js";
 
@@ -47,6 +47,21 @@ interface JournalRecord {
   changedEntityIds: string[];
 }
 interface Speech { speakerId: string; speakerName: string; text: string; audience: string[] }
+interface ExperienceDraft {
+  kind: WorldExperience["kind"];
+  text: string;
+  details?: WorldExperience["details"];
+  entityIds: string[];
+  private: boolean;
+  speechIndex?: number;
+}
+interface StoredExperience { experience: WorldExperience; entityIds: string[]; private: boolean }
+interface ExperienceView {
+  name: string;
+  location: string | null;
+  owner: string | null;
+  attributes: Record<string, WorldAttribute>;
+}
 
 /**
  * Single-process authoritative store. Every transition is validated on a private copy,
@@ -86,6 +101,14 @@ export class WorldKernel {
     return { proposal, basedOnSequence: this.state.sequence, changedEntityIds: result.changed };
   }
 
+  /** Read-only semantic preview: a lifecycle marker alone is not a new situation to decide about. */
+  hasPerceptibleProgress(prepared: PreparedProposal, actorId: string): boolean {
+    if (!Object.hasOwn(this.state.entities, actorId) || this.state.entities[actorId]?.kind !== "actor") return false;
+    const proposal = this.copyProposal(prepared.proposal);
+    const result = this.apply(this.state, proposal, proposal.effectiveAt ?? this.now(), { preview: true, captureExperiences: true });
+    return actorEntries(result.experiences, actorId).some(experience => experience.kind !== "action");
+  }
+
   commit(input: TransactionProposal | PreparedProposal, options: CommitOptions = {}): Promise<CommitResult> {
     // Capture immediately: callers cannot mutate an object while it waits in the queue.
     const proposal = this.copyProposal("proposal" in input ? input.proposal : input);
@@ -98,7 +121,7 @@ export class WorldKernel {
         return this.result(prior, true);
       }
       const effectiveAt = proposal.effectiveAt ?? this.now();
-      const result = this.apply(this.state, proposal, effectiveAt, { speakerId: options.speakerId, allowControllerChanges: options.allowControllerChanges });
+      const result = this.apply(this.state, proposal, effectiveAt, { speakerId: options.speakerId, allowControllerChanges: options.allowControllerChanges, captureExperiences: true });
       const sequence = this.state.sequence + 1;
       result.state.sequence = sequence;
       const command = envelope({ kind: "command", topic: "world.commit", source: proposal.source ?? "world", sequence, effectiveAt, priority: 3,
@@ -109,6 +132,22 @@ export class WorldKernel {
           perceptibleChanges: this.perceptibleChanges(this.state, result.state, result.changed, result.actionIds) } })];
       for (const speech of result.speeches) events.push(envelope({ kind: "event", topic: "world.speech", source: "kernel", actorId: speech.speakerId,
         sequence, effectiveAt, priority: 2, causationId: command.id, correlationId: proposal.correlationId ?? command.id, payload: speech }));
+      const payload = events[0]!.payload as { perceptibleChanges: Record<string, string[]>; experiences?: Record<string, StoredExperience[]> };
+      payload.experiences = Object.fromEntries(Object.entries(result.experiences).map(([actorId, drafts]) => {
+        const stored = drafts.map((draft, order) => {
+          const source = draft.speechIndex === undefined ? events[0]! : events[draft.speechIndex + 1]!;
+          return { entityIds: draft.entityIds, private: draft.private, experience: {
+            eventId: draft.speechIndex === undefined ? randomUUID() : source.id,
+            worldSequence: sequence, worldTime: effectiveAt, order, kind: draft.kind, text: draft.text,
+            sourceEventIds: [source.id], correlationId: proposal.correlationId ?? command.id,
+            ...(draft.details ? { details: draft.details } : {}),
+          } };
+        });
+        // A round trip or a temporary visible change is evidence even when the final state matches.
+        const changed = drafts.filter(d => d.kind !== "speech").flatMap(d => d.entityIds);
+        if (changed.length) payload.perceptibleChanges[actorId] = [...new Set([...actorEntries(payload.perceptibleChanges, actorId), ...changed])];
+        return [actorId, stored];
+      }));
       const record: JournalRecord = { schemaVersion: 1, type: "transaction", sequence, transactionId: command.id, effectiveAt,
         idempotencyKey: proposal.idempotencyKey, fingerprint, proposal, envelopes: [command, ...events], changedEntityIds: result.changed };
       this.checkSignal(options);
@@ -180,6 +219,21 @@ export class WorldKernel {
     return null;
   }
 
+  /** Exact action receipts survive intervening observations without consuming any actor's cursor. */
+  actionExperiences(actorId: string, actionId: string): WorldExperience[] {
+    const action = Object.hasOwn(this.state.actions, actionId) ? this.state.actions[actionId] : undefined;
+    if (!action || action.actorId !== actorId) return [];
+    let epochStart = 0;
+    for (let i = this.records.length - 1; i >= 0; i--) if (this.records[i]!.type === "reset") { epochStart = i; break; }
+    const experiences: WorldExperience[] = [];
+    for (const record of this.records.slice(epochStart)) for (const event of record.envelopes) {
+      if (event.topic !== "world.committed") continue;
+      const stored = actorEntries((event.payload as { experiences?: Record<string, StoredExperience[]> }).experiences, actorId);
+      for (const item of stored) if (item.experience.correlationId === actionId) experiences.push(clone(item.experience));
+    }
+    return experiences;
+  }
+
   observe(actorId: string, request: ObserveRequest = {}): Promise<WorldObservation> {
     return this.makeObservation(actorId, request, true);
   }
@@ -215,6 +269,20 @@ export class WorldKernel {
       let epochStart = 0;
       for (let i = this.records.length - 1; i >= 0; i--) if (this.records[i]!.type === "reset") { epochStart = i; break; }
       const currentRecords = this.records.slice(epochStart);
+      const experiences: WorldExperience[] = [];
+      for (const record of currentRecords) {
+        if (record.sequence <= since) continue;
+        for (const event of record.envelopes) {
+          if (event.topic !== "world.committed") continue;
+          const stored = actorEntries((event.payload as { experiences?: Record<string, StoredExperience[]> }).experiences, actorId);
+          for (const item of stored) {
+            if (captured.publicOnly && item.private) continue;
+            if (item.experience.kind === "speech" && (captured.selfOnly || captured.includeSpeech === false)) continue;
+            if ((targetId || captured.selfOnly) && !item.entityIds.some(id => ids.includes(id))) continue;
+            experiences.push(clone(item.experience));
+          }
+        }
+      }
       for (const record of currentRecords) {
         if (record.sequence <= since || captured.selfOnly || captured.includeSpeech === false) continue;
         for (const event of record.envelopes) {
@@ -234,14 +302,14 @@ export class WorldKernel {
           for (const id of ids) if (record.changedEntityIds.includes(id)) latestSources.set(id, event.id);
         }
         if (event.topic !== "world.committed") continue;
-        const changes = (event.payload as { perceptibleChanges?: Record<string, string[]> }).perceptibleChanges?.[actorId] ?? [];
+        const changes = actorEntries((event.payload as { perceptibleChanges?: Record<string, string[]> }).perceptibleChanges, actorId);
         for (const id of changes) {
           if (ids.includes(id)) latestSources.set(id, event.id);
           if (record.sequence > since && ((!targetId && !captured.selfOnly) || ids.includes(id))) recentSources.add(event.id);
         }
       }
-      const sourceEventIds = [...new Set([...latestSources.values(), ...recentSources, ...utterances.map(u => u.eventId)])];
-      const observation: WorldObservation = { observationId, actorId, worldSequence: sequence, observedAt, sourceEventIds, entities, utterances };
+      const sourceEventIds = [...new Set([...latestSources.values(), ...recentSources, ...utterances.map(u => u.eventId), ...experiences.flatMap(item => item.sourceEventIds)])];
+      const observation: WorldObservation = { observationId, actorId, worldSequence: sequence, observedAt, sourceEventIds, entities, utterances, experiences };
       if (!persist) return clone(observation);
       const event = envelope({ kind: "observation", topic: "world.observed", source: "kernel", actorId, sequence, effectiveAt: observedAt, priority: 4, payload: observation });
       const handles: [string, Handle][] = [...freshHandles].map(([entityId, handle]) => [handle, { actorId, entityId, observationId }]);
@@ -300,12 +368,14 @@ export class WorldKernel {
   }
 
   private apply(base: WorldSnapshot, proposal: TransactionProposal, effectiveAt: number,
-    options: { replay?: boolean; preview?: boolean; speakerId?: string; allowControllerChanges?: boolean }): { state: WorldSnapshot; changed: string[]; actionIds: string[]; speeches: Speech[] } {
+    options: { replay?: boolean; preview?: boolean; speakerId?: string; allowControllerChanges?: boolean; captureExperiences?: boolean }): { state: WorldSnapshot; changed: string[]; actionIds: string[]; speeches: Speech[]; experiences: Record<string, ExperienceDraft[]> } {
     if (!Number.isFinite(effectiveAt) || effectiveAt < 0) throw new KernelError("INVALID_TIME", "effectiveAt must be a nonnegative finite world time");
     if (effectiveAt < base.effectiveAt) throw new KernelError("PAST_COMMIT", "A transaction cannot move authoritative state backward in time");
     if (!options.replay && effectiveAt > this.now()) throw new KernelError("FUTURE_COMMIT", "Future state cannot commit before its effectiveAt");
     const state = clone(base);
     const changed = new Set<string>(); const actionIds = new Set<string>();
+    const speeches: Speech[] = [], experiences: Record<string, ExperienceDraft[]> = Object.create(null);
+    let previousViews = options.captureExperiences ? this.experienceViews(state) : new Map<string, Map<string, ExperienceView>>();
     const actor = proposal.actorId ? this.requireEntity(base, proposal.actorId, "actor") : undefined;
     const expected = proposal.expectedVersions ?? {};
     for (const [id, version] of Object.entries(expected)) {
@@ -320,7 +390,7 @@ export class WorldKernel {
         const action = Object.hasOwn(base.actions, operation.id) ? base.actions[operation.id] : undefined;
       if (!action || action.status !== "pending") throw new KernelError("ACTION_NOT_PENDING", `Action ${operation.id} is not pending`);
       if (actor && action.actorId !== actor.id) throw new KernelError("ACTOR_MISMATCH", "An actor cannot finish another actor's action");
-      if (operation.status === "completed") {
+      if (operation.status === "completed" || operation.status === "needs_input") {
         if (action.expectedEnd !== undefined && effectiveAt < action.expectedEnd) throw new KernelError("ACTION_NOT_DUE", "The action has not reached its expected end");
         for (const [id, version] of Object.entries(action.targetVersions)) {
           if (base.entities[id]?.revision !== version) throw new KernelError("ACTION_PRECONDITION_CHANGED", `Action target ${id} changed during execution`);
@@ -380,7 +450,7 @@ export class WorldKernel {
         state.actions[input.id] = { ...clone(input), ...(input.expectedEnd !== undefined ? { expectedEnd: Math.max(input.expectedEnd, effectiveAt) } : {}), status: "pending", startedAt: effectiveAt, targetVersions };
         actionIds.add(input.id);
       } else if (operation.op === "action.finish") {
-        if (!["completed", "cancelled", "failed"].includes(operation.status)) throw new KernelError("INVALID_ACTION", "Invalid terminal action status");
+        if (!["completed", "cancelled", "failed", "needs_input"].includes(operation.status)) throw new KernelError("INVALID_ACTION", "Invalid terminal action status");
         const action = state.actions[operation.id]!;
         if (action.status !== "pending") throw new KernelError("ACTION_NOT_PENDING", "Action was already finished in this transaction");
         action.status = operation.status; action.finishedAt = effectiveAt;
@@ -395,18 +465,23 @@ export class WorldKernel {
           throw new KernelError("SPEAKER_AUTHORIZATION_REQUIRED", "Only the controller may provide this actor's speech");
         }
         if (operation.audience && (!Array.isArray(operation.audience) || operation.audience.some(id => typeof id !== "string"))) throw new KernelError("INVALID_SPEECH", "audience must contain actor IDs");
+        const audible = this.visibleEntities(state, speaker.id);
+        const audience = [...audible].filter(id => state.entities[id]?.kind === "actor" && (!operation.audience || operation.audience.includes(id) || id === speaker.id));
+        const speechIndex = speeches.length;
+        speeches.push({ speakerId: speaker.id, speakerName: speaker.name, text: operation.text, audience });
+        if (options.captureExperiences) for (const listener of audience) (experiences[listener] ??= []).push({ kind: "speech",
+          text: `${listener === speaker.id ? "你" : speaker.name}说：“${operation.text}”`, entityIds: [speaker.id], private: false, speechIndex,
+          details: { speakerName: speaker.name, text: operation.text } });
       } else throw new KernelError("INVALID_OPERATION", `Unknown operation ${(operation as { op?: unknown }).op}`);
+      if (options.captureExperiences) {
+        const nextViews = this.experienceViews(state);
+        this.describeTransition(previousViews, nextViews, operation, state, experiences);
+        previousViews = nextViews;
+      }
     }
     this.validateWorld(state);
-    const speeches: Speech[] = [];
-    for (const operation of proposal.operations) if (operation.op === "say") {
-      const speaker = state.entities[operation.actorId]!;
-      const audible = this.visibleEntities(state, speaker.id);
-      const audience = [...audible].filter(id => state.entities[id]!.kind === "actor" && (!operation.audience || operation.audience.includes(id) || id === speaker.id));
-      speeches.push({ speakerId: speaker.id, speakerName: speaker.name, text: operation.text, audience });
-    }
     state.effectiveAt = effectiveAt;
-    return { state, changed: [...changed], actionIds: [...actionIds], speeches };
+    return { state, changed: [...changed], actionIds: [...actionIds], speeches, experiences };
   }
 
   private validateEntityInput(entity: EntityInput): void {
@@ -486,8 +561,14 @@ export class WorldKernel {
     const actor = this.requireEntity(state, actorId, "actor");
     const result = new Set<string>([actorId]);
     let regionId = actor.location;
+    const regions = new Set<string>();
     while (regionId) {
-      const region = state.entities[regionId]!;
+      // A transaction may create forward references or repair a temporary containment cycle.
+      // Such intermediate references confer no visibility before the complete graph is valid.
+      if (regions.has(regionId)) { regionId = null; break; }
+      regions.add(regionId);
+      const region = state.entities[regionId];
+      if (!region) { regionId = null; break; }
       if (region.kind === "place" || !this.isOpen(region)) break;
       if (!region.location) break;
       regionId = region.location;
@@ -496,10 +577,14 @@ export class WorldKernel {
     for (const entity of Object.values(state.entities)) {
       if (entity.id === actorId || entity.id === regionId) continue;
       let parentId = entity.location;
+      const visited = new Set<string>();
       while (parentId) {
+        if (visited.has(parentId)) break;
+        visited.add(parentId);
         if (parentId === actorId) { result.add(entity.id); break; }
         if (parentId === regionId) { result.add(entity.id); break; }
-        const parent = state.entities[parentId]!;
+        const parent = state.entities[parentId];
+        if (!parent) break;
         if (!this.isOpen(parent)) break;
         parentId = parent.location;
       }
@@ -518,6 +603,92 @@ export class WorldKernel {
   }
   private nonempty(value: unknown, field: string): asserts value is string {
     if (typeof value !== "string" || !value.trim()) throw new KernelError("INVALID_VALUE", `${field} must be nonempty text`);
+  }
+  /** Take only facts the actor could perceive at this operation, not at the transaction's end. */
+  private experienceViews(state: WorldSnapshot): Map<string, Map<string, ExperienceView>> {
+    const views = new Map<string, Map<string, ExperienceView>>();
+    for (const actor of Object.values(state.entities)) {
+      if (actor.kind !== "actor") continue;
+      const visible = this.visibleEntities(state, actor.id);
+      const entities = new Map<string, ExperienceView>();
+      for (const id of visible) {
+        const entity = state.entities[id]!;
+        const owned = id === actor.id || entity.owner === actor.id;
+        entities.set(id, { name: entity.name,
+          location: entity.location && visible.has(entity.location) ? entity.location : null,
+          owner: entity.owner && visible.has(entity.owner) && (entity.owner === actor.id || entity.owner === entity.location) ? entity.owner : null,
+          attributes: Object.fromEntries(Object.entries(entity.attributes)
+            .filter(([, a]) => a.visibility === "public" || (a.visibility === "owner" && owned))
+            .map(([key, a]) => [key, clone(a)])),
+        });
+      }
+      views.set(actor.id, entities);
+    }
+    return views;
+  }
+
+  private describeTransition(before: Map<string, Map<string, ExperienceView>>, after: Map<string, Map<string, ExperienceView>>,
+    operation: WorldOperation, state: WorldSnapshot, experiences: Record<string, ExperienceDraft[]>): void {
+    for (const [actorId, current] of after) {
+      const previous = before.get(actorId) ?? new Map<string, ExperienceView>();
+      const add = (id: string, kind: WorldExperience["kind"], text: string, details?: WorldExperience["details"], privateFact = false) => {
+        (experiences[actorId] ??= []).push({ kind, text, entityIds: [id], private: privateFact, ...(details ? { details } : {}) });
+      };
+      const name = (id: string, view: ExperienceView) => id === actorId ? "你" : view.name;
+      for (const id of new Set([...previous.keys(), ...current.keys()])) {
+        const old = previous.get(id), next = current.get(id);
+        const moving = operation.op === "move" && operation.id === id;
+        if (!old && next) {
+          add(id, moving ? "movement" : "appearance", `${name(id, next)}${moving ? "进入了你的视野" : "出现在你的视野中"}。`, { subjectName: next.name, presence: "visible" });
+        } else if (old && !next) {
+          // The unseen destination and any attributes changed after departure are deliberately absent.
+          add(id, moving ? "movement" : "appearance", `${name(id, old)}离开了你的视野。`, { subjectName: old.name, presence: "absent" });
+          continue;
+        } else if (old && next) {
+          if (old.name !== next.name) add(id, "change", `${name(id, old)}现在的名称是“${next.name}”。`, { subjectName: next.name, attribute: "name", before: old.name, after: next.name });
+          if (moving && old.location !== next.location) {
+            const from = old.location ? previous.get(old.location)?.name : undefined;
+            const to = next.location ? current.get(next.location)?.name : undefined;
+            add(id, "movement", `${name(id, next)}${from ? `从${from}` : ""}${to ? `移动到了${to}` : "改变了位置"}。`, {
+              subjectName: next.name, ...(from ? { from } : {}), ...(to ? { to } : {}),
+            });
+          }
+          if (old.owner !== next.owner) {
+            const ownerName = next.owner === actorId ? "你" : next.owner ? current.get(next.owner)?.name : undefined;
+            const wasOwned = old.owner === actorId;
+            // Ownership is only described when the same knowledge rule used by observe allows it.
+            if (ownerName) add(id, "change", `${next.name}现在归${ownerName}所有。`, { subjectName: next.name, ownerName });
+            else if (wasOwned) add(id, "change", `${old.name}已不再归你所有。`, { subjectName: next.name, ownership: "released" }, true);
+          }
+        }
+        if (!next) continue;
+        for (const key of new Set([...Object.keys(old?.attributes ?? {}), ...Object.keys(next.attributes)])) {
+          const from = old && Object.hasOwn(old.attributes, key) ? old.attributes[key] : undefined;
+          const to = Object.hasOwn(next.attributes, key) ? next.attributes[key] : undefined;
+          if (from && to && digest(from.value) === digest(to.value)) continue;
+          if (!from && !to) continue;
+          const subject = name(id, next);
+          const details: NonNullable<WorldExperience["details"]> = { subjectName: next.name, attribute: key,
+            ...(from ? { before: clone(from.value) } : {}), ...(to ? { after: clone(to.value) } : {}) };
+          const privateFact = from?.visibility === "owner" || to?.visibility === "owner";
+          const label = attributeLabel(key);
+          const text = from && to ? `${subject}的${label}从${describeValue(from.value, key)}变为${describeValue(to.value, key)}。`
+            : to ? `${subject}的${label}为${describeValue(to.value, key)}。` : `你暂时无法确认${subject}的${label}。`;
+          add(id, "change", text, details, privateFact);
+        }
+      }
+      if (operation.op === "action.start" || operation.op === "action.finish") {
+        const action = state.actions[operation.op === "action.start" ? operation.action.id : operation.id]!;
+        if (action.actorId !== actorId) continue;
+        const phase = operation.op === "action.start" ? "start" : "finish";
+        const text = phase === "start" ? `你开始尝试：${action.intent}。`
+          : action.status === "completed" ? `你的这次行动执行完毕（原定动作：${action.intent}）。`
+          : action.status === "needs_input" ? `行动推进到需要你决定的地方，本次尝试已停止（原定动作：${action.intent}）。`
+          : action.status === "cancelled" ? `你的这次尝试已中止（原定动作：${action.intent}）。`
+          : `你的这次尝试未能完成（原定动作：${action.intent}）。`;
+        add(actorId, "action", text, { phase, status: action.status, intent: action.intent }, true);
+      }
+    }
   }
   /** Compare visible facts, omitting revision so a private-only write is not evidence. */
   private perceptibleChanges(before: WorldSnapshot, after: WorldSnapshot, changed: string[], actionIds: string[]): Record<string, string[]> {
@@ -578,6 +749,55 @@ export class WorldKernel {
     return { transactionId: record.transactionId, sequence: record.sequence, duplicate,
       changedEntityIds: [...record.changedEntityIds], events: clone(record.envelopes.filter(e => e.kind === "event")) };
   }
+}
+
+/** Actor IDs are data, including valid names such as toString; inherited properties are not rows. */
+function actorEntries<T>(map: Record<string, T[]> | undefined, actorId: string): T[] {
+  const entries = map && Object.hasOwn(map, actorId) ? map[actorId] : undefined;
+  return Array.isArray(entries) ? entries : [];
+}
+
+const ATTRIBUTE_LABELS: Record<string, string> = {
+  hunger: "饥饿程度", health: "健康状态", energy: "精力", thirst: "口渴程度", temperature: "温度",
+  posture: "姿势", open: "开合状态", wetness: "湿润程度", injuries: "伤情", consciousness: "意识状态",
+  transparent: "透明状态", powered: "电源状态", locked: "锁定状态", color: "颜色",
+};
+const BOOLEAN_LABELS: Record<string, [string, string]> = {
+  open: ["关闭", "打开"], transparent: ["不透明", "透明"], powered: ["关闭", "开启"], locked: ["未锁定", "已锁定"],
+};
+const VALUE_LABELS: Record<string, Record<string, string>> = {
+  posture: { standing: "站立", sitting: "坐着", lying: "躺着", walking: "行走" },
+  consciousness: { awake: "清醒", asleep: "睡眠", unconscious: "无意识" },
+};
+const GRAPHEMES = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+/** A short reading excerpt; the full JSON value remains verbatim in experience.details. */
+function excerptText(text: string, limit: number): string {
+  let result = "", length = 0;
+  for (const { segment } of GRAPHEMES.segment(text)) {
+    const size = [...segment].length;
+    if (length + size > limit) return result + "…";
+    result += segment; length += size;
+  }
+  return result;
+}
+function attributeLabel(key: string): string { return Object.hasOwn(ATTRIBUTE_LABELS, key) ? ATTRIBUTE_LABELS[key]! : excerptText(key, 32); }
+function describeValue(value: JsonValue, key = "", depth = 0): string {
+  if (value === null) return "空";
+  if (typeof value === "boolean") return Object.hasOwn(BOOLEAN_LABELS, key) ? BOOLEAN_LABELS[key]![value ? 1 : 0] : (value ? "是" : "否");
+  if (typeof value === "number") return String(value); // Units and numerical scales are never inferred.
+  if (typeof value === "string") {
+    const labels = Object.hasOwn(VALUE_LABELS, key) ? VALUE_LABELS[key]! : undefined;
+    return excerptText(labels && Object.hasOwn(labels, value) ? labels[value]! : value, 120);
+  }
+  if (depth >= 2) return Array.isArray(value) ? `${value.length} 项记录` : "一项结构记录";
+  if (Array.isArray(value)) {
+    if (!value.length) return "空";
+    const text = value.slice(0, 4).map(item => describeValue(item, "", depth + 1)).join("、") + (value.length > 4 ? `等 ${value.length} 项` : "");
+    return excerptText(text, 120);
+  }
+  const entries = Object.entries(value);
+  const text = entries.slice(0, 4).map(([name, item]) => `${attributeLabel(name)}：${describeValue(item, name, depth + 1)}`).join("；") + (entries.length > 4 ? `；另有 ${entries.length - 4} 项` : "");
+  return excerptText(text, 120) || "空";
 }
 
 function digest(value: unknown): string {

@@ -11,6 +11,8 @@
  * All requests go through the real preview API. The wrapper records payloads;
  * it neither manufactures responses nor performs any external operation.
  */
+import smokeExperiences from './webui-smoke-experiences.mjs';
+
 export async function smokeJourney({ evaluate, wait, assert, navigate }) {
   const run = (fn, args) => evaluate(`(${fn.toString()})(${JSON.stringify(args) ?? 'undefined'})`);
   const click = (label) => run((label) => {
@@ -142,6 +144,8 @@ export async function smokeJourney({ evaluate, wait, assert, navigate }) {
       const cancel = calls.find(c => c.path === '/api/player/cancel');
       return cancel?.body.taskId === act.body.taskId && cancel.body.token === act.body.token;
     }), 'Cancellation refers to the same task and session; its final receipt clears pending state.');
+    await smokeExperiences({evaluate,wait,assert,navigate});
+    checks.push('action episodes, factual progress, NPC response, late scenes and replay');
     await click('离开世界');
     await wait(`!!document.querySelector('.journey-identity') && !document.querySelector('.journey-session-bar')`);
     checks.push('player cancellation receipt and leave');

@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { StructuredWorld } from "./runtime.js";
+import { presentObservation } from "./scene.js";
 import type { WorldObservation } from "./state.js";
 import type { Logger } from "koishi";
 import { type CalendarSpec, describeCalendar, gregorian, parseCalendarSpec } from "../calendar.js";
@@ -76,8 +77,8 @@ export class WorldAgent {
   private async emitIfChanged(actorId: string, deliver: (content: string) => void): Promise<void> {
     const kernel = await this.structured.kernel();
     const previous = kernel.latestObservation(actorId), current = await kernel.peek(actorId);
-    if (previous && !current.utterances.length && perceptionKey(previous) === perceptionKey(current)) return;
-    deliver(JSON.stringify(await this.structured.observe(actorId)));
+    if (previous && !current.utterances.length && !current.experiences?.length && perceptionKey(previous) === perceptionKey(current)) return;
+    deliver(JSON.stringify(presentObservation(await this.structured.observe(actorId))));
   }
   /** 写状态任务的可抢占队列：玩家 act 等高优先级任务会插到队头（在未开始的普通任务之前） */
   private queue: { fn: () => Promise<unknown>; priority: number; cancelKey?: string; resolve: (v: unknown) => void; reject: (e: unknown) => void }[] = [];
@@ -301,7 +302,7 @@ export class WorldAgent {
   /** Tingle：世界心跳，推进世界演化。返回 World 为下一次心跳设定的间隔（TU），未设定则返回 null */
   async tingle(deliver: (content: string) => void): Promise<number | null> {
     if (this.remote && !(this.visitorsProvider?.().length)) { this.notePresenceChange(); return null; }
-    await this.structured.evolve("世界心跳：按距离快照时刻的实际经过时间，结算自然过程及NPC的自主行动。常驻角色及玩家的主动选择由他们自己决定。不要为了制造事件而强制发生事情。");
+    await this.structured.evolve("世界心跳：按距离快照时刻的实际经过时间，结算自然过程及NPC的自主行动。承接正在进行的工作、交谈、等待和角色行动造成的影响，让NPC依据已有目标与处境作出合理回应；按发生顺序记录经过，不能只把所有变化压成最后一个属性值。常驻角色及玩家的主动选择由他们自己决定。没有合理变化时可保持安静，不强制制造冲突或奇遇。");
     if (!this.remote) await this.emitIfChanged("bot", deliver);
     await this.publishVisitors(); return null;
   }
