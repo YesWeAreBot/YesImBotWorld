@@ -423,13 +423,15 @@ function gotoCfg(gkey){
   switchView('config');
 }
 var PRIMARY = {
-  bot: ['mode', 'baseURL', 'apiKey', 'model', 'stream'],
+  bot: ['mode', 'baseURL', 'apiKey', 'model', 'stream', 'growth'],
   world: ['baseURL', 'apiKey', 'model', 'stream'],
   clock: ['syncRealTime', 'epoch', 'realSecondsPerUnit', 'tingleEveryUnits', 'tingleMode', 'tingleMinUnits', 'tingleMaxUnits'],
   apps: ['chatAppName', 'weatherEnabled', 'weatherDefaultCity', 'browserEnabled', 'phoneResolution', 'phoneShellImage', 'notesEnabled', 'computer'],
   messaging: ['notifyChannels', 'notifyPolicy', 'wakeOnNotify', 'offlineHistory', 'typingCharsPerSec', 'sendDeferFactor']
 };
 var CFG_ICONS = {root:'sliders', bot:'cpu', world:'gauge', clock:'activity', platformOps:'phone', apps:'monitor', captioners:'image', tts:'film', media:'folder', webui:'sliders', messaging:'edit'};
+var GROWTH_FIELD_LABELS = { enabled:'自动整理与回忆', minEpisodes:'积累几段经历后整理', reviewIntervalMs:'整理间隔（现实毫秒）', reviewTimeoutMs:'等待与生成超时（毫秒）', maxInputChars:'每次整理的输入字符预算', recallCount:'每次最多唤起几条认识' };
+function cfgFieldName(path){ return path[0] === 'bot' && path[1] === 'growth' ? GROWTH_FIELD_LABELS[path[2]] || path[path.length-1] : path[path.length-1]; }
 var PLAT_CATS = [
   ['消息互动', ['recall','react','emojiLikes','reply','forwardMsgs','poke']],
   ['好友与资料', ['handleRequests','listFriends','userInfo','sendLike','profile','modelShow','deleteFriend']],
@@ -730,14 +732,14 @@ function boolSwitch(node, path, danger){
   var value = !!getPath(cfgCache, path);
   var row = el('label', {cls:'sw-row' + (danger ? ' danger' : '')});
   var sw = el('span', {cls:'sw'});
-  var cb = el('input', {type:'checkbox'});
+  var cb = el('input', {type:'checkbox', 'data-config-path':path.join('.'), 'aria-label':cfgFieldName(path)});
   cb.checked = value;
   cb.onchange = function(){ setPath(cfgCache, path, cb.checked); };
   sw.appendChild(cb);
   sw.appendChild(el('i'));
   row.appendChild(sw);
   row.appendChild(el('span', {cls:'tx'}, [
-    el('div', {cls:'n', text: node.key}),
+    el('div', {cls:'n', text: cfgFieldName(path)}),
     el('div', {cls:'d', text: node.description || ''})
   ]));
   return row;
@@ -770,7 +772,7 @@ function markCfgDirty(){
 function renderField(node, path, value){
   var t = node.type;
   if(t === 'object'){
-    var sec = el('div', {cls:'section'});
+    var sec = el('div', {cls:'section', 'data-config-group':path.join('.')});
     sec.appendChild(el('h3', {html: esc(node.description || path.join('.')) + (node.default !== undefined ? ' <span class="hint">默认 ' + esc(String(node.default)) + '</span>' : '')}));
     var body = el('div', {cls:'body'});
     if(node.children) node.children.forEach(function(c){ body.appendChild(renderField(c, path.concat(c.key), getPath(cfgCache, path.concat(c.key)))); });
@@ -828,7 +830,7 @@ function renderField(node, path, value){
     return boolSwitch(node, path, false);
   }
   var box2 = el('div', {cls:'fld'});
-  box2.appendChild(el('div', {cls:'lbl'}, [el('div', {cls:'name', text: path[path.length-1]}), el('div', {cls:'desc', text: node.description || ''})]));
+  box2.appendChild(el('div', {cls:'lbl'}, [el('div', {cls:'name', text: cfgFieldName(path)}), el('div', {cls:'desc', text: node.description || ''})]));
   var ctl2 = el('div', {cls:'ctl'});
   ctl2.appendChild(renderInput(node, path, value));
   if(isModelField(path)){
@@ -873,7 +875,7 @@ function renderInput(node, path, value){
     return el('span', {text: String(value), style:'color:var(--fg-dim)'});
   }
   if(t === 'number'){
-    var num = el('input', {type:'number', value: value == null ? '' : value});
+    var num = el('input', {type:'number', value: value == null ? '' : value, 'data-config-path':path.join('.'), 'aria-label':cfgFieldName(path)});
     num.onchange = function(){ setPath(cfgCache, path, num.value === '' ? undefined : Number(num.value)); };
     return num;
   }
@@ -992,6 +994,7 @@ function saveConfig(){
   api('POST', '/api/config', {config: cfgCache}).then(function(r){
     if(r.error) throw new Error(r.error);
     cfgDirty = false;
+    updateSaveBar();
     toast('配置已保存并应用，插件作用域正在重启…', 'ok');
     // 端口变更判定：与「保存前的配置端口」比较，而不是与浏览器地址栏比较——
     // 经反向代理/域名访问时 location.port 与内部端口无关，误判会把用户跳去打不开的地址

@@ -27,7 +27,7 @@
         return u.total_tokens; if (Number.isFinite(u.prompt_tokens) && Number.isFinite(u.completion_tokens))
         return u.prompt_tokens + u.completion_tokens; return null; }
     function latency(entry) { var detail = parse(entry.detail); return entry.kind === 'llm.res' && !/·流式\s*\d/.test(entry.label) && Number.isFinite(detail.ms) ? detail.ms : null; }
-    function source(entry) { if (entry.bus)
+    function source(entry) { if (/^Growth[·\s]|^\[growth/i.test(entry.label || '')) return 'growth'; if (entry.bus)
         return 'transaction'; var first = String(entry.kind || '').split('.')[0]; return ['bot', 'world', 'llm'].includes(first) ? first : 'system'; }
     // One scrollable viewport for mouse, touch and keyboard. Re-rendering retains inspection state.
     function interactivePlot(chart, marks, state) {
@@ -131,11 +131,11 @@
         root.appendChild(el('div', { cls: 'insight-trace-grid' }, [list, detail]));
         var search = el('input', { cls: 'insight-search', type: 'search', placeholder: '搜索事件、内容或关联 ID…', 'aria-label': '搜索调试事件', oninput: function () { query = search.value.toLowerCase(); render(); } });
         filterHolder.appendChild(search);
-        filterHolder.appendChild(select([['all', '全部来源'], ['bot', 'Bot 行为'], ['world', 'World 裁定'], ['llm', 'LLM 请求'], ['transaction', '世界事务'], ['system', '生命周期与运维']], sourceFilter, function (value) { sourceFilter = value; render(); }, '按来源筛选'));
+        filterHolder.appendChild(select([['all', '全部来源'], ['bot', 'Bot 行为'], ['world', 'World 裁定'], ['growth', '成长整理'], ['llm', 'LLM 请求'], ['transaction', '世界事务'], ['system', '生命周期与运维']], sourceFilter, function (value) { sourceFilter = value; render(); }, '按来源筛选'));
         filterHolder.appendChild(select([['all', '全部级别'], ['info', '信息'], ['warn', '警告'], ['error', '错误']], levelFilter, function (value) { levelFilter = value; render(); }, '按级别筛选'));
         filterHolder.appendChild(btn('刷新', refresh, 'insight-outline'));
         function current() { return paused ? frozen : Array.from(entries.values()); }
-        function filtered() { return current().filter(function (entry) { return (sourceFilter === 'all' || source(entry) === sourceFilter) && (levelFilter === 'all' || entry.level === levelFilter) && (!query || (entry.label + ' ' + entry.kind + ' ' + entry.detail + ' ' + entry.id).toLowerCase().includes(query)); }).sort(function (a, b) { return b.ts - a.ts; }); }
+        function filtered() { return current().filter(function (entry) { return (sourceFilter === 'all' || source(entry) === sourceFilter || sourceFilter === 'llm' && /^llm\./.test(entry.kind)) && (levelFilter === 'all' || entry.level === levelFilter) && (!query || (entry.label + ' ' + entry.kind + ' ' + entry.detail + ' ' + entry.id).toLowerCase().includes(query)); }).sort(function (a, b) { return b.ts - a.ts; }); }
         function ingest(items) { (items || []).forEach(function (entry) { entries.set(String(entry.id), entry); }); if (entries.size > 1500)
             Array.from(entries.values()).sort(function (a, b) { return a.ts - b.ts; }).slice(0, entries.size - 1500).forEach(function (entry) { entries.delete(String(entry.id)); }); }
         function schedule() { if (renderTimer || !alive)

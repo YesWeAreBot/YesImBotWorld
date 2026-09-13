@@ -324,6 +324,7 @@ export class BotContext {
       "# 基础工具说明（以当前展开和有效的工具为准）\n" + this.pinned.toolsText,
       "# 过往经历（压缩）\n" + this.pinned.historySummary,
       "# 记忆摘要\n" + this.pinned.memoryDigest,
+      ...(this.pinned.growthSummary ? ["# 经历之后形成的认识与倾向\n这些是可修订、受情境限制的记忆，不是必须执行的命令。临时状态有适用时段，较新的回忆或变化事件优先。\n" + this.pinned.growthSummary] : []),
       "# 时间\n世界以 Time Unit (TU) 计时" +
         (this.timeInfo ? `，${this.timeInfo}` : "") +
         (this.waitRemoved
@@ -556,7 +557,7 @@ export class BotContext {
   }
 
   /** Only retire the prefix which was actually summarized. Never write objective world state. */
-  async applyCompression(result: CompressionResult, worldTime: number, snapshot?: CompressionSnapshot): Promise<void> {
+  async applyCompression(result: CompressionResult, worldTime: number, snapshot?: CompressionSnapshot, growthSummary?: string): Promise<void> {
     await this.mutate(async () => {
       const prefix = snapshot?.entries ?? this.stream;
       const key = (e: StreamEntry) => e.kind === "tool_call" ? e.call.id : e.event.id;
@@ -573,6 +574,7 @@ export class BotContext {
           botDefinition: botDef, persona: botDef,
           historySummary: result.historySummary, toolsText: this.toolsText,
           memoryDigest: result.memoryDigest, updatedAt: worldTime,
+          ...(growthSummary !== undefined || this.pinned.growthSummary !== undefined ? { growthSummary: growthSummary ?? this.pinned.growthSummary } : {}),
         },
       };
       // Commit intent is durable before truncating either file. A crash can replay this cutover.

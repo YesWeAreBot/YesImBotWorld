@@ -62,14 +62,18 @@
 .growth-workspace {
   display:grid;
   grid-template-columns:300px minmax(0,1fr);
-  gap:22px
+  gap:22px;
+  min-width:0
 }
+.growth-kind-filters { flex-wrap:wrap; min-width:0; }
+.growth-lifecycle-filters { flex-wrap:wrap; }
 .growth-claims {
   display:flex;
   flex-direction:column;
   gap:9px;
   max-height:800px;
-  overflow:auto
+  overflow:auto;
+  min-width:0
 }
 .growth-claim {
   display:block;
@@ -79,8 +83,11 @@
   white-space:normal;
   background:var(--surface);
   border:1px solid var(--line);
-  border-radius:14px
+  border-radius:14px;
+  min-width:0;
+  overflow-wrap:anywhere
 }
+.growth-claim.inactive { border-style:dashed; }
 .growth-claim.active {
   border-color:var(--accent);
   box-shadow:inset 3px 0 0 var(--accent)
@@ -108,9 +115,22 @@
   color:var(--fg-dim);
   font-weight:400
 }
+.growth-claim-situation { display:block; font-size:11px; color:var(--fg-dim); line-height:1.6; margin-bottom:10px; }
 .growth-detail {
-  min-width:0
+  min-width:0;
+  overflow-wrap:anywhere
 }
+.growth-lifecycle { display:block; color:var(--accent); font-size:11px; line-height:1.7; margin-bottom:12px; }
+.growth-lifecycle.inactive { color:var(--fg-dim); }
+.growth-situation { margin:15px 0; padding:14px 16px; background:var(--panel2); border-radius:12px; }
+.growth-situation strong { font-size:12px; }
+.growth-situation p { margin:8px 0 12px; font-size:13px; line-height:1.8; }
+.growth-cues { display:flex; flex-wrap:wrap; gap:7px; margin-top:7px; }
+.growth-cues span { border:1px solid var(--line2); border-radius:20px; font-size:11px; padding:5px 10px; }
+.growth-identity { margin:12px 0; color:var(--fg-dim); font-size:11px; }
+.growth-identity summary { cursor:pointer; min-height:32px; padding:7px 0; }
+.growth-identity p { margin:5px 0; }
+.growth-identity code { display:block; font:10px var(--mono); overflow-wrap:anywhere; }
 .growth-detail h2 {
   font-size:22px;
   font-weight:550;
@@ -173,13 +193,16 @@
   background:color-mix(in srgb,var(--accent2) 12%,var(--surface));
   color:var(--accent2)
 }
+.growth-record-icon.retire { color:var(--fg-dim); }
+.growth-record-origin { display:block; color:var(--fg-dim); font-size:10px; margin:0 0 9px; }
 .growth-record-head {
   display:flex;
   align-items:center;
   justify-content:space-between;
   gap:10px;
   font-size:11px;
-  margin:4px 0 8px
+  margin:4px 0 8px;
+  flex-wrap:wrap
 }
 .growth-record-head time {
   font:9px var(--mono);
@@ -196,7 +219,10 @@
   gap:5px
 }
 .growth-evidence-chips button {
-  font:9px var(--mono);
+  font-size:11px;
+  text-align:left;
+  line-height:1.6;
+  white-space:normal;
   background:var(--bg);
   padding:4px 7px;
   min-height:28px;
@@ -260,4 +286,6 @@
   .growth-claim { min-width:250px; flex-basis:270px; flex-shrink:0; scroll-snap-align:start; min-height:130px; }
   .growth-evidence-map svg { min-width:480px; }
   .growth-detail h2 { font-size:19px; }
+  .growth-kind-filters button,.growth-lifecycle-filters button,.growth-evidence-chips button { min-height:42px; }
+  .growth-identity summary { min-height:42px; }
 }

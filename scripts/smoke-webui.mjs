@@ -121,6 +121,46 @@ try {
   await evaluate("document.querySelector('.growth-evidence-node').dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true}))");
   assert.ok(await evaluate("document.querySelector('.growth-evidence-detail')?.textContent.includes('observed_1')"));
   console.log('PASS actor navigation, early event focus and growth evidence');
+  const growthFilter = async (group, label) => evaluate(`Array.from(document.querySelectorAll(${JSON.stringify(group + ' button')})).find(b=>b.textContent===${JSON.stringify(label)}).click()`);
+  await growthFilter('.growth-kind-filters', '习惯');
+  assert.ok(await evaluate("document.querySelector('.growth-situation').textContent.includes('天气适合出门') && document.querySelector('.growth-cues').textContent.includes('晚饭后')"));
+  assert.ok(await evaluate("document.querySelector('.growth-detail').textContent.includes('自动整理') && document.querySelector('.growth-detail').textContent.includes('修订原有判断')"));
+  await growthFilter('.growth-lifecycle-filters', '已结束');
+  assert.equal(await evaluate("document.querySelectorAll('.growth-claim').length"), 1);
+  assert.ok(await evaluate("document.querySelector('.growth-detail').textContent.includes('停止沿用这条认识')"));
+  await growthFilter('.growth-kind-filters', '临时状态');
+  assert.ok(await evaluate("document.querySelector('.growth-lifecycle').textContent.includes('已到期') && document.querySelector('.growth-lifecycle').textContent.includes('T 4248.0 TU')"), 'Expiry is world TU, never an epoch date');
+  await growthFilter('.growth-lifecycle-filters', '当前有效');
+  assert.ok(await evaluate("document.querySelector('.growth-detail').textContent.includes('不会直接归纳成性格')"));
+  await growthFilter('.growth-kind-filters', '性格倾向');
+  assert.ok(await evaluate("document.querySelector('.growth-topline').textContent.includes('存在反证') && document.querySelector('.growth-lifecycle').textContent.includes('当前有效')"), 'Contested and active describe separate dimensions');
+  assert.equal(await evaluate("document.querySelector('.growth-identity').open"), false);
+  await evaluate("document.querySelector('.growth-identity summary').click()");
+  assert.ok(await evaluate("document.querySelector('.growth-identity').textContent.includes('person:preview:friend-account')"));
+  assert.ok(await evaluate('document.documentElement.scrollWidth <= innerWidth'), 'Long identity stays inside mobile width');
+  await evaluate("var growthSearch=document.querySelector('[aria-label=搜索成长记录]');growthSearch.focus();growthSearch.value='阿青';growthSearch.dispatchEvent(new Event('input'));growthSearch.setSelectionRange(1,1);var originalGrowthFetch=Studio.fetchGrowth;Studio.fetchGrowth=()=>originalGrowthFetch().then(rows=>rows.map(row=>row.claimId==='claim_trait'?Object.assign({},row,{statement:row.statement+'（刷新样本）'}):row));window.dispatchEvent(new CustomEvent('studio:debug',{detail:{kind:'bot.event'}}));");
+  await wait("document.querySelector('.growth-detail h2').textContent.includes('刷新样本')");
+  assert.ok(await evaluate("document.activeElement===growthSearch && growthSearch.selectionStart===1 && growthSearch.value==='阿青' && document.querySelector('.growth-identity').open"), 'Live updates retain input focus, caret and expanded identity');
+  await evaluate("Studio.fetchGrowth=originalGrowthFetch");
+  await growthFilter('.growth-kind-filters', '全部类型');
+  await growthFilter('.growth-lifecycle-filters', '全部历史');
+  await evaluate("growthSearch.value='';growthSearch.dispatchEvent(new Event('input'))");
+  assert.equal(await evaluate("document.querySelectorAll('.growth-claim').length"), 8, 'All old and new kinds retain their history');
+  console.log('PASS growth scopes, habits, traits, expiry, retirement, live input focus and mobile layout');
+  await navigate('config');
+  await evaluate("gotoCfg('bot')");
+  await wait("document.querySelector('[data-config-group=\"bot.growth\"]')");
+  assert.equal(await evaluate("document.querySelectorAll('[data-config-group=\"bot.growth\"] input').length"), 6);
+  assert.ok(await evaluate("!document.querySelector('[data-config-group=\"bot.growth\"]').closest('details') && Array.from(document.querySelectorAll('[data-config-group=\"bot.growth\"] input')).every(input=>input.getClientRects().length && input.getAttribute('aria-label'))"), 'Growth configuration is directly discoverable and accessible');
+  await evaluate("window.__originalGrowthConfig=JSON.parse(JSON.stringify(cfgCache.bot.growth));document.querySelector('[data-config-path=\"bot.growth.enabled\"]').click();[['minEpisodes',5],['reviewIntervalMs',180000],['reviewTimeoutMs',60000],['maxInputChars',26000],['recallCount',2]].forEach(([key,value])=>{const input=document.querySelector('[data-config-path=\"bot.growth.'+key+'\"]');input.value=value;input.dispatchEvent(new Event('change',{bubbles:true}))});");
+  assert.ok(await evaluate('cfgDirty && cfgCache.bot.growth.recallCount===2 && cfgCache.bot.growth.reviewIntervalMs===180000'));
+  await evaluate("document.querySelector('.cfg-savebar .primary').click()");
+  await wait('!cfgDirty');
+  assert.ok(await evaluate("api('GET','/api/config').then(result=>result.value.bot.growth.recallCount===2 && result.value.bot.growth.enabled===!window.__originalGrowthConfig.enabled)"), 'All growth controls use the existing save/apply path');
+  await evaluate("cfgCache.bot.growth=window.__originalGrowthConfig;markCfgDirty();saveConfig();delete window.__originalGrowthConfig");
+  await wait('!cfgDirty');
+  assert.ok(await evaluate('document.documentElement.scrollWidth <= innerWidth'), 'Growth settings stay inside mobile width');
+  console.log('PASS visible growth settings, six editable fields and existing save/apply semantics');
   await evaluate("promptAuth();document.querySelector('#modal-x').click()");
   assert.equal(await evaluate('authPromise'), null, 'Closing login must settle the pending request');
   await evaluate("document.querySelector('#studio-command').click()");
@@ -145,7 +185,7 @@ try {
     const output = resolve(process.env.STUDIO_SCREENSHOT_DIR); await mkdir(output, { recursive: true });
     for (const width of [1440, 375]) {
       await page('Emulation.setDeviceMetricsOverride', { width, height: 1050, deviceScaleFactor: 1, mobile: width < 600 });
-      for (const route of ['overview', 'world', 'devices', 'player', 'debug']) {
+      for (const route of ['overview', 'world', 'growth', 'devices', 'player', 'debug']) {
         await navigate(route);
         const screenshot = await page('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false });
         await writeFile(join(output, `${route}-${width}.png`), Buffer.from(screenshot.data, 'base64'));

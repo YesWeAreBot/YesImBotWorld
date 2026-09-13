@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { validateToolCall } from "../src/llm/parse.js";
 import { BOT_TOOLS, BOT_TOOL_NAMES } from "../src/bot/tools.js";
-import { BOT_PROMPT_DEFAULTS } from "../src/prompts.js";
+import { BOT_PROMPT_DEFAULTS, GROWTH_RUNTIME_GUIDANCE, GROWTH_MANUAL_GUIDANCE } from "../src/prompts.js";
 import { Scheduler } from "../src/bot/scheduler.js";
 import { BotAgent } from "../src/bot/agent.js";
 import { BotContext } from "../src/bot/context.js";
@@ -26,7 +26,9 @@ assert.deepEqual(validateToolCall({ name: "act", arguments: '{"description":"喝
 assert.match(BOT_TOOLS.find(t => t.name === "recall_growth")!.signature, /scope.*event_ids/);
 assert.doesNotMatch(BOT_TOOLS.find(t => t.name === "send")!.description, /<img>|填满/);
 assert.match(BOT_PROMPT_DEFAULTS.outputFormatNative, /正文 JSON/);
-assert.match(BOT_PROMPT_DEFAULTS.lifestyleWithWait, /不会自动生成认识/);
+assert.doesNotMatch(BOT_PROMPT_DEFAULTS.lifestyleWithWait, /需要你主动.*才会成为|不会自动生成认识/);
+assert.match(GROWTH_RUNTIME_GUIDANCE, /不再需要每次主动 reflect/);
+assert.match(GROWTH_MANUAL_GUIDANCE, /自动回顾与情境回忆目前关闭/);
 const clock = { now: () => 0, realMsUntil: () => 0, timeLine: () => "T=0", unitRealSeconds: 1 } as any;
 const failure = await new Promise<{ text: string; ok?: boolean }>(resolve => {
   const scheduler = new Scheduler(clock, (text, ref, outcome) => { assert.equal(ref, call.id); resolve({ text: String(text), ok: outcome?.ok }); }, logger);

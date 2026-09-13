@@ -50,7 +50,7 @@ export default async function smokeCockpit({ evaluate, wait, assert, navigate, p
       assert(await run(mode=>window.__cockpitSmoke.calls.filter(c=>c.path==='/api/player/arrive').at(-1).body.mode === mode, mode), 'Selected consciousness mode reaches the server');
       assert.equal(await run(()=>!!document.querySelector('[data-cockpit-tool="recall_growth"]')), mode === 'avatar', 'Puppet cannot replace the character’s thoughts');
       assert(await run(()=>document.documentElement.scrollWidth <= innerWidth), 'Cockpit fits the viewport');
-      assert(await run(()=>document.querySelectorAll('.journey-live-status [data-live-source]').length === 2), 'Both real LLM lanes are visible in the cockpit');
+      assert(await run(()=>document.querySelectorAll('.journey-live-status [data-live-source=Bot],.journey-live-status [data-live-source=World]').length === 2), 'Both real LLM lanes are visible in the cockpit');
       assert(await run(()=>{const dock=document.querySelector('.journey-dock').getBoundingClientRect(), nav=document.querySelector('#mobile-nav').getBoundingClientRect();return getComputedStyle(document.querySelector('.journey-dock')).position==='fixed'&&dock.width<=innerWidth&&dock.left>=0&&dock.right<=innerWidth&&(!nav.height||dock.bottom<nav.top);}), 'Persistent operator dock clears bottom navigation');
       if (mode === 'puppet') {
         for (const [width,height] of [[320,568],[568,320],[320,240]]) {

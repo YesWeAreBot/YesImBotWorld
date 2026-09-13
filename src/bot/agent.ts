@@ -9,7 +9,7 @@ import { needsMsgIds, type Config } from "../config.js";
 import type { WorldFiles } from "../files.js";
 import { RepeatGuard, type ObserveResult } from "./repeatGuard.js";
 import { ToolCallParseError } from "../llm/parse.js";
-import type { BotEvent, CompressionResult, EventSource, MediaRef, ParsedToolCall, PhoneStatus, PickFailure, PickResult, RichText, RichTextPart, ToolCallRecord } from "../types.js";
+import type { BotEvent, CompressionResult, EventSource, ExperienceMetadata, MediaRef, ParsedToolCall, PhoneStatus, PickFailure, PickResult, RichText, RichTextPart, ToolCallRecord } from "../types.js";
 import type { WorldAgent } from "../world/agent.js";
 import type { NotifyManager } from "../koishi/notify.js";
 import { normalizeMsgId } from "../koishi/markers.js";
@@ -19,6 +19,7 @@ import type { BotContext } from "./context.js";
 import { describeToolCall, Scheduler, type ScheduleOptions } from "./scheduler.js";
 import { deviceKind, type DeviceKind } from "../apps/deviceTools.js";
 import { GrowthLedger, type GrowthKind, type ReflectionOpportunity, type ReflectionRelation } from "./growth.js";
+import { GrowthRuntime } from "./growth-runtime.js";
 import { ReceiptInbox } from "./receipts.js";
 import type { WorldObservation } from "../world/state.js";
 import { typingSlackTU } from "./typing.js";
@@ -60,6 +61,8 @@ export interface MessageSendReceipt {
   status: "sent" | "partial" | "blocked" | "unknown";
   text: string;
   messageIds: string[];
+  originEventIds?: string[];
+  experience?: ExperienceMetadata;
 }
 
 export interface MessengerApi {
@@ -122,6 +125,8 @@ export interface MessengerApi {
 }
 
 interface MailboxItem {
+  experience?: ExperienceMetadata;
+  growthReferences?: { claimId: string; recordId: string }[];
   /** Retry the same durable IDs when an append/counter checkpoint fails. */
   event?: BotEvent;
   toolCallRecord?: ToolCallRecord;
@@ -167,6 +172,8 @@ export class BotAgent {
   private backend: BotBackend;
   readonly scheduler: Scheduler;
   readonly growth: GrowthLedger;
+  private readonly growthRuntime: GrowthRuntime;
+  private operationCalls = new Map<string, ToolCallRecord>();
   private readonly receipts: ReceiptInbox;
   private retired = false;
   private receiptsPending = false;
@@ -302,6 +309,7 @@ export class BotAgent {
   ) {
     this.toolDefs = tools ?? BOT_TOOLS;
     this.growth = new GrowthLedger(files.base);
+    this.growthRuntime = new GrowthRuntime(this.growth, config.bot, clock, context, logger);
     this.receipts = new ReceiptInbox(files.base);
     this.repeatGuard = new RepeatGuard({
       thresholds: config.bot.repeatThresholds ?? [3, 5, 8],
@@ -319,20 +327,30 @@ export class BotAgent {
     this.scheduler = new Scheduler(
       clock,
       (content, ref, outcome) => {
+        const performed = ref ? this.operationCalls.get(ref) : undefined;
+        if (ref) this.operationCalls.delete(ref);
         if (ref && this.stealthCalls.has(ref)) {
           this.externalToolResults.get(ref)?.resolve({ ok: outcome?.ok ?? true, text: toPlainText(content), ...(typeof content === "string" ? {} : { content }) });
           this.externalToolResults.delete(ref);
           this.stealthCalls.delete(ref);
           return;
         }
+        const precedingObservations = typeof content === "string" ? [] : content.precedingObservations ?? [];
+        const followingObservations = typeof content === "string" ? [] : content.followingObservations ?? [];
+        if (typeof content !== "string" && (content.precedingObservations || content.followingObservations)) {
+          const { precedingObservations: _preceding, followingObservations: _following, ...receipt } = content;
+          content = receipt;
+        }
         // Preserve non-voluntary provenance before a retired agent persists a late receipt.
+        content = this.describeExperience(content, performed, outcome?.ok);
         content = this.puppetReceipt(content, ref);
         if (this.retired) {
           if (ref) {
             this.externalToolResults.get(ref)?.resolve({ ok: outcome?.ok ?? true, text: toPlainText(content), ...(typeof content === "string" ? {} : { content }) });
             this.externalToolResults.delete(ref);
           }
-          void this.receipts.save(content, this.clock.now(), ref).catch(error => this.logger.error("停止后的工具回执保存失败：%s", error));
+          void this.receipts.save({ ...(typeof content === "string" ? { text: content } : content), precedingObservations, followingObservations }, this.clock.now(), ref)
+            .catch(error => this.logger.error("停止后的工具回执保存失败：%s", error));
           return;
         }
         // 结果溢出治理（spill/prune）：超阈值的结果先裁剪为 head/tail 预览 + 全文落盘，
@@ -346,7 +364,11 @@ export class BotAgent {
             pending.resolve({ ok: outcome?.ok ?? true, text: toPlainText(gated), ...(typeof gated === "string" ? {} : { content: gated }) });
           }
         }
+        for (const observation of precedingObservations) this.pushEvent(observation.source ?? "world", this.spillResult(observation));
         this.pushEvent("tool", gated, { ref });
+        for (const observation of followingObservations) {
+          this.pushEvent(observation.source ?? "koishi", this.spillResult(observation));
+        }
         if (ref) this.puppetCalls.delete(ref);
         this.refreshToolGate();
       },
@@ -516,13 +538,19 @@ export class BotAgent {
   }
 
   async stop(): Promise<void> {
+    this.growthRuntime.stop();
     this.retired = true;
     this.perceptionListeners.clear();
     this.receipts.deactivate();
-    if (!this.running && !this.loopPromise) { this.scheduler.stopAll(); await this.receipts.settled(); return; }
+    if (!this.running && !this.loopPromise) {
+      this.scheduler.stopAll();
+      for (const id of this.operationCalls.keys()) if (!this.scheduler.isPending(id)) this.operationCalls.delete(id);
+      await this.receipts.settled(); return;
+    }
     this.running = false;
     this.abort?.abort();
     this.scheduler.stopAll();
+    for (const id of this.operationCalls.keys()) if (!this.scheduler.isPending(id)) this.operationCalls.delete(id);
     this.stopAllDeferred();
     this.waiting = null;
     this.wakeFn?.();
@@ -622,6 +650,7 @@ export class BotAgent {
       const { callId, kind, startedTU } = this.waiting!;
       const timer = this.scheduler.pending().find(task => task.id === callId);
       const cancellation = this.scheduler.cancel(callId);
+      if (cancellation === "cancelled") this.operationCalls.delete(callId);
       if (cancellation === "cancelled") {
         const elapsed = Math.max(0, this.clock.now() - (startedTU ?? timer?.issuedAt ?? this.clock.now()));
         this.externalToolResults.get(callId)?.resolve({ ok: false, callId, text: `（${kind === "nap" ? "休息" : "等待"}被新动静打断，实际经过 ${elapsed.toFixed(1)} TU；未继续等待到原定时刻。）` });
@@ -668,6 +697,8 @@ export class BotAgent {
 
     this.mailbox.push({
       source,
+      experience: rich.experience,
+      growthReferences: rich.growthReferences,
       originEventIds: opts.originEventIds ?? rich.originEventIds ?? (source === "world" ? observationOrigins(rich.text) : undefined),
       content: rich.text,
       attachments: rich.attachments?.length ? rich.attachments : undefined,
@@ -698,9 +729,64 @@ export class BotAgent {
     const first = rich.parts?.[0];
     return {
       ...rich,
+      experience: { ...rich.experience, agency: "imposed", opportunity: false },
       text: rich.text.startsWith(prefix) ? rich.text : prefix + rich.text,
       ...(rich.parts ? { parts: first?.kind === "text" && first.text.startsWith(prefix) ? rich.parts : [{ kind: "text", text: prefix }, ...rich.parts] } : {}),
     };
+  }
+
+  /** Completion and ownership come from the dispatch path, never from the model's claim of success. */
+  private describeExperience(content: string | RichText, call?: ToolCallRecord, ok?: boolean): RichText {
+    let rich: RichText = typeof content === "string" ? { text: content } : content;
+    if (!call) return rich;
+    const imposed = call.control?.mode === "puppet" || this.puppetCalls.has(call.id);
+    const own = call.role === "agent" || call.control?.mode === "avatar";
+    // Only these dispatchers have an explicit delivery/completion contract. Other application
+    // strings, observations and administrative acknowledgements cannot prove a completed choice.
+    if (!["act", "send"].includes(call.name)) {
+      if (!imposed && !rich.experience) return rich;
+      return { ...rich, experience: { ...rich.experience,
+        agency: imposed ? "imposed" : rich.experience?.agency === "self" ? "unknown" : rich.experience?.agency,
+        opportunity: false,
+        ...(rich.experience?.outcome === "completed" ? { outcome: "unknown" } : {}),
+      } };
+    }
+    let completed = ok === true;
+    let outcome: ExperienceMetadata["outcome"] = rich.experience?.outcome === "unknown" ? "unknown" : ok === false ? "failed" : "unknown";
+    let scene = "";
+    if (call.name === "act") {
+      try {
+        const value = JSON.parse(rich.text);
+        completed = ok === true && value?.action?.status === "completed";
+        outcome = value?.action?.status === "failed" ? "failed" : completed ? "completed" : "unknown";
+        scene = value?.observation?.narrative ?? value?.narrative ?? value?.scene?.text ?? "";
+        if (imposed && value?.action && typeof value.action === "object") {
+          // The perception is public to this character; a controller's submitted intention is not.
+          delete value.action.intent;
+          rich = { ...rich, text: JSON.stringify(value) };
+        }
+      } catch {
+        completed = false;
+        if (imposed) rich = { ...rich, text: ok === false
+          ? "（这次非自主身体动作未能完成，没有可确认的动作经过。）"
+          : "（身体发生了非自主变化，但这次没有取得可确认的动作经过。）" };
+      }
+    } else if (completed) outcome = "completed";
+    if (rich.originEventIds?.length === 0) return rich;
+    const unit = Number.isFinite(this.clock.unitWorldSeconds) ? this.clock.unitWorldSeconds : 1;
+    const experience: ExperienceMetadata = {
+      ...rich.experience,
+      episodeId: rich.experience?.episodeId ?? `choice-period:${Math.floor(call.issuedAt * unit / 1800)}`,
+      agency: imposed ? "imposed" : own ? "self" : "unknown",
+      // Send metadata is supplied after canonical channel resolution using the actual submitted body.
+      action: imposed ? "身体或设备发生了非自主变化"
+        : sliceText(rich.experience?.action ?? describeToolCall(call), 0, 1200),
+      outcome,
+      situation: rich.experience?.situation ?? (call.name === "send" ? `聊天频道 ${this.phoneUi.channelKey ?? "当前会话"}`
+        : `世界中的情境：${sliceText(typeof scene === "string" ? scene : "", 0, 200) || "周围环境"}`),
+      opportunity: own && !imposed && completed,
+    };
+    return { ...rich, experience };
   }
 
   /**
@@ -719,6 +805,8 @@ export class BotAgent {
     const suffix = "\n〔已发送消息结束〕";
     this.mailbox.push({
       source: args ? "tool" : "koishi",
+      originEventIds: rich.originEventIds,
+      experience: { ...rich.experience, agency: "self", action: args ? sliceText(`send ${args.msg}`, 0, 1200) : "发出消息", outcome: "completed", opportunity: true },
       content: prefix + rich.text + suffix,
       attachments: rich.attachments,
       parts: rich.parts ? [{ kind: "text", text: prefix }, ...rich.parts, { kind: "text", text: suffix }] : undefined,
@@ -759,6 +847,7 @@ export class BotAgent {
     const cancelled = this.scheduler.cancelUncommitted();
     if (this.waiting && cancelled.includes(this.waiting.callId)) { this.waiting = null; this.wakeFn?.(); }
     for (const id of cancelled) {
+      this.operationCalls.delete(id);
       this.externalToolResults.get(id)?.resolve({ ok: false, text: "（管理员接管前已取消尚未提交的调用。）" });
       this.externalToolResults.delete(id);
       this.stealthCalls.delete(id);
@@ -832,6 +921,7 @@ export class BotAgent {
     const status = this.scheduler.cancel(id);
     const text = status === "cancelled" ? "尚未提交的调用已取消。" : "调用已开始提交，无法撤销；请等待真实回执。";
     if (status === "cancelled") {
+      this.operationCalls.delete(id);
       this.externalToolResults.get(id)?.resolve({ ok: false, text, callId: id });
       this.externalToolResults.delete(id);
       this.pushEvent("system", text, { ref: id });
@@ -1175,6 +1265,8 @@ export class BotAgent {
       }
       const event = item.event ??= {
         id: this.context.nextEventId(),
+        experience: item.experience,
+        growthReferences: item.growthReferences,
         originEventIds: item.originEventIds,
         source: item.source,
         content: item.content,
@@ -1217,6 +1309,16 @@ export class BotAgent {
   }
 
   private async offerReflection(): Promise<void> {
+    // Maintenance never edits the active request: only this serialized delivery boundary may
+    // append its results. Avatar control defers private automatic changes until handback.
+    if (this.running && !this.manualPaused) {
+      for (const event of [...await this.growthRuntime.drain(), ...await this.growthRuntime.remember()]) {
+        this.publishPerception(event);
+        debug.emit("bot.event", `[growth] ${event.id}`, event);
+      }
+      this.growthRuntime.tick(this.abort?.signal);
+    }
+    if (this.config.bot.growth?.enabled) return;
     if (!this.currentToolNames().includes("reflect")) return;
     if (!this.reflectionPending) {
       const opportunity = await this.growth.reflectionOpportunity();
@@ -1349,13 +1451,22 @@ export class BotAgent {
       case "reflect":
         return this.dispatchLocal(call, async () => {
           const a = call.arguments;
+          const now = this.clock.now(), unit = this.clock.unitWorldSeconds > 0 ? this.clock.unitWorldSeconds : 1;
+          let expiresAt = a.expires_at as number | undefined;
+          if (a.kind === "state" && a.relation !== "counter" && a.relation !== "retire") {
+            if (expiresAt !== undefined && (typeof expiresAt !== "number" || !Number.isFinite(expiresAt) || expiresAt <= now)) throw new Error("临时状态 expires_at 必须是未来的世界 TU 时刻");
+            expiresAt = Math.min(expiresAt ?? now + 7200 / unit, now + 86400 / unit);
+          }
           const result = await this.growth.reflect({
             kind: a.kind as GrowthKind, subject: a.subject as string, statement: a.statement as string,
             evidenceIds: Array.isArray(a.event_ids) ? a.event_ids as string[] : [],
             relation: a.relation as ReflectionRelation | undefined,
             claimId: typeof a.claim_id === "string" ? a.claim_id : undefined,
-          }, this.clock.now());
-          return { text: JSON.stringify(result), originEventIds: [] };
+            situation: a.situation as string | undefined, cues: a.cues as string[] | undefined,
+            subjectId: a.subject_id as string | undefined,
+            expiresAt,
+          }, now);
+          return { text: JSON.stringify(result), originEventIds: [], growthReferences: [{ claimId: result.view.claimId, recordId: result.view.records.at(-1)!.id }] };
         });
       case "recall_growth":
         return this.dispatchLocal(call, async () => {
@@ -1369,6 +1480,7 @@ export class BotAgent {
             keyword,
             claimId: typeof call.arguments.claim_id === "string" ? call.arguments.claim_id : undefined,
             n,
+            at: this.clock.now(),
           });
           if (call.arguments.event_ids != null && (!Array.isArray(call.arguments.event_ids) ||
             call.arguments.event_ids.length > 50 || call.arguments.event_ids.some(id => typeof id !== "string" || !id.trim()))) {
@@ -1377,7 +1489,7 @@ export class BotAgent {
           const evidence = scope === "claims" ? undefined : await this.growth.recallEvidence({
             eventIds: call.arguments.event_ids as string[] | undefined, keyword, n,
           });
-          return { text: JSON.stringify({ ...(claims ? { claims } : {}), ...(evidence ? { evidence } : {}) }), originEventIds: [] };
+          return { text: JSON.stringify({ ...(claims ? { claims } : {}), ...(evidence ? { evidence } : {}) }), originEventIds: [], growthReferences: claims?.map(view => ({ claimId: view.claimId, recordId: view.records.at(-1)!.id })) };
         });
       case "travel":
         return this.dispatchLocal(call, async () => {
@@ -1976,6 +2088,8 @@ export class BotAgent {
    * 且不引入任何等待延迟。带 duration 的调用额外附上编号（可 cancel）与预计完成时刻。
    */
   private ackStart(call: ToolCallRecord): void {
+    // A body controller's request is an administrative intention, not something already perceived.
+    if (call.control?.mode === "puppet" || this.puppetCalls.has(call.id)) return;
     // 按 expectedAt 判断（而非 duration）：ignoreSendDuration 会把 expectedAt 拉回当下，此时按即时调用确认
     if (call.expectedAt - call.issuedAt > 0) {
       this.pushEvent(
@@ -2118,10 +2232,21 @@ export class BotAgent {
         actionCompleted = ok && !adjudicatedFailure;
         if (!ok && !adjudicatedFailure) throw new Error("世界未能裁定此动作，结果尚未确认");
         if (!parts.length) throw new Error("世界未返回可感知的动作结果，不能认定动作成功");
-        // A world snapshot is not a perception. Only return the adjudicator's actor-filtered receipt.
-        const text = parts.join("\n");
-        const origins = parts.flatMap((part) => observationOrigins(part) ?? []);
-        return { text, originEventIds: [...new Set(origins)] };
+        // World delivery can include previously unread perceptions before/after this action.
+        // Each is its own experience; concatenating JSON both breaks the receipt contract and
+        // wrongly attributes those earlier world events to this newly completed choice.
+        let actionIndex = parts.length - 1;
+        for (let index = parts.length - 1; index >= 0; index--) {
+          try { if (JSON.parse(parts[index]!)?.action) { actionIndex = index; break; } } catch { /* retain an opaque remote receipt as unknown below */ }
+        }
+        const observation = (text: string): RichText & { source: "world" } => ({ text, source: "world",
+          originEventIds: observationOrigins(text), experience: { agency: "observed", opportunity: false },
+        });
+        const text = parts[actionIndex]!;
+        return { text, originEventIds: observationOrigins(text) ?? [],
+          precedingObservations: parts.slice(0, actionIndex).map(observation),
+          followingObservations: parts.slice(actionIndex + 1).map(observation),
+        };
       },
     });
   }
@@ -2209,6 +2334,9 @@ export class BotAgent {
 
   /** Both autonomous and human calls serialize one side effect, then release the device. */
   private schedule(call: ToolCallRecord, opts: ScheduleOptions): void {
+    for (const id of this.operationCalls.keys()) if (!this.scheduler.isPending(id)) this.operationCalls.delete(id);
+    if (this.scheduler.isPending(call.id)) throw new Error(`工具调用编号重复：${call.id}`);
+    this.operationCalls.set(call.id, call);
     const kind = call.name === "observe_device" ? call.arguments.device as DeviceKind : this.classifyDevice(call.name);
     if (!kind) {
       this.scheduler.schedule(call, { ...opts, beforeStart: () => {
@@ -2590,17 +2718,27 @@ export class BotAgent {
   /**
    * 发送类工具的成功结果后，回显该频道最近 n 条消息（文本），让模型看到自己的
    * 话"上墙"了、以及对方的最新回应——消除"没发出去/发错了"的错觉，抑制重复发送。
-   * 只取文本（不转发附件），保持轻量。messaging.sendEcho 关闭时只回 out、不带频道列表。
+   * 回显作为随后独立交付的观察，保留图文顺序；发送自身的行为证据不包含群友的历史。
+   * messaging.sendEcho 关闭时只回 out、不带频道列表。
    */
-  private async echoChannelRecent(id: string, out: string, n?: number): Promise<string | RichText> {
+  private async echoChannelRecent(id: string, out: string | RichText, n?: number): Promise<string | RichText> {
     if (this.config.messaging.sendEcho === false) return out;
+    const receipt = typeof out === "string" ? { text: out } : out;
     try {
       const recent = await this.messenger.channelMessages(id, n ?? this.config.messaging.sendEchoRecent, { intro: "echo" });
       const recentText = recent.text.trim();
-      return recentText ? { text: `${out}\n\n${recentText}` } : out;
+      // Readback is a different observation. Combining roots here would make many
+      // independent sends share all older messages and falsely merge their evidence.
+      return recentText ? {
+        ...receipt,
+        followingObservations: [...(receipt.followingObservations ?? []), {
+          ...recent, experience: { ...recent.experience, agency: "observed", opportunity: false },
+        }],
+      } : out;
     } catch (error) {
       this.logger.warn("发送后的聊天回显读取失败，保留原始发送回执：%s", error);
-      return `${out}\n（暂时读不到最新聊天记录；以上发送回执仍有效，不要因回显缺失重复发送。）`;
+      const suffix = "\n（暂时读不到最新聊天记录；以上发送回执仍有效，不要因回显缺失重复发送。）";
+      return { ...receipt, text: receipt.text + suffix, ...(receipt.parts ? { parts: [...receipt.parts, { kind: "text" as const, text: suffix }] } : {}) };
     }
   }
 
@@ -2720,7 +2858,7 @@ export class BotAgent {
     if (!resend && this.config.messaging.recentRepeatThreshold > 0 && recentRepeat >= this.config.messaging.recentRepeatThreshold) {
       return `（你最近已经向这个频道发出过相同内容 ${recentRepeat} 次。本次没有再次发送。没有新的意思就无需换个措辞再说；确有必要重复时才使用 resend: true。）`;
     }
-    const receipt = this.messenger.sendReceipt
+    const receipt: MessageSendReceipt = this.messenger.sendReceipt
       ? await this.messenger.sendReceipt(target.key, msg, media, replyTo, atSender, insist)
       : await this.messenger.send(target.key, msg, media, replyTo, atSender, insist).then(text => ({ text, status: "sent" as const, messageIds: [] }));
     if (receipt.status === "sent") {
@@ -2736,7 +2874,13 @@ export class BotAgent {
     if (receipt.status === "blocked") return receipt.text;
     try { this.noteDeferredSelfSent(target.key); }
     catch (error) { this.logger.warn("发送后更新延期意图失败，保留真实发送回执：%s", error); }
-    return this.echoChannelRecent(id, receipt.text);
+    return this.echoChannelRecent(id, { text: receipt.text, originEventIds: receipt.originEventIds,
+      experience: { ...receipt.experience,
+        action: `向 ${target.key} ${receipt.status === "sent" ? "发送了" : "尝试发送"}消息：${sliceText(msg, 0, 1000)}${media.length ? `（附 ${media.length} 个媒体引用）` : ""}`,
+        situation: `聊天频道 ${target.key}`,
+        outcome: receipt.status === "sent" ? "completed" : "unknown",
+      },
+    });
   }
 
   /** 记录一条已发出的 send 签名，滑窗维护「最近 N 条」（超窗滑出最老） */
@@ -2753,6 +2897,7 @@ export class BotAgent {
     const target = String(call.arguments.id ?? call.arguments.toolcall_id ?? "");
     const result = this.scheduler.cancel(target);
     if (result === "cancelled") {
+      this.operationCalls.delete(target);
       this.externalToolResults.get(target)?.resolve({ ok: false, callId: target, text: "（尚未提交的调用已取消，没有继续执行。）" });
       this.externalToolResults.delete(target);
       this.puppetCalls.delete(target);
@@ -2815,6 +2960,7 @@ export class BotAgent {
 
   private async compactContext(reason: "overflow" | "breakLoop" | null): Promise<void> {
     await this.drainMailbox();
+    if (this.running && !this.manualPaused) this.growthRuntime.tick(this.abort?.signal, true);
     const snapshot = await this.context.compressionSnapshot();
     if (!snapshot.entries.length) return;
     await this.growth.restorePerceptions(snapshot.entries);
@@ -2842,7 +2988,7 @@ export class BotAgent {
     this.refreshToolGate();
     try {
       // The memory writer cannot mutate objective world state.
-      await this.context.applyCompression(result, this.clock.now(), snapshot);
+      await this.context.applyCompression(result, this.clock.now(), snapshot, await this.growth.summary(this.clock.now()));
     } catch (error) {
       for (const name of previousBans) this.tempBannedTools.add(name);
       this.refreshToolGate();

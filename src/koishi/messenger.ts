@@ -27,7 +27,7 @@ import type { NotifyManager } from "./notify.js";
 import type { OwnSendTracker } from "./ownsends.js";
 import type { RequestStore } from "./requests.js";
 import { channelKey as makeChannelKey, parseChannelKey } from "./channels.js";
-import { conversationKind, conversationLabel, describeConversation, type ConversationContext } from "./conversation.js";
+import { chatMessageEvidence, evidenceHash, conversationKind, conversationLabel, describeConversation, type ConversationContext } from "./conversation.js";
 import { normalizeMsgId } from "./markers.js";
 import { executeSelfCommand } from "./self-commands.js";
 
@@ -135,28 +135,32 @@ export class KoishiMessenger implements MessengerApi {
 
   async recentChannels(n: number): Promise<RichText> {
     const channels = await this.store.recentChannels(n);
-    if (!channels.length) return { text: "你翻了翻手机，最近没有任何频道有消息。" };
+    if (!channels.length) return { text: "你翻了翻手机，最近没有任何频道有消息。", originEventIds: [] };
     const lines = await Promise.all(
       channels.map(async ({ key, latest }) => {
         const time = formatTime(latest.timestamp);
-        const who = latest.self ? "你自己" : latest.username || latest.userId;
+        const who = latest.self ? "本账号" : latest.username || latest.userId;
         // 预览只做轻量替换，不触发解释器
         const kind = conversationKind(latest.isDirect, latest.channelId, latest.guildId);
         return `- ${await this.names.display(key)}（${kind === "direct" ? "私聊" : kind === "group" ? "群聊" : "会话类型未知"}） [${time}] ${who}: ${truncate(stripPlaceholders(latest.content), 80)}`;
       }),
     );
-    return { text: `你翻了翻手机，最近活跃的频道：\n${lines.join("\n")}` };
+    return {
+      text: `你翻了翻手机，最近活跃的频道：\n${lines.join("\n")}`,
+      originEventIds: [...new Set(channels.flatMap(({ key, latest }) => chatMessageEvidence(latest, parseChannelKey(key).selfId).originEventIds ?? []))],
+      experience: { agency: "observed", situation: "聊天频道列表" },
+    };
   }
 
   async channelMessages(id: string, n: number, opts?: { intro?: "open" | "read" | "echo" }): Promise<RichText> {
     const resolved = await this.resolveChannel(id);
-    if ("error" in resolved) return { text: resolved.error };
+    if ("error" in resolved) return { text: resolved.error, originEventIds: [] };
     const { platform, channelId, selfId } = resolved;
     // 打开频道 = 开始关注：一段时间内该频道的新消息会直接呈现内容
     await this.focus.focus(makeChannelKey(platform, channelId, selfId));
     const display = await this.names.display(makeChannelKey(platform, channelId, selfId));
     const rows = await this.store.channelMessages(platform, channelId, n, selfId);
-    if (!rows.length) return { text: `频道 ${display} 里还没有任何消息记录。` };
+    if (!rows.length) return { text: `频道 ${display} 里还没有任何消息记录。`, originEventIds: [] };
 
     const attachments: MediaRef[] = [];
     const lines: string[] = [];
@@ -211,6 +215,11 @@ export class KoishiMessenger implements MessengerApi {
     const heading = `${intro}（${channelNote}）。这是此刻可见记录的快照，按消息时间从早到晚排列；同一频道、同一记录编号或 msg 编号再次出现是回读，不是对方又说了一遍。更早看过的内容仍属于你的经历，不因这次只显示最近几条而作废。\n发送者、时间和对话指向是界面标注；只有“消息正文”内是对方的话，不要把昵称标头当成自己要发送的内容。\n`;
     return {
       text: `${heading}${lines.join("\n")}${tail}`,
+      originEventIds: [...new Set(rows.flatMap(row => chatMessageEvidence(row, selfId).originEventIds ?? []))],
+      experience: {
+        ...chatMessageEvidence(rows[rows.length - 1]!, selfId).experience,
+        subjectIds: [...new Set(rows.flatMap(row => chatMessageEvidence(row, selfId).experience?.subjectIds ?? []))],
+      },
       attachments: attachments.length ? attachments : undefined,
       parts: [{ kind: "text", text: heading }, ...parts, ...(tail ? [{ kind: "text" as const, text: tail }] : [])],
     };
@@ -616,6 +625,16 @@ export class KoishiMessenger implements MessengerApi {
     const sentMsgIds: string[] = [];
     const receiptProblems: string[] = [];
     const channelKey = makeChannelKey(target.platform, target.channelId, target.bot.selfId);
+    let confirmedAt: Date | undefined;
+    const confirmedEvidence = (): Pick<MessageSendReceipt, "originEventIds" | "experience"> => {
+      if (!sentMsgIds.length || !confirmedAt) return {};
+      const metadata = sentMsgIds.map(messageId => chatMessageEvidence({ id: 0,
+        platform: target.platform, channelId: target.channelId, selfId: target.bot.selfId,
+        userId: target.bot.selfId, messageId, timestamp: confirmedAt! }));
+      return { originEventIds: [...new Set(metadata.flatMap(item => item.originEventIds ?? []))],
+        // Only the action runner knows whether a human or the character chose this.
+        experience: { episodeId: metadata[0]!.experience?.episodeId, situation: metadata[0]!.experience?.situation } };
+    };
     for (let bi = 0; bi < batches.length; bi++) {
       const batch = batches[bi]!;
       let ids: string[];
@@ -626,15 +645,16 @@ export class KoishiMessenger implements MessengerApi {
         const text = `${bi > 0 ? `（消息已部分发出：前 ${bi} 批已由平台确认${sentMsgIds.length ? `（msg:${sentMsgIds.join("、")}）` : ""}。` : "（"}` +
           `第 ${bi + 1} 批没有取得发送确认：${sendFailText(err)}。${mute ? `${mute}。` : ""}` +
           `这不等于消息一定没有送达，请先查看聊天记录；不要将整条内容缩短后重发，也不要重复已确认的部分。后续 ${batches.length - bi - 1} 批没有提交。）`;
-        return { status: bi > 0 ? "partial" : "unknown", text, messageIds: sentMsgIds };
+        return { status: bi > 0 ? "partial" : "unknown", text, messageIds: sentMsgIds, ...confirmedEvidence() };
       }
       if (!Array.isArray(ids) || !ids.some(Boolean)) {
-        return { status: bi > 0 ? "partial" : "unknown", messageIds: sentMsgIds,
+        return { status: bi > 0 ? "partial" : "unknown", messageIds: sentMsgIds, ...confirmedEvidence(),
           text: `（${bi ? `前 ${bi} 批已确认发送；` : ""}第 ${bi + 1} 批的调用已经返回，但平台没有提供消息确认，送达状态未知。后续批次没有提交，也未执行聊天指令。请先查看聊天记录，不要直接重复发送。）` };
       }
       sentMsgIds.push(...ids.filter(Boolean));
+      confirmedAt = new Date();
       // Platform success is irreversible. A local record failure must never claim it did not send.
-      try { await this.storeSelf(target, batch.stored, ids[0]); }
+      try { await this.storeSelf(target, batch.stored, ids[0], confirmedAt); }
       catch { receiptProblems.push(`第 ${bi + 1} 批已由平台确认发送，但本地聊天记录保存失败`); }
     }
     try { await this.focus.focus(channelKey); }
@@ -654,7 +674,7 @@ export class KoishiMessenger implements MessengerApi {
     if (stickerCount) result += `（其中 ${stickerCount} 个表情包按原顺序单独发送）`;
     if (problems.length) result += `注意：${problems.join("；")}`;
     if (receiptProblems.length) result += `注意：${receiptProblems.join("；")}；不要重复发送。`;
-    return { status: "sent", text: result, messageIds: sentMsgIds };
+    return { status: "sent", text: result, messageIds: sentMsgIds, ...confirmedEvidence() };
   }
 
   private runOwnSend<T>(key: string, run: () => Promise<T>): Promise<T> {
@@ -858,10 +878,11 @@ export class KoishiMessenger implements MessengerApi {
    * 但会把内层内容内联在外层响应里——查看外层时缓存下来，点开内层直接读缓存。
    */
   private forwardCache = new Map<string, Record<string, unknown>[]>();
-  private nestedSeq = 0;
 
   private cacheForward(nodes: Record<string, unknown>[], preferId?: string): string {
-    const key = preferId?.trim() || `nested_${++this.nestedSeq}`;
+    // Reopening an outer record must not invent a fresh ID/experience for the same
+    // embedded child. Platforms without nested IDs still expose a stable payload.
+    const key = preferId?.trim() || `nested_${evidenceHash(nodes).slice(0, 32)}`;
     this.forwardCache.delete(key);
     this.forwardCache.set(key, nodes);
     while (this.forwardCache.size > 30) {
@@ -886,7 +907,7 @@ export class KoishiMessenger implements MessengerApi {
     let lastErr = "";
     if (!nodes) {
       const bot = this.findOnebot();
-      if (!bot) return { text: "（查看聊天记录目前只支持 QQ（OneBot）平台，但当前没有唯一可确定的在线 OneBot 账号。）" };
+      if (!bot) return { text: "（查看聊天记录目前只支持 QQ（OneBot）平台，但当前没有唯一可确定的在线 OneBot 账号。）", originEventIds: [] };
       // 依次尝试：message_id（NapCat 按所在消息取）→ id（resid，go-cqhttp/旧记录）。
       // 不能同时传：部分实现端优先读 id，resid 失效时会直接报错、轮不到 message_id
       for (const params of [{ message_id: toIdValue(rawId) }, { id: rawId }]) {
@@ -914,11 +935,12 @@ export class KoishiMessenger implements MessengerApi {
           if (!m) {
             return {
               text: `（消息（msg:${rawId}）不是合并转发的聊天记录——view_forward 的 id 要用消息里 <forward id="…"/> 标签中的那个。）`,
+              originEventIds: [],
             };
           }
         }
       }
-      return { text: `（点不开这份聊天记录：${lastErr || "内容为空或格式无法解析"}。它可能已过期，或需要先点开包含它的那一层。）` };
+      return { text: `（点不开这份聊天记录：${lastErr || "内容为空或格式无法解析"}。它可能已过期，或需要先点开包含它的那一层。）`, originEventIds: [] };
     }
 
     const selfId = this.findOnebot()?.selfId ?? "";
@@ -929,19 +951,22 @@ export class KoishiMessenger implements MessengerApi {
       const sender = (node.sender ?? {}) as Record<string, unknown>;
       const who =
         selfId && String(sender.user_id ?? "") === String(selfId)
-          ? "你自己"
+          ? "本账号"
           : String(sender.nickname ?? sender.card ?? node.nickname ?? sender.user_id ?? "?");
       const time =
         typeof node.time === "number" && node.time > 0 ? `[${formatTime(new Date(node.time * 1000))}] ` : "";
       const segments = (Array.isArray(node.content) ? node.content : Array.isArray(node.message) ? node.message : []) as Record<string, unknown>[];
       const body = typeof node.content === "string" ? escapeMediaStorageText(node.content) : await this.serializeRawSegments(segments);
-      lines.push(`${time}${who}: ${body || "（空消息）"}`);
+      lines.push(`〔转发条目 · ${time || "原时间未知"}〕\n转发内署名：${who}\n转发正文：\n${body || "（空消息）"}\n〔转发条目结束〕`);
     }
     if (nodes.length > shown.length) lines.push(`（还有 ${nodes.length - shown.length} 条未显示）`);
 
     // 媒体占位符 → 按当前能力渲染（原生附件 / 解释文本）
-    const rendered = await this.renderer.render(lines.join("\n"));
-    return rendered;
+    const rendered = await this.renderer.render("你读到这份转发记录。下面的署名、时间和正文来自转发内容；它们不是这些人此刻在当前聊天中又说了一遍，也不证明本账号署名的内容由你亲自发出。\n" + lines.join("\n"));
+    const root = "chat-forward:" + evidenceHash(["onebot", selfId, rawId]);
+    return { ...rendered, originEventIds: [root], experience: {
+      episodeId: root, agency: "observed", situation: "阅读转发记录", subjectIds: [],
+    } };
   }
 
   /** 原始 OneBot 消息段 → 存储文本（媒体入资产库，嵌套聊天记录保留为标签） */
@@ -1975,6 +2000,7 @@ export class KoishiMessenger implements MessengerApi {
     target: { bot: Bot; platform: string; channelId: string; isDirect: boolean },
     content: string,
     messageId?: string,
+    timestamp = new Date(),
   ): Promise<void> {
     await this.store.store({
       platform: target.platform,
@@ -1984,7 +2010,7 @@ export class KoishiMessenger implements MessengerApi {
       userId: target.bot.selfId ?? "self",
       username: "（我）",
       content,
-      timestamp: new Date(),
+      timestamp,
       self: true,
       messageId: messageId ?? "",
       isDirect: target.isDirect,

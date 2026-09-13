@@ -132,6 +132,8 @@
   color:var(--accent2);
   background:#c66c4012
 }
+.live-lane[data-live-source=Growth] { grid-column:1 / -1; }
+.live-lane[data-live-source=Growth] .live-source-mark { color:var(--accent-blue,#718fe4); background:color-mix(in srgb,var(--accent-blue,#718fe4) 12%,var(--surface)); }
 
 .live-lane-state {
   display:inline-flex;

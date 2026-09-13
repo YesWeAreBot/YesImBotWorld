@@ -5,7 +5,7 @@ export default async function smokeCharts({ evaluate, wait, assert, navigate, pa
   assert.equal(await evaluate("document.querySelectorAll('#nav a[href=\"#debug\"]').length"), 0);
   await evaluate("document.querySelector('#observatory-tab-events').click()");
   await wait("document.querySelector('#observatory-events .insight-plot-mark')");
-  assert(await evaluate("document.querySelector('#observatory-calls').hidden && !document.querySelector('#observatory-events').hidden && document.querySelectorAll('.live-lane').length === 2"));
+  assert(await evaluate("document.querySelector('#observatory-calls').hidden && !document.querySelector('#observatory-events').hidden && document.querySelectorAll('.live-lane[data-live-source=Bot],.live-lane[data-live-source=World]').length === 2"));
   await evaluate("Array.from(document.querySelectorAll('.insight-tabs button')).find(b=>b.textContent==='事件密度').click()");
   await wait("document.querySelector('.insight-plot-detail').textContent.includes('条事件')");
   await evaluate("document.querySelector('.insight-plot-detail button').click()");

@@ -23,7 +23,7 @@ async function main() {
   const bot: any = { platform: "fixture", selfId: "self" };
   const logger = { warn() {}, info() {}, debug() {} };
   const ctx: any = { bots: [bot], on() {}, logger: () => logger, model: { extend() {} }, database: {
-    async create(_table: string, row: any) { rows.push({ ...row, id: rows.length + 1 }); },
+    async create(_table: string, row: any) { const saved = { ...row, id: rows.length + 1 }; rows.push(saved); return saved; },
     async get(_table: string, query: any) { return rows.filter(row => Object.entries(query).every(([key, value]: [string, any]) => value?.$in ? value.$in.includes(row[key]) : row[key] === value)); },
   } };
   const refs = new Map<number, any>();
@@ -77,11 +77,17 @@ async function main() {
     cfg.messaging.externalSelfMessages = "silent";
     await emit("silent-image", [h("img", { src: "fixture:3", sub_type: 1 })]);
     assert.equal(rendered, captionsBefore);
-    assert.deepEqual(deliveries.at(-1)!.content, { text: "" });
+    assert.deepEqual(deliveries.at(-1)!.content, { text: "", originEventIds: [] });
     cfg.messaging.externalSelfMessages = "event"; phone.down = true;
     await emit("phone-down-image", [h("img", { src: "fixture:4" })]);
     assert.equal(rendered, captionsBefore);
-    assert.deepEqual(deliveries.at(-1)!.content, { text: "" });
+    const downNotice = deliveries.at(-1)!.content;
+    assert.equal(downNotice.text, "");
+    assert.ok(downNotice.originEventIds.every((id: string) => id.startsWith("chat-notice:")));
+    assert.equal(downNotice.experience.subjectIds, undefined);
+    assert.equal(downNotice.attachments, undefined);
+    assert.equal(downNotice.parts, undefined);
+    assert.doesNotMatch(JSON.stringify(downNotice), /summary-4|media:4|room/);
     assert.ok(rows.some(row => row.messageId === "phone-down-image" && row.content.includes('media id="4"')));
 
     phone.down = false; cfg.messaging.externalSelfMessages = "simulate";

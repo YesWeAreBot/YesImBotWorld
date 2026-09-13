@@ -1477,6 +1477,7 @@ details.adv>.body {
 /* ---------- 弹层 ---------- */
 #toasts {
   position:fixed;
+  pointer-events:none;
   top:16px;
   right:16px;
   z-index:80;

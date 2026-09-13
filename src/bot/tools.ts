@@ -80,13 +80,13 @@ export const BOT_TOOLS: BotToolDef[] = [
   },
   {
     name: "reflect",
-    signature: 'reflect(kind: "relationship" | "commitment" | "preference", subject: string, statement: string, event_ids: string[], relation?: "support" | "counter" | "revise", claim_id?: string)',
-    description: "根据亲身感知的经历形成或修正认识：关系、承诺、偏好。event_ids 引用意识流 event 的 id，至少一个；无法引用未感知的事。新认识保持暂定；已有认识用 claim_id，support 补证据、counter 记录反例、revise 修正判断。重复观察同一来源不会算新证据；单次经历不自动变成永久人格。",
+    signature: 'reflect(kind: "relationship" | "commitment" | "preference" | "state" | "habit" | "trait", subject: string, statement: string, event_ids: string[], relation?: "support" | "counter" | "revise" | "retire", claim_id?: string, situation?: string, cues?: string[], subject_id?: string, expires_at?: number)',
+    description: "主动整理或修正关系、承诺、偏好、临时状态、情境习惯和性格倾向。event_ids 引用至少一个实际感知事件。state/habit/trait 必须写 situation（适用情境），cues 写想起它的情境词；subject_id 只能使用已感知的稳定身份。state 的 expires_at 为未来 TU，省略为两世界小时，最长一天，不代表永久性格。habit 至少有3段独立的自主完成选择，trait 至少6段且跨3种情境；次数只是核验底线，还须真实支持判断。已有认识给 claim_id；support 补证、counter 反例、revise 修正、retire 停止沿用。重读、失败重试和被迫行为不证明自主习惯；没有实践机会不等于习惯消退。",
   },
   {
     name: "recall_growth",
-    signature: 'recall_growth(scope?: "claims" | "evidence" | "all", event_ids?: string[], kind?: "relationship" | "commitment" | "preference", subject?: string, keyword?: string, claim_id?: string, n?: number)',
-    description: "回顾已经记录的认识与亲历。scope 默认 claims：关系、承诺、偏好及其证据；evidence：尚未整理或已归档的亲历，可用 event_ids 精确重读；all：两者。压缩后仍可找到原始事件 ID 并交给 reflect。keyword 与 n 两者通用，kind/subject/claim_id 仅筛选认识。主观认识可被修正，回忆本身不构成新证据。",
+    signature: 'recall_growth(scope?: "claims" | "evidence" | "all", event_ids?: string[], kind?: "relationship" | "commitment" | "preference" | "state" | "habit" | "trait", subject?: string, keyword?: string, claim_id?: string, n?: number)',
+    description: "回顾已经记录的认识与亲历。scope 默认 claims：关系、承诺、偏好、临时状态、情境习惯、性格倾向及其修订依据（包括已到期或停止沿用的历史，请注意 active 与适用时段）；evidence：尚未整理或已归档的亲历，可用 event_ids 精确重读；all：两者。压缩后仍可找到原始事件 ID 并交给 reflect。keyword 与 n 两者通用，kind/subject/claim_id 仅筛选认识。主观认识可被修正，回忆本身不构成新证据。",
   },
   {
     name: "check_msg",

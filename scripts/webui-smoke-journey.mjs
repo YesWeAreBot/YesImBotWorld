@@ -73,7 +73,7 @@ export async function smokeJourney({ evaluate, wait, assert, navigate }) {
       document.querySelector('[data-cockpit-field="action:target"]')?.tagName === 'INPUT'),
     'An observation presents the actor and observed action targets.');
 
-    assert(await run(()=>document.querySelectorAll('.journey-live-status [data-live-source]').length === 2), 'Independent actors see both permitted LLM status lanes.');
+    assert(await run(()=>document.querySelectorAll('.journey-live-status [data-live-source=Bot],.journey-live-status [data-live-source=World]').length === 2), 'Independent actors see both permitted LLM status lanes.');
     await run(async()=>{
       const input=document.querySelector('.journey-action-input'); window.__journeySmoke.imeNode=input; input.focus(); input.value='尚在编写';input.dispatchEvent(new Event('input',{bubbles:true}));input.dispatchEvent(new CompositionEvent('compositionstart',{bubbles:true}));
       const arrive=window.__journeySmoke.calls.find(c=>c.path==='/api/player/arrive');

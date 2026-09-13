@@ -30,10 +30,11 @@ import type { CrossingPerceptionEvent, PlayerMode } from "./crossing/protocol.js
 import { CrossingServer } from "./crossing/server.js";
 import { WorldFiles } from "./files.js";
 import { resolvePhoneResolution } from "./phone.js";
-import { CHAT_RUNTIME_GUIDANCE, Prompts, type PromptOverrides } from "./prompts.js";
+import { CHAT_RUNTIME_GUIDANCE, GROWTH_RUNTIME_GUIDANCE, GROWTH_MANUAL_GUIDANCE, Prompts, type PromptOverrides } from "./prompts.js";
 import { WebUIServer, type BotStatusSummary, type DevicesInfo, type NoteEntry, type WebUIHost } from "./webui/server.js";
 import { FocusManager } from "./koishi/focus.js";
 import { Gateway, prefixRichText } from "./koishi/gateway.js";
+import { anonymousChatNoticeEvidence } from "./koishi/conversation.js";
 import { MessageStore } from "./koishi/messages.js";
 import { KoishiMessenger } from "./koishi/messenger.js";
 import { ChannelNameResolver } from "./koishi/names.js";
@@ -199,14 +200,14 @@ export class WorldService extends Service<Config> {
         } else if (mode === "event") {
           const recipient = this.bot;
           if (this.phoneStatus.down) {
-            recipient.pushEvent("koishi", "放在一边的手机震了一下。", { wake: config.messaging.wakeOnNotify });
+            recipient.pushEvent("koishi", { text: "放在一边的手机震了一下。", ...anonymousChatNoticeEvidence(content) }, { wake: config.messaging.wakeOnNotify });
             return;
           }
           try {
             const display = await this.names.display(key);
             if (!this.worldActive || this.bot !== recipient) return;
             if (this.phoneStatus.down) {
-              recipient.pushEvent("koishi", "放在一边的手机震了一下。", { wake: config.messaging.wakeOnNotify });
+              recipient.pushEvent("koishi", { text: "放在一边的手机震了一下。", ...anonymousChatNoticeEvidence(content) }, { wake: config.messaging.wakeOnNotify });
               return;
             }
             const msgTag = msgId && needsMsgIds(config.platformOps) ? `(msg:${msgId}) ` : "";
@@ -572,6 +573,11 @@ export class WorldService extends Service<Config> {
     if (!this.botContext.stream.some(entry => entry.kind === "event" && entry.event.source === "system" && entry.event.content === CHAT_RUNTIME_GUIDANCE)) {
       this.bot.pushEvent("system", CHAT_RUNTIME_GUIDANCE);
     }
+    const growthGuidance = this.config.bot.growth?.enabled ? GROWTH_RUNTIME_GUIDANCE : GROWTH_MANUAL_GUIDANCE;
+    const previousGrowthGuidance = [...this.botContext.stream].reverse().find(entry => entry.kind === "event" && entry.event.source === "system" && entry.event.content.startsWith("（经历整理方式："));
+    if (previousGrowthGuidance?.kind !== "event" || previousGrowthGuidance.event.content !== growthGuidance) {
+      this.bot.pushEvent("system", growthGuidance);
+    }
     this.bot.pushEvent("system", "可以继续先前的生活。recovered 标记表示已保存处境的回读，不是新发生的行动，也不证明这些动作出于你的自主意图。未完成动作以实际回执为准；系统暂停本身不代表角色睡眠或失神。");
     const offline = this.clock.consumeOfflineGap();
     const min = this.config.clock.offlineNarrateMinUnits;
@@ -879,7 +885,7 @@ export class WorldService extends Service<Config> {
     const session = this.crossingServer?.residentSession(token), bot = this.bot;
     if (!session || !bot || this.residentSession?.id !== session.id) throw new Error("常驻角色接管会话不存在或已结束");
     const [evidence, claims] = session.mode === "avatar"
-      ? await Promise.all([bot.growth.recallEvidence({ n: 30 }), bot.growth.recall({ n: 50 })]) : [[], []];
+      ? await Promise.all([bot.growth.recallEvidence({ n: 30 }), bot.growth.recall({ n: 50, at: this.clock?.now() })]) : [[], []];
     return {
       mode: session.mode, running: this.worldActive && bot.status().running,
       control: { paused: bot.manualMode, busy: this.devicePending > 0 || bot.residentBusy },
@@ -889,6 +895,7 @@ export class WorldService extends Service<Config> {
       }), pending: bot.pendingManualCalls(),
       time: { unitWorldSeconds: this.clock?.unitWorldSeconds ?? 1, unitRealSeconds: this.clock?.unitRealSeconds ?? 1 },
       choices: {
+        subject_id: [...new Set(evidence.flatMap(item => item.experience?.subjectIds ?? []))].map(id => ({ id, label: `已感知的身份 · ${id}` })),
         evidence: evidence.map(item => ({ id: item.eventId, label: `T=${item.observedAt.toFixed(1)} · ${perceptionLabel(item.text)}` })),
         claims: claims.map(item => ({ id: item.claimId, label: `${item.subject} · ${item.statement}` })),
       },
@@ -1173,7 +1180,7 @@ export class WorldService extends Service<Config> {
     return this.world.runtime.inspect();
   }
 
-  async getGrowth(): Promise<unknown> { return new GrowthLedger(this.files.base).recall({ n: 50 }); }
+  async getGrowth(): Promise<unknown> { return new GrowthLedger(this.files.base).recall({ n: 50, at: this.clock?.now() }); }
 
   getClock() {
     return this.clock ?? null;

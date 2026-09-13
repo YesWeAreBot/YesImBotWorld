@@ -62,9 +62,26 @@ export type RichTextPart =
   | { kind: "text"; text: string }
   | { kind: "media"; ref: MediaRef; name?: string; summary?: string; sticker?: boolean; marker: string };
 
+/** Facts about an already delivered experience, never access to hidden controller intent. */
+export interface ExperienceMetadata {
+  episodeId?: string;
+  agency?: "self" | "imposed" | "observed" | "unknown";
+  action?: string;
+  outcome?: "completed" | "failed" | "unknown";
+  situation?: string;
+  subjectIds?: string[];
+  /** Only an observed opportunity can support a decision not to repeat a habit. */
+  opportunity?: boolean;
+}
+
 /** 带附件的富文本（附件 = Bot-LLM 原生支持的模态，以 content part 注入） */
 export interface RichText {
   text: string;
+  /** Separate already committed perceptions; preserve their order without merging action agency or roots. */
+  precedingObservations?: (RichText & { source?: "world" | "koishi" })[];
+  followingObservations?: (RichText & { source?: "world" | "koishi" })[];
+  experience?: ExperienceMetadata;
+  growthReferences?: { claimId: string; recordId: string }[];
   /** Original events actually perceived by this actor; inherited by summaries/repeated observations. */
   originEventIds?: string[];
   attachments?: MediaRef[];
@@ -92,6 +109,8 @@ export interface PhoneStatus {
 
 export interface BotEvent {
   id: string;
+  experience?: ExperienceMetadata;
+  growthReferences?: { claimId: string; recordId: string }[];
   /** Original perceived causes, for evidence deduplication (never a global event access grant). */
   originEventIds?: string[];
   source: EventSource;
@@ -141,6 +160,8 @@ export interface PinnedContext {
   toolsText: string;
   /** 记忆摘要 */
   memoryDigest: string;
+  /** A derived, bounded growth summary, refreshed only at a committed compression boundary. */
+  growthSummary?: string;
   /** 上次刷新（压缩）时的世界时刻 */
   updatedAt: number;
 }

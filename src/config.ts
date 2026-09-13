@@ -7,6 +7,7 @@ export interface ModalitySupport {
 }
 
 export interface BotModelConfig {
+  growth: GrowthConfig;
   baseURL: string;
   apiKey: string;
   model: string;
@@ -40,6 +41,15 @@ export interface BotModelConfig {
   /** 移除工具后仍在重复，达到多少次就强制执行带压缩的 rest（需 breakLoop 开启） */
   breakLoopForceRestAt: number;
   modalities: ModalitySupport;
+}
+
+export interface GrowthConfig {
+  enabled: boolean;
+  minEpisodes: number;
+  reviewIntervalMs: number;
+  reviewTimeoutMs: number;
+  maxInputChars: number;
+  recallCount: number;
 }
 
 export interface CaptionerConfig {
@@ -332,6 +342,14 @@ export const Config: Schema<Config> = Schema.intersect([
 
   Schema.object({
     bot: Schema.object({
+      growth: Schema.object({
+        enabled: Schema.boolean().default(true).description("自动整理已感知经历，形成可修订的关系、习惯和性格倾向，并在相关情境中唤起记忆；使用 Bot 的模型配置，独立请求，不改写当前上下文前缀"),
+        minEpisodes: Schema.natural().min(1).max(24).default(4).description("积累多少段不同经历后尝试整理；这是调用节流条件，不是习惯或性格升级阈值"),
+        reviewIntervalMs: Schema.natural().min(1000).default(120000).description("两次自动整理的最短现实间隔（毫秒），无变化或失败也等待该间隔"),
+        reviewTimeoutMs: Schema.natural().min(1000).max(300000).default(45000).description("一次自动整理的超时（毫秒），包含等待共享模型端点的时间；超时保留经历供后续重试"),
+        maxInputChars: Schema.natural().min(4000).max(100000).default(24000).description("自动整理请求的输入预算（字符），超长证据以明确的节选呈现，原文继续保存在账本"),
+        recallCount: Schema.natural().min(0).max(6).default(3).description("相关情境中最多自动想起几条认识；0 关闭自动回忆，仍可主动 recall_growth"),
+      }).description("关系、习惯与性格变化"),
       baseURL: Schema.string()
         .default("http://127.0.0.1:8080/v1")
         .description("API 地址（OpenAI 兼容根路径，含 /v1）"),

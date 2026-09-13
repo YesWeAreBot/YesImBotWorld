@@ -13,7 +13,7 @@ import type { NotifyManager } from "./notify.js";
 import type { OwnSendTracker } from "./ownsends.js";
 import { SelfMessageCapture, type ConfirmedSelfMessage } from "./self-message-capture.js";
 import type { RequestStore } from "./requests.js";
-import { conversationKind, conversationLabel, describeConversation, isStickerElement, type ConversationContext } from "./conversation.js";
+import { anonymousChatNoticeEvidence, chatMessageEvidence, conversationKind, conversationLabel, describeConversation, isStickerElement, type ConversationContext } from "./conversation.js";
 export { isStickerElement } from "./conversation.js";
 
 export interface GatewayCallbacks {
@@ -346,7 +346,7 @@ export class Gateway {
     const content = await this.serializeElements(message.elements, { containerMsgId: messageId });
     if (!content.trim()) return;
     const direct = session?.event?.channel?.type == null ? undefined : session.isDirect;
-    await this.store.store({
+    const saved = await this.store.store({
       selfId: bot.selfId, platform, channelId, guildId: session?.guildId ?? "",
       userId: bot.selfId, username: "（我）", content, timestamp: new Date(message.timestamp), self: true, messageId,
       isDirect: direct ?? channelId.startsWith("private:"),
@@ -356,7 +356,11 @@ export class Gateway {
     // Store all enabled modes, but expand media only when that mode actually exposes
     // the message. A put-down phone event must never smuggle images into awareness.
     const visible = this.cfg.externalSelfMessages === "simulate" || (this.cfg.externalSelfMessages === "event" && !this.phone.down);
-    const rendered = visible ? await this.renderer.render(content) : { text: "" };
+    const rendered: RichText = visible
+      ? { ...await this.renderer.render(content), ...chatMessageEvidence(saved) }
+      : this.cfg.externalSelfMessages === "event"
+        ? { text: "", ...anonymousChatNoticeEvidence(chatMessageEvidence(saved), saved.timestamp.getTime()) }
+        : { text: "", originEventIds: [] };
     await this.callbacks.selfMessage(key, rendered, messageId, selfSendArguments(message.elements, content));
   }
 
@@ -422,7 +426,7 @@ export class Gateway {
         }) + ` ${content}`;
     }
 
-    await this.store.store({
+    const saved = await this.store.store({
       selfId: session.selfId ?? session.bot?.selfId ?? "",
       platform: session.platform ?? "unknown",
       channelId: session.channelId ?? "unknown",
@@ -446,14 +450,27 @@ export class Gateway {
 
     // 手机被放下：本会通知的消息一律降级为"感觉到震动"，不呈现任何内容
     if (this.phone.down) {
-      this.callbacks.notify({ text: "放在一边的手机震了一下。" }, this.cfg.wakeOnNotify);
+      this.callbacks.notify({ text: "放在一边的手机震了一下。",
+        ...anonymousChatNoticeEvidence(chatMessageEvidence(saved), saved.timestamp.getTime()) }, this.cfg.wakeOnNotify);
       return;
     }
 
     const notification = focused
       ? await this.renderFocused(key, session, content, conversation)
       : await this.renderNotification(key, session, content, conversation);
-    this.callbacks.notify(notification, focused ? true : this.cfg.wakeOnNotify);
+    // Rendering images or resolving names can finish after the phone was put down.
+    // Recheck the actual delivery boundary before exposing text or participant facts.
+    if (this.phone.down) {
+      this.callbacks.notify({ text: "放在一边的手机震了一下。",
+        ...anonymousChatNoticeEvidence(chatMessageEvidence(saved), saved.timestamp.getTime()) }, this.cfg.wakeOnNotify);
+      return;
+    }
+    // Only full message delivery grants the evidence identity and its participants.
+    // A vibration/count/channel preview is not the unseen message's body.
+    this.callbacks.notify(focused || this.cfg.notifyPolicy === "content"
+      ? { ...notification, ...chatMessageEvidence(saved) }
+      : { ...notification, ...anonymousChatNoticeEvidence(chatMessageEvidence(saved), saved.timestamp.getTime()) },
+    focused ? true : this.cfg.wakeOnNotify);
   }
 
   /** 元素树 → 存储文本：媒体下载入资产库并替换为占位符 */

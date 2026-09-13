@@ -68,8 +68,10 @@ export class MessageStore {
     );
   }
 
-  async store(row: Omit<WorldMessageRow, "id">): Promise<void> {
-    await this.ctx.database.create("yesimbot_world_message", row);
+  async store(row: Omit<WorldMessageRow, "id">): Promise<WorldMessageRow> {
+    // Keep the database identity when the platform provides no message ID. A later
+    // history read must identify this as the same experience as its live notification.
+    return this.ctx.database.create("yesimbot_world_message", row);
   }
 
   private accountId(row: WorldMessageRow): string | undefined {

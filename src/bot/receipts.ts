@@ -3,7 +3,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import type { BotEvent, RichText } from "../types.js";
 
-interface StoredReceipt { version: 1; epoch: string; event: BotEvent }
+interface StoredReceipt { version: 1; epoch: string; event: BotEvent; precedingObservations?: BotEvent[]; followingObservations?: BotEvent[] }
 const consumers = new Map<string, { owner: object; wake: () => void }>();
 
 /** Late results never write an old BotContext. Epochs deliberately do not roll back with saves. */
@@ -26,13 +26,23 @@ export class ReceiptInbox {
 
   save(content: string | RichText, worldTime: number, refToolCallId?: string): Promise<void> {
     const rich: RichText = typeof content === "string" ? { text: content } : content;
-    const event: BotEvent = { id: `ev_receipt_${randomUUID()}`, source: "tool", content: rich.text, worldTime,
-      ...(refToolCallId ? { refToolCallId } : {}), ...(rich.originEventIds ? { originEventIds: rich.originEventIds } : {}),
-      ...(rich.attachments ? { attachments: rich.attachments } : {}), ...(rich.parts ? { parts: rich.parts } : {}), ...(rich.statusEcho ? { statusEcho: rich.statusEcho } : {}) };
+    const toEvent = (value: RichText, source: BotEvent["source"], ref?: string): BotEvent => ({
+      id: `ev_receipt_${randomUUID()}`, source, content: value.text, worldTime,
+      ...(value.experience ? { experience: value.experience } : {}), ...(value.growthReferences ? { growthReferences: value.growthReferences } : {}),
+      ...(ref ? { refToolCallId: ref } : {}), ...(value.originEventIds ? { originEventIds: value.originEventIds } : {}),
+      ...(value.attachments ? { attachments: value.attachments } : {}), ...(value.parts ? { parts: value.parts } : {}), ...(value.statusEcho ? { statusEcho: value.statusEcho } : {}),
+    });
+    const event = toEvent(rich, "tool", refToolCallId);
+    const precedingObservations = rich.precedingObservations?.map(observation => toEvent(observation, observation.source ?? "world"));
+    const followingObservations = rich.followingObservations?.map(observation => toEvent(observation, observation.source ?? "koishi"));
     const work = this.writes.then(async () => {
       const epoch = await this.epoch;
       await fs.mkdir(this.directory, { recursive: true });
-      await this.atomicFile(path.join(this.directory, `${event.id}.json`), JSON.stringify({ version: 1, epoch, event } satisfies StoredReceipt));
+      // One durable envelope preserves receipt-before-readback order through a crash.
+      await this.atomicFile(path.join(this.directory, `${event.id}.json`), JSON.stringify({ version: 1, epoch, event,
+        ...(precedingObservations?.length ? { precedingObservations } : {}),
+        ...(followingObservations?.length ? { followingObservations } : {}),
+      } satisfies StoredReceipt));
       consumers.get(this.base)?.wake();
     });
     this.writes = work.catch(() => {});
@@ -50,7 +60,12 @@ export class ReceiptInbox {
       const receipt = JSON.parse(await fs.readFile(file, "utf8")) as StoredReceipt;
       if (receipt.version !== 1 || receipt.epoch !== epoch) continue; // Retain other timelines as an administrative audit only.
       if ((await fs.readFile(this.epochPath, "utf8")).trim() !== epoch) return;
+      for (const observation of receipt.precedingObservations ?? []) await accept(observation);
       await accept(receipt.event);
+      for (const observation of receipt.followingObservations ?? []) {
+        if ((await fs.readFile(this.epochPath, "utf8")).trim() !== epoch) return;
+        await accept(observation);
+      }
       await fs.rm(file, { force: true });
     }
   }

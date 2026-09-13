@@ -180,7 +180,9 @@ async function galleryAndSend() {
   assert.ok(confirmed.startsWith("消息已发送")); assert.ok(confirmed.includes("不要重复发送")); assert.equal(f.sent.length, sendCount + 1);
   chooser.logger = logger; chooser.config = { messaging: { sendEcho: true } };
   chooser.messenger.channelMessages = async () => { throw new Error("echo unavailable"); };
-  assert.ok((await chooser.echoChannelRecent("fixture:private:peer", confirmed)).startsWith("消息已发送"));
+  const echoFailure = await chooser.echoChannelRecent("fixture:private:peer", confirmed);
+  assert.ok(echoFailure.text.startsWith("消息已发送"));
+  assert.match(echoFailure.text, /不要因回显缺失重复发送/);
   console.log("PASS gallery names/summaries verified against asset hashes, strict ref parsing, read-only selection, exact outgoing image bytes and sticker/text ordering");
 }
 async function repeatedMediaBoundaries() {

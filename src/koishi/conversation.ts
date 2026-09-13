@@ -1,4 +1,53 @@
 import type { h } from "koishi";
+import { createHash } from "node:crypto";
+import type { RichText } from "../types.js";
+import type { WorldMessageRow } from "./messages.js";
+import { channelKey } from "./channels.js";
+
+/** A record identity is independent of notification/read/tool-call IDs. Opaque roots
+ * cannot accidentally reveal a hidden message's sender or content to a later reader. */
+export function chatMessageEvidence(row: Pick<WorldMessageRow, "id" | "platform" | "selfId" | "channelId" | "userId" | "messageId" | "timestamp">, accountId = row.selfId ?? ""): Pick<RichText, "originEventIds" | "experience"> {
+  const account = row.selfId || accountId;
+  const channel = [row.platform, account, row.channelId];
+  const timestamp = new Date(row.timestamp).getTime();
+  // Timestamp also protects the fallback if an administrator clears a database
+  // whose auto-increment sequence is then reused; ordinary rereads keep both values.
+  const message = row.messageId ? ["platform", String(row.messageId)] : ["stored", row.id, timestamp];
+  return {
+    originEventIds: ["chat-message:" + evidenceHash([...channel, ...message])],
+    experience: {
+      episodeId: "chat-episode:" + evidenceHash([...channel, Number.isFinite(timestamp) ? Math.floor(timestamp / 1_800_000) : "unknown-time"]),
+      agency: "observed",
+      situation: `聊天频道 ${channelKey(row.platform, row.channelId, account || undefined)}`,
+      // A quotation/forwarded author's name does not make them a live participant.
+      // Account ownership also does not prove voluntary authorship of a self message.
+      subjectIds: row.userId ? [chatSubjectId(row.platform, row.userId)] : [],
+    },
+  };
+}
+
+export function chatSubjectId(platform: string, userId: string): string {
+  return "chat-user:" + JSON.stringify([platform, userId]);
+}
+
+/** A heard vibration is evidence of the notification, never of its unseen message.
+ * All anonymous notifications share a phone/time episode without leaking which
+ * account, channel or person caused them. Body delivery keeps a distinct root. */
+export function anonymousChatNoticeEvidence(content: Pick<RichText, "originEventIds" | "experience">, timestamp = Date.now()): Pick<RichText, "originEventIds" | "experience"> {
+  return {
+    ...(content.originEventIds ? { originEventIds: [...new Set(content.originEventIds.map(root =>
+      root.startsWith("chat-notice:") ? root : "chat-notice:" + evidenceHash([root])))] } : {}),
+    experience: {
+      episodeId: content.experience?.episodeId?.startsWith("phone-notice-episode:") ? content.experience.episodeId
+        : "phone-notice-episode:" + evidenceHash([Number.isFinite(timestamp) ? Math.floor(timestamp / 1_800_000) : "unknown-time"]),
+      agency: "observed", situation: "手机通知",
+    },
+  };
+}
+
+export function evidenceHash(parts: readonly unknown[]): string {
+  return createHash("sha256").update(JSON.stringify(parts)).digest("hex");
+}
 
 /** Platform-declared use, not a visual/filename/summary guess. NapCat also reports market faces
  * as image.file=marketface (https://napneko.github.io/develop/msg). */
