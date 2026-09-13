@@ -652,7 +652,7 @@ img.full {
   border-radius:10px;
   padding:10px;
   margin-bottom:10px;
-  background:rgba(7,9,15,.4)
+  background:var(--panel)
 }
 .list-item .row {
   display:flex;
@@ -1399,7 +1399,7 @@ details.adv>.body {
   display:none;
   padding:9px 12px;
   border-top:1px solid var(--line);
-  background:rgba(7,9,15,.45)
+  background:var(--bg)
 }
 .dbg.open .detail {
   display:block

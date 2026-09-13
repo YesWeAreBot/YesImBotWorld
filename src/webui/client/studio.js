@@ -125,6 +125,18 @@ var Studio = (function () {
         $('#account-role').textContent = isVisitor() ? (VISITOR_PRESET === 'player' ? '体验与互动' : '按授权范围观测') : '管理与观测';
         document.body.classList.toggle('visitor-readonly', isVisitor());
     };
+    function observeMobileNavigation() {
+        var nav = $('#mobile-nav');
+        // Include wrapped labels and the device safe area; desktop display:none yields zero.
+        function measure() {
+            document.documentElement.style.setProperty('--mobile-nav-height', nav.getBoundingClientRect().height + 'px');
+        }
+        if (typeof ResizeObserver === 'function')
+            new ResizeObserver(measure).observe(nav, { box: 'border-box' });
+        else
+            window.addEventListener('resize', measure);
+        measure();
+    }
     function dispatch(name, detail) { window.dispatchEvent(new CustomEvent(name, { detail: detail })); }
     refreshOverview = function () {
         if (overviewRequest)
@@ -380,9 +392,14 @@ var Studio = (function () {
         return function () { alive = false; };
     });
     function start() {
-        document.body.dataset.theme = localStorage.getItem('studio_theme') === 'dark' ? 'dark' : 'light';
-        $('#btn-theme').innerHTML = icon(document.body.dataset.theme === 'dark' ? 'moon' : 'sun');
-        $('#btn-theme').onclick = function () { var theme = document.body.dataset.theme === 'dark' ? 'light' : 'dark'; document.body.dataset.theme = theme; localStorage.setItem('studio_theme', theme); $('#btn-theme').innerHTML = icon(theme === 'dark' ? 'moon' : 'sun'); };
+        function applyTheme(theme) {
+            document.body.dataset.theme = theme;
+            document.documentElement.style.colorScheme = theme;
+            $('#btn-theme').innerHTML = icon(theme === 'dark' ? 'moon' : 'sun');
+            $('meta[name="theme-color"]').content = theme === 'dark' ? '#0b1420' : '#f3f6fa';
+        }
+        applyTheme(localStorage.getItem('studio_theme') === 'dark' ? 'dark' : 'light');
+        $('#btn-theme').onclick = function () { var theme = document.body.dataset.theme === 'dark' ? 'light' : 'dark'; applyTheme(theme); localStorage.setItem('studio_theme', theme); };
         $('#btn-refresh').innerHTML = icon('refresh');
         $('#btn-refresh').onclick = function () { navigate(activeView); refreshOverview(false).catch(showErr); };
         $('.search-glyph').innerHTML = icon('search');
@@ -441,6 +458,7 @@ var Studio = (function () {
         } });
         $('#main').appendChild(el('div', { cls: 'studio-skeleton' }));
         buildNav();
+        observeMobileNavigation();
         refreshOverview(false).then(function () { started = true; buildNav(); navigate(can(location.hash.slice(1)) ? location.hash.slice(1) : firstRoute()); connectSSE(); }).catch(function (e) { error($('#main'), e, function () { location.reload(); }); });
         setInterval(function () { if (!document.hidden)
             refreshOverview(false).catch(function () { }); }, 10000);

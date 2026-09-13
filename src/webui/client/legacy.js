@@ -755,11 +755,14 @@ function updateSaveBar(bar){
     bar.appendChild(el('span', {style:'font-size:12.5px;color:var(--fg-dark)', text:'只读模式 · 配置不可修改'}));
     return;
   }
-  bar.appendChild(el('span', {id:'cfg-dirty-dot', cls:'dirty-dot', style: cfgDirty ? '' : 'visibility:hidden'}));
-  bar.appendChild(el('span', {style:'font-size:12.5px;color:var(--fg-dim)', text: cfgDirty ? '有未保存的修改' : '已保存的状态'}));
-  bar.appendChild(el('span', {cls:'spacer'}));
-  if(cfgDirty) bar.appendChild(el('button', {text:'放弃修改', onclick:function(){ cfgDirty = false; loadConfig(); }}));
-  bar.appendChild(el('button', {cls:'primary', text:'保存并应用', onclick: saveConfig}));
+  bar.appendChild(el('span', {cls:'cfg-save-status', role:'status'}, [
+    el('span', {id:'cfg-dirty-dot', cls:'dirty-dot', style: cfgDirty ? '' : 'visibility:hidden'}),
+    el('span', {text: cfgDirty ? '有未保存的修改' : '已保存的状态'})
+  ]));
+  var actions = el('div', {cls:'cfg-save-actions'});
+  if(cfgDirty) actions.appendChild(el('button', {text:'放弃修改', onclick:function(){ cfgDirty = false; loadConfig(); }}));
+  actions.appendChild(el('button', {cls:'primary', text:'保存并应用', onclick: saveConfig}));
+  bar.appendChild(actions);
 }
 function markCfgDirty(){
   if(!cfgDirty){ cfgDirty = true; updateSaveBar(); }
@@ -1485,7 +1488,7 @@ function renderGalleryGrid(){
       img.onclick = function(){ showImage(e.category + ' / ' + e.name, url); };
       card.appendChild(img);
     } else {
-      card.appendChild(el('div', {style:'height:120px;display:flex;align-items:center;justify-content:center;background:rgba(7,9,15,.5);font-size:30px;color:var(--fg-dark)', text:'📄'}));
+      card.appendChild(el('div', {style:'height:120px;display:flex;align-items:center;justify-content:center;background:var(--bg2);font-size:30px;color:var(--fg-dark)', text:'📄'}));
     }
     card.appendChild(el('div', {cls:'m', text: e.name + ' · ' + fmtBytes(e.size)}));
     card.appendChild(el('div', {cls:'d', text: e.description || '（无描述）'}));

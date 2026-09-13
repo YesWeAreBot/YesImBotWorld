@@ -13,6 +13,7 @@ import smokeCharts from './webui-smoke-charts.mjs';
 import smokeCockpit from './webui-smoke-cockpit.mjs';
 import smokeCommands from './webui-smoke-commands.mjs';
 import smokeAttachments from './webui-smoke-attachments.mjs';
+import smokeLayout from './webui-smoke-layout.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const children = [];
@@ -99,7 +100,10 @@ try {
     await page('Emulation.setDeviceMetricsOverride', { width, height: 1050, deviceScaleFactor: 1, mobile: width < 600 });
     for (const route of routes) {
       await navigate(route);
-      assert.ok(await evaluate('document.documentElement.scrollWidth <= innerWidth'), `${route}: horizontal overflow at ${width}px`);
+      const viewport = await evaluate('({content:document.documentElement.scrollWidth,layout:innerWidth,visual:visualViewport.width,scale:visualViewport.scale})');
+      // Mobile Chromium may widen innerWidth and zoom out to accommodate overflow.
+      // Compare with the emulated device, not with that already-expanded viewport.
+      assert.ok(viewport.content <= width + 1 && viewport.layout <= width + 1 && viewport.visual <= width + 1 && Math.abs(viewport.scale - 1) < .01, `${route}: viewport overflow at ${width}px: ${JSON.stringify(viewport)}`);
     }
     console.log(`PASS all ${routes.length} pages at ${width}px`);
   }
@@ -126,6 +130,7 @@ try {
   assert.equal(await evaluate('document.body.dataset.theme'), 'dark');
   await evaluate("document.querySelector('#btn-theme').click()");
   console.log('PASS login cancellation, command search and theme switch');
+  console.log('PASS', await smokeLayout(helpers));
   console.log('PASS', await smokeLive(helpers));
   console.log('PASS', await smokeAttachments(helpers));
   console.log('PASS', await smokeCharts(helpers));
