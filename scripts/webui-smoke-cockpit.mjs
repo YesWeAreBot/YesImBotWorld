@@ -12,10 +12,38 @@ export default async function smokeCockpit({ evaluate, wait, assert, navigate, p
   try {
     for (const mode of ['puppet','avatar']) {
       await page('Emulation.setDeviceMetricsOverride', { width: mode === 'puppet' ? 375 : 1440, height: 1050, deviceScaleFactor:1, mobile:mode === 'puppet' });
+      await run(async () => {
+        await refreshOverview(false);
+        await api('POST','/api/world/stop',{});
+        lastOverview = null;
+        window.__cockpitSmoke.overviewBeforeMount = window.__cockpitSmoke.calls.filter(c=>c.path==='/api/overview').length;
+      });
       await navigate('player');
+      await wait(`document.querySelector('[data-journey-availability]')?.hidden === false && document.querySelector('[data-journey-arrive]')?.disabled`);
+      assert(await run(()=>window.__cockpitSmoke.calls.filter(c=>c.path==='/api/overview').length>window.__cockpitSmoke.overviewBeforeMount), 'Entry fetches authoritative running status even without a cached overview');
+      assert(await run(()=>document.querySelector('[data-journey-availability] a')?.getAttribute('href')==='#overview' && document.querySelector('[data-journey-availability]').textContent.includes('世界尚未运行')), 'Stopped entry explains the prerequisite and links administrators to the overview');
+      await click('作为独立角色入场');
+      await run(async()=>{
+        const name=document.querySelector('.journey-identity input'),persona=document.querySelector('.journey-persona');
+        name.value='等待开场的旅人';persona.value='世界暂停时仍能准备的角色设定';
+        [name,persona].forEach(n=>n.dispatchEvent(new Event('input',{bubbles:true})));
+        window.__cockpitSmoke.entryDraft=name;name.focus();name.setSelectionRange(1,3);
+        await refreshOverview(false);
+      });
+      assert(await run(()=>{const n=window.__cockpitSmoke.entryDraft;return n.isConnected&&!n.disabled&&document.activeElement===n&&n.selectionStart===1&&n.selectionEnd===3&&n.value==='等待开场的旅人'&&!document.querySelector('.journey-persona').disabled;}),'Stopped-world updates preserve editable identity drafts and the exact focused input');
       await click('接管常驻角色');
-      await wait(`document.querySelector('[data-takeover-mode="${mode}"]') && !Array.from(document.querySelectorAll('main button')).find(b=>b.textContent==='接管 小澈')?.disabled`);
+      await wait(`!!document.querySelector('[data-takeover-mode="${mode}"]') && document.querySelector('[data-journey-arrive]')?.textContent === '接管 小澈'`);
       await run(mode=>document.querySelector('[data-takeover-mode="'+mode+'"]').click(), mode);
+      assert(await run(mode=>document.querySelector('[data-takeover-mode="'+mode+'"]').getAttribute('aria-pressed')==='true' && !document.querySelector('[data-takeover-mode="'+mode+'"]').disabled && document.querySelector('[data-journey-arrive]').disabled,mode), 'Both consciousness modes remain selectable while entry is blocked');
+      await run(()=>{
+        window.__cockpitSmoke.arrivalsBeforeStart=window.__cockpitSmoke.calls.filter(c=>c.path==='/api/player/arrive').length;
+        document.querySelector('[data-journey-arrive]').dispatchEvent(new MouseEvent('click',{bubbles:true}));
+      });
+      assert(await run(()=>window.__cockpitSmoke.calls.filter(c=>c.path==='/api/player/arrive').length===window.__cockpitSmoke.arrivalsBeforeStart), 'A stopped-world submission does not reach the entry API');
+      await run(async()=>{await api('POST','/api/world/start',{});await refreshOverview(false);});
+      await wait(`!document.querySelector('[data-journey-arrive]')?.disabled && document.querySelector('[data-journey-availability]')?.hidden === true`);
+      await run(()=>window.dispatchEvent(new CustomEvent('studio:overview',{detail:{}})));
+      assert(await run(mode=>document.querySelector('[data-takeover-mode="'+mode+'"]').getAttribute('aria-pressed')==='true'&&!document.querySelector('[data-journey-arrive]').disabled,mode), 'Running-state events restore entry without changing the selected mode; unknown status does not imply a stopped world');
       await click('接管 小澈');
       await wait(`!!document.querySelector('.journey-connection.connected') && !!document.querySelector('[data-cockpit-tool="observe"]')`);
       assert(await run(mode=>window.__cockpitSmoke.calls.filter(c=>c.path==='/api/player/arrive').at(-1).body.mode === mode, mode), 'Selected consciousness mode reaches the server');
@@ -153,6 +181,6 @@ export default async function smokeCockpit({ evaluate, wait, assert, navigate, p
     });
     assert(await run(()=>window.__cockpitSmoke.evidenceInitiallyEmpty&&window.__cockpitSmoke.evidenceDraft.isConnected&&document.activeElement===window.__cockpitSmoke.evidenceDraft&&window.__cockpitSmoke.evidenceDraft.value==='这件事值得记住'&&window.__cockpitSmoke.evidenceSubmission.args.event_ids[0]==='perceived-exact-id'),'Evidence choices can arrive later without manual IDs, draft replacement or focus changes');
     await run(()=>document.querySelector('[data-cockpit-test]').remove());
-    return ['puppet/avatar mode selection, authorized observation and schema-driven tools','real pending call cancellation, TU conversion and dynamic app capabilities','resident-aware devices, mobile dock safe area and persistent IME inputs','name-based application choices and nested typed forms'];
+    return ['stopped-world entry guidance, preserved identity drafts and automatic start recovery in both modes','puppet/avatar mode selection, authorized observation and schema-driven tools','real pending call cancellation, TU conversion and dynamic app capabilities','resident-aware devices, mobile dock safe area and persistent IME inputs','name-based application choices and nested typed forms'];
   } finally { await run(()=>{api=window.__cockpitSmoke.original;delete window.__cockpitSmoke;}); }
 }

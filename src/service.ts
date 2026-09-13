@@ -764,6 +764,7 @@ export class WorldService extends Service<Config> {
 
   /** WebUI：玩家入世界（同部署真人玩家，复用 crossing server，不走邀请码） */
   arrivePlayer(name: string, persona: string, mode: PlayerMode = "cross"): { ok: true; token: string; worldName: string; timeLine: string } | { ok: false; error: string } {
+    if (!this.worldActive || !this.bot) return { ok: false, error: "世界尚未运行，暂时无法进入或接管角色。请先启动世界。" };
     if (!this.crossingServer) return { ok: false, error: "穿越服务未开启（crossing.serverEnabled）" };
     return this.crossingServer.arrivePlayer(name, persona, mode);
   }

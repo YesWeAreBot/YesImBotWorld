@@ -37,6 +37,7 @@
     Studio.register('player', function (container) {
         var key = scope(), state = getSession(key), destroyed = false, stream = null, busy = false, observeBusy = false, selectedTarget = state.selectedTarget || '';
         var profile = { name: '', persona: '' }, resident = '', residentDefinition = '', errorText = '', route = state.takeover ? 'takeover' : 'cross', takeoverMode = state.mode === 'puppet' ? 'puppet' : 'avatar', cockpitDraft = state.cockpitDraft || (state.cockpitDraft = {}), cockpit = { tools: [], pending: [] }, formDraft = state.actionDraft || (state.actionDraft = { description: '', speech: '', duration: '0' });
+        var worldRunning = lastOverview && typeof lastOverview.worldRunning === 'boolean' ? lastOverview.worldRunning : null;
         var main = el('div', { cls: 'journey-page' }), readableStates = new WeakMap(), shellKey = '', shell = null, liveCleanup = null, dockObserver = null, deviceSession = null, deviceRefreshing = false, profileEdited = false, pickerChoices = {}, pickerFlights = {}, lastViewportHeight = 0;
         function readState(record, key) { var group = readableStates.get(record); if (!group) { group = Object.create(null); readableStates.set(record, group); } return group[key] || (group[key] = {}); }
         container.appendChild(main);
@@ -258,7 +259,7 @@
             return Promise.resolve();
         }
         function arrive() {
-            if (busy)
+            if (busy || worldRunning === false)
                 return;
             busy = true;
             errorText = '';
@@ -485,12 +486,18 @@
             if (!isVisitor())
                 choice.appendChild(button('接管常驻角色', function () { route = 'takeover'; redraw(); }, route === 'takeover' ? 'journey-route active' : 'journey-route'));
             var action = button(busy ? '正在建立连接…' : route === 'takeover' ? '接管 ' + (resident || '常驻角色') : '以这个角色入场', arrive, 'journey-primary');
-            action.disabled = busy || (route === 'takeover' && !resident);
+            action.disabled = busy || worldRunning === false || (route === 'takeover' && !resident);
             action.dataset.journeyArrive = '1';
+            var availability = el('div', { cls: 'journey-note', 'data-journey-availability': '', role: 'status' }, [
+                el('p', { text: '世界尚未运行，暂时无法进入或接管角色。你可以先准备角色设定与接管模式。' }),
+                isVisitor() ? el('span', { text: '请联系管理员先启动世界。' }) : el('a', { href: '#overview', text: '前往总览启动世界' })
+            ]);
+            availability.hidden = worldRunning !== false;
             return el('section', { cls: 'journey-card journey-identity' }, [
                 el('div', { cls: 'journey-section-kicker', text: '01 / 角色身份' }), el('h2', { text: '你将以谁的身份出现？' }),
                 choice, field('角色名', name), field(route === 'takeover' ? '常驻角色定义' : '角色设定', persona, route === 'takeover' ? '沿用创作者的角色定义；如需修改，请前往世界设定。' : '这是你维护的身份。世界观测不会替换这里的文字。'),
                 route === 'takeover' ? modePicker() : note('在世界中创建一位独立访客。你的每个动作都由世界根据实际条件裁定。'),
+                availability,
                 errorText ? el('div', { cls: 'journey-error', role: 'alert', text: errorText }) : null,
                 action, note('入场前可以修改；到达后的观测会告诉你身处何处。')
             ]);
@@ -648,7 +655,8 @@
                 if (shell) updateInside();
                 else {
                     updatePreview();
-                    var action = main.querySelector('[data-journey-arrive]'); if (action) { action.disabled = busy || (route === 'takeover' && !resident); action.textContent = busy ? '正在建立连接…' : route === 'takeover' ? '接管 ' + (resident || '常驻角色') : '以这个角色入场'; }
+                    var action = main.querySelector('[data-journey-arrive]'); if (action) { action.disabled = busy || worldRunning === false || (route === 'takeover' && !resident); action.textContent = busy ? '正在建立连接…' : route === 'takeover' ? '接管 ' + (resident || '常驻角色') : '以这个角色入场'; }
+                    var availability = main.querySelector('[data-journey-availability]'); if (availability) availability.hidden = worldRunning !== false;
                     main.querySelectorAll('.journey-routes button,.journey-takeover-modes button').forEach(function (node) { node.disabled = busy; });
                     main.querySelectorAll('.journey-identity input,.journey-persona').forEach(function (node) { node.disabled = busy || route === 'takeover' && node.tagName === 'INPUT'; });
                     if (!profileEdited || route === 'takeover') { var input = main.querySelector('.journey-identity input'), persona = main.querySelector('.journey-persona'); if (input && document.activeElement !== input) input.value = route === 'takeover' ? resident : profile.name; if (persona && document.activeElement !== persona) persona.value = route === 'takeover' ? residentDefinition : profile.persona; }
@@ -663,7 +671,9 @@
             if (nextKey.startsWith('inside:')) inside(); else outside();
         }
         function onSessionChange(event) { if (event.detail !== key) return; if (state.phase === 'inside' && state.token && !connections[key]) connect(); else redraw(); }
+        function onOverview(event) { if (destroyed || !event.detail || typeof event.detail.worldRunning !== 'boolean' || worldRunning === event.detail.worldRunning) return; worldRunning = event.detail.worldRunning; redraw(); }
         window.addEventListener('studio:journey', onSessionChange);
+        window.addEventListener('studio:overview', onOverview);
         window.addEventListener('studio:refresh', refreshControl);
         controlTimer = setInterval(refreshControl, 2000);
         window.addEventListener('resize', resizeDock);
@@ -679,7 +689,8 @@
                 }
                 catch (_) { }
             } }),
-            api('GET', '/api/state').then(function (result) { resident = result.meta && result.meta.botName || result.botName || ''; residentDefinition = result.botDef || ''; })
+            api('GET', '/api/state').then(function (result) { resident = result.meta && result.meta.botName || result.botName || ''; residentDefinition = result.botDef || ''; }),
+            refreshOverview(false)
         ]).then(function (results) {
             if (destroyed)
                 return;
@@ -692,6 +703,6 @@
             else
                 redraw();
         });
-        return function () { destroyed = true; state.selectedTarget = selectedTarget; if (liveCleanup) liveCleanup(); if (dockObserver) dockObserver.disconnect(); window.removeEventListener('resize', resizeDock); window.removeEventListener('pagehide', saveDrafts); if (window.visualViewport) { visualViewport.removeEventListener('resize', resizeDock); visualViewport.removeEventListener('scroll', resizeDock); } if (!state.token || state.phase !== 'inside') closeStream(); clearInterval(controlTimer); window.removeEventListener('studio:journey', onSessionChange); window.removeEventListener('studio:refresh', refreshControl); persist(key, state); };
+        return function () { destroyed = true; state.selectedTarget = selectedTarget; if (liveCleanup) liveCleanup(); if (dockObserver) dockObserver.disconnect(); window.removeEventListener('resize', resizeDock); window.removeEventListener('pagehide', saveDrafts); if (window.visualViewport) { visualViewport.removeEventListener('resize', resizeDock); visualViewport.removeEventListener('scroll', resizeDock); } if (!state.token || state.phase !== 'inside') closeStream(); clearInterval(controlTimer); window.removeEventListener('studio:journey', onSessionChange); window.removeEventListener('studio:overview', onOverview); window.removeEventListener('studio:refresh', refreshControl); persist(key, state); };
     });
 })();

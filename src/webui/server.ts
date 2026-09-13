@@ -559,6 +559,17 @@ export class WebUIServer {
     // 到达：玩家用账号档案；管理员用请求体里的角色身份（含 mode=进入语义）
     if (pathname === "/api/player/arrive" && method === "POST") {
       const body = await readJson(req, 1024 * 1024).catch(() => null);
+      // A stopped world may not have loaded its resident name into memory yet. Check the
+      // lifecycle before comparing identities, so ordinary unavailability never looks like
+      // an unsupported NPC takeover. Keep this server check even when the UI disables entry.
+      if (!this.host.worldRunning()) {
+        return void sendJSON(res, 409, {
+          error: isAdmin
+            ? "世界尚未运行，暂时无法进入或接管角色。请先在总览页启动世界。"
+            : "世界尚未运行，暂时无法进入。请等待管理员启动世界。",
+          code: "world_not_running",
+        });
+      }
       let name: string;
       let persona: string;
       let mode: PlayerMode;
@@ -578,13 +589,16 @@ export class WebUIServer {
           ? body.mode
           : (profile.mode ?? "cross");
       }
-      if (mode !== "cross" && (!isAdmin || name !== this.host.residentBotName().trim())) {
+      const botName = this.host.residentBotName().trim();
+      if (isAdmin && mode !== "cross" && !botName) {
+        return void sendJSON(res, 409, { error: "常驻 Bot 的身份信息尚未就绪，请稍后重试接管。", code: "resident_not_ready" });
+      }
+      if (mode !== "cross" && (!isAdmin || name !== botName)) {
         return void sendJSON(res, 400, { error: "目前只支持穿越独立角色；已有 NPC 的扮演/操纵尚未实现。管理员可同名接管常驻 Bot。" });
       }
       const r = this.host.arrivePlayer(name, persona, mode);
       if (!r.ok) return void sendJSON(res, 400, { error: r.error });
       // 管理员与常驻 Bot 同名（扮演/操纵）＝接管 Bot：扮演=暂停 Bot-LLM 自主生成，操纵=继续自主运行
-      const botName = this.host.residentBotName().trim();
       let control: void | DeviceControlResult = undefined;
       if (isAdmin && botName && name === botName && (mode === "avatar" || mode === "puppet")) {
         control = await this.host.acquirePlayerControl(r.token);

@@ -105,7 +105,7 @@ const server=http.createServer(async(req,res)=>{
   if(path==='/api/computer/screen')return json({error:'开发样本的电脑为终端模式，没有远程桌面画面。'},503);
   if(path==='/api/notes')return json(fixture.notes());
   if(path==='/api/player/profile'){if(req.method==='PUT')profile=body;return json({profile,botName:'小澈'});}
-  if(path==='/api/player/arrive'){player={token:'preview-player',mode:body.mode,takeover:['avatar','puppet'].includes(body.mode)};if(body.name)profile={name:body.name,persona:body.persona||''};const control=player.takeover?fixture.resident(player.mode):undefined;return json({ok:true,control,token:player.token,worldName:'林间小屋',timeLine:'09:41 · 初秋的清晨',botName:'小澈',takeover:player.takeover,isAdmin:true});}
+  if(path==='/api/player/arrive'){if(!running)return json({error:'世界尚未运行，暂时无法进入或接管角色。请先在总览页启动世界。',code:'world_not_running'},409);player={token:'preview-player',mode:body.mode,takeover:['avatar','puppet'].includes(body.mode)};if(body.name)profile={name:body.name,persona:body.persona||''};const control=player.takeover?fixture.resident(player.mode):undefined;return json({ok:true,control,token:player.token,worldName:'林间小屋',timeLine:'09:41 · 初秋的清晨',botName:'小澈',takeover:player.takeover,isAdmin:true});}
   if(path==='/api/player/task'){
    if(receipts.has(body.taskId)){setTimeout(()=>playerEvent(receipts.get(body.taskId)),40);return json({ok:true,accepted:true,taskId:body.taskId});}
    const result={type:'task_result',taskId:body.taskId,ok:true,content:JSON.stringify(body.kind==='observe'?observation():{observation:observation(),action:{id:body.taskId,status:'completed'}})};receipts.set(body.taskId,result);setTimeout(()=>playerEvent(result),150);return json({ok:true,accepted:true,taskId:body.taskId});

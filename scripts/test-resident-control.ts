@@ -156,9 +156,68 @@ async function httpAndCrossing(dir: string) {
   await cross.disconnectVisitors("fixture disconnect"); assert.deepEqual(released, [resident.id]); assert.equal(cross.residentSession(arrival.token), null);
 }
 
+async function admission(dir: string) {
+  const cfg = Config({ autoStart: false }); cfg.webui.token = "fixture-admin";
+  let running = false, residentName = "", acquired = 0;
+  const arrivals: { name: string; mode: string }[] = [];
+  const host: any = {
+    config: cfg, webuiDir: dir, files: { base: dir },
+    worldRunning: () => running, residentBotName: () => residentName,
+    arrivePlayer(name: string, _persona: string, mode: string) {
+      arrivals.push({ name, mode });
+      return { ok: true, token: "local-control", worldName: "fixture", timeLine: "T=1" };
+    },
+    acquirePlayerControl: async () => {
+      acquired++;
+      return { ok: true, paused: arrivals.at(-1)?.mode === "avatar", busy: false, text: "fixture control" };
+    },
+  };
+  const server: any = new WebUIServer(host);
+  async function arrive(mode: string, name = "resident") {
+    const req: any = Readable.from([Buffer.from(JSON.stringify({ mode, name, persona: "fixture" }))]);
+    req.method = "POST"; req.url = "/api/player/arrive"; req.headers = { authorization: "Bearer fixture-admin" };
+    let status = 0, result = "";
+    await server.handle(req, { writeHead(code: number) { status = code; }, end(data: any) { result = String(data); }, setHeader() {} });
+    return { status, body: JSON.parse(result) };
+  }
+  // Before first startup the displayed name exists on disk but the runtime name is empty.
+  // After a pause it may remain cached. Both states must report lifecycle, not identity errors.
+  for (const cachedName of ["", "resident"]) {
+    residentName = cachedName;
+    for (const mode of ["avatar", "puppet", "cross"]) {
+      const response = await arrive(mode);
+      assert.equal(response.status, 409);
+      assert.equal(response.body.code, "world_not_running");
+      assert.match(response.body.error, /世界尚未运行.*总览页启动世界/);
+      assert.doesNotMatch(response.body.error, /NPC|同名|尚未实现/);
+    }
+  }
+  assert.equal(arrivals.length, 0); assert.equal(acquired, 0, "stopped entry creates no control session");
+  running = true;
+  residentName = "";
+  const loading = await arrive("avatar");
+  assert.equal(loading.status, 409); assert.equal(loading.body.code, "resident_not_ready");
+  assert.doesNotMatch(loading.body.error, /NPC|尚未实现/);
+  assert.equal(arrivals.length, 0);
+  residentName = "resident";
+  for (const mode of ["avatar", "puppet"]) {
+    const response = await arrive(mode);
+    assert.equal(response.status, 200); assert.equal(response.body.mode, mode);
+    assert.equal(response.body.control.paused, mode === "avatar");
+    assert.deepEqual(arrivals.at(-1), { name: "resident", mode });
+  }
+  assert.equal(acquired, 2, "both resident takeover modes remain supported once the world runs");
+  assert.equal((await arrive("avatar", "some-npc")).status, 400, "starting the world does not bypass actor authorization");
+  assert.equal(arrivals.length, 2);
+  const service: any = Object.create(WorldService.prototype);
+  Object.assign(service, { worldActive: false, bot: null, crossingServer: { arrivePlayer() { throw Error("must not create a stopped-world session"); } } });
+  assert.match(service.arrivePlayer("resident", "", "avatar").error, /世界尚未运行/);
+  console.log("PASS resident admission: cold start and paused world report lifecycle before identity; both takeover modes resume after startup");
+}
+
 async function main() {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "yesimbot-resident-"));
-  try { await semantics(path.join(dir, "semantics")); await lifecycles(path.join(dir, "lifecycle")); await httpAndCrossing(path.join(dir, "webui")); console.log("PASS resident control: puppet agency, avatar inheritance, device ownership, complete tool schemas, session authorization, cancellation/commit and lifecycle fences"); }
+  try { await semantics(path.join(dir, "semantics")); await lifecycles(path.join(dir, "lifecycle")); await httpAndCrossing(path.join(dir, "webui")); await admission(path.join(dir, "admission")); console.log("PASS resident control: puppet agency, avatar inheritance, device ownership, complete tool schemas, session authorization, cancellation/commit and lifecycle fences"); }
   finally { await fs.rm(dir, { recursive: true, force: true }); }
 }
 main().catch(error => { console.error(error); process.exitCode = 1; });
