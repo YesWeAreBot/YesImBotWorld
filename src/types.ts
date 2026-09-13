@@ -60,7 +60,7 @@ export interface PickFailure {
 /** RichText 的一个有序分段：文本段 或 原生媒体段（图文混排按此顺序铺开） */
 export type RichTextPart =
   | { kind: "text"; text: string }
-  | { kind: "media"; ref: MediaRef; name?: string; summary?: string; marker: string };
+  | { kind: "media"; ref: MediaRef; name?: string; summary?: string; sticker?: boolean; marker: string };
 
 /** 带附件的富文本（附件 = Bot-LLM 原生支持的模态，以 content part 注入） */
 export interface RichText {
@@ -98,6 +98,8 @@ export interface BotEvent {
   content: string;
   /** Frozen model-facing prose for a newly persisted narrative-world event. Raw content stays intact. */
   contextText?: string;
+  /** New-event media projection may refer to complete earlier events; absent preserves legacy rendering. */
+  mediaReuse?: boolean;
   /** 事件进入上下文时的世界时刻（Time Unit） */
   worldTime: number;
   /** 若此事件是某个工具调用的结果，指向该调用 */

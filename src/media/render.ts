@@ -3,10 +3,10 @@ import type { CaptionService } from "./captioner.js";
 import type { MediaStore } from "./store.js";
 import { mediaPart, mediaText } from "./presentation.js";
 
-export const MEDIA_PLACEHOLDER = /<media id="(\d+)" type="(image|audio|video)"\/>/g;
+export const MEDIA_PLACEHOLDER = /<media id="(\d+)" type="(image|audio|video)"(?: sticker="(true|false)")?\/>/g;
 
-export function mediaPlaceholder(id: number, type: MediaType): string {
-  return `<media id="${id}" type="${type}"/>`;
+export function mediaPlaceholder(id: number, type: MediaType, sticker?: boolean): string {
+  return `<media id="${id}" type="${type}"${type === "image" && sticker !== undefined ? ` sticker="${sticker}"` : ""}/>`;
 }
 
 /** User-authored text must not masquerade as a persisted asset downloaded from the platform. */
@@ -70,7 +70,7 @@ export class MediaRenderer {
       cursor = match.index! + match[0].length;
       const id = Number(match[1]);
       const type = match[2] as MediaType;
-      const seg = await this.renderOneParts(id, type, attachments);
+      const seg = await this.renderOneParts(id, type, attachments, match[3] === undefined ? undefined : match[3] === "true");
       if (seg.kind === "media") {
         result += mediaText(seg);
         parts.push(seg);
@@ -98,12 +98,13 @@ export class MediaRenderer {
     id: number,
     type: MediaType,
     attachments: MediaRef[],
+    sticker?: boolean,
   ): Promise<RichTextPart> {
     const row = await this.store.get(id);
     if (!row) return { kind: "text", text: `（${TYPE_LABEL[type]} media:${id} 已丢失，无法查看或发送。）` };
 
     const caption = await this.captioner.describe(row.ref);
-    const part = mediaPart(row.ref, { summary: caption ?? undefined });
+    const part = mediaPart(row.ref, { summary: caption ?? undefined, ...((sticker ?? row.sticker) ? { sticker: true } : {}) });
 
     if (this.nativeSupport(row.ref) && attachments.length < this.maxAttachments) {
       attachments.push(row.ref);

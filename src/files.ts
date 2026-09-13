@@ -20,9 +20,9 @@ export interface WorldMeta {
   phoneShellHtml?: string;
 }
 
-const BOT_DEF_TEMPLATE = `# Bot 角色定义
+const BOT_DEF_TEMPLATE = `# 角色定义
 
-<!-- 在这里编写你的 Bot 角色定义，然后执行 world.init 生成初始状态。 -->
+<!-- 在这里编写角色定义，然后执行 world.init 生成初始状态。 -->
 <!-- 建议包含：姓名、年龄、身份、性格、说话风格、兴趣爱好、日常作息、与聊天软件的关系等。 -->
 
 （尚未编写）
@@ -31,7 +31,7 @@ const BOT_DEF_TEMPLATE = `# Bot 角色定义
 const WORLD_DEF_TEMPLATE = `# 世界定义
 
 <!-- 在这里编写虚拟世界的定义，然后执行 world.init 生成初始状态。 -->
-<!-- 建议包含：世界观、地点、Bot 所处环境、周边人物、社会规则、可能发生的事件类型等。 -->
+<!-- 建议包含：世界观、地点、角色所处环境、周边人物、社会规则、可能发生的事件类型等。 -->
 
 （尚未编写）
 `;

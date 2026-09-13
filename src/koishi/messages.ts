@@ -99,7 +99,7 @@ export class MessageStore {
     const rows = await this.ctx.database.get(
       "yesimbot_world_message",
       {},
-      { sort: { timestamp: "desc" }, limit: 500 },
+      { sort: { timestamp: "desc", id: "desc" }, limit: 500 },
     );
     const seen = new Map<string, WorldMessageRow>();
     for (const row of rows) {
@@ -118,7 +118,7 @@ export class MessageStore {
     const rows = await this.ctx.database.get(
       "yesimbot_world_message",
       {},
-      { sort: { timestamp: "desc" }, limit: 1000 },
+      { sort: { timestamp: "desc", id: "desc" }, limit: 1000 },
     );
     const map = new Map<string, KnownChannel>();
     for (const row of rows) {
@@ -188,7 +188,9 @@ export class MessageStore {
     const rows = await this.ctx.database.get(
       "yesimbot_world_message",
       { platform, channelId, ...this.accountFilter(platform, selfId) },
-      { sort: { timestamp: "desc" }, limit: n },
+      // OneBot timestamps have second precision. Without an ID tiebreaker, reversing a
+      // timestamp-only query reverses replies delivered within that second as well.
+      { sort: { timestamp: "desc", id: "desc" }, limit: n },
     );
     return rows.reverse();
   }

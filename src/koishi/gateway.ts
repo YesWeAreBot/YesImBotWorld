@@ -11,14 +11,16 @@ import type { MessageStore } from "./messages.js";
 import type { ChannelNameResolver } from "./names.js";
 import type { NotifyManager } from "./notify.js";
 import type { OwnSendTracker } from "./ownsends.js";
+import { SelfMessageCapture, type ConfirmedSelfMessage } from "./self-message-capture.js";
 import type { RequestStore } from "./requests.js";
-import { conversationKind, conversationLabel, describeConversation, type ConversationContext } from "./conversation.js";
+import { conversationKind, conversationLabel, describeConversation, isStickerElement, type ConversationContext } from "./conversation.js";
+export { isStickerElement } from "./conversation.js";
 
 export interface GatewayCallbacks {
   /** 向 Bot-LLM 投递通知事件；wake 表示是否唤醒 wait() 中的 Bot */
   notify(content: RichText, wake: boolean): void;
   /** 外部（其他插件/指令输出）以 Bot 账号发出的消息（externalSelfMessages 开启时）；msgId 为平台消息 id（可能为空） */
-  selfMessage(channelKey: string, content: string, msgId: string): void;
+  selfMessage(channelKey: string, content: RichText, msgId: string, sendArgs: { msg: string } | null): void | Promise<void>;
   /** 任意频道收到了新消息（不管是否聚焦/通知）。用于打断"过会儿再发"的延期发送意图 */
   channelActivity(channelKey: string): void;
 }
@@ -30,6 +32,10 @@ export interface GatewayCallbacks {
  * - 来自 Allow Notification 频道列表的消息，按处理策略生成 Event 投递给 Bot-LLM。
  */
 export class Gateway {
+  private selfCapture?: SelfMessageCapture;
+  private messageTails = new Map<string, Promise<void>>();
+  private ownMessageIds = new Set<string>();
+
   constructor(
     private ctx: Context,
     private cfg: MessagingConfig,
@@ -47,24 +53,36 @@ export class Gateway {
     private clockInfo: () => { syncRealTime: boolean; unitRealSeconds: number } | null,
     private callbacks: GatewayCallbacks,
   ) {
+    const logger = ctx.logger("yesimbot-world");
     // 用 message 事件而非中间件：保证他人的指令消息（会被指令系统处理）也一样被当作普通消息
     // 入库并按通知策略投递（指令照常执行，互不影响）
     ctx.on("message", (session) => {
-      void this.handle(session).catch((err) => {
-        ctx.logger("yesimbot-world").warn("消息处理失败: %s", err);
+      const key = channelKey(session.platform ?? "unknown", session.channelId ?? "unknown", session.selfId ?? session.bot?.selfId);
+      // Reserve the same queue position used by confirmed account replies before any
+      // media work starts. Never return the queued promise to platform dispatch.
+      const next = this.queueMessage(key, () => this.handle(session));
+      void next.catch((err) => {
+        logger.warn("消息处理失败: %s", err);
       });
     });
 
-    // Bot 账号发出的、非本插件产生的消息（其他插件/指令输出等）。
-    // 注意：koishi 4.18 / satori 4.6 起 "send" 事件不再被派发（session 创建后没有 dispatch），
-    // 只能用 before-send（发送前的 serial 事件，elements 已就绪）。
-    // 监听器必须同步返回 undefined——返回真值会取消发送，处理逻辑异步进行不阻塞发送。
     if (cfg.externalSelfMessages !== "off") {
-      ctx.on("before-send", (session) => {
-        void this.handleSelfSent(session).catch((err) => {
-          ctx.logger("yesimbot-world").warn("外发消息处理失败: %s", err);
+      this.selfCapture = new SelfMessageCapture(ctx, ownSends, (message) => {
+        const key = channelKey(message.bot.platform ?? "unknown", message.channelId, message.bot.selfId);
+        if (message.own) {
+          this.ownMessageIds.add(`${key}\0${message.messageId}`);
+          if (this.ownMessageIds.size > 4096) this.ownMessageIds.delete(this.ownMessageIds.values().next().value!);
+          return;
+        }
+        void this.queueMessage(key, () => this.handleConfirmedSelfSent(message)).catch((err) => {
+          logger.warn("已确认外发消息入库失败: %s", err);
         });
-        return undefined;
+      });
+      // Some adapters dispatch account echoes as send; others use message with the
+      // account's own userId. Both enter the same confirmed-ID deduplication path.
+      ctx.on("send", (session) => {
+        const key = channelKey(session.platform ?? "unknown", session.channelId ?? "unknown", session.selfId ?? session.bot?.selfId);
+        void this.queueMessage(key, () => this.handleSelfEcho(session)).catch((err) => logger.warn("账号回声处理失败: %s", err));
       });
     }
 
@@ -80,10 +98,10 @@ export class Gateway {
     // 禁言（group_ban）同理：适配器把它映射为 guild-member 会话，也从 internal/session 感知
     ctx.on("internal/session" as never, ((session: Session) => {
       void this.handlePoke(session).catch((err) => {
-        ctx.logger("yesimbot-world").warn("戳一戳处理失败: %s", err);
+        logger.warn("戳一戳处理失败: %s", err);
       });
       void this.handleGroupBan(session).catch((err) => {
-        ctx.logger("yesimbot-world").warn("禁言通知处理失败: %s", err);
+        logger.warn("禁言通知处理失败: %s", err);
       });
     }) as never);
 
@@ -91,8 +109,9 @@ export class Gateway {
     // 都会映射到这里）。别人撤回消息后，消息记录里对应的那条会被改写为"撤回了一条消息"，
     // 否则消息已经缓存在记录里，Bot 会一直"看到"一条其实已经不存在了的消息
     ctx.on("message-deleted", (session) => {
-      void this.handleRecall(session).catch((err) => {
-        ctx.logger("yesimbot-world").warn("撤回处理失败: %s", err);
+      const key = channelKey(session.platform ?? "unknown", session.channelId ?? "unknown", session.selfId ?? session.bot?.selfId);
+      void this.queueMessage(key, () => this.handleRecall(session)).catch((err) => {
+        logger.warn("撤回处理失败: %s", err);
       });
     });
   }
@@ -100,7 +119,7 @@ export class Gateway {
   /**
    * 撤回感知：把消息记录里被撤回的那条改写为撤回标记（上下文不动——Bot 已经看过的
    * 消息它自然记得内容，无需篡改历史）；Bot 正在关注该频道时追加事件告知是哪条被撤回了。
-   * Bot 自己发起的撤回（unsend 工具 / 其他设备上操作）只改记录、不另行告知——它知道。
+   * 账号自身的撤回也可能来自其他设备；没有操作归属证据时只陈述账号行为。
    */
   private async handleRecall(session: Session): Promise<void> {
     const channelId = session.channelId ?? "";
@@ -109,20 +128,25 @@ export class Gateway {
     const platform = session.platform ?? "unknown";
     const key = channelKey(platform, channelId, session.selfId ?? session.bot?.selfId);
     const selfId = String(session.selfId ?? session.bot?.selfId ?? "");
-    // OneBot 群撤回：user_id 是消息发送者、operator_id 是执行撤回的人（可能是管理员）；私聊撤回没有 operator
-    const senderId = String(session.userId ?? "");
-    const operatorId =
-      String((session as unknown as { operatorId?: string }).operatorId ?? "") || senderId;
-
     const row = await this.store.findByMessageId(platform, channelId, messageId, selfId);
+    // Group user_id identifies the original author, not necessarily the operator.
+    // Missing operator metadata must not turn an admin recall into a self action.
+    const senderId = String(session.userId ?? row?.userId ?? "");
+    const raw = ((session as unknown as { onebot?: Record<string, unknown> }).onebot ??
+      (session.event as unknown as { _data?: Record<string, unknown> })?._data ?? {}) as Record<string, unknown>;
+    const operatorId = String((session as unknown as { operatorId?: string }).operatorId ?? raw.operator_id ?? "") ||
+      (session.isDirect || channelId.startsWith("private:") ? senderId : "");
     const selfOp = !!selfId && operatorId === selfId;
     const selfSender = !!selfId && senderId === selfId;
     const samePerson = !!operatorId && operatorId === senderId;
-    const operatorName = selfOp ? "你" : await this.lookupUsername(platform, channelId, operatorId);
+    const operatorName = selfOp ? "你的账号" : await this.lookupUsername(platform, channelId, operatorId);
     const senderName = selfSender
       ? "你"
       : (row?.username || (await this.lookupUsername(platform, channelId, senderId)));
-    const notice = recallNoticeText({ operatorName, selfOp, senderName, selfSender, samePerson });
+    const notice = !operatorId ? `${selfSender ? "本账号" : senderName || "未知发送者"}的一条消息被撤回了`
+      : selfOp
+      ? selfSender ? "你的账号撤回了一条消息" : `你的账号撤回了 ${senderName} 的一条消息`
+      : recallNoticeText({ operatorName, selfOp, senderName, selfSender, samePerson });
 
     if (row) {
       await this.store.updateContent(row.id, `[${notice}]`);
@@ -143,8 +167,7 @@ export class Gateway {
       });
     }
 
-    // Bot 自己撤的：它已经通过工具结果知道了，不再打扰
-    if (selfOp) return;
+    // The account's operator ID alone is not proof of a known, voluntary action.
     // 只有正在关注这个频道时才追加事件（翻记录时总能看到撤回标记，不必每条都提醒）
     if (this.phone.down || !this.focus.isFocused(key)) return;
     const msgTag = needsMsgIds(this.ops) ? `（msg:${messageId}）` : "";
@@ -304,58 +327,65 @@ export class Gateway {
     this.callbacks.notify({ text }, this.cfg.wakeOnNotify);
   }
 
-  /** before-send：Bot 账号即将发出一条消息。区分本插件发送与外部发送 */
-  private async handleSelfSent(session: Session): Promise<void> {
-    if (!session.channelId) return;
-    const key = channelKey(session.platform ?? "unknown", session.channelId ?? "unknown", session.selfId ?? session.bot?.selfId);
-    // 本插件（messenger）发出的：已由 storeSelf 入库并有工具调用结果，跳过
-    if (this.ownSends.consume(key)) return;
-
-    const elements = session.elements ?? h.parse(session.content ?? "");
-    const content = await this.serializeElements(elements, {
-      containerMsgId: session.messageId ?? undefined,
-      selfId: session.selfId ?? session.bot?.selfId ?? undefined,
-    });
-    if (!content.trim()) return;
-
-    // before-send 时消息尚未真正发出，平台消息 id 还没生成；适配器发送成功后会把
-    // messageId 写回同一个 session 对象（satori 的 MessageEncoder 全程复用 this.session），
-    // 短暂轮询等它就绪——拿到 id 才能让 Bot 对这条消息 recall / react / 引用
-    const msgId = await this.waitMessageId(session, 3000);
-
-    await this.store.store({
-      selfId: session.selfId ?? session.bot?.selfId ?? "",
-      platform: session.platform ?? "unknown",
-      channelId: session.channelId,
-      guildId: session.guildId ?? "",
-      userId: session.selfId ?? "self",
-      username: "（我）",
-      content,
-      timestamp: new Date(),
-      self: true,
-      messageId: msgId,
-      isDirect: session.isDirect,
-    });
-    this.callbacks.selfMessage(key, toMarkerText(content), msgId);
+  private queueMessage(key: string, run: () => Promise<void>): Promise<void> {
+    const previous = this.messageTails.get(key) ?? Promise.resolve();
+    const next = previous.catch(() => {}).then(run);
+    this.messageTails.set(key, next);
+    void next.finally(() => { if (this.messageTails.get(key) === next) this.messageTails.delete(key); }).catch(() => {});
+    return next;
   }
 
-  /** 等待发送完成后适配器写回的平台消息 id（拿不到时返回空串，不阻塞投递） */
-  private async waitMessageId(session: Session, timeoutMs: number): Promise<string> {
-    const deadline = Date.now() + timeoutMs;
-    for (;;) {
-      const id = session.messageId;
-      if (id) return String(id);
-      if (Date.now() >= deadline) return "";
-      await new Promise((r) => setTimeout(r, 150));
-    }
+  /** Called only for successful adapter receipts, never an attempted before-send. */
+  private async handleConfirmedSelfSent(message: ConfirmedSelfMessage): Promise<void> {
+    const { bot, channelId, messageId, session } = message;
+    const platform = bot.platform ?? "unknown";
+    const key = channelKey(platform, channelId, bot.selfId);
+    if (messageId && await this.store.findByMessageId(platform, channelId, messageId, bot.selfId)) return;
+    // Outgoing tool arguments must not include incoming-only annotations such as
+    // “@的是你”, which were never part of the platform message actually sent.
+    const content = await this.serializeElements(message.elements, { containerMsgId: messageId });
+    if (!content.trim()) return;
+    const direct = session?.event?.channel?.type == null ? undefined : session.isDirect;
+    await this.store.store({
+      selfId: bot.selfId, platform, channelId, guildId: session?.guildId ?? "",
+      userId: bot.selfId, username: "（我）", content, timestamp: new Date(message.timestamp), self: true, messageId,
+      isDirect: direct ?? channelId.startsWith("private:"),
+      conversation: describeConversation(message.elements,
+        conversationKind(direct, channelId, session?.guildId), isStickerElement),
+    });
+    // Store all enabled modes, but expand media only when that mode actually exposes
+    // the message. A put-down phone event must never smuggle images into awareness.
+    const visible = this.cfg.externalSelfMessages === "simulate" || (this.cfg.externalSelfMessages === "event" && !this.phone.down);
+    const rendered = visible ? await this.renderer.render(content) : { text: "" };
+    await this.callbacks.selfMessage(key, rendered, messageId, selfSendArguments(message.elements, content));
+  }
+
+  /** Already-observed platform traffic, including another client logged into this account. */
+  private async handleSelfEcho(session: Session): Promise<void> {
+    if (this.cfg.externalSelfMessages === "off" || !session.channelId || !session.bot) return;
+    const key = channelKey(session.platform ?? session.bot.platform, session.channelId, session.selfId ?? session.bot.selfId);
+    await this.selfCapture?.waitForPending(key);
+    await this.ownSends.waitForPending(key);
+    const messageId = session.messageId ? String(session.messageId) : "";
+    if (messageId && (this.ownMessageIds.has(`${key}\0${messageId}`) || this.ownSends.wasSent(key, messageId))) return;
+    // Already running in the channel queue: enqueuing again here would await itself.
+    // Sending does not await this consumer, so waiting for adapter receipts above
+    // cannot create a transport -> consumer -> transport cycle.
+    await this.handleConfirmedSelfSent({ bot: session.bot, channelId: session.channelId, messageId,
+      elements: session.elements ?? h.parse(session.content ?? ""), session, own: false, timestamp: session.timestamp ?? Date.now() });
   }
 
   private async handle(session: Session): Promise<void> {
     if (!session.content && !session.elements?.length) return;
-    // 忽略机器人自己发出的回环消息（自己发送的消息在 send 工具中入库）
-    if (session.userId && session.bot && session.userId === session.bot.selfId) return;
+    if (session.userId && session.bot && String(session.userId) === String(session.bot.selfId)) {
+      await this.handleSelfEcho(session);
+      return;
+    }
 
     const selfId = session.selfId ?? session.bot?.selfId ?? undefined;
+    if (session.messageId && session.channelId && await this.store.findByMessageId(
+      session.platform ?? "unknown", session.channelId, String(session.messageId), selfId,
+    )) return;
     const elements = session.elements ?? h.parse(session.content ?? "");
     let content = await this.serializeElements(elements, {
       containerMsgId: session.messageId ?? undefined,
@@ -438,7 +468,9 @@ export class Gateway {
           out += escapeMediaStorageText(String(el.attrs.content ?? ""));
           break;
         case "img":
-        case "image": {
+        case "image":
+        case "mface":
+        case "sticker": {
           out += await this.ingest(el, "image", "[图片（获取失败）]", isStickerElement(el));
           break;
         }
@@ -495,7 +527,7 @@ export class Gateway {
     if (!src) return fallback;
     const mimeHint = typeof el.attrs.type === "string" && el.attrs.type.includes("/") ? el.attrs.type : undefined;
     const id = await this.media.ingest(src, type, mimeHint, undefined, sticker);
-    return id !== null ? mediaPlaceholder(id, type) : fallback;
+    return id !== null ? mediaPlaceholder(id, type, type === "image" ? sticker : undefined) : fallback;
   }
 
   /** 关注中的频道：始终呈现完整内容（相当于强制 content 策略） */
@@ -503,8 +535,8 @@ export class Gateway {
     const rendered = await this.renderer.render(content);
     const msgTag =
       needsMsgIds(this.ops) && session.messageId ? `(msg:${session.messageId}) ` : "";
-    const header = `你正留意着 ${await this.names.display(key)}，看到新消息（${conversationLabel(conversation, session.selfId ?? session.bot?.selfId)}）——${msgTag}${session.username ?? session.userId}（账号 ${JSON.stringify(session.userId ?? "未知")}）说：`;
-    return prefixRichText(header, rendered);
+    const header = `你正留意着 ${await this.names.display(key)}，看到新消息（${conversationLabel(conversation, session.selfId ?? session.bot?.selfId)}）\n${msgTag}发送者：${session.username ?? session.userId}（账号 ${JSON.stringify(session.userId ?? "未知")}）\n消息正文：\n`;
+    return prefixRichText(header, rendered, "\n〔该条消息结束〕");
   }
 
   private async renderNotification(key: string, session: Session, content: string, conversation: ConversationContext): Promise<RichText> {
@@ -516,47 +548,25 @@ export class Gateway {
       case "content": {
         const rendered = await this.renderer.render(content);
         const msgTag = needsMsgIds(this.ops) && session.messageId ? `(msg:${session.messageId}) ` : "";
-        const header = `手机响了一下：收到来自 ${await this.names.display(key)} 的消息（${conversationLabel(conversation, session.selfId ?? session.bot?.selfId)}），${msgTag}${session.username ?? session.userId}（账号 ${JSON.stringify(session.userId ?? "未知")}）说：`;
-        return prefixRichText(header, rendered);
+        const header = `手机响了一下：收到来自 ${await this.names.display(key)} 的消息（${conversationLabel(conversation, session.selfId ?? session.bot?.selfId)}）\n${msgTag}发送者：${session.username ?? session.userId}（账号 ${JSON.stringify(session.userId ?? "未知")}）\n消息正文：\n`;
+        return prefixRichText(header, rendered, "\n〔该条消息结束〕");
       }
     }
   }
 }
 
 /** Both representations must retain sender/channel identity when BotContext uses ordered media parts. */
-function prefixRichText(prefix: string, rendered: RichText): RichText {
+export function prefixRichText(prefix: string, rendered: RichText, suffix = ""): RichText {
   return {
     ...rendered,
-    text: prefix + rendered.text,
-    parts: rendered.parts ? [{ kind: "text", text: prefix }, ...rendered.parts] : undefined,
+    text: prefix + rendered.text + suffix,
+    parts: rendered.parts ? [{ kind: "text", text: prefix }, ...rendered.parts, ...(suffix ? [{ kind: "text" as const, text: suffix }] : [])] : undefined,
   };
 }
 
 /** 标签属性转义（与 Koishi 元素语法一致） */
 function escAttr(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
-}
-
-/**
- * 判断一个 img 元素是否为「图片表情」（表情包）而非普通图片。
- * QQ OneBot v11 image 段的 subType 语义：
- * - 1 = 用户收藏的表情包 / 超级 QQ 秀表情；
- * - 2 = QQ 自带的 gif 表情（文件名可能是 .jpg 但实际是动图）；
- * - 0 或缺省 = 普通图片。
- * 无 subType 的兜底：QQ 表情商城成套表情（summary 有文案 + gif 文件）。
- * 与我们出站时附加的 STICKER_ATTRS（sub_type: 1）对应，据此识别。
- */
-export function isStickerElement(el: h): boolean {
-  const st = el.attrs?.sub_type ?? el.attrs?.subType;
-  if (st === 1 || st === "1" || st === 2 || st === "2" || st === true) return true;
-  const summary = el.attrs?.summary;
-  const file = el.attrs?.file;
-  return (
-    typeof summary === "string" &&
-    summary.trim() !== "" &&
-    typeof file === "string" &&
-    file.toLowerCase().endsWith(".gif")
-  );
 }
 
 /** at 元素的标签文本形式（Bot 可照抄发出） */
@@ -589,7 +599,9 @@ function plainText(elements: h[]): string {
         break;
       case "img":
       case "image":
-        out += "[图片]";
+      case "mface":
+      case "sticker":
+        out += isStickerElement(el) ? "[表情包]" : "[图片]";
         break;
       case "audio":
         out += "[语音]";
@@ -642,10 +654,17 @@ export function formatBanDuration(
   return parts.join(" ") || `${seconds} 秒`;
 }
 
-/** Convert persisted media positions to explicit references for same-account message observations. */
-function toMarkerText(content: string): string {
-  return content.replace(
+/** A simulated send must use its actual supported media references, not observation
+ * summaries or persisted media tags. Other message kinds remain account-action events. */
+function selfSendArguments(elements: h[], content: string): { msg: string } | null {
+  const supported = new Set(["text", "img", "image", "mface", "sticker", "video", "at", "face"]);
+  if (elements.some(element => !supported.has(element.type))) return null;
+  const mediaCount = elements.filter(element => ["img", "image", "mface", "sticker", "video"].includes(element.type)).length;
+  const references = [...content.matchAll(MEDIA_PLACEHOLDER)];
+  if (references.some(match => match[2] === "audio") || references.length !== mediaCount) return null;
+  const msg = content.replace(
     MEDIA_PLACEHOLDER,
     (_, id) => `<media ref="media:${id}"/>`,
   );
+  return { msg };
 }

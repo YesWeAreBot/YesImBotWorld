@@ -160,7 +160,7 @@ export class FileManagerApp implements WorldApp {
     }
     return {
       tools: TOOLS,
-      opening: "虚构文件资源管理器已打开，依据虚构电脑中已经确立的目录和文件进行操作。",
+      opening: "文件资源管理器已打开，可以查看和操作这台电脑已有的目录与文件。",
     };
   }
 
@@ -451,9 +451,9 @@ export class FileManagerApp implements WorldApp {
   private async virtualList(args: Record<string, unknown>): Promise<string | RichText> {
     const where = args.path != null && String(args.path).trim() ? `目录 ${String(args.path).trim()}` : "主目录";
     const task =
-      `Bot 打开了自己电脑上的文件资源管理器，查看${where}（当前 ${this.clock.timeLine()}）。\n` +
-      `请扮演这台电脑，输出资源管理器窗口里显示的目录内容：\n` +
-      `1. 只读查看角色可用的虚构电脑中已确立的目录记录，不调用工具、不改变世界；没有设备或目录记录时显示未知/不可用，不把未知当作空目录；\n` +
+      `通过角色可用电脑的文件资源管理器查询${where}（当前 ${this.clock.timeLine()}）；这项设备请求不证明角色的身体已经行动或看过结果。\n` +
+      `请输出资源管理器窗口里显示的目录内容：\n` +
+      `1. 只读查看该电脑中已确立的目录记录，不调用工具、不改变世界；没有设备或目录记录时显示未知/不可用，不把未知当作空目录；\n` +
       `2. 一行一个条目，目录以 / 结尾，文件可附大小；最多列 ${MAX_LIST_ITEMS} 条；与世界状态中已有的设定保持一致，不要凭空出现这个世界不该有的文件；\n` +
       `3. 只输出资源管理器屏幕上的内容，不要任何解释、旁白或代码围栏。`;
     try {
@@ -468,9 +468,9 @@ export class FileManagerApp implements WorldApp {
     const file = String(args.path ?? args.file ?? "");
     if (!file.trim()) return "（show 需要 path 参数。）";
     const task =
-      `Bot 在自己电脑上的资源管理器里打开了文件 ${file.trim()}（当前 ${this.clock.timeLine()}）。\n` +
-      `请扮演这台电脑，输出文件在屏幕上显示的内容：\n` +
-      `1. 只读查看角色可用的虚构电脑中已确立的文件原文；有明确证据才显示文件不存在或非文本，没有记录的内容显示未知/不可用，禁止补写文件；\n` +
+      `通过角色可用电脑的资源管理器读取文件 ${file.trim()}（当前 ${this.clock.timeLine()}）；这项设备请求不证明角色的身体已经行动或看过结果。\n` +
+      `请输出文件在屏幕上显示的内容：\n` +
+      `1. 只读查看该电脑中已确立的文件原文；有明确证据才显示文件不存在或非文本，没有记录的内容显示未知/不可用，禁止补写文件；\n` +
       `2. 这是只读查看；仅将已提供的文件原文加行号，不得续写或补全。按请求的 start/max_lines 取窗口，请求为 ${JSON.stringify({ start: args.start ?? 1, max_lines: args.max_lines ?? 200 })}；\n` +
       `3. 只输出屏幕上显示的内容，不要解释或旁白。`;
     try {
@@ -483,7 +483,7 @@ export class FileManagerApp implements WorldApp {
   }
 
   private async virtualWrite(args: Record<string, unknown>, action: string): Promise<string | RichText> {
-    return this.world.executeAppAction("在角色实际可用的虚构电脑上执行文件操作；依据该设备的能力模拟，保留既定目录、路径和精确文件内容；创建或编辑的结果必须记入自然语言状态供后续读取。请求=" + JSON.stringify({ ...args, action }));
+    return this.world.executeAppAction("通过角色可用的电脑执行文件操作；依据该设备的实际能力处理，保留既定目录、路径和精确文件内容；创建或编辑的结果必须记入自然语言状态供后续读取。设备请求不证明角色的身体已经行动或看过结果。请求=" + JSON.stringify({ ...args, action }));
   }
 
   private async isRealWorld(): Promise<boolean> {

@@ -91,7 +91,8 @@ async function main() {
         else { assert.equal(options.tools, undefined); assert.match(system, /本次使用正文 JSON 协议/); }
         return { content: '{"name":"observe","arguments":{},"duration":0}', toolCalls: [] };
       } };
-      const context = new BotContext(files, "", prompts); await context.load();
+      const protocolFiles = new WorldFiles(path.join(dir, `protocol-${nativeToolCalls}`)); await protocolFiles.ensure();
+      const context = new BotContext(protocolFiles, "", prompts); await context.load();
       assert.equal((await backend.generate(context, "T=10")).name, "observe"); assert.equal(count, 1);
       backend.client = { complete: async () => ({ content: "", toolCalls: [1, 2].map(i => ({ id: String(i), function: { name: "observe", arguments: "{}" } })) }) };
       await assert.rejects(backend.generate(context, "T=10"), /多个调用均未执行/);

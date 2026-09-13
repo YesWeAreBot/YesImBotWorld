@@ -13,7 +13,7 @@ export function parseMediaId(value: string): number | null {
   return Number.isSafeInteger(id) ? id : null;
 }
 
-export function mediaPart(ref: MediaRef, metadata: { name?: string; summary?: string } = {}): MediaPart {
+export function mediaPart(ref: MediaRef, metadata: { name?: string; summary?: string; sticker?: boolean } = {}): MediaPart {
   const part: MediaPart = { kind: "media", ref, ...metadata, marker: "" };
   part.marker = mediaText(part);
   return part;
@@ -24,8 +24,9 @@ export function mediaOpen(part: MediaPart): string {
   // Read descriptions from persisted pre-0.3 events without exposing the old #N/attachment protocol.
   const legacySummary = part.marker.match(/^\[(?:图片|视频|音频|语音)#\d+[:：]([\s\S]*)\]$/)?.[1]?.trim();
   const summary = part.summary ?? legacySummary;
-  return `<media ref="${mediaRefText(part.ref)}" type="${part.ref.type}"${part.name ? ` name="${escape(part.name)}"` : ""}>\n` +
-    `${LABEL[part.ref.type]}${summary ? `；文字摘要（可能有误）：${escape(summary)}` : "；暂无文字摘要"}\n`;
+  const sticker = part.ref.type === "image" && part.sticker === true;
+  return `<media ref="${mediaRefText(part.ref)}" type="${part.ref.type}"${sticker ? ' usage="sticker"' : ""}${part.name ? ` name="${escape(part.name)}"` : ""}>\n` +
+    `${sticker ? "表情包（按表情使用）" : LABEL[part.ref.type]}${summary ? `；文字摘要（可能有误）：${escape(summary)}` : "；暂无文字摘要"}\n`;
 }
 
 export function mediaText(part: MediaPart, reason = "此处仅保留媒体身份与文字摘要，未展开原始媒体"): string {

@@ -151,9 +151,36 @@ async function compressionRecoveryBarrier() {
       const resumed = new BotContext(f.files); await resumed.load();
       assert.deepEqual(resumed.stream, f.context.stream);
       assert.deepEqual(resumed.pinned, f.context.pinned);
+      assert.deepEqual(await resumed.toChatMessages("重启后的不同时间"), messages, "the new compressed prefix is durable across restart");
       assert.equal(resumed.nextEventId(), "ev_3");
     } finally { fs.rm = remove; }
   }
+}
+
+async function durableFixedPrefix() {
+  const f = await fixture(); await f.context.appendEvent(event(f.context.nextEventId()));
+  f.context.botNameProvider = () => "旧名字";
+  const savedBefore = await f.files.readText(f.files.pinned);
+  const syncPrefix = f.context.renderSystemText("最早的时刻");
+  const atomic = f.files.atomicWrite.bind(f.files); let blocked = true;
+  f.files.atomicWrite = async (file, data) => { if (blocked && file === f.files.pinned) throw Error("prefix checkpoint unavailable"); return atomic(file, data); };
+  await assert.rejects(f.context.toChatMessages("不应替换的时间"), /prefix checkpoint unavailable/);
+  assert.equal(await f.files.readText(f.files.pinned), savedBefore, "failed preparation preserves the older pinned data");
+  blocked = false;
+  const first = await f.context.toChatMessages("另一个时间");
+  assert.equal(first[0]!.content, syncPrefix, "the synchronous API freezes content but actual requests await its checkpoint");
+  const reload = new BotContext(f.files); await reload.load(); reload.botNameProvider = () => "新版名字";
+  assert.deepEqual(await reload.toChatMessages("重启时刻"), first);
+  await reload.appendEvent({ id: reload.nextEventId(), source: "system", worldTime: 50, content: "现在已经到了重启时刻。" });
+  const appended = await reload.toChatMessages("重启时刻");
+  assert.deepEqual(appended.slice(0, first.length), first);
+  await reload.applyCompression({ historySummary: "保留此前经历", memoryDigest: "" }, 51);
+  const compressed = await reload.toChatMessages("压缩后的起点");
+  assert.match(String(compressed[0]!.content), /新版名字/);
+  assert.match(String(compressed[0]!.content), /压缩后的起点/);
+  assert.doesNotMatch(String(compressed[0]!.content), /最早的时刻/);
+  const afterCompression = new BotContext(f.files); await afterCompression.load();
+  assert.deepEqual(await afterCompression.toChatMessages("再次重启"), compressed);
 }
 
 async function spillProvenance() {
@@ -172,7 +199,7 @@ async function spillProvenance() {
 }
 
 async function main() {
-  try { await partialAppends(); await pinnedFailure(); await reflectionCheckpoint(); await compressionRecoveryBarrier(); await spillProvenance(); console.log("PASS durable context: partial append rollback, damaged-tail isolation, idempotent pinned recovery, retained inbox, reflection retry/restart, compression recovery barrier and spill provenance"); }
+  try { await partialAppends(); await pinnedFailure(); await reflectionCheckpoint(); await compressionRecoveryBarrier(); await durableFixedPrefix(); await spillProvenance(); console.log("PASS durable context: partial append rollback, damaged-tail isolation, idempotent pinned recovery, retained inbox, reflection retry/restart, compression recovery barrier, durable fixed prefix and spill provenance"); }
   finally { fs.appendFile = append; await Promise.all(dirs.map(dir => fs.rm(dir, { recursive: true, force: true }))); }
 }
 main().catch(error => { console.error(error); process.exitCode = 1; });

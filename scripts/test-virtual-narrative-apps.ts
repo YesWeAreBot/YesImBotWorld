@@ -158,8 +158,8 @@ async function main() {
     assert.equal(await browser.call("search", { query: "weather" }), "REAL_SEARCH");
     assert.equal(await weather.call("query_weather", {}), "REAL_WEATHER");
     assert.match(String(await terminal.call("run_command", { command: "ls" })), /REAL_TERMINAL/);
-    await assert.rejects(world.observeVirtualApp("读取文件"), /真实应用内容必须由设备工具读取/);
-    await assert.rejects(world.executeAppAction("写入文件"), /真实应用操作必须由设备工具执行/);
+    await assert.rejects(world.observeVirtualApp("读取文件"), /必须通过设备提供的读取能力/);
+    await assert.rejects(world.executeAppAction("写入文件"), /必须通过设备提供的操作能力/);
     assert.equal(appReads, beforeReal);
     console.log("PASS virtual narrative apps: write/read continuity, private durable receipts, unchanged awareness, invalid/cancelled write isolation, captured read roots, refreshed pages, real IO isolation");
   } finally { await world?.runtime.shutdown(); await fs.rm(dir, { recursive: true, force: true }); }

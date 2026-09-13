@@ -14,7 +14,7 @@ import { Gateway } from "../src/koishi/gateway.js";
 import { KoishiMessenger, rawGroupConversation } from "../src/koishi/messenger.js";
 import { MessageStore, type WorldMessageRow } from "../src/koishi/messages.js";
 import { OwnSendTracker } from "../src/koishi/ownsends.js";
-import { conversationKind } from "../src/koishi/conversation.js";
+import { conversationKind, isStickerElement } from "../src/koishi/conversation.js";
 import { MediaRenderer } from "../src/media/render.js";
 import { richPartsText } from "../src/media/presentation.js";
 import type { RichText } from "../src/types.js";
@@ -31,7 +31,7 @@ async function main() {
         async create(_table: string, row: any) { const next = { id: rows.length + 1, ...row }; rows.push(next); return next; },
         async get(_table: string, query: Record<string, any>, options: any) {
           return rows.filter((row: any) => Object.entries(query).every(([key, value]) => value && typeof value === "object" ? value.$in.includes(row[key]) : row[key] === value))
-            .sort((a, b) => b.timestamp.getTime() - a.timestamp.getTime()).slice(0, options?.limit);
+            .sort((a, b) => b.timestamp.getTime() - a.timestamp.getTime() || (options?.sort?.id === "desc" ? b.id - a.id : a.id - b.id)).slice(0, options?.limit);
         },
       },
     };
@@ -86,9 +86,23 @@ async function main() {
     const parts = await requestParts(plainSticker);
     assert.equal(parts[1]!.type, "image_url", "image remains immediately after its sender and conversation header");
     assert.match((parts[0] as any).text, /朋友群.*群聊.*无明确 @.*仅含表情包.*小明.*alice/s);
+    assert.match((parts[0] as any).text, /usage="sticker"/);
+    assert.match(plainSticker.text, /表情包（按表情使用）/);
     assert.match(context.renderSystemText("T=1"), /已有用户覆盖保持不变/);
     assert.match(context.renderSystemText("T=1"), /群聊是多人共享的场合/);
     assert.match(JSON.stringify(await requestParts(plainSticker, false)), /朋友群.*小明/s);
+    assert.match(JSON.stringify(await requestParts(plainSticker, false)), /usage=\\"sticker\\"/);
+    assert.equal(isStickerElement(h("img", { file: "marketface" })), true);
+    assert.equal(isStickerElement(h("mface", { url: "fixture:sticker" })), true);
+    assert.equal(isStickerElement(h("img", { file: "vacation.gif", summary: "普通动图" })), false, "a GIF/summary is not platform evidence of sticker usage");
+    assert.equal(isStickerElement(h("img", { sub_type: 0, file: "vacation.gif", summary: "[动画表情]" })), false);
+    const mixedSticker = await incoming([h.text("哈哈"), sticker]);
+    assert.match(mixedSticker.text, /附有表情包/);
+    const ordinary = await incoming([h("img", { src: "fixture:photo" })]);
+    const ordinaryId = mediaRows.size;
+    mediaRows.get(ordinaryId).sticker = true; // The same bytes may later be sent as a sticker.
+    assert.doesNotMatch((await renderer.render(rows.at(-1)!.content)).text, /usage="sticker"/, "per-message plain-image use survives asset metadata becoming a known sticker");
+    assert.doesNotMatch(ordinary.text, /usage="sticker"/);
     // Exercise the real forwarding dispatch branch while replacing only scheduling and the platform fetch.
     let forwarded: RichText | undefined;
     const forwardingAgent: any = Object.assign(new BotAgent(cfg,
@@ -172,6 +186,35 @@ async function main() {
     assert.ok(!full.includes("隔离账号"));
     const allText = richPartsText(history.parts!);
     assert.equal(allText, history.text, "history prose and ordered media parts preserve identical contextual framing");
+    assert.match(history.text, /这是此刻可见记录的快照/);
+    assert.match(history.text, /发送者：[\s\S]*消息正文：[\s\S]*〔该条消息结束〕/);
+    const rawSticker = await (messenger as any).serializeRawSegments([{ type: "image", data: { file: "marketface", url: "fixture:marketface" } }]);
+    assert.match((await renderer.render(rawSticker)).text, /usage="sticker"/, "offline and forwarded raw messages retain platform sticker semantics");
+
+    const time = new Date(1000);
+    for (const [i, content] of ["先问：明天约几点？", "后答：下午三点。"].entries()) {
+      await store.store({ ...base, channelId: "same-second", userId: "peer", self: false, content, timestamp: time, messageId: "order-" + i });
+    }
+    assert.deepEqual((await store.channelMessages("fixture", "same-second", 2, "bot-a")).map(row => row.content), ["先问：明天约几点？", "后答：下午三点。"], "same-second messages preserve receipt order instead of reversing question and answer");
+    assert.equal((await store.channelMessages("fixture", "same-second", 1, "bot-a"))[0]!.messageId, "order-1", "latest-N cuts include the most recent same-second row");
+
+    // Seeing the newest 10 never replaces the older conversation in the actual model request.
+    const memoryFiles = new WorldFiles(path.join(dir, "chat-memory")); await memoryFiles.ensure();
+    const memory = new BotContext(memoryFiles, ""); await memory.load();
+    for (let i = 0; i < 12; i++) await store.store({ ...base, channelId: "ongoing", userId: i % 2 ? "bob" : "alice", self: false, content: i === 0 ? "周六下午三点在旧书店见，不是周日。" : `正在继续的话题 ${i}`, timestamp: new Date(2000 + i), messageId: `ongoing-${i}` });
+    const appendHistory = async (n: number) => {
+      const value = await messenger.channelMessages("fixture@bot-a:ongoing", n, { intro: "echo" });
+      await memory.appendEvent({ id: memory.nextEventId(), source: "koishi", worldTime: n, content: value.text, parts: value.parts, attachments: value.attachments });
+      return memory.toChatMessages("T=1");
+    };
+    const beforeRead = await appendHistory(12);
+    const afterRead = await appendHistory(10);
+    assert.deepEqual(afterRead.slice(0, beforeRead.length), beforeRead, "new history read leaves every prior model message byte-identical");
+    assert.match(JSON.stringify(afterRead), /周六下午三点在旧书店见，不是周日/);
+    assert.doesNotMatch(JSON.stringify(afterRead.at(-1)), /周六下午三点在旧书店见/);
+    assert.match((await memory.compressionSnapshot()).text, /周六下午三点在旧书店见，不是周日/);
+    const resumed = new BotContext(memoryFiles, ""); await resumed.load();
+    assert.deepEqual(await resumed.toChatMessages("T=1"), afterRead, "the full append-only conversation survives a restart");
     console.log("PASS group conversation: sender/channel retained in actual multimodal requests, scoped quote attribution, mentions/DM/stickers, history framing and notification privacy");
   } finally { await fs.rm(dir, { recursive: true, force: true }); }
 }

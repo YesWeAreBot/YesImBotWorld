@@ -51,7 +51,7 @@ export class TerminalApp implements WorldApp {
     }
     return {
       tools: TOOLS,
-      opening: "虚构终端界面已打开。命令依据虚构电脑的自然语言状态模拟，不会在真实操作系统中运行。",
+      opening: "终端界面已打开，可以使用这台电脑已有的命令与文件。无法支持的操作会返回原因。",
     };
   }
 
@@ -84,7 +84,7 @@ export class TerminalApp implements WorldApp {
   /** 虚构世界：World-LLM 扮演这台电脑 */
   private async virtualRun(command: string, cwd?: string): Promise<string | RichText> {
     try {
-      const result = await this.world.executeAppAction("执行虚构电脑命令。依据虚构设备的既定能力模拟，保持路径和文件内容前后一致；新增文件和命令影响必须记入状态。不具备的能力如实说明。命令=" + JSON.stringify({ command, cwd: cwd || "." }));
+      const result = await this.world.executeAppAction("通过角色可用电脑的终端处理命令请求。这是软件应用请求，仅依据该设备的既定能力裁定输出与影响；保持路径和文件内容前后一致，新增文件和命令影响必须记入状态，不调用外部操作系统。设备请求不证明角色的身体已经行动或看过结果。不具备的能力如实说明。命令=" + JSON.stringify({ command, cwd: cwd || "." }));
       return { ...result, text: result.text + PROMPT_HINT };
     } catch (err) {
       this.logger.warn("虚构终端输出生成失败: %s", err);
@@ -98,7 +98,7 @@ const TOOLS: AppRawTool[] = [
     name: "run_command",
     description:
       "在当前终端里执行一条命令，返回它在电脑上产生的输出。cwd 可指定相对电脑主目录的工作目录（缺省为电脑主目录；cd 与环境变量不跨调用保留）。" +
-      "真实模式执行容器命令；虚构模式由世界模拟命令影响与可见输出，并记住文件变化，不是在真实操作系统执行。",
+      "仅能使用这台电脑提供的命令、文件与连接；不支持的能力会返回原因，是否完成以实际回执为准。",
     inputSchema: {
       type: "object",
       properties: {

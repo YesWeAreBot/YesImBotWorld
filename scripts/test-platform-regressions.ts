@@ -161,7 +161,7 @@ async function accounts(root: string) {
   assert.ok(notify.isNotifyChannel("fixture@b:private:peer"));
   const activity: string[] = [];
   const gateway = new Gateway(ctx, { ...cfg.messaging, externalSelfMessages: "off" }, cfg.platformOps, store, {} as never, renderer as never, focus as never, notify, { down: false }, {} as never, new OwnSendTracker(), { display: async (key: string) => key } as never, () => null, { notify() {}, selfMessage() {}, channelActivity: (key) => activity.push(key) });
-  await (gateway as any).handle({ ...entry, selfId: "b", bot: ctx.bots[1], content: "incoming b" });
+  await (gateway as any).handle({ ...entry, messageId: "incoming-b-id", selfId: "b", bot: ctx.bots[1], content: "incoming b" });
   assert.equal(rows.at(-1)!.selfId, "b");
   assert.equal(activity[0], "fixture@b:private:peer");
   ctx.bots = [bot("a")];

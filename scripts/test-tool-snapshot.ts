@@ -34,6 +34,11 @@ async function main() {
       { name: "send", signature: "send(msg: string)", description: "明确发送" },
     ];
     const backend = new ChatBackend({ ...cfg.bot, baseURL: `http://127.0.0.1:${address.port}/v1`, model: "offline-snapshot-fixture", stream: false, nativeToolCalls: true }, ["observe", "send"], definitions);
+    const initialSave = files.atomicWrite.bind(files); let prefixBlocked = true;
+    files.atomicWrite = async (file, data) => { if (file === files.pinned && prefixBlocked) throw Error("fixed prefix write failed"); return initialSave(file, data); };
+    await assert.rejects(backend.generate(context, "初始时刻"), /fixed prefix write failed/);
+    assert.equal(received.length, 0, "HTTP cannot send a system/native prefix which failed persistence");
+    prefixBlocked = false;
     const first = await backend.generate(context, "初始时刻"); assert.equal(first.name, "observe"); assert.equal(first.duration, 3);
     assert.deepEqual(first.arguments, {});
     const baseline = received[0]!;
@@ -53,6 +58,14 @@ async function main() {
     assert.equal(received.at(-1)!.tools, baseline.tools);
     assert.equal(received.at(-1)!.body.messages[0].content, baseline.body.messages[0].content);
     assert.ok(received.at(-1)!.body.messages[1].content.startsWith(baseline.body.messages[1].content));
+    const beforeRestart = received.at(-1)!;
+    const restartedContext = new BotContext(files, "新版工具描述"); await restartedContext.load();
+    restartedContext.accountsProvider = () => "新的显示配置不会改写固定前缀";
+    const restartedBackend = new ChatBackend({ ...cfg.bot, baseURL: `http://127.0.0.1:${address.port}/v1`, model: "offline-restart-fixture", stream: false, nativeToolCalls: false }, ["observe", "dynamic_app_action"], latest);
+    await restartedBackend.generate(restartedContext, "重启之后的时刻");
+    assert.equal(received.at(-1)!.tools, baseline.tools, "a new backend restores exact native declarations from the context window instead of applying current definitions early");
+    assert.equal(restartedContext.generationUsesNativeTools(false), true, "disabling the protocol takes effect at compression, not partway through a saved window");
+    assert.deepEqual(received.at(-1)!.body.messages, beforeRestart.body.messages, "actual HTTP system and message prefix survive process recreation");
     let nativeError = "", textError = "";
     reply = native("send");
     await assert.rejects(backend.generate(context, "T"), (error: Error) => { nativeError = error.message; return /send 此刻不可用/.test(error.message); });
@@ -108,16 +121,39 @@ async function main() {
       assert.match(received.at(-1)!.body.messages[0].content, /第二次整理/);
     } finally { fs.rm = remove; }
     // An empty native snapshot is also frozen, rather than treated as "not initialized".
+    const emptyFiles = new WorldFiles(path.join(dir, "empty")); await emptyFiles.ensure();
+    const emptyContext = new BotContext(emptyFiles, ""); await emptyContext.load();
     const empty = new ChatBackend({ ...cfg.bot, baseURL: `http://127.0.0.1:${address.port}/v1`, model: "offline-empty-snapshot", stream: false, nativeToolCalls: true }, [], []);
-    reply = text("observe"); await assert.rejects(empty.generate(context, "T"), /未知工具/); assert.equal(received.at(-1)!.body.tools, undefined);
+    reply = text("observe"); await assert.rejects(empty.generate(emptyContext, "T"), /未知工具/); assert.equal(received.at(-1)!.body.tools, undefined);
     empty.setToolDefs(definitions); empty.setToolNames(["observe"]);
-    assert.equal((await empty.generate(context, "T")).name, "observe"); assert.equal(received.at(-1)!.body.tools, undefined);
-    empty.resetToolSnapshot(); await empty.generate(context, "T"); assert.deepEqual(received.at(-1)!.body.tools.map((tool: any) => tool.function.name), ["observe"]);
+    assert.equal((await empty.generate(emptyContext, "T")).name, "observe"); assert.equal(received.at(-1)!.body.tools, undefined);
+    empty.resetToolSnapshot(); await empty.generate(emptyContext, "T"); assert.equal(received.at(-1)!.body.tools, undefined, "a backend-only reset cannot override the durable native prefix mid-window");
+    await emptyContext.applyCompression({ historySummary: "新窗口", memoryDigest: "" }, 10);
+    await empty.generate(emptyContext, "T"); assert.deepEqual(received.at(-1)!.body.tools.map((tool: any) => tool.function.name), ["observe"]);
     // A text-only backend follows the same current-availability checks and never sends native tools.
+    const textFiles = new WorldFiles(path.join(dir, "text")); await textFiles.ensure();
+    const textContext = new BotContext(textFiles, ""); await textContext.load();
     const bodyOnly = new ChatBackend({ ...cfg.bot, baseURL: `http://127.0.0.1:${address.port}/v1`, model: "offline-text-snapshot", stream: false, nativeToolCalls: false }, ["observe", "send"], definitions);
     bodyOnly.setToolNames(["observe"]); reply = text("send");
-    await assert.rejects(bodyOnly.generate(context, "T"), (error: Error) => error.message === nativeError);
+    await assert.rejects(bodyOnly.generate(textContext, "T"), (error: Error) => error.message === nativeError);
     assert.equal(received.at(-1)!.body.tools, undefined);
+    const textPrefix = received.at(-1)!.body.messages[0].content;
+    const restoredText = new BotContext(textFiles, ""); await restoredText.load();
+    const turnNativeOn = new ChatBackend({ ...cfg.bot, baseURL: `http://127.0.0.1:${address.port}/v1`, model: "offline-toggle-fixture", stream: false, nativeToolCalls: true }, ["observe"], definitions);
+    reply = text("observe"); await turnNativeOn.generate(restoredText, "新时间");
+    assert.equal(received.at(-1)!.body.tools, undefined);
+    assert.equal(received.at(-1)!.body.messages[0].content, textPrefix);
+    await restoredText.applyCompression({ historySummary: "开启原生协议", memoryDigest: "" }, 20);
+    await turnNativeOn.generate(restoredText, "新窗口");
+    assert.deepEqual(received.at(-1)!.body.tools.map((tool: any) => tool.function.name), ["observe"]);
+    assert.match(received.at(-1)!.body.messages[0].content, /已有原生声明的能力使用 function calling/);
+    const turnNativeOff = new ChatBackend({ ...cfg.bot, baseURL: `http://127.0.0.1:${address.port}/v1`, model: "offline-toggle-fixture", stream: false, nativeToolCalls: false }, ["observe"], definitions);
+    await turnNativeOff.generate(restoredText, "仍在同一窗口");
+    assert.ok(received.at(-1)!.body.tools?.length);
+    await restoredText.applyCompression({ historySummary: "关闭原生协议", memoryDigest: "" }, 21);
+    await turnNativeOff.generate(restoredText, "下一窗口");
+    assert.equal(received.at(-1)!.body.tools, undefined);
+    assert.match(received.at(-1)!.body.messages[0].content, /本次使用正文 JSON 协议/);
     console.log("PASS native tool snapshots: stable HTTP prefix, blocked requests during pinned/commit cleanup failures, automatic recovery cutover, updated validation, body JSON fallback and empty snapshots");
   } finally {
     server.closeAllConnections(); await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));

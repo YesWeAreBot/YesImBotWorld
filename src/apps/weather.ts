@@ -47,11 +47,12 @@ export class WeatherApp implements WorldApp {
   ) {}
 
   async open(): Promise<{ tools: AppRawTool[] }> {
+    const realWorld = (await this.files.readMeta()).realWorld ?? this.clock.syncRealTime;
     return {
       tools: [
         {
           name: "query_weather",
-          description: "查询当前天气与未来几天的简要预报。现实模式中 city 缺省使用配置的默认城市，无默认城市则需要指定；虚构模式缺省查询当前可观测地区，只展示已有记录，不生成天气或预报。",
+          description: "查询当前天气与未来几天的简要预报。" + (realWorld ? "city 缺省使用设定的默认城市，无默认城市则需要指定。" : "city 缺省查询当前可观测地区；只展示应用已收录的天气与预报，没有资料时显示未知或不可用。"),
           inputSchema: {
             type: "object",
             properties: {
@@ -154,9 +155,9 @@ export class WeatherApp implements WorldApp {
   private async virtualWeather(city?: string): Promise<string | RichText> {
     const where = city ? `「${city}」` : "它当前所在的地区";
     const task =
-      `Bot 打开了手机上的天气应用，查询${where}的天气（当前 ${this.clock.timeLine()}）。\n` +
-      `请扮演这个天气应用给出查询结果：\n` +
-      `仅查询角色可用的虚构天气应用中已确立的天气或预报；缺少记录、地点不明或资料过时就说明未知/不可用。\n` +
+      `通过角色可用的天气应用查询${where}的天气（当前 ${this.clock.timeLine()}）；这项设备请求不证明角色的身体已经行动或看过结果。\n` +
+      `请给出天气应用的查询结果：\n` +
+      `仅查询该应用中已确立的天气或预报；缺少记录、地点不明或资料过时就说明未知/不可用。\n` +
       `这是只读查询，不修改世界，不新增天气，也不编造未来预报。只输出有来源支持的应用结果。`;
     try {
       return await this.world.observeVirtualApp(task);

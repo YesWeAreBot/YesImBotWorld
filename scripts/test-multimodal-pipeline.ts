@@ -105,6 +105,14 @@ async function inboundAndCache() {
   name = "新名字"; modalities.image = false; c.attachmentLoader.clearCache?.();
   const unchanged = await c.toChatMessages("不应改写起点"); assert.deepEqual(unchanged, first);
   modalities.image = true;
+  const sizeBeforeReread = c.approxChars(), textBeforeReread = c.renderStreamText().length;
+  await append(c, rich);
+  const reread = await c.toChatMessages("起点");
+  assert.deepEqual(reread.slice(0, first.length), first);
+  assert.equal(images(contentParts(reread)).length, 2, "rereading history reuses the prior exact image instead of spending another attachment slot");
+  assert.equal(c.attachmentBudgetExceeded, false, "the same two images cannot force premature memory compression");
+  assert.match(JSON.stringify(reread.at(-1)), /已在事件 ev_1 中展开/);
+  assert.equal(c.approxChars() - sizeBeforeReread, c.renderStreamText().length - textBeforeReread, "approximate size also counts unique media, so historical rereads do not fake attachment overflow");
   await c.appendToolCall({ id: c.nextToolId(), name: "view_media", arguments: { media: [`media:${bird.id}`] }, issuedAt: 1, expectedAt: 1 });
   await append(c, await f.renderer.render(mediaPlaceholder(bird.id, "image")));
   const after = await c.toChatMessages("起点");
@@ -154,7 +162,7 @@ async function galleryAndSend() {
   await f.media.ingest(dataUrl(png("CAT")), "image", undefined, undefined, true);
   const output = await f.messenger.send("fixture:private:peer", `甲 ${mediaSendTag(cat)} 乙 ${mediaSendTag(dog)} 丙`);
   assert.ok(output.startsWith("消息已发送")); assert.equal(f.sent.length, 3);
-  assert.deepEqual(f.stored, ["甲 ", mediaPlaceholder(cat.id, "image"), ` 乙 ${mediaPlaceholder(dog.id, "image")} 丙`]);
+  assert.deepEqual(f.stored, ["甲 ", mediaPlaceholder(cat.id, "image", true), ` 乙 ${mediaPlaceholder(dog.id, "image", false)} 丙`]);
   const all = f.sent.flat(); const emitted = all.filter(el => el.type === "img");
   assert.equal(emitted[0].attrs.src, dataUrl(png("CAT"))); assert.equal(emitted[1].attrs.src, dataUrl(png("DOG")));
   // A missing/corrupt cached file is never silently paired with an old summary.
@@ -174,6 +182,51 @@ async function galleryAndSend() {
   chooser.messenger.channelMessages = async () => { throw new Error("echo unavailable"); };
   assert.ok((await chooser.echoChannelRecent("fixture:private:peer", confirmed)).startsWith("消息已发送"));
   console.log("PASS gallery names/summaries verified against asset hashes, strict ref parsing, read-only selection, exact outgoing image bytes and sticker/text ordering");
+}
+async function repeatedMediaBoundaries() {
+  const f = await fixture(), [cat, dog] = f.refs as [MediaRef, MediaRef];
+  const rich = await f.renderer.render(`第一次猫${mediaPlaceholder(cat.id, "image")}中间狗${mediaPlaceholder(dog.id, "image")}再看猫${mediaPlaceholder(cat.id, "image")}`);
+  const root = path.join(f.root, "repeat-boundaries"), c = await context(root);
+  const loader = createAttachmentLoader(f.media, { image: true, audio: true, video: true }, logger as any);
+  c.attachmentLoader = loader; c.maxAttachmentsPerRequest = 3;
+  await append(c, rich);
+  const first = await c.toChatMessages("T1");
+  assert.deepEqual(images(contentParts(first)).map(part => part.image_url.url), [dataUrl(png("CAT")), dataUrl(png("DOG")), dataUrl(png("CAT"))], "A/B/A is rendered at all three original positions, without a forward reference inside the current event");
+  assert.doesNotMatch(JSON.stringify(first.at(-1)), /已在事件/);
+  const rawBefore = await fs.readFile(path.join(root, "stream.jsonl"), "utf8");
+  await append(c, rich);
+  const repeated = await c.toChatMessages("T1");
+  assert.deepEqual(repeated.slice(0, first.length), first);
+  assert.equal(images(contentParts(repeated)).length, 3);
+  assert.equal(c.attachmentBudgetExceeded, false);
+  assert.equal((JSON.stringify(repeated.at(-1)).match(/已在事件 ev_1 中展开/g) ?? []).length, 3);
+  assert.ok((await fs.readFile(path.join(root, "stream.jsonl"), "utf8")).startsWith(rawBefore));
+  const reloaded = await context(root); reloaded.attachmentLoader = loader; reloaded.maxAttachmentsPerRequest = 3;
+  assert.deepEqual(await reloaded.toChatMessages("T1"), repeated, "reloading does not revise settled media occurrences or budget decisions");
+
+  // Pre-upgrade events keep their original repetition/attachment admission rules.
+  const legacyRoot = path.join(f.root, "legacy-media"), legacy = await context(legacyRoot);
+  const oldEvents = [1, 2].map(n => ({ kind: "event", event: { id: `ev_${n}`, source: "koishi", content: rich.text, parts: rich.parts, attachments: rich.attachments, worldTime: n } }));
+  const legacyBytes = oldEvents.map(event => JSON.stringify(event)).join("\n") + "\n";
+  await fs.writeFile(path.join(legacyRoot, "stream.jsonl"), legacyBytes);
+  await legacy.load(); legacy.attachmentLoader = loader; legacy.maxAttachmentsPerRequest = 6;
+  const oldRequest = await legacy.toChatMessages("T1");
+  assert.equal(images(contentParts(oldRequest)).length, 6, "absence of the persisted new-event marker preserves legacy rendering");
+  await append(legacy, rich);
+  const afterNew = await legacy.toChatMessages("T1");
+  assert.deepEqual(afterNew.slice(0, oldRequest.length), oldRequest);
+  assert.equal(images(contentParts(afterNew)).length, 6);
+  assert.ok((await fs.readFile(path.join(legacyRoot, "stream.jsonl"), "utf8")).startsWith(legacyBytes));
+  const reloadOld = await context(legacyRoot); reloadOld.attachmentLoader = loader; reloadOld.maxAttachmentsPerRequest = 6;
+  assert.deepEqual(await reloadOld.toChatMessages("T1"), afterNew);
+
+  const retry = await context(path.join(f.root, "media-load-failure")); retry.maxAttachmentsPerRequest = 3;
+  let fail = true;
+  retry.attachmentLoader = async ref => { if (fail && ref.id === dog.id) { fail = false; throw Error("temporary read failure"); } return loader(ref); };
+  await append(retry, rich);
+  await assert.rejects(retry.toChatMessages("T1"), /temporary read failure/);
+  assert.equal(images(contentParts(await retry.toChatMessages("T1"))).length, 3, "failed rendering restores every reserved attachment slot and publishes no dangling event reference");
+  console.log("PASS repeated media: exact A/B/A positions, reuse of complete earlier events only, frozen append/reload semantics, unchanged legacy media and failed-render recovery");
 }
 async function replyIdentity() {
   const accepted = ["12", "-12", "satori.message_A-9:opaque", "$matrixEvent:server", "opaque12-extra34"];
@@ -217,5 +270,5 @@ async function replyIdentity() {
   assert.equal(f.sent.length, 2);
   console.log("PASS message/media namespace isolation, opaque platform reply IDs, canonical send parameters and identical inline-quote validation");
 }
-async function main() { try { await inboundAndCache(); await galleryAndSend(); await replyIdentity(); } finally { await Promise.all(rootDirs.map(dir => fs.rm(dir, { recursive: true, force: true }))); } }
+async function main() { try { await inboundAndCache(); await repeatedMediaBoundaries(); await galleryAndSend(); await replyIdentity(); } finally { await Promise.all(rootDirs.map(dir => fs.rm(dir, { recursive: true, force: true }))); } }
 void main().catch(error => { console.error(error); process.exitCode = 1; });

@@ -54,7 +54,7 @@ export class NarrativeWorld {
     const signal = this.lifetime.signal;
     await this.serial(async () => {
       if (store.snapshot().initialized) return;
-      const definitions = { bot: botDef ?? await this.files.readText(this.files.botDef), world: worldDef ?? await this.files.readText(this.files.worldDef) };
+      const definitions = { character: botDef ?? await this.files.readText(this.files.botDef), world: worldDef ?? await this.files.readText(this.files.worldDef) };
       const actor: NarrativeActor = { id: "bot", name: "常驻角色", controller: "bot", present: true, state: "", perception: "" };
       await this.change(`根据作者定义创世，用自然语言建立可持续承接的世界状态、角色身体处境和初始感知。botName填写角色名字，不替角色决定未来行为。\n${JSON.stringify(definitions)}`,
         { kind: "initialize", actorId: "bot", actors: { bot: actor }, id: "initialize", signal });
@@ -98,11 +98,11 @@ export class NarrativeWorld {
   /** Internal virtual-device read. Unlike physical observe, this cannot establish missing files. */
   async observeVirtualApp(actorId: string, task: string): Promise<NarrativeObservation> {
     const meta = await this.files.readMeta();
-    if (meta.realWorld ?? this.clock.syncRealTime) throw new Error("真实应用内容必须由设备工具读取，不能通过世界模型模拟。");
+    if (meta.realWorld ?? this.clock.syncRealTime) throw new Error("该应用必须通过设备提供的读取能力获取内容，此读取入口不可用。");
     await this.ensure(); const signal = this.lifetime.signal;
     return this.serial(async () => {
       if (!(await this.store()).snapshot().actors[actorId]?.present) throw new Error("角色当前不在这个世界中。");
-      const result = await this.change(`仅通过角色可使用的虚构应用读取已经确立的内容：${task}\n这次仅可返回该actorId的一份perceptions，不可填写worldState、actorStates、outcome，不可发送其他角色事件。只读取已存在的虚构文件、页面、记录或已明确预报。文件原文逐字保留；没有记载的内容说明未知或不可用，不猜测不存在、不创建新原文，不执行写入、命令或真实网络请求。`,
+      const result = await this.change(`仅通过角色可使用的应用读取已经确立的内容：${task}\n这次仅可返回该actorId的一份perceptions，不可填写worldState、actorStates、outcome，不可发送其他角色事件。只读取已存在的文件、页面、记录或已明确预报。文件原文逐字保留；没有记载的内容说明未知或不可用，不猜测不存在、不创建新原文，不执行写入、命令或外部网络请求。`,
         { kind: "app_observe", actorId, id: `app-observe:${randomUUID()}`, signal });
       const perception = result?.perceptions.find(p => p.actorId === actorId);
       return perception ? observationOf(perception) : this.peek(actorId);
@@ -111,7 +111,7 @@ export class NarrativeWorld {
   /** App writes change device records; only the caller's attention/control gate may expose output. */
   async executeVirtualApp(actorId: string, task: string, signal?: AbortSignal): Promise<RichText> {
     const meta = await this.files.readMeta();
-    if (meta.realWorld ?? this.clock.syncRealTime) throw new Error("真实应用操作必须由设备工具执行，不能通过世界模型模拟。");
+    if (meta.realWorld ?? this.clock.syncRealTime) throw new Error("该应用必须通过设备提供的操作能力执行，此操作入口不可用。");
     const id = `${actorId}:app:${randomUUID()}`, controller = new AbortController();
     this.controllers.set(id, controller);
     const combined = AbortSignal.any([this.lifetime.signal, controller.signal, ...(signal ? [signal] : [])]);
@@ -119,10 +119,10 @@ export class NarrativeWorld {
       combined.throwIfAborted(); await this.ensure();
       return await this.serial(async () => {
         if (!(await this.store()).snapshot().actors[actorId]?.present) throw new Error("角色当前不在这个世界中。");
-        const result = await this.change(`仅执行角色可用的虚构设备上的应用请求：${task}\n这是应用操作，不是角色身体或意识的行动，不代表角色已经看过结果。必须显式返回worldState全文：根据实际影响更新，未发生变化时返回原文，必须保留既有精确文件内容；不能改actorStates、代替角色行动或给其他角色发送感知。perceptions只放该actorId一份私有应用回执，outcome明确completed、failed或needs_input。回执只输出实际应用结果；未执行、能力不足或失败要如实说明，不以猜测当作成功。`,
+        const result = await this.change(`仅执行角色可用设备上的应用请求：${task}\n这是应用操作，不是角色身体或意识的行动，不代表角色已经看过结果。必须显式返回worldState全文：根据实际影响更新，未发生变化时返回原文，必须保留既有精确文件内容；不能改actorStates、代替角色行动或给其他角色发送感知。perceptions只放该actorId一份私有应用回执，outcome明确completed、failed或needs_input。回执只输出实际应用结果；未执行、能力不足或失败要如实说明，不以猜测当作成功。`,
           { kind: "app_action", actorId, id, signal: combined });
         const receipt = result?.toolReceipt;
-        if (!receipt) throw new Error("虚构应用没有提交可确认的执行回执。");
+        if (!receipt) throw new Error("应用没有返回可确认的执行结果。");
         const status = receipt.status === "failed" ? "操作未完成。\n" : receipt.status === "needs_input" ? "操作需要补充输入。\n" : "";
         return { text: status + receipt.text, originEventIds: result.events.filter(event => event.topic === "world.committed").map(event => event.id) };
       }, combined);
@@ -239,12 +239,12 @@ export class NarrativeWorld {
   private async change(task: string, options: Change): Promise<NarrativeCommitResult | undefined> {
     const store = await this.store(), previous = store.findCommit(`${options.id}:commit`); if (previous) return previous;
     const definitions = await this.files.readDefinitions();
-    const messages: ChatMessage[] = [{ role: "system", content: this.prompts.world.narrativeSystem + "\n<world_definition>\n" + definitions.worldDef + "\n</world_definition>\n<bot_definition>\n" + definitions.botDef + "\n</bot_definition>" }];
+    const messages: ChatMessage[] = [{ role: "system", content: this.prompts.world.narrativeSystem + "\n<world_definition>\n" + definitions.worldDef + "\n</world_definition>\n<character_definition>\n" + definitions.botDef + "\n</character_definition>" }];
     for (let attempt = 0; attempt < 3; attempt++) {
       options.signal?.throwIfAborted();
       const snapshot = store.snapshot(), actors = { ...snapshot.actors, ...options.actors };
       messages.push({ role: "user", content: JSON.stringify({ task, kind: options.kind, actorId: options.actorId, time: Math.max(this.clock.now(), snapshot.effectiveAt), stateUpdatedAt: snapshot.stateUpdatedAt, stateVersion: snapshot.sequence,
-        worldState: snapshot.worldState, actors: Object.values(actors).filter(a => a.present || a.id === options.actorId), pendingActions: Object.values(snapshot.actions).filter(a => a.status === "pending") }) });
+        worldState: snapshot.worldState, actors: Object.values(actors).filter(a => a.present || a.id === options.actorId).map(a => ({ id: a.id, name: a.name, present: a.present, state: a.state, perception: a.perception, ...(a.persona !== undefined ? { persona: a.persona } : {}) })), pendingActions: Object.values(snapshot.actions).filter(a => a.status === "pending") }) });
       const result = await abortable(this.infer(messages, [worldResolutionTool(options.kind === "initialize")], options.signal), options.signal);
       options.signal?.throwIfAborted();
       messages.push({ role: "assistant", content: result.content, ...(result.toolCalls.length ? { tool_calls: result.toolCalls } : {}) });
@@ -254,9 +254,9 @@ export class NarrativeWorld {
         const call = result.toolCalls.length === 1 ? result.toolCalls[0] : undefined;
         if (!call || call.function.name !== "resolve_world") throw new Error("请且仅调用一次resolve_world提交自然语言裁定。");
         input = parseResolution(JSON.parse(call.function.arguments), options); updates = { ...options.actors };
-        if (options.kind === "app_observe" && (input.worldState !== undefined || input.actorStates !== undefined || input.outcome !== undefined || input.perceptions.some(p => p.actorId !== options.actorId))) throw new Error("虚构应用只读请求只能返回该角色的感知，不能修改状态、执行操作或投递其他角色。");
-        if (options.kind === "app_action" && (input.actorStates !== undefined || !input.outcome || input.perceptions.some(p => p.actorId !== options.actorId))) throw new Error("虚构应用操作必须返回明确outcome及本角色私有回执，不能修改角色状态或投递其他角色。");
-        if (options.kind === "app_action" && input.worldState === undefined) throw new Error("虚构应用操作必须显式返回worldState全文；没有状态变化时返回原文，不能只声明应用结果而不保存世界事实。");
+        if (options.kind === "app_observe" && (input.worldState !== undefined || input.actorStates !== undefined || input.outcome !== undefined || input.perceptions.some(p => p.actorId !== options.actorId))) throw new Error("应用只读请求只能返回该角色的感知，不能修改状态、执行操作或投递其他角色。");
+        if (options.kind === "app_action" && (input.actorStates !== undefined || !input.outcome || input.perceptions.some(p => p.actorId !== options.actorId))) throw new Error("应用操作必须返回明确outcome及本角色私有回执，不能修改角色状态或投递其他角色。");
+        if (options.kind === "app_action" && input.worldState === undefined) throw new Error("应用操作必须显式返回worldState全文；没有状态变化时返回原文，不能只声明应用结果而不保存世界事实。");
         for (const update of input.actorStates ?? []) {
           const actor = actors[update.actorId]; if (!actor || (!actor.present && update.actorId !== options.actorId)) throw new Error("不能更新本次输入之外的角色身份。");
           updates[actor.id] = { ...actor, state: update.state };
@@ -265,7 +265,7 @@ export class NarrativeWorld {
         const primary = input.perceptions.find(p => p.actorId === options.actorId);
         if (["initialize", "action", "observe", "app_observe", "app_action", "arrive"].includes(options.kind) && !primary) throw new Error("必须向操作角色提供可读实际感知，不能只更新后台状态。");
         if (options.kind === "initialize") {
-          if (!input.worldState || !updates.bot?.state || !input.botName) throw new Error("创世需要完整世界状态、bot状态、初始感知和botName。");
+          if (!input.worldState || !updates.bot?.state || !input.botName) throw new Error("创世需要完整世界状态、角色状态、初始感知和botName。");
           updates.bot = { ...updates.bot, name: input.botName };
         }
         if (options.action?.speech && input.outcome?.speechSpoken && !primary!.text.includes(options.action.speech)) throw new Error("speechSpoken=true时，行动者感知必须逐字包含请求原话，不能改写或只说已经说过。");

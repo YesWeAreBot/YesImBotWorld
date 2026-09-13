@@ -402,7 +402,7 @@ export class WorldAgent {
   /** Only explicitly virtual app branches use this entry; real device tools keep their own IO. */
   async observeVirtualApp(task: string, actorId = "bot"): Promise<RichText> {
     if (this.remote && actorId === "bot") {
-      if (!this.remote.observeVirtualApp) throw new Error("远方世界暂不支持读取虚构应用的既有内容。");
+      if (!this.remote.observeVirtualApp) throw new Error("当前所在地的应用暂不支持读取这项内容。");
       return this.remote.observeVirtualApp(task);
     }
     const observation = await this.runtime.observeVirtualApp(actorId, task);
@@ -429,7 +429,7 @@ export class WorldAgent {
 
   async executeAppAction(intent: string, actorId = "bot", signal?: AbortSignal): Promise<RichText> {
     if (this.remote && actorId === "bot") {
-      if (!this.remote.executeVirtualApp) throw new Error("远方世界暂不支持虚构应用操作。");
+      if (!this.remote.executeVirtualApp) throw new Error("当前所在地的应用暂不支持这项操作。");
       return this.remote.executeVirtualApp(intent, signal);
     }
     // App output is private until the existing BotAgent device gate chooses to perceive it.

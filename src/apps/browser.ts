@@ -223,7 +223,7 @@ export class BrowserApp implements WorldApp {
         },
       );
     }
-    return { tools: real ? tools : tools.map(tool => ({ ...tool, description: tool.description + "虚构模式只读取角色可访问的既有网页记录，没有内容记录则显示未知或不可用，不会访问真实互联网。" })) };
+    return { tools: real ? tools : tools.map(tool => ({ ...tool, description: tool.description + "此浏览器只能查看已经收录、且当前可访问的网页；没有资料时显示未知或不可用，不能访问其他网络。" })) };
   }
 
   async call(tool: string, args: Record<string, unknown>): Promise<string | RichText> {
@@ -426,9 +426,9 @@ export class BrowserApp implements WorldApp {
 
     // 每次导航重新读取已确立的世界记录；旧的“未知”页面不能永久遮住后续内容。
     const task =
-      `浏览器收到请求：${what}（当前 ${this.clock.timeLine()}）。\n` +
-      `请只读呈现已有网页内容，不模拟尚未存在的互联网事实：\n` +
-      `1. 仅查询角色可用的虚构浏览器中已确立的网页记录；` +
+      `通过角色可用浏览器处理请求：${what}（当前 ${this.clock.timeLine()}）；这项设备请求不证明角色的身体已经行动或看过结果。\n` +
+      `请只读呈现已有网页内容，不补写尚未存在的互联网事实：\n` +
+      `1. 仅查询该浏览器中已确立的网页记录；` +
       `观测明确记录无网络或网址不存在时才显示对应错误；没有记录时只说明未知/不可用，不能猜测 404 或断网。\n` +
       `2. 缺少已知网页内容时生成不可用页面，不创建世界事实。\n` +
       `3. 最后输出这个网页的完整 HTML 文档（从 <!DOCTYPE html> 或 <html> 开始）：\n` +
@@ -464,7 +464,7 @@ export class BrowserApp implements WorldApp {
     const page = this.current!;
     const pptr = this.puppeteer;
     if (!pptr) {
-      return "（截图失败：这台手机没有截图组件。让主人安装并启用 koishi-plugin-puppeteer 后就能截图了。）";
+      return "（截图失败：这台设备的截图功能尚不可用，需要先由设备维护者完成配置。）";
     }
     if (!real && !page.html) {
       return "（这个页面没法截图（缺少页面内容）。重新打开它试试。）";

@@ -86,7 +86,7 @@ export class ComputerDevice {
         return this.openAs([this.terminal, this.filesApp].filter(Boolean) as WorldApp[]);
       }
       case "remote_desktop": {
-        if (!this.remote) return { error: "远程桌面模式需要 Bot-LLM 开启图片多模态（bot.modalities.image）。" };
+        if (!this.remote) return { error: "当前无法查看远程桌面的画面，暂时不能使用这台电脑。" };
         return this.openAs([this.remote]);
       }
     }

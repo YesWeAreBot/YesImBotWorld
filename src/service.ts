@@ -30,10 +30,10 @@ import type { CrossingPerceptionEvent, PlayerMode } from "./crossing/protocol.js
 import { CrossingServer } from "./crossing/server.js";
 import { WorldFiles } from "./files.js";
 import { resolvePhoneResolution } from "./phone.js";
-import { Prompts, type PromptOverrides } from "./prompts.js";
+import { CHAT_RUNTIME_GUIDANCE, Prompts, type PromptOverrides } from "./prompts.js";
 import { WebUIServer, type BotStatusSummary, type DevicesInfo, type NoteEntry, type WebUIHost } from "./webui/server.js";
 import { FocusManager } from "./koishi/focus.js";
-import { Gateway } from "./koishi/gateway.js";
+import { Gateway, prefixRichText } from "./koishi/gateway.js";
 import { MessageStore } from "./koishi/messages.js";
 import { KoishiMessenger } from "./koishi/messenger.js";
 import { ChannelNameResolver } from "./koishi/names.js";
@@ -189,21 +189,33 @@ export class WorldService extends Service<Config> {
       notify: (content, wake) => {
         if (this.worldActive && this.bot) this.bot.pushEvent("koishi", content, { wake });
       },
-      selfMessage: (key, content, msgId) => {
+      selfMessage: async (key, content, msgId, sendArgs) => {
         if (!this.worldActive || !this.bot) return;
         // 自己的账号发出了消息：无论何种呈现模式，先打断对该频道的延期发送意图
         this.bot.noteDeferredSelfSent(key);
         const mode = config.messaging.externalSelfMessages;
         if (mode === "simulate") {
-          this.bot.simulateExternalSend(key, content, msgId);
+          this.bot.simulateExternalSend(key, content, msgId, sendArgs);
         } else if (mode === "event") {
-          void this.names.display(key).then((display) => {
+          const recipient = this.bot;
+          if (this.phoneStatus.down) {
+            recipient.pushEvent("koishi", "放在一边的手机震了一下。", { wake: config.messaging.wakeOnNotify });
+            return;
+          }
+          try {
+            const display = await this.names.display(key);
+            if (!this.worldActive || this.bot !== recipient) return;
+            if (this.phoneStatus.down) {
+              recipient.pushEvent("koishi", "放在一边的手机震了一下。", { wake: config.messaging.wakeOnNotify });
+              return;
+            }
             const msgTag = msgId && needsMsgIds(config.platformOps) ? `(msg:${msgId}) ` : "";
-            this.bot?.pushEvent(
+            recipient.pushEvent(
               "koishi",
-              `你注意到自己的账号在 ${display} 发出了一条消息——但那不是你发的（大概是手机里某个应用的自动回复）：${msgTag}${content}`,
+              prefixRichText(`你注意到自己的账号在 ${display} 发出了一条消息，但你没有操作发送。可能来自其他设备或应用，具体原因尚不清楚。消息正文开始：\n${msgTag}`, content, "\n消息正文结束。"),
+              { wake: config.messaging.wakeOnNotify },
             );
-          });
+          } catch (error) { this.logger.warn("外发消息通知失败: %s", error); }
         }
       },
       channelActivity: (key) => {
@@ -557,6 +569,9 @@ export class WorldService extends Service<Config> {
       ...archivedPerceptions.flatMap(entry => entry.rootEventIds),
     ])];
     await this.world.restorePerceptions("bot", content => this.bot!.pushEvent("world", content), knownWorldSources);
+    if (!this.botContext.stream.some(entry => entry.kind === "event" && entry.event.source === "system" && entry.event.content === CHAT_RUNTIME_GUIDANCE)) {
+      this.bot.pushEvent("system", CHAT_RUNTIME_GUIDANCE);
+    }
     this.bot.pushEvent("system", "可以继续先前的生活。recovered 标记表示已保存处境的回读，不是新发生的行动，也不证明这些动作出于你的自主意图。未完成动作以实际回执为准；系统暂停本身不代表角色睡眠或失神。");
     const offline = this.clock.consumeOfflineGap();
     const min = this.config.clock.offlineNarrateMinUnits;

@@ -362,9 +362,8 @@ export const Config: Schema<Config> = Schema.intersect([
         .description(
           "工具的原生声明（仅 chat 模式生效）：开启后，工具通过 OpenAI tools 参数正式声明，" +
             "模型以 function calling 接口调用（利用模型训练时的工具调用特殊 token，对云端 API 与做过工具调用训练的模型更稳）。" +
-            "声明仅包含当前实际可用的工具，随进频道/开应用变化；" +
-            "分层解锁同时以事件通知，调用已失效的工具会被拦下并提示。" +
-            "关闭时沿用文本协议：工具列在置顶区，模型在正文输出 JSON",
+            "声明在建立工作窗口时保存，与固定提示一起跨重启保留。频道或应用的能力变化通过追加事件通知，失效调用立即拦截；新能力可先用正文 JSON 调用。" +
+            "关闭时使用正文 JSON 协议；修改本开关及刷新固定声明都在下次记忆整理后生效，以保持上下文前缀稳定。",
         ),
       disableWait: Schema.boolean()
         .default(false)
@@ -1067,7 +1066,7 @@ export const Config: Schema<Config> = Schema.intersect([
         .default(100)
         .description(
           "单条消息的长度提醒阈值（字符数）。send 的 msg 超过该长度时不会立即发出，" +
-            "而是提醒 Bot 日常聊天应使用短消息，需要它加 confirm_long: true 二次确认才发送。0 表示禁用",
+            "而是说明本次调用尚未提交，需要它加 confirm_long: true 确认完整内容才发送；不否认先前已发送的消息。0 表示禁用",
         ),
       coldChannelMsgs: Schema.natural()
         .default(3)
@@ -1083,15 +1082,15 @@ export const Config: Schema<Config> = Schema.intersect([
       ])
         .default("off")
         .description(
-          "Bot 账号发出的、非本插件产生的消息（其他插件的输出、Koishi 指令回复等）是否让 Bot-LLM 看到。" +
-            "开启后这类消息也会入库（消息记录中可回看）",
+          "Bot 账号发出的、非本插件产生的消息（其他插件输出、Koishi 指令回复、平台上报的其他登录设备消息）是否让 Bot-LLM 看到。" +
+            "仅记录平台确认发送或收到的账号消息；开启后可在消息记录中回看。其他设备消息需要适配器提供账号自身的消息事件",
         ),
       selfCommands: Schema.boolean()
         .default(false)
         .description(
-          "允许 Bot 触发 Koishi 指令（自己玩自己）：它发出的消息若以某个已注册指令名开头（不带前缀），" +
+          "允许 Bot 触发 Koishi 指令（自己玩自己）：平台确认发送成功的纯文本消息若以某个已注册指令名开头（不带前缀），" +
             "将以它自己的身份执行，指令输出照常发回频道（配合 externalSelfMessages 可让它看到结果）。" +
-            "能执行哪些指令取决于 Bot 账号在 Koishi 的权限等级；本插件自身的 world 系列指令除外",
+            "能执行哪些指令取决于 Bot 账号在 Koishi 的权限等级；带媒体或引用的组合消息不触发，本插件自身的 world 系列指令（含别名和嵌套调用）除外",
         ),
       offlineHistory: Schema.boolean()
         .default(true)

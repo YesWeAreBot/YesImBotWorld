@@ -55,6 +55,13 @@ export interface BotCrossingApi {
 }
 
 /** Koishi 侧能力（消息查询与发送），由 service 层实现注入 */
+export interface MessageSendReceipt {
+  /** `unknown` includes timeouts: lack of an acknowledgement is not proof of non-delivery. */
+  status: "sent" | "partial" | "blocked" | "unknown";
+  text: string;
+  messageIds: string[];
+}
+
 export interface MessengerApi {
   /** 宽松解析频道 id，返回规范化 key 与是否私聊（用于进入频道页/自动切频道） */
   resolveKey(id: string): Promise<{ key: string; isPrivate: boolean } | { error: string }>;
@@ -75,6 +82,8 @@ export interface MessengerApi {
     atSender?: boolean,
     insist?: boolean,
   ): Promise<string>;
+  /** Internal delivery facts; the text-only entry point remains available to integrations. */
+  sendReceipt?(id: string, msg: string, media?: (string | number)[], replyTo?: string, atSender?: boolean, insist?: boolean): Promise<MessageSendReceipt>;
   putDownPhone(): Promise<string>;
   recall(id: string, msgId: string): Promise<string>;
   react(id: string, msgId: string, emoji: string, remove?: boolean): Promise<string>;
@@ -179,6 +188,7 @@ export class BotAgent {
    * 不只是相邻两条，而是同一句话在最近 N 条里重复出现就拦（治"口头禅式复读"）。
    */
   private recentSendSigs: string[] = [];
+  private uncertainSendSigs = new Set<string>();
   /** 延期发送意图（"过会儿再发"），到点询问、三类情况打断 */
   private pendingDeferred: PendingDeferred[] = [];
   /** 上一次 act 的描述与调用编号，用于拦截“结果未出就重复做同一件事” */
@@ -694,20 +704,28 @@ export class BotAgent {
   }
 
   /**
-   * 外部（其他插件 / Koishi 指令输出）以 Bot 账号发出的消息，伪装成 Bot 自己的
-   * send 工具调用注入流（externalSelfMessages = simulate）——Bot 会以为是自己发的。
+   * externalSelfMessages = simulate：认领账号已发出的消息；可由 send 表达时记录
+   * 合法工具参数，其他消息类型保留为行动感知，真实图文感知始终附在结果中。
    * 注入同样遵守阻塞规则：在下一次生成前统一追加。
    * msgId：平台消息 id，与真实 send 工具的结果格式一致（开启引用类操作时展示）。
    */
-  simulateExternalSend(channelKey: string, msg: string, msgId?: string): void {
+  simulateExternalSend(channelKey: string, content: string | RichText, msgId?: string, sendArgs?: { msg: string } | null): void {
+    const rich = typeof content === "string" ? { text: content } : content;
+    // Callers with unsupported message kinds retain the actual perceived action,
+    // without inventing a send tool invocation that could never send that content.
+    const args = sendArgs === undefined ? (typeof content === "string" ? { msg: content } : null) : sendArgs;
     const msgTag = msgId && needsMsgIds(this.config.platformOps) ? `（msg:${msgId}）` : "";
+    const prefix = `${args ? "消息已发送到" : "你刚才在"} ${channelKey}${msgTag}${args ? "。" : "发出了一条消息。"}已发送的消息正文：\n`;
+    const suffix = "\n〔已发送消息结束〕";
     this.mailbox.push({
-      source: "tool",
-      content: `消息已发送到 ${channelKey}${msgTag}。`,
+      source: args ? "tool" : "koishi",
+      content: prefix + rich.text + suffix,
+      attachments: rich.attachments,
+      parts: rich.parts ? [{ kind: "text", text: prefix }, ...rich.parts, { kind: "text", text: suffix }] : undefined,
       worldTime: this.clock.now(),
-      asToolCall: { name: "send", arguments: { id: channelKey, msg } },
+      ...(args ? { asToolCall: { name: "send", arguments: { id: channelKey, ...args } } } : {}),
     });
-    this.logger.info("[external-send:simulate] %s %s", channelKey, truncate(msg, 100));
+    this.logger.info("[external-send:simulate] %s %s", channelKey, truncate(rich.text, 100));
     // 账号自己发出了一条消息：打断对该频道的延期发送意图
     this.noteDeferredSelfSent(channelKey);
   }
@@ -2231,7 +2249,13 @@ export class BotAgent {
             this.attention = null;
             this.observingPlacedPhone = false;
           }
-          if (call.name !== "observe_device" && (stealth || revealOnAttention) && this.running && this.deviceAttention === kind) await this.perceiveDeviceChange(kind);
+          if (call.name !== "observe_device" && (stealth || revealOnAttention) && this.running && this.deviceAttention === kind) {
+            try { await this.perceiveDeviceChange(kind); }
+            catch (error) {
+              // The operation already completed. A subsequent screen refresh cannot undo it.
+              this.logger.warn("设备操作完成后读取界面失败，保留操作真实回执：%s", error);
+            }
+          }
           return result;
         } finally { this.deviceOperations--; }
       },
@@ -2593,7 +2617,11 @@ export class BotAgent {
       }
     }
     const id = this.channelArg(call) ?? "";
-    const msg = String(call.arguments.msg ?? "");
+    if (call.arguments.msg !== undefined && typeof call.arguments.msg !== "string") {
+      this.pushEvent("system", "（消息没有发出：msg 必须是你准备发送的正文字符串，不能是消息对象、消息列表或其他参数结构。）", { ref: call.id });
+      return;
+    }
+    const msg = call.arguments.msg ?? "";
     const aliases = ["images", "replyTo", "quote", "atSender", "at"].filter(key => Object.hasOwn(call.arguments, key));
     if (aliases.length) {
       this.pushEvent("system", `（消息没有发出：send 不接受旧参数 ${aliases.join("、")}。媒体使用 media，引用消息使用 reply_to，是否自动提醒被引用者使用 at_sender；请修正参数后重新发送。）`, { ref: call.id });
@@ -2648,9 +2676,9 @@ export class BotAgent {
       if (failures.length) return `（选图未完成，没有发送消息：${failures.map(r => `${r.refText}：${r.error}`).join("；")}）`;
       const selected = results.filter((r): r is PickResult => r.ok);
       const rows = selected.map((r, index) => r.ref.type === "audio"
-        ? `${refs[index]} → media:${r.ref.id}（音频；使用 send_file 发送，不能插入 send 图文）`
+        ? `${refs[index]} → media:${r.ref.id}（音频；当前 send 不支持发送音频，没有选为可发送内容）`
         : `${refs[index]} → <media ref="media:${r.ref.id}"/>${r.sticker ? "（表情包，发送时在原位置独立成一条）" : ""}`);
-      return `已确认以下媒体引用；尚未发送任何消息：\n${rows.join("\n")}\n请先确认内容，再将明确的 media 标签放入 send.msg 对应位置，或放入 send.media 在末尾追加。选图本身不创建草稿，也不会自动发送。`;
+      return `已确认以下媒体引用；尚未发送任何消息：\n${rows.join("\n")}\n请先确认内容，再将可发送的图片或视频的 media 标签放入 send.msg 对应位置，或将它们的引用放入 send.media 在末尾追加。选图本身不创建草稿，也不会自动发送。`;
     });
   }
 
@@ -2660,39 +2688,55 @@ export class BotAgent {
     if (longLimit > 0 && msg.length > longLimit && !isTruthy(call.arguments.confirm_long)) {
       this.pushEvent(
         "system",
-        `（这条消息长达 ${msg.length} 字，没有发出。日常聊天中一条消息一般只有十来个字，太长会显得不像真人——精简一下，或确需发长文就加 confirm_long: true。）`,
+        `（本次发送 ${call.id} 的正文为 ${msg.length} 个字符，超过 ${longLimit} 的长度提醒阈值，本次尚未提交到聊天平台。若确实需要这些内容，可加 confirm_long: true；否则只保留尚未表达的新内容。此提示不撤销或否认之前任何一次发送的回执。）`,
         { ref: call.id },
       );
       return;
     }
     if (this.maybeDeferSend(call, "text", id, msg)) return;
     if (this.gateSendDuration(call, "打字")) return;
-    const sig = JSON.stringify([id, msg, media.map(String)]);
-    const recentRepeat = this.recentSendSigs.filter((s) => s === sig).length;
-    const repeatThreshold = this.config.messaging.recentRepeatThreshold;
-    if (repeatThreshold > 0 && recentRepeat >= repeatThreshold && !isTruthy(call.arguments.resend)) {
-      this.pushEvent("system", `（你最近已经说过「${truncate(msg, 24)}」${recentRepeat} 次了。这句没有发出——换一种说法，或真的没有新内容就别说。）`, { ref: call.id });
-      return;
-    }
-    this.recordSendSig(sig);
     this.ackStart(call);
     const insist = isTruthy(call.arguments.insist);
+    let sent = false;
     this.schedule(call, {
       executeAt: "expected",
       run: async () => {
-        const out = await this.deliverSend(id, msg, media, replyTo, atSender, insist);
+        const out = await this.deliverSend(id, msg, media, replyTo, atSender, insist, isTruthy(call.arguments.resend), receipt => { sent = receipt.status === "sent"; });
         return out;
       },
+      resultOk: () => sent,
     });
   }
 
   /** 真正发出：切频道 + messenger.send，打断延期发送意图，回显。 */
-  private async deliverSend(id: string, msg: string, media: (string | number)[], replyTo: string | undefined, atSender: boolean, insist: boolean): Promise<string | RichText> {
+  private async deliverSend(id: string, msg: string, media: (string | number)[], replyTo: string | undefined, atSender: boolean, insist: boolean, resend = false, onReceipt?: (receipt: MessageSendReceipt) => void): Promise<string | RichText> {
     const target = await this.switchToTarget(id);
     if ("error" in target) return target.error;
-    const out = await this.messenger.send(target.key, msg, media, replyTo, atSender, insist);
-    this.noteDeferredSelfSent(target.key);
-    return this.echoChannelRecent(id, out);
+    // Check at actual execution, after resolving aliases and after earlier queued sends settle.
+    // A cancelled, invalid or rejected attempt is not something the person has already said.
+    const sig = JSON.stringify([target.key, msg, media.map(String)]);
+    const recentRepeat = this.recentSendSigs.filter(s => s === sig).length;
+    if (!resend && this.uncertainSendSigs.has(sig)) return "（同一内容的上次发送没有取得完整确认，可能已经送达；本次没有重复提交。请先 read_channel 检查记录，确认需要重发时再使用 resend: true。）";
+    if (!resend && this.config.messaging.recentRepeatThreshold > 0 && recentRepeat >= this.config.messaging.recentRepeatThreshold) {
+      return `（你最近已经向这个频道发出过相同内容 ${recentRepeat} 次。本次没有再次发送。没有新的意思就无需换个措辞再说；确有必要重复时才使用 resend: true。）`;
+    }
+    const receipt = this.messenger.sendReceipt
+      ? await this.messenger.sendReceipt(target.key, msg, media, replyTo, atSender, insist)
+      : await this.messenger.send(target.key, msg, media, replyTo, atSender, insist).then(text => ({ text, status: "sent" as const, messageIds: [] }));
+    if (receipt.status === "sent") {
+      this.recordSendSig(sig);
+      this.uncertainSendSigs.delete(sig);
+    } else if (receipt.status === "partial" || receipt.status === "unknown") {
+      if (!this.deviceExecution.getStore()?.stealth) {
+        this.uncertainSendSigs.add(sig);
+        if (this.uncertainSendSigs.size > Math.max(1, this.config.messaging.recentRepeatWindow)) this.uncertainSendSigs.delete(this.uncertainSendSigs.values().next().value!);
+      }
+    }
+    onReceipt?.(receipt);
+    if (receipt.status === "blocked") return receipt.text;
+    try { this.noteDeferredSelfSent(target.key); }
+    catch (error) { this.logger.warn("发送后更新延期意图失败，保留真实发送回执：%s", error); }
+    return this.echoChannelRecent(id, receipt.text);
   }
 
   /** 记录一条已发出的 send 签名，滑窗维护「最近 N 条」（超窗滑出最老） */
@@ -2708,9 +2752,7 @@ export class BotAgent {
   private dispatchCancel(call: ToolCallRecord): void {
     const target = String(call.arguments.id ?? call.arguments.toolcall_id ?? "");
     const result = this.scheduler.cancel(target);
-    // 撤回成功后，重发相同内容是合理操作，不应再被重复拦截——清空近期发送窗口
     if (result === "cancelled") {
-      this.recentSendSigs = [];
       this.externalToolResults.get(target)?.resolve({ ok: false, callId: target, text: "（尚未提交的调用已取消，没有继续执行。）" });
       this.externalToolResults.delete(target);
       this.puppetCalls.delete(target);
@@ -2982,19 +3024,7 @@ function isBreakLoopSafeTool(name: string): boolean {
  */
 export function sendBusyMessage(pending: ToolCallRecord[]): string | null {
   if (!pending.length) return null;
-  const what = "";
-  return pickMeta([
-    `（你上一条消息${what}还在发送中、还没看到结果，这次没有发出。等它的结果回显后再接着说——可以先做点别的，或整理一下接下来想说的话。）`,
-    `（你上一条${what}还没发出去，又急着发新的了？先等等，看到上一条的结果再继续，别抢话。）`,
-    `（上一条${what}还在路上，这条先别发。等它尘埃落定，再想下一句。）`,
-    `（你刚才那条${what}还没回显，这一条被拦下了。慢慢来，一句一句说。）`,
-    `（别急，上一条${what}还没发完。等它真正发出、看到结果，再开口说下一步。）`,
-    `（你连着要发两条，可上一条${what}都还没见着影。先等上一条落地。）`,
-    `（上一条${what}仍在发送中，这次没有发出。等回显了你再继续，别自说自话。）`,
-    `（你上一条消息${what}还没看到结果，这条就没发出去。先确认上一条，再接着说。）`,
-    `（前一条${what}还没发出，这条先收住。等看到结果再推进对话。）`,
-    `（上一条${what}仍在途中，这条不急着发。喘口气，等上一条到位。）`,
-  ]);
+  return `（发送 ${pending.map(call => call.id).join("、")} 仍在处理，最终回执尚未交付；它可能已经提交到平台，不能据此认为没有发出。本次新的 send 没有提交。请等原调用的回执，不要缩短或改写同一内容重发。）`;
 }
 
 function clampInt(value: unknown, min: number, max: number, fallback: number): number {

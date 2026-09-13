@@ -86,8 +86,10 @@ export class ChatBackend implements BotBackend {
     for (;;) {
       await context.settled();
       const revision = context.windowRevision;
-      tools = this.useNativeTools ? this.currentNativeDefs(context, revision) : undefined;
-      messages = await context.toChatMessages(timeLine, this.useNativeTools);
+      const nativeToolCalls = context.generationUsesNativeTools(this.useNativeTools);
+      tools = nativeToolCalls ? await context.nativeToolSnapshot(timeLine, this.currentNativeDefs(context, revision)) : undefined;
+      for (const tool of tools ?? []) this.knownToolNames.add(tool.function.name);
+      messages = await context.toChatMessages(timeLine, nativeToolCalls);
       // Media loading can yield while compression finishes. Never pair old messages with the
       // declarations of a new window, or send while a failed cutover still needs recovery.
       await context.settled();

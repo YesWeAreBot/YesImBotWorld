@@ -1,7 +1,7 @@
 import { promises as fs } from "node:fs";
 import { appendJsonLine } from "../jsonl.js";
 import type { WorldFiles } from "../files.js";
-import type { ChatMessage, ContentPart } from "../llm/chat.js";
+import type { ChatMessage, ChatToolDef, ContentPart } from "../llm/chat.js";
 import type { AttachmentLoadFn } from "../media/parts.js";
 import { BOT_PROMPT_DEFAULTS, type Prompts } from "../prompts.js";
 import type {
@@ -31,6 +31,8 @@ interface CompressionCommit {
 interface PinnedPersist {
   pinned: PinnedContext;
   counters: { tool: number; event: number };
+  /** Exact provider prefix for this working window. Missing in pre-upgrade archives. */
+  rendered?: { systemText: string; nativeToolCalls?: boolean; nativeTools?: ChatToolDef[] };
 }
 
 /**
@@ -72,7 +74,7 @@ export class BotContext {
   /** Freeze admission and bytes for each event until compression; new images never evict old ones. */
   private mediaWindow = this.newMediaWindow();
   private newMediaWindow() {
-    return { events: new Map<string, Promise<ContentPart[]>>(), count: 0, bytes: 0, exceeded: false };
+    return { events: new Map<string, Promise<ContentPart[]>>(), assets: new Map<string, string>(), count: 0, bytes: 0, exceeded: false };
   }
   /** Ask the runtime to compact before the next generation if new images cannot fit. */
   get attachmentBudgetExceeded(): boolean { return this.mediaWindow.exceeded; }
@@ -81,6 +83,9 @@ export class BotContext {
   private counters = { tool: 0, event: 0 };
   private toolsText: string;
   private frozenSystemText: string | null = null;
+  private frozenNativeTools: ChatToolDef[] | undefined;
+  private frozenNativeMode: boolean | undefined;
+  private renderedNeedsSave = false;
   private renderingRevision = 0;
   /** Native declarations and rendered messages must start the same committed working window. */
   get windowRevision(): number { return this.renderingRevision; }
@@ -122,12 +127,21 @@ export class BotContext {
   private async loadUnlocked(): Promise<void> {
     try {
       const raw = JSON.parse(await fs.readFile(this.files.pinned, "utf8")) as PinnedPersist;
+      if (raw.rendered !== undefined && (!raw.rendered || typeof raw.rendered.systemText !== "string" || (raw.rendered.nativeTools !== undefined && !Array.isArray(raw.rendered.nativeTools)) || (raw.rendered.nativeToolCalls !== undefined && typeof raw.rendered.nativeToolCalls !== "boolean"))) {
+        throw new Error("已保存的上下文固定前缀损坏，拒绝用新内容覆盖历史窗口");
+      }
       this.pinned = raw.pinned;
       this.counters = raw.counters;
+      this.frozenSystemText = raw.rendered?.systemText ?? null;
+      this.frozenNativeTools = raw.rendered?.nativeTools === undefined ? undefined : structuredClone(raw.rendered.nativeTools);
+      this.frozenNativeMode = raw.rendered?.nativeToolCalls ?? (raw.rendered?.nativeTools !== undefined ? true : undefined);
+      this.renderedNeedsSave = false;
       // 注意：置顶区保留持久化时的工具列表（保护前缀缓存）。
       // 与当前实际可用工具的差异由 service 层通过 toolsChangeNotice() 以 Event 形式告知 Bot，
       // 置顶列表在下次 rest 压缩（applyCompression）时才同步为当前列表。
-    } catch {
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      this.frozenSystemText = null; this.frozenNativeTools = undefined; this.frozenNativeMode = undefined; this.renderedNeedsSave = false;
       this.pinned.persona = (await this.files.readDefinitions()).botDef;
     }
     // 迁移/兜底：置顶区缺少「最初设定」（旧版 pinned.json 或没有 pinned.json 的旧世界），
@@ -140,7 +154,6 @@ export class BotContext {
     // Identity is owner-authored; world snapshots are observations, never a system persona.
     this.pinned.persona = this.pinned.botDefinition;
     this.stream = [];
-    this.frozenSystemText = null;
     this.mediaWindow = this.newMediaWindow();
     const raw = await this.files.readText(this.files.stream);
     const seenIds = new Set<string>();
@@ -162,6 +175,7 @@ export class BotContext {
         /* 跳过损坏行 */
       }
     }
+    this.renderingRevision++;
   }
 
   async persistPinned(): Promise<void> {
@@ -169,8 +183,10 @@ export class BotContext {
   }
 
   private async persistPinnedUnlocked(): Promise<void> {
-    const data: PinnedPersist = { pinned: this.pinned, counters: this.counters };
+    const data: PinnedPersist = { pinned: this.pinned, counters: this.counters,
+      ...(this.frozenSystemText !== null ? { rendered: { systemText: this.frozenSystemText, ...(this.frozenNativeMode !== undefined ? { nativeToolCalls: this.frozenNativeMode } : {}), ...(this.frozenNativeTools !== undefined ? { nativeTools: this.frozenNativeTools } : {}) } } : {}) };
     await this.files.atomicWrite(this.files.pinned, JSON.stringify(data, null, 2));
+    this.renderedNeedsSave = false;
   }
 
   private async appendEntry(entry: StreamEntry): Promise<void> {
@@ -206,11 +222,14 @@ export class BotContext {
       const existing = this.stream.find(entry => entry.kind === "event" && entry.event.id === event.id);
       const stored = { ...event };
       delete stored.contextText;
+      delete stored.mediaReuse;
       if (existing?.kind === "event") {
         // A retry after the journal append must reuse the original persisted projection. In
         // particular, an older raw JSON event must never be rewritten just because code upgraded.
         if (existing.event.contextText !== undefined) stored.contextText = existing.event.contextText;
+        if (existing.event.mediaReuse !== undefined) stored.mediaReuse = existing.event.mediaReuse;
       } else {
+        if (hasEventMedia(event)) stored.mediaReuse = true;
         const call = event.refToolCallId ? this.stream.find(entry => entry.kind === "tool_call" && entry.call.id === event.refToolCallId) : undefined;
         const projected = narrativeContextText(event, call?.kind === "tool_call" ? call.call.name : undefined);
         if (projected !== undefined) stored.contextText = projected;
@@ -232,12 +251,37 @@ export class BotContext {
   waitRemoved = false;
 
   renderSystemText(timeLine: string, nativeToolCalls = true): string {
-    return this.frozenSystemText ??= this.buildSystemText(timeLine, nativeToolCalls);
+    if (this.frozenNativeMode === undefined) { this.frozenNativeMode = nativeToolCalls; this.renderedNeedsSave = true; }
+    if (this.frozenSystemText === null) {
+      this.frozenSystemText = this.buildSystemText(timeLine, this.frozenNativeMode);
+      this.renderedNeedsSave = true;
+    }
+    return this.frozenSystemText;
+  }
+
+  /** Protocol changes, like tool declaration changes, take effect only in a new working window. */
+  generationUsesNativeTools(requested: boolean): boolean { return this.frozenNativeMode ?? requested; }
+
+  /** The backend must capture native declarations together with the exact system prefix before
+   * sending. Empty arrays are real snapshots; new tool eligibility remains append-only guidance. */
+  async nativeToolSnapshot(timeLine: string, candidate: ChatToolDef[]): Promise<ChatToolDef[]> {
+    return this.mutate(async () => {
+      this.renderSystemText(timeLine, true);
+      if (this.frozenNativeTools === undefined) {
+        this.frozenNativeTools = structuredClone(candidate);
+        this.renderedNeedsSave = true;
+      }
+      if (this.renderedNeedsSave) await this.persistPinnedUnlocked();
+      return structuredClone(this.frozenNativeTools);
+    });
   }
 
   /** Projection changes become a new prefix only after the previous window has been summarized. */
   resetRenderingAfterCompression(): void {
     this.frozenSystemText = null;
+    this.frozenNativeTools = undefined;
+    this.frozenNativeMode = undefined;
+    this.renderedNeedsSave = false;
     this.mediaWindow = this.newMediaWindow();
     this.renderingRevision++;
   }
@@ -311,6 +355,7 @@ export class BotContext {
   ): Promise<ContentPart[]> {
     const existing = window.events.get(event.id);
     if (existing) return structuredClone(await existing);
+    const admitted: { key: string; size: number }[] = [];
     const task = (async () => {
       const refAttr = event.refToolCallId ? ` ref="${event.refToolCallId}"` : "";
       let buf = `<event id="${event.id}" t="${event.worldTime.toFixed(1)}" src="${event.source}"${refAttr}>`;
@@ -328,6 +373,15 @@ export class BotContext {
       ];
       for (const seg of segments) {
         if (seg.kind === "text") { buf += seg.text; continue; }
+        // Reading the same conversation/photo again must not refill the media budget and force
+        // premature memory compression. Keep the original image and its bytes in the prefix;
+        // only this newly appended occurrence refers back to its already visible source event.
+        const assetKey = JSON.stringify([seg.ref.id, seg.ref.type, seg.ref.mime, seg.ref.file]);
+        const previousEvent = event.mediaReuse ? window.assets.get(assetKey) : undefined;
+        if (previousEvent) {
+          buf += mediaText(seg, `同一媒体的原始内容已在事件 ${previousEvent} 中展开；此处是再次看到同一素材，按 media 引用对应，勿当作另一张图`);
+          continue;
+        }
         let part = loader && eligible.has(seg.ref.id) ? await loader(seg.ref) : null;
         let reason = "当前未展开原始媒体；仅有此条目的身份与文字摘要";
         if (part) {
@@ -337,7 +391,7 @@ export class BotContext {
             // A single asset larger than the whole budget cannot be fixed by repeated compaction.
             if (window.count && size <= this.maxAttachmentBytesPerRequest && this.maxAttachmentsPerRequest > 0) window.exceeded = true;
             reason = "本次媒体预算已满，尚未展开此媒体；整理记忆后可再次 view_media 查看，不能将摘要当作已看见原图";
-          } else { window.count++; window.bytes += size; }
+          } else { window.count++; window.bytes += size; admitted.push({ key: assetKey, size }); }
         }
         if (part) {
           buf += mediaOpen(seg);
@@ -348,11 +402,21 @@ export class BotContext {
         } else buf += mediaText(seg, reason);
       }
       if (event.statusEcho) buf += `\n\n（这条事件发生时你的状态：\n${event.statusEcho}\n）`;
-      buf += "</event>"; flush(); return out;
+      buf += "</event>"; flush();
+      // A/B/A within this event retains each native image in place. Only a fully rendered
+      // event can become another event's reference source; never point into an unfinished one.
+      for (const asset of admitted) window.assets.set(asset.key, event.id);
+      return out;
     })();
     window.events.set(event.id, task);
     try { return structuredClone(await task); }
-    catch (error) { window.events.delete(event.id); throw error; }
+    catch (error) {
+      window.events.delete(event.id);
+      for (const asset of admitted) {
+        window.count--; window.bytes -= asset.size;
+      }
+      throw error;
+    }
   }
 
   renderStreamText(): string {
@@ -375,14 +439,18 @@ export class BotContext {
    * 每个事件首次渲染时冻结其媒体内容与预算决策。新媒体超限只能追加说明，不能淘汰历史媒体。
    */
   async toChatMessages(timeLine: string, nativeToolCalls = true): Promise<ChatMessage[]> {
-    await this.settled();
-    const entries = structuredClone(this.stream);
+    // Capturing the stream and prefix inside the same durable mutation prevents an intervening
+    // compression from combining the new stream with an old system block (or the inverse).
+    const { entries, systemText, window } = await this.mutate(async () => {
+      const systemText = this.renderSystemText(timeLine, nativeToolCalls);
+      if (this.renderedNeedsSave) await this.persistPinnedUnlocked();
+      return { entries: structuredClone(this.stream), systemText, window: this.mediaWindow };
+    });
     const loader = this.attachmentLoader && !this.attachmentsDisabled ? this.attachmentLoader : null;
-    const window = this.mediaWindow;
     this.lastAttachmentPartTypes = new Set();
 
     const built: { role: ChatMessage["role"]; parts: ContentPart[] }[] = [
-      { role: "system", parts: [{ type: "text", text: this.renderSystemText(timeLine, nativeToolCalls) }] },
+      { role: "system", parts: [{ type: "text", text: systemText }] },
     ];
     for (const entry of entries) {
       const role = entry.kind === "tool_call" ? "assistant" : "user";
@@ -403,10 +471,13 @@ export class BotContext {
 
   /** 近似上下文大小（字符数），用于判断是否需要强制 rest。每个原生附件按 2000 字符计 */
   approxChars(): number {
+    const assets = new Set<string>();
     let attachmentCost = 0;
     for (const entry of this.stream) {
       if (entry.kind === "event" && entry.event.attachments?.length) {
-        attachmentCost += entry.event.attachments.length * 2000;
+        const current = entry.event.attachments.map(ref => JSON.stringify([ref.id, ref.type, ref.mime, ref.file]));
+        for (const key of current) if (!entry.event.mediaReuse || !assets.has(key)) attachmentCost += 2000;
+        for (const key of current) assets.add(key);
       }
     }
     return (this.frozenSystemText ?? this.buildSystemText("")).length + this.renderStreamText().length + attachmentCost;

@@ -1,5 +1,14 @@
 import type { h } from "koishi";
 
+/** Platform-declared use, not a visual/filename/summary guess. NapCat also reports market faces
+ * as image.file=marketface (https://napneko.github.io/develop/msg). */
+export function isStickerElement(el: h): boolean {
+  if (el.type === "mface" || el.type === "sticker") return true;
+  if (el.type !== "img" && el.type !== "image") return false;
+  const subtype = el.attrs?.sub_type ?? el.attrs?.subType;
+  return subtype === 1 || subtype === "1" || subtype === 2 || subtype === "2" || el.attrs?.file === "marketface";
+}
+
 /** Platform evidence about a message, not a guess about its author's intent. */
 export interface ConversationContext {
   kind: "direct" | "group" | "unknown";
@@ -33,7 +42,7 @@ export function describeConversation(
         // Quoted and forwarded messages do not address the recipient of the containing message.
         if (!result.reply && node.attrs.id != null) result.reply = { messageId: String(node.attrs.id) };
       } else if (node.type === "forward") result.media.push("forward");
-      else if (node.type === "img" || node.type === "image") result.media.push(isSticker(node) ? "sticker" : "image");
+      else if (["img", "image", "mface", "sticker"].includes(node.type)) result.media.push(isSticker(node) ? "sticker" : "image");
       else if (node.type === "face" || node.type === "audio" || node.type === "video") result.media.push(node.type);
       else if (node.children?.length) visit(node.children);
     }
@@ -62,9 +71,9 @@ export function conversationLabel(context: ConversationContext | null | undefine
     }
     if (!context.mentions.length && !context.mentionsEveryone && !context.reply) facts.push("无明确 @ 或引用指向，需结合上下文判断");
   }
-  if (!context.hasText && context.media.length) {
+  if (context.media.length) {
     const labels = { image: "图片", sticker: "表情包", face: "平台表情", audio: "语音", video: "视频", forward: "转发记录" };
-    facts.push("仅含" + context.media.map(type => labels[type]).join("、") + "，未附文字");
+    facts.push((context.hasText ? "附有" : "仅含") + context.media.map(type => labels[type]).join("、") + (context.hasText ? "" : "，未附文字"));
   }
   return facts.join("；");
 }

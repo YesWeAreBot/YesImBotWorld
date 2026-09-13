@@ -171,7 +171,7 @@ export const BOT_TOOLS: BotToolDef[] = [
     description:
       "翻看你的收藏夹。收藏夹按分类存放：表情包、meme、截图、照片、未整理。不带参数看总览（各分类的数量），" +
       "带 category 打开某一类，列出每项的内容和描述（挑中后用 pick_media 确认明确的媒体引用）。" +
-      "发图先来这里挑；「未整理」里是主人放进来还没归类的东西，有空时看看（view_media）并用 gallery_move 整理。",
+      "发图先来这里挑；「未整理」里是从外部导入、还没归类的东西，有空时看看（view_media）并用 gallery_move 整理。",
   },
   {
     name: "check_media",
@@ -199,7 +199,7 @@ export const BOT_TOOLS: BotToolDef[] = [
     name: "gallery_move",
     signature: 'gallery_move(name: string, category: string, description?: string)',
     description:
-      "把收藏夹里的文件移到某个分类，主要用来整理「未整理」里主人放进来的东西。" +
+      "把收藏夹里的文件移到某个分类，主要用来整理「未整理」里从外部导入的东西。" +
       'name 为文件名（可带分类前缀，如 "未整理/xx.png"）；category 为目标分类（表情包 / meme / 截图 / 照片）。' +
       "还没有描述的文件必须先 view_media 看清内容，再带上 description 一起移动。",
   },

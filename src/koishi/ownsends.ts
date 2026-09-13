@@ -1,39 +1,47 @@
-/**
- * 本插件自身发送标记：messenger 每次调用 bot.sendMessage 前登记一次，
- * Koishi `send` 事件监听器据此区分"本插件发出的消息"与"外部（其他插件/指令）
- * 以 Bot 账号发出的消息"——只有后者需要按 externalSelfMessages 呈现给 Bot-LLM。
- */
+import { AsyncLocalStorage } from "node:async_hooks";
+
+/** Identify the actual sending call, rather than consuming a channel-wide FIFO that can
+ * mistake a concurrent plugin reply for our own message. */
 export class OwnSendTracker {
-  /** 频道 key → 登记时间戳队列 */
-  private pending = new Map<string, number[]>();
-  private readonly ttlMs = 60_000;
+  private scope = new AsyncLocalStorage<{ key: string; claimed: boolean }>();
+  private pending = new Map<string, Set<Promise<unknown>>>();
+  private confirmed = new Set<string>();
 
-  /** 即将通过 bot.sendMessage 向该频道发出一条消息 */
-  expect(key: string): void {
-    const arr = this.pending.get(key) ?? [];
-    arr.push(Date.now());
-    this.pending.set(key, arr);
+  run<T>(key: string, send: () => Promise<T>): Promise<T> {
+    const task = this.scope.run({ key, claimed: false }, async () => {
+      const result = await send();
+      const ids = Array.isArray(result) ? result : [(result as any)?.message_id ?? (result as any)?.messageId];
+      for (const value of ids) {
+        const id = typeof value === "object" ? value?.id : value;
+        if (id == null || id === "") continue;
+        this.confirmed.add(`${key}\0${String(id)}`);
+      }
+      while (this.confirmed.size > 4096) this.confirmed.delete(this.confirmed.values().next().value!);
+      return result;
+    });
+    const pending = this.pending.get(key) ?? new Set();
+    pending.add(task); this.pending.set(key, pending);
+    void task.finally(() => {
+      pending.delete(task); if (!pending.size) this.pending.delete(key);
+    }).catch(() => {});
+    return task;
   }
 
-  /** 发送失败：撤销登记 */
-  unexpect(key: string): void {
-    const arr = this.pending.get(key);
-    if (arr?.length) arr.pop();
-    if (arr && !arr.length) this.pending.delete(key);
+  async waitForPending(key: string): Promise<void> {
+    await Promise.allSettled([...(this.pending.get(key) ?? [])]);
   }
 
-  /** send 事件到达：若该频道有登记则消耗一条并返回 true（本插件发的） */
-  consume(key: string): boolean {
-    const arr = this.pending.get(key);
-    if (!arr) return false;
-    const now = Date.now();
-    while (arr.length && now - arr[0]! > this.ttlMs) arr.shift();
-    if (!arr.length) {
-      this.pending.delete(key);
-      return false;
-    }
-    arr.shift();
-    if (!arr.length) this.pending.delete(key);
+  wasSent(key: string, messageId: string): boolean { return this.confirmed.has(`${key}\0${messageId}`); }
+
+  isOwn(key: string): boolean {
+    const scope = this.scope.getStore();
+    return scope?.key === key && !scope.claimed;
+  }
+
+  claim(key: string): boolean {
+    const scope = this.scope.getStore();
+    if (!scope || scope.key !== key || scope.claimed) return false;
+    scope.claimed = true;
     return true;
   }
 }

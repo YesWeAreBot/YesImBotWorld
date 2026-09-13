@@ -162,7 +162,7 @@ export class CrossingClient implements RemoteWorldLink {
   private async virtualAppTask(kind: "observeVirtualApp" | "executeVirtualApp", task: string, signal?: AbortSignal): Promise<import("../types.js").RichText> {
     let content = "";
     const ok = await this.runTask(kind, { task }, text => { content = text; }, { signal });
-    if (!ok) throw new Error(content || "远方世界未能完成虚构应用请求");
+    if (!ok) throw new Error(content || "当前所在地的应用未能完成请求");
     let result: { text?: unknown; originEventIds?: unknown };
     try { result = JSON.parse(content); } catch { throw new Error("远方世界返回了无效的应用内容"); }
     if (!result || typeof result.text !== "string" || !Array.isArray(result.originEventIds) || !result.originEventIds.every(id => typeof id === "string")) throw new Error("远方世界返回了无效的应用内容");
