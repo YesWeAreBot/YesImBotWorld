@@ -54,11 +54,11 @@ export const BOT_TOOLS: BotToolDef[] = [
   },
   {
     name: "act",
-    signature: 'act(description: string, target?: string, observationId?: string, speech?: string, repeat?: boolean)',
+    signature: 'act(description: string, target?: string, speech?: string, repeat?: boolean)',
     description:
       "在世界中做一件事，用自然语言描述。description 只写**行动本身**——简短、明确地说你" +
       "要做什么（如「去厨房泡一杯咖啡」「走到窗边看看外面」），**不要写剧情**：不要描写环境、心情，" +
-      "也不要在行动里预设结果或替别人说话。结果由世界裁定，以可感知的经过、场景和结果事件返回；needs_input 表示已经推进到需要你作新决定的地方，整体目标尚未完成，请据此给出下一步意图，不要当作仍在后台自动执行。记得给出合理的 duration；作用于具体对象时，target 填最近 observe 返回的 observedId，observationId 可填对应观察编号。" +
+      "也不要在行动里预设结果或替别人说话。世界会返回你实际能感知的经过、他人的反应和行动结果，无需再调用 observe 才能知道这次发生了什么。needs_input 表示已经推进到需要你作新决定的地方，整体目标尚未完成，请据此给出下一步意图，不要当作仍在后台自动执行。记得给出合理的 duration；target 可直接写对象的名字或足以辨认的自然语言描述，不需要 ID，也不要求行动前先观察。" +
       "要在物理世界开口说话时，speech 写你自己决定说出的逐字原话；世界只负责传播和他人的反应，不替你生成台词。" +
       "上一个相同的动作还在进行中时，重复的 act 会被拦截（结果会自动送达，无需再发起一次）；确实要同时再做一遍时加 repeat: true。",
   },
@@ -66,12 +66,12 @@ export const BOT_TOOLS: BotToolDef[] = [
     name: "rest",
     signature: "rest(duration?: number)",
     description:
-      "主动暂停自主思考一段时间，duration 以 TU 为单位，缺省或非正数使用 300 TU。有重要动静可提前恢复。此工具是休息计时，不提交睡姿或体力恢复；身体动作需要 act，身体状态以 observe 为准。记忆整理独立进行。",
+      "主动暂停自主思考一段时间，duration 以 TU 为单位，缺省或非正数使用 300 TU。有重要动静可提前恢复。此工具是休息计时，不提交睡姿或体力恢复；身体动作需要 act，身体状态以真实感知为准，需要进一步检查时才 observe。记忆整理独立进行。",
   },
   {
     name: "observe",
-    signature: 'observe(target?: string, modality?: "all" | "sight" | "self")',
-    description: "观察自己或周围。target 可填 self 或最近观察到的 observedId；modality 可选 all（默认，周围视觉与台词）、sight（视觉）或 self（自身状态）。返回可感知实体、属性及观察句柄；看不到的对象和秘密不会出现。行动时可把 observedId 交给 act 的 target。",
+    signature: 'observe(intent?: string, target?: string, modality?: "all" | "sight" | "self")',
+    description: "主动把注意力放到自己、周围或某个细节。intent 写想了解什么，如「看看菜单上有哪些菜」「检查左手的伤口」；target 可补充对象名字或描述，也可用 self 指自身；modality 可选 all（默认）、sight（视觉）或 self（自身感受）。世界根据当前位置、感官和遮挡给出自然语言感知，必要时确立并记住尚未描写的合理细节；不会替你打开抽屉、移动身体、决定心情或透露不可感知的秘密。普通行动结果、眼前动静和通知会主动送达，不必反复观察；手机或电脑的真实界面请用 observe_device。",
   },
   {
     name: "observe_device",

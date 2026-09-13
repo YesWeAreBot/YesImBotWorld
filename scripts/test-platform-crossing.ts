@@ -24,6 +24,9 @@ async function hostProtocol() {
   const actions: { duration: number; taskId: string; options: unknown }[] = [];
   const waitDurations: number[] = [];
   const observed: string[] = [];
+  const appObserved: { task: string; actor: string }[] = [];
+  const appExecuted: { task: string; actor: string; signal: AbortSignal }[] = [];
+  const prematureNotices: string[] = [];
   let blocking = false;
   let activeSignal: AbortSignal | undefined;
   const world = {
@@ -49,10 +52,12 @@ async function hostProtocol() {
     visitorLeave: async (session: any) => { actors.delete(session.id); return true; },
     visitorCheckTime: async () => true,
     visitorQuery: async () => "query result",
-    structured: { observe: async (id: string) => { observed.push(id); return observation(id); } },
+    observe: async (id: string) => { observed.push(id); return observation(id); },
+    observeVirtualApp: async (task: string, actor: string) => { appObserved.push({ task, actor }); return { text: "saved file", originEventIds: ["state-root"] }; },
+    executeAppAction: async (task: string, actor: string, signal: AbortSignal) => { appExecuted.push({ task, actor, signal }); return { text: "file written", originEventIds: ["write-root"] }; },
     cancelPending() {}, notePresenceChange() {}, setVisitorsProvider() {},
   };
-  const server = new CrossingServer({ cfg: { ...config.crossing, maxVisitors: 4 }, logger, world, ready: () => true, clock: () => ({ unitWorldSeconds: 10, unitRealSeconds: 2, timeLine: () => "T=0" }), notifyHostBot() {} } as never);
+  const server = new CrossingServer({ cfg: { ...config.crossing, maxVisitors: 4 }, logger, world, ready: () => true, clock: () => ({ unitWorldSeconds: 10, unitRealSeconds: 2, timeLine: () => "T=0" }), notifyHostBot(text: string) { prematureNotices.push(text); } } as never);
   (server as any).push = (_session: any, message: CrossingSseMsg) => messages.push(message);
   async function post(endpoint: string, body: unknown) {
     const req: any = Readable.from([Buffer.from(JSON.stringify(body))]);
@@ -67,16 +72,27 @@ async function hostProtocol() {
     if (!arrived.ok) throw new Error(arrived.error);
     const token = arrived.token;
     const id = server.visitors()[0]!.id;
-    const body = { token, taskId: "action-1", kind: "act", payload: { desc: "wave", durationWorldSeconds: 40, speech: "hello", target: "seen-1", observationId: "obs-1" } };
+    const body = { token, taskId: "action-1", kind: "act", payload: { desc: "wave", durationWorldSeconds: 40, speech: "hello", target: "柜台后的店员" } };
     const accepted = await post("task", body);
     assert.equal(accepted.status, 200);
     assert.equal(accepted.data.unitWorldSeconds, 10);
     assert.equal(accepted.data.unitRealSeconds, 2);
     await tick(); assert.equal(actions.length, 0);
+    assert.equal(prematureNotices.length, 0, "a connection request cannot announce an uncommitted arrival to the resident");
     arrival.resolve();
     await until(() => actions.length === 1);
     assert.equal(actions[0]!.duration, 4);
-    assert.deepEqual(actions[0]!.options, { speech: "hello", target: "seen-1", observationId: "obs-1" });
+    assert.deepEqual(actions[0]!.options, { speech: "hello", target: "柜台后的店员" });
+    const actionEvent = messages.find(message => message.type === "event" && message.eventId === "obs-fixture");
+    assert.ok(actionEvent?.type === "event" && actionEvent.actorId === "visitor:" + id);
+    const connect = (cursor?: string) => {
+      const frames: string[] = [];
+      const req = new Readable({ read() {} }) as any; req.headers = cursor ? { "last-event-id": cursor } : {};
+      (server as any).handleEvents(new URL(`http://fixture/crossing/events?token=${token}`), req, { writeHead() {}, write(text: string) { frames.push(text); }, end() {} });
+      return frames.join("");
+    };
+    assert.equal(connect().split('"eventId":"obs-fixture"').length - 1, 1, "ordinary visitors replay committed perceptions with stable IDs");
+    assert.equal(connect("obs-fixture").split('"eventId":"obs-fixture"').length - 1, 0, "visitor reconnection honors its last event cursor");
     assert.equal(server.visitors()[0]!.id, id);
     const duplicate = await post("task", body);
     assert.equal(duplicate.data.duplicate, true);
@@ -86,6 +102,18 @@ async function hostProtocol() {
     await post("task", { token, taskId: "observe-1", kind: "observe", payload: {} });
     await until(() => observed.length === 1);
     assert.equal(observed[0], "visitor:" + id);
+    await post("task", { token, taskId: "app-read-1", kind: "observeVirtualApp", payload: { task: "read note", actorId: "bot" } });
+    await until(() => appObserved.length === 1);
+    assert.deepEqual(appObserved[0], { task: "read note", actor: "visitor:" + id }, "host binds app reads to the authenticated visitor");
+    await until(() => messages.some(m => m.type === "task_result" && m.taskId === "app-read-1"));
+    const appResult = messages.find(m => m.type === "task_result" && m.taskId === "app-read-1");
+    assert.ok(appResult?.type === "task_result" && appResult.ok);
+    assert.deepEqual(JSON.parse(appResult.content), { text: "saved file", originEventIds: ["state-root"] });
+    const appWriteRequest = { token, taskId: "app-write-1", kind: "executeVirtualApp", payload: { task: "write note", actorId: "bot" } };
+    await post("task", appWriteRequest); await until(() => appExecuted.length === 1);
+    assert.equal(appExecuted[0]!.actor, "visitor:" + id); assert.equal(appExecuted[0]!.task, "write note");
+    assert.ok(appExecuted[0]!.signal instanceof AbortSignal);
+    await post("task", appWriteRequest); assert.equal(appExecuted.length, 1, "remote app writes share authenticated task idempotency");
     await post("task", { token, taskId: "legacy-wait", kind: "wait", payload: { n: 3 } });
     await until(() => waitDurations.length === 1);
     assert.equal(waitDurations[0], 3);
@@ -149,19 +177,46 @@ async function clientProtocol() {
     }
     return { ok: true };
   };
-  const call: ToolCallRecord = { id: "remote-1", name: "act", role: "agent", arguments: { description: "wave", speech: "hello", target: "seen", observationId: "obs" }, issuedAt: 0, expectedAt: 4, duration: 4 };
+  const call: ToolCallRecord = { id: "remote-1", name: "act", role: "agent", arguments: { description: "wave", speech: "hello", target: "柜台后的店员" }, issuedAt: 0, expectedAt: 4, duration: 4 };
   let fenced = false;
   assert.ok(await client.adjudicateAct(call, () => {}, undefined, () => { assert.equal(posts.length, 0); fenced = true; return true; }));
   assert.ok(fenced);
   assert.equal(posts[0]!.body.payload.durationWorldSeconds, 20);
   assert.equal(posts[0]!.body.payload.duration, 2);
   assert.equal(posts[0]!.body.payload.speech, "hello");
-  assert.equal(posts[0]!.body.payload.target, "seen");
-  assert.equal(posts[0]!.body.payload.observationId, "obs");
+  assert.equal(posts[0]!.body.payload.target, "柜台后的店员");
+  assert.ok(!("observationId" in posts[0]!.body.payload));
   assert.equal((await client.observe()).actorId, "visitor:stable");
+  const previousPost = internal.post;
+  internal.post = async (endpoint: string, body: any) => {
+    if (endpoint !== "/crossing/task") return previousPost(endpoint, body);
+    posts.push({ endpoint, body });
+    internal.receiveMessage({ type: "task_result", taskId: body.taskId, ok: true, content: JSON.stringify({ ...observation("visitor:stable"), mode: "narrative", narrative: "菜单上写着牛肉面与青菜面。" }) });
+    return { ok: true };
+  };
+  assert.equal((await client.observe({ intent: "看看有哪些菜", target: "菜单" }) as any).narrative, "菜单上写着牛肉面与青菜面。");
+  assert.equal(posts.at(-1)!.body.payload.target, "菜单");
+  assert.equal(posts.at(-1)!.body.payload.intent, "看看有哪些菜");
+  internal.post = async (endpoint: string, body: any) => {
+    if (endpoint !== "/crossing/task") return previousPost(endpoint, body);
+    posts.push({ endpoint, body });
+    internal.receiveMessage({ type: "task_result", taskId: body.taskId, ok: true, content: JSON.stringify({ text: "文件原文", originEventIds: ["state:1"], attachments: [{ path: "/host/private" }] }) });
+    return { ok: true };
+  };
+  assert.deepEqual(await client.observeVirtualApp("read note"), { text: "文件原文", originEventIds: ["state:1"] }, "remote app text retains roots without accepting host-local media paths");
+  assert.equal(posts.at(-1)!.body.kind, "observeVirtualApp");
+  assert.equal(posts.at(-1)!.body.payload.task, "read note");
+  assert.deepEqual(await client.executeVirtualApp("write note"), { text: "文件原文", originEventIds: ["state:1"] });
+  assert.equal(posts.at(-1)!.body.kind, "executeVirtualApp");
+  internal.post = previousPost;
+  await assert.rejects(client.adjudicateAct({ ...call, arguments: { str: "旧参数不再支持" } }, () => {}), /act.description/);
   internal.receiveMessage({ type: "status_update", content: "REMOTE-DESCRIPTION" });
   assert.equal(statusWrites, 0);
   assert.ok(events[0]!.includes("REMOTE-DESCRIPTION"));
+  internal.receiveMessage({ type: "event", eventId: "perception-1", content: "门外响起敲门声。" });
+  internal.receiveMessage({ type: "event", eventId: "perception-1", content: "门外响起敲门声。" });
+  assert.equal(events.filter(text => text === "门外响起敲门声。").length, 1);
+  assert.equal(internal.lastPerceptionId, "perception-1", "a reconnect resumes from the last accepted perception");
   const before = posts.length;
   assert.equal(await client.adjudicateAct({ ...call, id: "blocked" }, () => {}, undefined, () => false), false);
   assert.equal(posts.length, before);

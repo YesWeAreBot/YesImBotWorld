@@ -203,7 +203,19 @@ export class BotContext {
 
   async appendEvent(event: BotEvent): Promise<void> {
     await this.mutate(async () => {
-      await this.appendEntry({ kind: "event", event });
+      const existing = this.stream.find(entry => entry.kind === "event" && entry.event.id === event.id);
+      const stored = { ...event };
+      delete stored.contextText;
+      if (existing?.kind === "event") {
+        // A retry after the journal append must reuse the original persisted projection. In
+        // particular, an older raw JSON event must never be rewritten just because code upgraded.
+        if (existing.event.contextText !== undefined) stored.contextText = existing.event.contextText;
+      } else {
+        const call = event.refToolCallId ? this.stream.find(entry => entry.kind === "tool_call" && entry.call.id === event.refToolCallId) : undefined;
+        const projected = narrativeContextText(event, call?.kind === "tool_call" ? call.call.name : undefined);
+        if (projected !== undefined) stored.contextText = projected;
+      }
+      await this.appendEntry({ kind: "event", event: stored });
       await this.persistPinnedUnlocked();
     });
   }
@@ -288,7 +300,7 @@ export class BotContext {
   static renderEventLine(event: BotEvent): string {
     const ref = event.refToolCallId ? ` ref="${event.refToolCallId}"` : "";
     const echo = event.statusEcho ? `\n\n（这条事件发生时你的状态：\n${event.statusEcho}\n）` : "";
-    return `<event id="${event.id}" t="${event.worldTime.toFixed(1)}" src="${event.source}"${ref}>${event.parts?.length ? richPartsText(event.parts) : event.content}${echo}</event>`;
+    return `<event id="${event.id}" t="${event.worldTime.toFixed(1)}" src="${event.source}"${ref}>${frozenEventText(event)}${echo}</event>`;
   }
 
   /** Render one immutable event, keeping each asset beside its own identity/summary. */
@@ -307,7 +319,7 @@ export class BotContext {
       const eligible = new Set(event.attachments?.map(ref => ref.id) ?? []);
       // Legacy events without ordered parts cannot establish image positions. Keep their text and
       // explicitly identify the remaining media instead of pretending array order is message order.
-      const segments: RichTextPart[] = event.parts?.length ? event.parts : [
+      const segments: RichTextPart[] = canUseContextText(event) ? [{ kind: "text", text: event.contextText! }] : event.parts?.length ? event.parts : [
         { kind: "text", text: event.content },
         ...(event.attachments?.length ? [
           { kind: "text" as const, text: "\n（以下为旧事件独立保存的媒体；原始插入位置未记录，不能据排列推断对应文字。）\n" },
@@ -534,6 +546,46 @@ export class BotContext {
     this.needsRecovery = false;
   }
 
+}
+
+function hasEventMedia(event: BotEvent): boolean {
+  return !!event.attachments?.length || !!event.parts?.some(part => part.kind !== "text");
+}
+
+function canUseContextText(event: BotEvent): boolean {
+  return typeof event.contextText === "string" && !hasEventMedia(event);
+}
+
+function frozenEventText(event: BotEvent): string {
+  return canUseContextText(event) ? event.contextText! : event.parts?.length ? richPartsText(event.parts) : event.content;
+}
+
+/** Projection happens once at append, never while loading or rendering historical events. */
+function narrativeContextText(event: BotEvent, toolName?: string): string | undefined {
+  if (hasEventMedia(event) || (event.source !== "world" && !(event.source === "tool" && ["act", "observe"].includes(toolName ?? "")))) return undefined;
+  let text = event.parts?.length ? richPartsText(event.parts) : event.content;
+  let controlNote = "";
+  if (text.startsWith("（以下是外部操纵你身体/设备产生的回执，")) {
+    const boundary = text.indexOf("\n");
+    if (boundary < 0) return undefined;
+    controlNote = text.slice(0, boundary);
+    text = text.slice(boundary + 1);
+  }
+  try {
+    const parsed = JSON.parse(text), observation = parsed?.observation ?? parsed;
+    if (observation?.mode !== "narrative" || typeof observation.actorId !== "string" || typeof observation.observationId !== "string") return undefined;
+    const body = typeof observation.narrative === "string" ? observation.narrative : observation.scene?.text ?? parsed.scene?.text;
+    if (typeof body !== "string" || !body.trim()) return undefined;
+    const sections = controlNote ? [controlNote] : [];
+    if (parsed.recovered === true) sections.push("（以下是已保存处境的回读，不是新发生的行动。）");
+    if (parsed.action && typeof parsed.action === "object") {
+      if (typeof parsed.action.intent === "string" && parsed.action.intent.trim()) sections.push(`本次操作：${parsed.action.intent}`);
+      const status: Record<string, string> = { pending: "仍在进行", completed: "已完成", needs_input: "已推进到需要你决定下一步的地方，本次裁定结束；后续不会自动执行", failed: "未完成", cancelled: "已取消" };
+      if (Object.hasOwn(status, parsed.action.status)) sections.push(`行动结果：${status[parsed.action.status]}`);
+    }
+    sections.push(body);
+    return sections.join("\n\n");
+  } catch { return undefined; }
 }
 
 /** 附件 content part 的近似载荷大小（base64 字符数） */

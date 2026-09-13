@@ -844,8 +844,8 @@ export class WebUIServer {
 
     // ---------- 概览 / 状态 ----------
     if (pathname === "/api/world/state" && method === "GET") {
-      if (access.kind !== "admin") return void sendJSON(res, 403, { error: "仅管理员可读取世界完整结构化状态" });
-      if (!host.getStructuredWorld) return void sendJSON(res, 503, { error: "结构化世界尚未就绪" });
+      if (access.kind !== "admin") return void sendJSON(res, 403, { error: "仅管理员可读取世界完整世界状态" });
+      if (!host.getStructuredWorld) return void sendJSON(res, 503, { error: "世界状态尚未就绪" });
       return void sendJSON(res, 200, { state: await host.getStructuredWorld() });
     }
     if (pathname === "/api/bot/growth" && method === "GET") {

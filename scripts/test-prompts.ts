@@ -37,21 +37,21 @@ async function main() {
     const files = new WorldFiles(path.join(dir, "world")); await files.ensure(); await files.writeMeta({ realWorld: false } as any);
     const clock = { now: () => 10, timeLine: () => "T=10", syncRealTime: false, realMsUntil: () => 0 } as any;
     world = new WorldAgent(cfg.world, files, clock, logger, prompts);
-    const kernel = await world.structured.kernel();
-    await kernel.commit({ idempotencyKey: "seed", operations: [
-      { op: "create", entity: { id: "room", kind: "place", name: "房间", location: null } },
-      { op: "create", entity: { id: "bot", kind: "actor", name: "角色", controller: "bot", location: "room" } },
-    ] });
+    const store = await world.runtime.store();
+    await store.commit({ idempotencyKey: "seed", source: "fixture", initialized: true, worldState: "角色在房间。", actors: {
+      bot: { id: "bot", name: "角色", controller: "bot", present: true, state: "在房间里。", perception: "你在房间里。" },
+    }, perceptions: [{ actorId: "bot", text: "你在房间里。" }] });
     const seen: any[] = [];
     (world as any).client = { complete: async (messages: any[], options: any = {}) => {
       seen.push({ messages, options });
-      return options.tools?.length ? { content: "", toolCalls: [{ id: "p", type: "function", function: { name: "propose_world", arguments: '{"operations":[]}' } }] } : { content: "未知", toolCalls: [] };
+      return options.tools?.length ? { content: "", toolCalls: [{ id: "p", type: "function", function: { name: "resolve_world", arguments: '{"perceptions":[]}' } }] } : { content: "未知", toolCalls: [] };
     } };
     for (const version of ["A", "B"]) {
-      prompts.setOverrides({ bot: { constitutionHead: version }, world: { adjudicationSystem: "裁定-" + version, presentationSystem: "呈现-" + version } });
-      await world.structured.evolve("无事发生"); await world.query("天气查询");
+      prompts.setOverrides({ bot: { constitutionHead: version }, world: { narrativeSystem: "裁定-" + version, presentationSystem: "呈现-" + version } });
+      await world.runtime.evolve("无事发生"); await world.query("天气查询");
       assert.ok(seen.at(-2).messages[0].content.startsWith("裁定-" + version));
-      assert.deepEqual(seen.at(-2).options.tools.map((t: any) => t.function.name), ["propose_world"]);
+      assert.deepEqual(seen.at(-2).options.tools.map((t: any) => t.function.name), ["resolve_world"]);
+      assert.deepEqual(seen.at(-2).options.toolChoice, { type: "function", function: { name: "resolve_world" } });
       assert.equal(seen.at(-1).messages[0].content, "呈现-" + version);
       assert.equal(seen.at(-1).options.tools, undefined);
       const context = new BotContext(files, "", prompts); await context.load();
@@ -68,8 +68,8 @@ async function main() {
     }
     const response = await request("GET");
     assert.equal(response.data.defaults.bot.constitutionHead, BOT_PROMPT_DEFAULTS.constitutionHead);
-    assert.equal(response.data.defaults.world.adjudicationSystem, WORLD_PROMPT_DEFAULTS.adjudicationSystem);
-    assert.equal(response.data.overrides.world.adjudicationSystem, "裁定-B");
+    assert.equal(response.data.defaults.world.narrativeSystem, WORLD_PROMPT_DEFAULTS.narrativeSystem);
+    assert.equal(response.data.overrides.world.narrativeSystem, "裁定-B");
     failSave = true;
     await assert.rejects(request("POST", { overrides: { bot: { constitutionHead: "不能生效" }, world: {} } }), /fixture disk failure/);
     assert.equal(prompts.bot.constitutionHead, "B");
@@ -97,14 +97,14 @@ async function main() {
       await assert.rejects(backend.generate(context, "T=10"), /多个调用均未执行/);
     }
     const queries: string[] = [], actions: string[] = [];
-    const appWorld = { query: async (task: string) => { queries.push(task); return "<html><title>未知</title><body>不可用</body></html>"; }, executeAppAction: async (task: string) => { actions.push(task); return "未执行"; } } as any;
+    const appWorld = { query: async () => { throw new Error("Virtual apps must read established device content, not only the last perception"); }, observeVirtualApp: async (task: string) => { queries.push(task); return { text: "<html><title>未知</title><body>不可用</body></html>", originEventIds: ["fixture"] }; }, executeAppAction: async (task: string) => { actions.push(task); return { text: "未执行", originEventIds: ["fixture"] }; } } as any;
     const computer = { ensureReady() { throw new Error("Virtual apps must not access real computer"); } } as any;
     const weather = new WeatherApp(appWorld, files, clock, cfg.apps, logger);
     const explorer = new FileManagerApp(computer, appWorld, files, clock, cfg.apps, logger);
     const terminal = new TerminalApp(computer, appWorld, files, clock, cfg.apps, logger);
     const browser = new BrowserApp({} as any, appWorld, files, clock, {} as any, {} as any, {} as any, () => false, cfg.apps, logger);
     await weather.call("query_weather", {}); await explorer.call("list", {}); await explorer.call("show", { path: "note", start: 21, max_lines: 5 }); await browser.call("open_url", { url: "https://fixture.invalid" });
-    assert.equal(actions.length, 0, "read-only apps only use query");
+    assert.equal(actions.length, 0, "read-only apps only observe existing virtual device records");
     assert.equal(queries.length, 4);
     for (const task of queries) assert.doesNotMatch(task, /check world_status|send_event|update world_status|虚构但合理的网址/);
     assert.match(queries[2]!, /"start":21,"max_lines":5/);
@@ -121,6 +121,6 @@ async function main() {
     assert.match(tools.find(t => t.function.name === "send")!.function.description!, /忽略发送耗时/);
     assert.ok(!JSON.stringify(tools).includes("省略表示瞬间完成"));
     console.log("PASS prompts: live runtime overrides, real defaults/reset API, save failure isolation, legacy backup, read-only app boundaries and exact action arguments");
-  } finally { await world?.structured.shutdown(); await fs.rm(dir, { recursive: true, force: true }); }
+  } finally { await world?.runtime.shutdown(); await fs.rm(dir, { recursive: true, force: true }); }
 }
 main().catch(error => { console.error(error); process.exitCode = 1; });

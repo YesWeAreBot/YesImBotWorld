@@ -14,6 +14,7 @@ import type { WorldClock } from "../clock.js";
 import type { AppsConfig } from "../config.js";
 import type { WorldFiles } from "../files.js";
 import type { WorldAgent } from "../world/agent.js";
+import type { RichText } from "../types.js";
 import type { AppRawTool, WorldApp } from "./app.js";
 
 const PROMPT_HINT =
@@ -50,11 +51,11 @@ export class TerminalApp implements WorldApp {
     }
     return {
       tools: TOOLS,
-      opening: "虚构终端界面已打开。命令只能通过已建模状态裁定，不会在真实操作系统中运行。",
+      opening: "虚构终端界面已打开。命令依据虚构电脑的自然语言状态模拟，不会在真实操作系统中运行。",
     };
   }
 
-  async call(tool: string, args: Record<string, unknown>): Promise<string> {
+  async call(tool: string, args: Record<string, unknown>): Promise<string | RichText> {
     if (tool !== "run_command") throw new Error(`终端没有 ${tool} 这个操作`);
     const command = String(args.command ?? args.cmd ?? "").trim();
     if (!command) return "（终端里还没敲入任何命令。）";
@@ -81,9 +82,10 @@ export class TerminalApp implements WorldApp {
   }
 
   /** 虚构世界：World-LLM 扮演这台电脑 */
-  private async virtualRun(command: string, cwd?: string): Promise<string> {
+  private async virtualRun(command: string, cwd?: string): Promise<string | RichText> {
     try {
-      return (await this.world.executeAppAction("执行虚构电脑命令。只在能根据已建模设备和文件精确结算时执行，否则返回不支持。命令=" + JSON.stringify({ command, cwd: cwd || "." }))) + PROMPT_HINT;
+      const result = await this.world.executeAppAction("执行虚构电脑命令。依据虚构设备的既定能力模拟，保持路径和文件内容前后一致；新增文件和命令影响必须记入状态。不具备的能力如实说明。命令=" + JSON.stringify({ command, cwd: cwd || "." }));
+      return { ...result, text: result.text + PROMPT_HINT };
     } catch (err) {
       this.logger.warn("虚构终端输出生成失败: %s", err);
       return "（终端请求失败，未取得结果，不能据此判断是否执行成功。）" + PROMPT_HINT;
@@ -96,7 +98,7 @@ const TOOLS: AppRawTool[] = [
     name: "run_command",
     description:
       "在当前终端里执行一条命令，返回它在电脑上产生的输出。cwd 可指定相对电脑主目录的工作目录（缺省为电脑主目录；cd 与环境变量不跨调用保留）。" +
-      "真实模式执行容器命令；虚构模式仅裁定已建模设备，返回结构化结果或不支持，不保证得到真实终端输出。",
+      "真实模式执行容器命令；虚构模式由世界模拟命令影响与可见输出，并记住文件变化，不是在真实操作系统执行。",
     inputSchema: {
       type: "object",
       properties: {

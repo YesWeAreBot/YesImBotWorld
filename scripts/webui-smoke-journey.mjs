@@ -70,7 +70,7 @@ export async function smokeJourney({ evaluate, wait, assert, navigate }) {
     await click('重新观察');
     await wait(`document.querySelectorAll('.journey-entity').length > 1`);
     assert(await run(() => !!document.querySelector('.journey-entity-self') &&
-      document.querySelectorAll('.journey-two-fields select option').length > 1),
+      document.querySelector('[data-cockpit-field="action:target"]')?.tagName === 'INPUT'),
     'An observation presents the actor and observed action targets.');
 
     assert(await run(()=>document.querySelectorAll('.journey-live-status [data-live-source]').length === 2), 'Independent actors see both permitted LLM status lanes.');
@@ -92,10 +92,10 @@ export async function smokeJourney({ evaluate, wait, assert, navigate }) {
       };
       input('.journey-action-input', '检查眼前的物件');
       input('.journey-speech-input', '我想仔细看看。');
-      input('.journey-two-fields input', '3');
-      const target = document.querySelector('.journey-two-fields select');
-      target.value = target.options[target.options.length - 1].value;
-      target.dispatchEvent(new Event('change', { bubbles: true }));
+      input('.journey-two-fields input[type="number"]', '3');
+      const target = document.querySelector('[data-cockpit-field="action:target"]');
+      target.value = '眼前温热的茶';
+      target.dispatchEvent(new Event('input', { bubbles: true }));
       window.__journeySmoke.target = target.value;
     });
     await click('提交这次行动');
@@ -106,8 +106,8 @@ export async function smokeJourney({ evaluate, wait, assert, navigate }) {
         call.body.payload.speech === '我想仔细看看。' &&
         call.body.payload.durationWorldSeconds === 3 &&
         call.body.payload.target === window.__journeySmoke.target &&
-        typeof call.body.payload.observationId === 'string' && !!call.body.payload.observationId;
-    }), 'Action preserves separate intent, speech, duration, and observation handles.');
+        !('observationId' in call.body.payload);
+    }), 'Action preserves separate intent, speech, duration, and a described target without observation handles.');
     checks.push('player arrival, observation, action payload and terminal receipt');
 
     await run(()=>{

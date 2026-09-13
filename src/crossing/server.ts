@@ -4,7 +4,7 @@
  * - 邀请码鉴权（crossing.invites，可随时吊销）；
  * - 访客到达/离开由本世界的 World-LLM 叙述并记录进 World_Status；
  * - 访客的 act 裁定 / wait 补叙 / 查看时间 / 世界查询由本世界的 World-LLM 处理，
- *   结果经 SSE 回传（task_result）；世界也可主动向访客广播事件（send_event to=访客名）。
+ *   结果经 SSE 回传（task_result）；世界提交的角色感知会主动送达对应访客。
  * - 零依赖（node:http），风格与 webui/server.ts 一致。
  *
  * 安全：网络上只有任务与事件文本；本服务不暴露任何 LLM API 地址/密钥，
@@ -32,38 +32,6 @@ import {
 const ABSENCE_MS = 180_000;
 /** SSE 心跳间隔 */
 const HEARTBEAT_MS = 20_000;
-
-/** 真人玩家到达时告知常驻 Bot 的语义说明（按进入语义区分） */
-function playerArriveNotice(name: string, mode: PlayerMode): string {
-  switch (mode) {
-    case "avatar":
-      return `一位真人玩家以角色「${name}」的身份进入了这个世界——他要**扮演**这位角色（入替，完全接管其言行）。`;
-    case "puppet":
-      return `一位真人玩家以角色「${name}」的身份进入了这个世界——他要**操纵**这位角色的身体行动，但该角色仍保有自己的意识（身体可能不听使唤、有内心活动）。`;
-    default:
-      return `一位真人玩家以角色「${name}」的身份进入了这个世界（从外界穿越降临）。`;
-  }
-}
-
-/** 真人玩家离开时告知常驻 Bot 的语义说明（按进入语义 + 离场原因区分） */
-function playerLeaveNotice(name: string, mode: PlayerMode, cause: "returned" | "lost"): string {
-  const gone = cause === "lost";
-  const how = gone ? "与这个世界的联系突然断开（失联）" : "";
-  switch (mode) {
-    case "avatar":
-      return gone
-        ? `真人玩家扮演的角色「${name}」${how}——玩家不再操控，这个角色已归还给世界，之后可继续演化其后续。`
-        : `真人玩家扮演的角色「${name}」停止了扮演——这个角色仍在世界，之后由世界继续演化它的后续行动与决策。`;
-    case "puppet":
-      return gone
-        ? `真人玩家操纵的角色「${name}」${how}——操纵中断，这个角色恢复了自主意识，之后由世界继续演化。`
-        : `真人玩家对角色「${name}」放开了操纵——它挣脱束缚、恢复自主意识，之后由世界继续演化。`;
-    default:
-      return gone
-        ? `异世界的访客「${name}」${how}，身影消散了。`
-        : `异世界的访客「${name}」回自己的世界去了。`;
-  }
-}
 
 interface VisitorSession extends VisitorInfo {
   token: string;
@@ -179,13 +147,30 @@ export class CrossingServer {
 
   /** 推一条剧情事件给访客，附带当前世界观时间戳 */
   private pushEvent(session: VisitorSession, content: string): void {
-    this.push(session, { type: "event", content, timeLine: this.worldTimeLine() });
+    const event: CrossingPerceptionEvent = { type: "event", content, timeLine: this.worldTimeLine() };
+    try {
+      const parsed = JSON.parse(content), observation = parsed.observation ?? parsed;
+      if (observation.actorId === `visitor:${session.id}` && typeof observation.observationId === "string" && Array.isArray(observation.sourceEventIds)) {
+        event.eventId = observation.observationId;
+        event.actorId = observation.actorId;
+        event.sourceEventIds = observation.sourceEventIds.filter((id: unknown): id is string => typeof id === "string");
+        if (Number.isFinite(observation.worldSequence)) event.worldSequence = observation.worldSequence;
+        if (Number.isFinite(observation.observedAt)) event.worldTime = observation.observedAt;
+        if (typeof parsed.action?.id === "string") event.actionId = parsed.action.id;
+      }
+    } catch { /* Plain connection notices remain plain text. */ }
+    if (event.eventId) {
+      const replay = session.perceptionReplay ??= new Map();
+      if (replay.has(event.eventId)) return;
+      replay.set(event.eventId, event);
+      if (replay.size > 256) replay.delete(replay.keys().next().value!);
+    }
+    this.push(session, event);
   }
 
   /**
    * 当前在场访客的完整通道（按到达顺序，逐字稳定）：
-   * 状态档案进 World-LLM 系统提示的 <visitors> 区、send_event to= 定向投递、
-   * update_visitor_status 状态写回。
+   * 身份和状态交给世界裁定，感知通过已认证会话定向投递。
    */
   visitors(): { id: string; name: string; persona: string; mode: PlayerMode; deliver: (content: string) => void; updateStatus: (content: string) => void; expel: (reason: string) => void }[] {
     return [...this.sessions.values()].filter((s) => !s.residentControl).map((s) => ({
@@ -212,7 +197,6 @@ export class CrossingServer {
     this.closeSession(session);
     this.host.logger.info("[穿越] 访客「%s」被世界驱逐（%s）", name, reason || "未说明原因");
     debug.emit("world.task", `穿越·访客「${name}」被驱逐`, { reason });
-    this.host.notifyHostBot(`${name ? `「${name}」` : "一位访客"}已被这个世界排除（${reason || "死亡/消散/升天等"}），不再在场。`);
     // 清掉它尚未开始执行的 act/wait，避免"已死角色"的旧行动照常演出来
     this.host.world.cancelPending("visitor:" + session.id);
     this.trackCleanup(session, false);
@@ -281,7 +265,6 @@ export class CrossingServer {
     const timeLine = this.host.clock()?.timeLine() ?? "";
     this.host.logger.info("[穿越] 玩家「%s」入世界", safeName);
     debug.emit("world.task", `穿越·玩家「${safeName}」入世界`, {});
-    if (!residentControl) this.host.notifyHostBot(playerArriveNotice(safeName, safeMode));
     session.ready = this.initializeSession(session);
     return { ok: true, token: session.token, worldName: this.worldName, timeLine };
   }
@@ -450,7 +433,6 @@ export class CrossingServer {
     // 到达叙事（异步）：World-LLM 生成到达场景、记录访客在场；主世界 Bot 同步感知。
     // 世界若在沉睡（常驻 Bot 外出、此前无访客），先补叙沉睡期间的演化再接待
     // （两个任务同步入队，串行队列保证先后顺序）
-    this.host.notifyHostBot(`一位异世界的访客「${name}」穿越降临到了这个世界。`);
     session.ready = this.initializeSession(session);
   }
 
@@ -492,7 +474,7 @@ export class CrossingServer {
     session.absenceTimer = null;
     const timeLine = this.host.clock()?.timeLine() ?? "";
     res.write(sseFrame({ type: "hello", worldName: this.worldName, timeLine, visitorId: session.id, ...this.timeUnits() }));
-    if (session.residentControl) {
+    if (session.perceptionReplay?.size) {
       const replay = [...(session.perceptionReplay?.values() ?? [])];
       const cursor = String(req.headers["last-event-id"] ?? url.searchParams.get("lastEventId") ?? "");
       const index = cursor ? replay.findIndex(event => event.eventId === cursor) : -1;
@@ -516,7 +498,7 @@ export class CrossingServer {
     if (!session || session.closed) return void sendJSON(res, 403, { error: "会话不存在或已结束" });
     const taskId = String(body.taskId ?? "");
     const kind = String(body.kind ?? "") as CrossingTaskKind;
-    if (!taskId || taskId.length > 64 || !["act", "wait", "checkTime", "query", "observe"].includes(kind)) {
+    if (!taskId || taskId.length > 64 || !["act", "wait", "checkTime", "query", "observe", "observeVirtualApp", "executeVirtualApp"].includes(kind)) {
       return void sendJSON(res, 400, { error: "taskId / kind 无效" });
     }
     if (!body.payload || typeof body.payload !== "object" || Array.isArray(body.payload)) {
@@ -602,18 +584,24 @@ export class CrossingServer {
       ok = await this.host.world.visitorAct(session, clip(payload.desc), this.taskDuration(payload.durationWorldSeconds, payload.duration), deliver, task.abort.signal, taskId, {
         ...(payload.speech ? { speech: clip(payload.speech) } : {}),
         ...(payload.target ? { target: clip(payload.target) } : {}),
-        ...(payload.observationId ? { observationId: clip(payload.observationId) } : {}),
       });
     } else if (kind === "wait") {
       ok = await this.host.world.visitorWait(session, this.taskDuration(payload.waitWorldSeconds, payload.n), deliver, task.abort.signal, taskId);
     } else if (kind === "checkTime") {
       ok = await this.host.world.visitorCheckTime(session, deliver);
     } else if (kind === "observe") {
-      const observation = await this.host.world.structured.observe("visitor:" + session.id, {
+      const observation = await this.host.world.observe("visitor:" + session.id, {
+        ...(payload.intent ? { intent: clip(payload.intent) } : {}),
         ...(payload.target ? { target: clip(payload.target) } : {}),
         ...(payload.modality ? { modality: clip(payload.modality) } : {}),
       });
       parts.push(JSON.stringify(observation));
+      ok = true;
+    } else if (kind === "observeVirtualApp") {
+      parts.push(JSON.stringify(await this.host.world.observeVirtualApp(clip(payload.task), "visitor:" + session.id)));
+      ok = true;
+    } else if (kind === "executeVirtualApp") {
+      parts.push(JSON.stringify(await this.host.world.executeAppAction(clip(payload.task), "visitor:" + session.id, task.abort.signal)));
       ok = true;
     } else {
       parts.push(await this.host.world.visitorQuery(session, clip(payload.task)));
@@ -639,7 +627,6 @@ export class CrossingServer {
     this.closeSession(session);
     this.host.logger.info("[穿越] 访客「%s」离开（%s，mode=%s）", session.name, cause, session.mode ?? "cross");
     debug.emit("world.task", `穿越·访客「${session.name}」离开`, { cause, mode: session.mode ?? "cross" });
-    if (!session.residentControl) this.host.notifyHostBot(playerLeaveNotice(session.name, session.mode ?? "cross", cause));
     // 先清掉该玩家尚未开始执行的 act/wait（避免它离开后，队列里的旧行动还照常演一遍）
     if (!session.residentControl) {
       this.host.world.cancelPending("visitor:" + session.id);
@@ -681,8 +668,8 @@ export class CrossingServer {
         this.armAbsence(session);
       }
     }
-    // Durable resident perceptions already have a replay entry; do not queue the same ID twice.
-    if (session.residentControl && msg.type === "event" && msg.eventId && session.perceptionReplay?.has(msg.eventId)) return;
+    // Committed perceptions already have a replay entry; do not queue the same ID twice.
+    if (msg.type === "event" && msg.eventId && session.perceptionReplay?.has(msg.eventId)) return;
     session.outbox.push(msg);
     if (session.outbox.length > 100) session.outbox.splice(0, session.outbox.length - 100);
   }

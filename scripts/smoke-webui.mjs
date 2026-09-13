@@ -15,6 +15,7 @@ import smokeCommands from './webui-smoke-commands.mjs';
 import smokeAttachments from './webui-smoke-attachments.mjs';
 import smokeLayout from './webui-smoke-layout.mjs';
 import smokeNotes from './webui-smoke-notes.mjs';
+import smokeNarrative from './webui-smoke-narrative.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const children = [];
@@ -38,7 +39,7 @@ function launch(command, args, pattern, options = {}) {
 }
 
 try {
-  const base = await launch(process.execPath, ['scripts/preview-webui.mjs'], /preview: (http:\/\/127\.0\.0\.1:\d+)/, { env: { ...process.env, STUDIO_PREVIEW_PORT: '0' } });
+  const base = await launch(process.execPath, ['scripts/preview-webui.mjs'], /preview: (http:\/\/127\.0\.0\.1:\d+)/, { env: { ...process.env, STUDIO_PREVIEW_PORT: '0', STUDIO_PREVIEW_LEGACY: '1' } });
   assert.equal((await (await fetch(base + '/api/health')).json()).preview, true);
   const chrome = process.env.CHROMIUM_PATH || (existsSync('/snap/bin/chromium') ? '/snap/bin/chromium' : 'chromium');
   // Snap Chromium can only use its own writable directory; other installations use /tmp.
@@ -140,6 +141,7 @@ try {
   console.log('PASS', await smokeJourney(helpers));
   console.log('PASS', await smokeCockpit(helpers));
   console.log('PASS', await smokeCommands(helpers));
+  console.log('PASS', await smokeNarrative(helpers));
   assert.deepEqual(errors, [], 'Browser exceptions or unexpected external requests');
   if (process.env.STUDIO_SCREENSHOT_DIR) {
     const output = resolve(process.env.STUDIO_SCREENSHOT_DIR); await mkdir(output, { recursive: true });

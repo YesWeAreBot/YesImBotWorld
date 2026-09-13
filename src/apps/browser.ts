@@ -4,8 +4,8 @@
  * 双模式（创世时判定的世界性质，meta.json）：
  * - 现实世界：对接真实互联网——fetch 网页 → HTML 转可读文本（链接/图片编号化），
  *   搜索走可配置的引擎（默认 DuckDuckGo Lite）；网页里的图片可存进媒体缓存供发送/收藏；
- * - 虚构世界：World-LLM 扮演"这个世界的互联网"，直接生成完整 HTML 网页
- *   （与世界状态一致），文本浏览与截图共用同一份 HTML。
+ * - 虚构世界：World-LLM 只读查询这个世界已确立的网页记录并呈现为 HTML；
+ *   文本浏览与截图共用同一份 HTML，缺失内容显示未知。
  *
  * 截图（两种模式都支持）依赖 koishi-plugin-puppeteer 提供的 ctx.puppeteer 服务：
  * - 现实世界：无头浏览器打开当前网址实拍；
@@ -41,8 +41,6 @@ const MAX_HTML_BYTES = 3 * 1024 * 1024;
 /** 每屏正文字符数（长页面分屏，scroll_down 翻页） */
 const SCREEN_CHARS = 2600;
 const HISTORY_LIMIT = 10;
-/** 虚构模式网页缓存的最大页数 */
-const MAX_CACHE_PAGES = 300;
 const USER_AGENT =
   "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36";
 
@@ -109,6 +107,8 @@ interface BrowserPage extends ParsedPage {
   html?: string;
   /** 当前滚动到第几屏（0 起） */
   screen: number;
+  /** 本次虚构页面读取的实际状态来源；滚动和后退不产生新事实。 */
+  originEventIds?: string[];
 }
 
 export class BrowserApp implements WorldApp {
@@ -118,13 +118,6 @@ export class BrowserApp implements WorldApp {
 
   private current: BrowserPage | null = null;
   private history: BrowserPage[] = [];
-
-  /**
-   * 虚构模式的网页缓存（browserCache.json，随世界持久化）：
-   * 同一个网址（或同一个搜索词）总呈现同一份网页，而不是每次访问都重新生成。
-   * 上限 MAX_CACHE_PAGES 条，超出时丢弃最久未用的条目。
-   */
-  private vcache: Map<string, string> | null = null;
 
   constructor(
     private ctx: Context,
@@ -230,7 +223,7 @@ export class BrowserApp implements WorldApp {
         },
       );
     }
-    return { tools: real ? tools : tools.map(tool => ({ ...tool, description: tool.description + "虚构模式只呈现已观测的页面内容，没有已知内容则显示不可用，不会访问真实互联网。" })) };
+    return { tools: real ? tools : tools.map(tool => ({ ...tool, description: tool.description + "虚构模式只读取角色可访问的既有网页记录，没有内容记录则显示未知或不可用，不会访问真实互联网。" })) };
   }
 
   async call(tool: string, args: Record<string, unknown>): Promise<string | RichText> {
@@ -264,7 +257,7 @@ export class BrowserApp implements WorldApp {
         if (!prev) return "（没有可以后退的页面了。）";
         this.current = prev;
         this.current.screen = 0;
-        return this.renderScreen("你按了后退，回到之前的页面。");
+        return this.perceivedScreen("你按了后退，回到之前的页面。");
       }
       case "view_image":
       case "save_image": {
@@ -322,13 +315,20 @@ export class BrowserApp implements WorldApp {
     );
   }
 
-  private scrollDown(): string {
+  private perceivedScreen(prefix?: string): string | RichText {
+    const text = this.renderScreen(prefix);
+    return this.current?.originEventIds
+      ? { text, originEventIds: this.current.originEventIds.slice() }
+      : text;
+  }
+
+  private scrollDown(): string | RichText {
     const page = this.current;
     if (!page) return "（还没有打开任何页面。）";
     const screens = splitScreens(page.text);
     if (page.screen >= screens.length - 1) return "（已经到页面底部了。）";
     page.screen++;
-    return this.renderScreen();
+    return this.perceivedScreen();
   }
 
   // ---------- 现实模式：真实互联网 ----------
@@ -412,11 +412,11 @@ export class BrowserApp implements WorldApp {
     );
   }
 
-  // ---------- 虚构模式：World-LLM 扮演互联网 ----------
+  // ---------- 虚构模式：只读查看既有网页记录 ----------
 
   private async virtualNavigate(
     nav: { url?: string; search?: string; fromLink?: string },
-  ): Promise<string> {
+  ): Promise<string | RichText> {
     const what = nav.search
       ? `在浏览器里搜索了「${nav.search}」`
       : nav.fromLink
@@ -424,87 +424,33 @@ export class BrowserApp implements WorldApp {
         : `在浏览器地址栏输入并打开了 ${nav.url}`;
     const displayUrl = nav.search ? `search://${nav.search}` : nav.url!;
 
-    // 先查持久化缓存：同一个网址总是呈现同一份网页，而不是每次访问都"改头换面"
-    const key = browserCacheKey(nav);
-    if (key) {
-      const cache = await this.loadVCache();
-      const hit = cache.get(key);
-      if (hit) {
-        // 命中的条目移到末尾（最近使用），维持简单的 LRU 淘汰
-        cache.delete(key);
-        cache.set(key, hit);
-        await this.saveVCache(cache);
-        const parsed = parseHtml(hit, displayUrl);
-        this.pushHistory();
-        this.current = { ...parsed, url: displayUrl, html: hit, screen: 0 };
-        return this.renderScreen(nav.search ? `你搜索了「${nav.search}」。` : undefined);
-      }
-    }
-
+    // 每次导航重新读取已确立的世界记录；旧的“未知”页面不能永久遮住后续内容。
     const task =
       `浏览器收到请求：${what}（当前 ${this.clock.timeLine()}）。\n` +
       `请只读呈现已有网页内容，不模拟尚未存在的互联网事实：\n` +
-      `1. 仅依据提供的可感知结构化信息呈现页面；` +
+      `1. 仅查询角色可用的虚构浏览器中已确立的网页记录；` +
       `观测明确记录无网络或网址不存在时才显示对应错误；没有记录时只说明未知/不可用，不能猜测 404 或断网。\n` +
       `2. 缺少已知网页内容时生成不可用页面，不创建世界事实。\n` +
       `3. 最后输出这个网页的完整 HTML 文档（从 <!DOCTYPE html> 或 <html> 开始）：\n` +
       `   - 保留已提供的标题和原文；没有内容时只显示不可用，不为凑长度补写。\n` +
-      `   - 只保留观测中提供的链接、地址和搜索结果；没有来源就不生成链接，不虚构合理的网址。\n` +
+      `   - 只保留既有网页记录中的链接、地址和搜索结果；没有来源就不生成链接，不虚构合理的网址。\n` +
       `   - 不要引用任何外部资源（图片、脚本、样式表都不要）；需要样式就写在 <style> 里；\n` +
       `   - 除 HTML 外不要输出任何解释。`;
 
-    let raw: string;
+    let result: RichText;
     try {
-      raw = await this.world.query(task);
+      result = await this.world.observeVirtualApp(task);
     } catch (err) {
       this.logger.warn("虚构网页生成失败: %s", err);
       return "（浏览器转了半天圈，页面加载失败了。稍后再试试。）";
     }
-    const html = extractHtml(raw);
-    if (!html) return "（页面加载出来一片乱码，什么都看不清。刷新试试。）";
-
-    if (key) {
-      const cache = await this.loadVCache();
-      cache.delete(key);
-      cache.set(key, html);
-      while (cache.size > MAX_CACHE_PAGES) {
-        const oldest = cache.keys().next().value as string | undefined;
-        if (oldest === undefined) break;
-        cache.delete(oldest);
-      }
-      await this.saveVCache(cache);
-    }
+    const html = extractHtml(result.text);
+    if (!html) return result;
 
     const parsed = parseHtml(html, displayUrl);
     this.pushHistory();
-    this.current = { ...parsed, url: displayUrl, html, screen: 0 };
-    return this.renderScreen(nav.search ? `你搜索了「${nav.search}」。` : undefined);
-  }
-
-  /** 惰性加载虚构网页缓存（browserCache.json 不存在或损坏时为空） */
-  private async loadVCache(): Promise<Map<string, string>> {
-    if (this.vcache) return this.vcache;
-    this.vcache = new Map();
-    try {
-      const raw = await fs.readFile(this.files.browserCache, "utf8");
-      const obj = JSON.parse(raw) as unknown;
-      if (obj && typeof obj === "object") {
-        for (const [k, v] of Object.entries(obj as Record<string, unknown>)) {
-          if (typeof v === "string" && v) this.vcache.set(k, v);
-        }
-      }
-    } catch {
-      /* 首次使用或文件损坏：当作空缓存 */
-    }
-    return this.vcache;
-  }
-
-  private async saveVCache(cache: Map<string, string>): Promise<void> {
-    const obj: Record<string, string> = {};
-    for (const [k, v] of cache) obj[k] = v;
-    await this.files
-      .atomicWrite(this.files.browserCache, JSON.stringify(obj))
-      .catch((err) => this.logger.warn("虚构网页缓存写盘失败: %s", err));
+    this.current = { ...parsed, url: displayUrl, html, screen: 0, originEventIds: result.originEventIds?.slice() };
+    return this.perceivedScreen(nav.search ? `你搜索了「${nav.search}」。` : undefined);
   }
 
   // ---------- 截图（两种模式通用，依赖 ctx.puppeteer） ----------
@@ -659,8 +605,7 @@ function normalizeUrl(url: string): string {
 }
 
 /**
- * 虚构模式网页缓存的键：搜索词与网址统一归一化（小写、剥协议与尾斜杠），
- * 让"同一个网站"（无论 http/https、带不带尾斜杠）命中同一份缓存页面。
+ * 旧网页缓存归档的键规范，仅用于读取/检查旧归档；新导航不再使用持久化页面缓存。
  */
 export function browserCacheKey(nav: { url?: string; search?: string }): string {
   if (nav.search !== undefined && nav.search !== null) {

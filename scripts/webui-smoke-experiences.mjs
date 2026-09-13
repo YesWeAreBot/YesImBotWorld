@@ -5,7 +5,7 @@ export default async function smokeExperiences({ evaluate, wait, assert, navigat
   await run(resident=>{
     const input=document.querySelector(resident?'[data-cockpit-field="act:description"]':'.journey-action-input');
     input.value='去吃饭';input.dispatchEvent(new Event('input',{bubbles:true}));
-    const duration=document.querySelector(resident?'[data-cockpit-field="duration"]':'.journey-two-fields input');
+    const duration=document.querySelector(resident?'[data-cockpit-field="duration"]':'.journey-two-fields input[type="number"]');
     if(duration){duration.value='0';duration.dispatchEvent(new Event('input',{bubbles:true}));}
     input.closest('form').requestSubmit();
   },resident);
@@ -44,9 +44,9 @@ export default async function smokeExperiences({ evaluate, wait, assert, navigat
   await wait(`Array.from(document.querySelectorAll('.journey-feed-experience')).some(n=>n.textContent.includes('两下敲门声'))`);
   await run(()=>{window.__experienceSmoke.latestObservation=document.querySelector('.journey-state-details').dataset.journeyObservation;});
   assert(await run(resident=>{
-    const id=window.__experienceSmoke.latestObservation,select=document.querySelector(resident?'[data-cockpit-field="act:target"]':'.journey-two-fields select'),suffix=id.replace('ambient_','');
-    return id.startsWith('ambient_')&&[...select.options].some(option=>option.value.includes('seen_'+suffix+'_'))&&document.querySelector('[data-journey-event="ambient_scene_'+suffix+'"]')&&document.querySelector('[data-journey-event="ambient_'+suffix+'"]');
-  },resident),'A top-level observation plus scene updates the current observation, available target handles and factual experience together');
+    const id=window.__experienceSmoke.latestObservation,target=document.querySelector(resident?'[data-cockpit-field="act:target"]':'[data-cockpit-field="action:target"]'),suffix=id.replace('ambient_','');
+    return id.startsWith('ambient_')&&target&&target.tagName!=='SELECT'&&document.querySelector('[data-journey-event="ambient_scene_'+suffix+'"]')&&document.querySelector('[data-journey-event="ambient_'+suffix+'"]');
+  },resident),'A top-level observation plus scene updates the current observation, free-description target input and factual experience together');
   await run(async()=>{await fetch('/api/preview/player/story',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({phase:'replay',actionId:window.__experienceSmoke.actionId})});});
   await run(()=>new Promise(resolve=>setTimeout(resolve,100)));
   assert(await run(()=>{

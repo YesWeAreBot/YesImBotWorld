@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { WorldKernel } from "./world/kernel.js";
+import type { NarrativeStore } from "./world/narrative-store.js";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import type { NewsEntry } from "./types.js";
@@ -43,8 +44,10 @@ const WORLD_DEF_TEMPLATE = `# 世界定义
  * basePath/
  * ├── Bot_Definition.md    # 用户编写：Bot 角色定义
  * ├── World_Definition.md  # 用户编写：世界定义
- * ├── Bot_Status.md        # Bot-LLM 维护（压缩时更新）：Bot 当前状态
- * ├── World_Status.md      # World-LLM 维护：世界当前状态
+ * ├── world-narrative.jsonl # 权威状态与事件：同笔提交，可恢复
+ * ├── world-transactions.jsonl # 旧结构化日志：保留用于迁移与审计
+ * ├── Bot_Status.md        # 角色当前状态的可重建自然语言镜像
+ * ├── World_Status.md      # 全知世界当前状态的可重建自然语言镜像
  * ├── News.jsonl           # World-LLM 维护：世界重大事件列表（JSONL 格式，世界中心）
  * ├── facts.jsonl          # World-LLM 维护：Bot 的小事记（JSONL 格式，Bot 中心）
  * ├── clock.json           # World Clock 状态
@@ -60,8 +63,12 @@ const WORLD_DEF_TEMPLATE = `# 世界定义
  */
 export class WorldFiles {
   private kernel?: WorldKernel;
+  private narrative?: NarrativeStore;
   bindKernel(kernel: WorldKernel): void { this.kernel = kernel; }
+  bindNarrativeStore(store: NarrativeStore): void { this.narrative = store; }
   readonly worldJournal: string;
+  /** 自然语言世界的权威日志；Markdown 状态只是可重建镜像。 */
+  readonly narrativeJournal: string;
   readonly growthJournal: string;
   readonly contextCommit: string;
   readonly botDef: string;
@@ -87,6 +94,7 @@ export class WorldFiles {
 
   constructor(readonly base: string) {
     this.worldJournal = path.join(base, "world-transactions.jsonl");
+    this.narrativeJournal = path.join(base, "world-narrative.jsonl");
     this.growthJournal = path.join(base, "growth.jsonl");
     this.contextCommit = path.join(base, "context-commit.json");
     this.botDef = path.join(base, "Bot_Definition.md");
@@ -159,6 +167,8 @@ export class WorldFiles {
   }
 
   async isInitialized(): Promise<boolean> {
+    if (this.narrative) return this.narrative.snapshot().initialized;
+    if ((await this.readText(this.narrativeJournal)).trim()) return true;
     return !!this.kernel?.snapshot().entities.bot || (await this.readText(this.worldJournal)).trim().length > 0 || ((await this.exists(this.botStatus)) && (await this.exists(this.worldStatus)));
   }
 
@@ -171,12 +181,14 @@ export class WorldFiles {
   }
 
   async readBotStatus(): Promise<string> {
+    if (this.narrative) return this.narrative.snapshot().actors.bot?.state ?? "";
     const state = this.kernel?.snapshot(), actor = state?.entities.bot;
     if (actor) return JSON.stringify({ name: actor.name, location: actor.location ? state?.entities[actor.location]?.name : null, attributes: Object.fromEntries(Object.entries(actor.attributes).filter(([, attr]) => attr.visibility !== "hidden").map(([key, attr]) => [key, attr.value])) }, null, 2);
     return this.readText(this.botStatus);
   }
 
   async writeBotStatus(content: string): Promise<void> {
+    if (this.narrative || await this.exists(this.narrativeJournal)) throw new Error("角色状态由自然语言世界事务维护，请通过世界行动更新，不能单独覆盖状态镜像。");
     if (this.kernel?.snapshot().entities.bot || await this.exists(this.worldJournal)) throw new Error("状态已由结构化世界管理，不能覆写旧 Markdown；请通过动作改变世界。");
     await this.atomicWrite(this.botStatus, content);
   }
@@ -190,6 +202,10 @@ export class WorldFiles {
   }
 
   async readWorldStatus(publicOnly = false): Promise<string> {
+    if (this.narrative) {
+      const state = this.narrative.snapshot();
+      return publicOnly ? state.actors.bot?.perception ?? "" : state.worldState;
+    }
     if (this.kernel?.snapshot().entities.bot) {
       if (publicOnly) {
         const view = await this.kernel.peek("bot", { publicOnly: true });
@@ -197,10 +213,12 @@ export class WorldFiles {
       }
       return JSON.stringify(this.kernel.snapshot(), null, 2);
     }
-    return this.readText(this.worldStatus);
+    // A legacy omniscient Markdown document has no reliable visibility markers.
+    return this.readText(publicOnly ? this.botStatus : this.worldStatus);
   }
 
   async writeWorldStatus(content: string): Promise<void> {
+    if (this.narrative || await this.exists(this.narrativeJournal)) throw new Error("世界状态由自然语言世界事务维护，不能单独覆盖状态镜像。");
     if (this.kernel?.snapshot().entities.bot || await this.exists(this.worldJournal)) throw new Error("世界已由结构化事务管理，不能覆写旧 Markdown。");
     await this.atomicWrite(this.worldStatus, content);
   }
@@ -334,7 +352,9 @@ export class WorldFiles {
   async snapshot(label = ""): Promise<string> {
     const dir = await this.makeArchiveDir(label);
     const saved: string[] = [];
+    const narrativeSnapshot = await this.narrative?.exportJournal();
     for (const file of [
+      this.narrativeJournal,
       this.worldJournal,
       this.growthJournal,
       this.contextCommit,
@@ -349,6 +369,13 @@ export class WorldFiles {
       this.focus,
       this.notify,
     ]) {
+      if (file === this.narrativeJournal && narrativeSnapshot !== undefined) {
+        if (narrativeSnapshot.trim()) {
+          await fs.writeFile(path.join(dir, path.basename(file)), narrativeSnapshot);
+          saved.push(path.basename(file));
+        }
+        continue;
+      }
       if (await this.exists(file)) {
         await fs.copyFile(file, path.join(dir, path.basename(file)));
         saved.push(path.basename(file));
@@ -366,6 +393,7 @@ export class WorldFiles {
   async restoreFrom(snapDir: string): Promise<void> {
     await this.atomicWrite(path.join(this.base, "bot-receipts-epoch"), randomUUID());
     for (const file of [
+      this.narrativeJournal,
       this.worldJournal,
       this.growthJournal,
       this.contextCommit,
@@ -385,6 +413,8 @@ export class WorldFiles {
       else await fs.rm(file, { force: true });
     }
     await this.kernel?.reload();
+    await this.narrative?.reload();
+    await this.narrative?.migrateLegacy(this);
     const notesSrc = path.join(snapDir, "Notes");
     await fs.rm(this.notesDir, { recursive: true, force: true });
     if (await this.exists(notesSrc)) {
@@ -424,6 +454,7 @@ export class WorldFiles {
     const pinnedFacts = await this.readPinnedFacts();
     await this.snapshot("重置");
     for (const file of [
+      this.narrativeJournal,
       this.worldJournal,
       this.growthJournal,
       this.contextCommit,
@@ -446,6 +477,7 @@ export class WorldFiles {
       await fs.rm(this.notesDir, { recursive: true, force: true });
     }
     await this.kernel?.reload();
+    await this.narrative?.reload();
     if (pinnedFacts.length) await this.writeFacts(pinnedFacts);
   }
 

@@ -24,7 +24,7 @@ export type DebugKind =
   | "world.task"
   /** World-LLM 一轮工具调用的最终结果 */
   | "world.result"
-  /** World-LLM 执行了某个工具（update/check/send_event） */
+  /** World-LLM 提交了世界裁定或返回了协议校验诊断 */
   | "world.tool"
   /** 世界生命周期（init/start/stop/reload/reset） */
   | "lifecycle"

@@ -2029,8 +2029,8 @@ export class BotAgent {
     }
     this.waiting = { callId: call.id, startedTU: this.clock.now() };
 
-    // Observations are now kernel reads, not predictive narration. Read only after the wait actually ends:
-    // an early read would consume another actor's speech even when this wait is interrupted.
+    // Drain already committed passive perceptions only after the wait actually ends.
+    // Interrupted waits must not trigger active observation or invent an elapsed interval.
     const narrateMinMs = this.config.world.waitNarrateMinRealSeconds * 1000;
     const shouldObserve = narrateMinMs > 0 && this.clock.realMsUntil(call.expectedAt) >= narrateMinMs;
     this.schedule(call, {
@@ -2039,7 +2039,7 @@ export class BotAgent {
         this.recordWait(call.issuedAt);
         if (shouldObserve) {
           void this.world.resolveWait(call, (content) => this.pushEvent("world", content)).catch((err) => {
-            this.logger.warn("等待后的观测失败：%s", err);
+            this.logger.warn("等待后的感知交付失败：%s", err);
           });
         }
         return { text: "等待结束了。", originEventIds: [] };
@@ -2729,12 +2729,13 @@ export class BotAgent {
     this.pushEvent("system", text, { ref: call.id });
   }
 
-  /** Observation is the only entry to physical/world state. */
+  /** Active attention complements passive world events and action results. */
   private async observe(call: ToolCallRecord): Promise<RichText> {
     const self = call.arguments.target === "self";
     const target = !self && typeof call.arguments.target === "string" ? call.arguments.target : undefined;
+    const intent = typeof call.arguments.intent === "string" ? call.arguments.intent : undefined;
     const modality = self ? "self" : typeof call.arguments.modality === "string" ? call.arguments.modality : undefined;
-    const observation: WorldObservation = await this.world.observe("bot", { target, modality });
+    const observation: WorldObservation = await this.world.observe("bot", { ...(intent ? { intent } : {}), target, modality });
     return { text: JSON.stringify(observation), originEventIds: observation.sourceEventIds };
   }
 
@@ -2814,7 +2815,7 @@ export class BotAgent {
 
 }
 
-/** The reading scene is derived from committed perceptions; retain every original observation root. */
+/** World prose and its presentation share committed causes; retain every original root. */
 function observationOrigins(text: string): string[] | undefined {
   try {
     if (text.startsWith("（以下是外部操纵你身体/设备产生的回执，")) text = text.slice(text.indexOf("\n") + 1);

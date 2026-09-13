@@ -2,7 +2,7 @@
 var WorldCockpit = (function () {
     'use strict';
     var labels = { observe: '观察世界', observe_device: '看向设备', act: '身体行动', reflect: '整理认识', recall_growth: '回顾成长', wait: '等待', rest: '休息', check_time: '查看时间', read_channel: '阅读会话', check_msg: '查看消息', select_channel: '进入会话', pick_up_phone: '拿起手机', put_down_phone: '放下手机', open_app: '打开应用', close_app: '关闭应用', open_computer: '打开电脑', close_computer: '关闭电脑', run_command: '运行终端命令', screen: '查看屏幕', keyboard: '使用键盘', mouse: '使用鼠标', travel: '前往其他世界', go_home: '回家', send: '发送消息', view_media: '查看媒体', pick_media: '选择媒体', check_gallery: '翻看收藏', check_media: '查看媒体缓存' };
-    var fields = { description: '动作描述', speech: '说出的原话', target: '目标', observationId: '观测依据', device: '设备', scope: '观察范围', modality: '感知方式', query: '检索内容', text: '文字', app: '应用', command: '命令', channel: '会话', channelId: '会话', content: '内容', name: '名称', path: '路径', title: '标题', url: '网址', n: '数量', kind: '认识类别', subject: '关于谁或什么', statement: '你的认识', event_ids: '亲历证据', claim_id: '已有认识', relation: '更新方式', msg: '消息正文', msg_id: '消息', msg_ids: '消息', reply_to: '回复哪条消息', id: '对象', media: '媒体', repeat: '允许重复动作', duration: '时长', full: '完整信息' };
+    var fields = { intent: '观察意图', description: '动作描述', speech: '说出的原话', target: '目标', observationId: '观测依据', device: '设备', scope: '观察范围', modality: '感知方式', query: '检索内容', text: '文字', app: '应用', command: '命令', channel: '会话', channelId: '会话', content: '内容', name: '名称', path: '路径', title: '标题', url: '网址', n: '数量', kind: '认识类别', subject: '关于谁或什么', statement: '你的认识', event_ids: '亲历证据', claim_id: '已有认识', relation: '更新方式', msg: '消息正文', msg_id: '消息', msg_ids: '消息', reply_to: '回复哪条消息', id: '对象', media: '媒体', repeat: '允许重复动作', duration: '时长', full: '完整信息' };
     var words = { phone: '手机', computer: '电脑', self: '自己', all: '周围与自己', sight: '眼前景象', relationship: '关系', commitment: '承诺', preference: '偏好', support: '补充证据', counter: '记录反例', revise: '修正判断' };
     function label(tool) { return labels[tool.name] || tool.title || tool.name; }
     function note(text) { return el('p', { cls: 'journey-note', text: text }); }
@@ -29,8 +29,7 @@ var WorldCockpit = (function () {
         function candidates(name, tool) {
             var context = data.choices || {}, devices = data.deviceSession || {}, chat = devices.chat || {}, result = null;
             if (name === 'target' && (tool.name === 'act' || tool.name === 'observe')) {
-                result = ((data.observation && data.observation.entities) || []).filter(function (e) { return tool.name === 'observe' || !e.self; }).map(function (e) { return { value: e.observedId, text: e.self ? '自己 · ' + e.name : e.name }; });
-                if (tool.name === 'observe') result.unshift({ value: 'self', text: '自己' });
+                return null; // World targets are descriptions, never observation handles.
             } else if (tool.name === 'open_app' && name === 'name') result = (devices.apps || []).map(function (a) { return { value: a.id, text: a.name || a.title || a.id }; });
             else if (['channel', 'channelId', 'id'].includes(name) && /^(select_channel|send|channel_notify|unsend|react|get_emoji_likes|forward_msgs)$/.test(tool.name)) result = (chat.channels || []).map(function (c) { return { value: c.key, text: c.name || c.title || (c.participants || []).map(function (p) { return p.username; }).filter(Boolean).join('、') || c.channelId || c.key }; });
             else if (['msg_id', 'msg_ids', 'reply_to'].includes(name) && /^(send|unsend|react|get_emoji_likes|forward_msgs|view_forward|set_essence)$/.test(tool.name)) result = (chat.messages || []).filter(function (m) { return m.messageId; }).map(function (m) { return { value: String(m.messageId), text: (m.username || m.userName || m.senderName || '消息') + ' · ' + ReadableData.text(m.content || m.text || '').slice(0, 95) }; });
@@ -120,7 +119,7 @@ var WorldCockpit = (function () {
                     if (spec.maximum !== undefined) input.max = spec.maximum;
                     holder.appendChild(input); read = function () { if (input.value === '') return undefined; var number = Number(input.value); if (!Number.isFinite(number) || type === 'integer' && !Number.isInteger(number)) throw Error((fields[name] || name) + '需要有效数字。'); if (spec.minimum !== undefined && number < spec.minimum || spec.maximum !== undefined && number > spec.maximum) throw Error((fields[name] || name) + '超出了此能力支持的范围。'); return number; };
                 } else {
-                    input = el('textarea', { cls: 'journey-input', rows: tool.name === 'act' && name === 'description' ? '2' : '2', placeholder: tool.name === 'act' && name === 'description' ? '想做什么？例如走到窗边，把窗户推开。' : '' });
+                    input = el('textarea', { cls: 'journey-input', rows: tool.name === 'act' && name === 'description' ? '2' : '2', placeholder: tool.name === 'act' && name === 'description' ? '想做什么？例如走到窗边，把窗户推开。' : name === 'target' && ['act', 'observe'].includes(tool.name) ? '用名字或描述指定，例如柜台后的店员；可以留空' : tool.name === 'observe' && name === 'intent' ? '想了解什么？例如仔细看看菜单上的菜品。' : '' });
                     input.value = value === undefined ? '' : String(value); holder.appendChild(input); read = function () { return input.value === '' ? undefined : input.value; };
                 }
                 if (input) { input.dataset.cockpitField = tool.name + ':' + path; input.setAttribute('aria-label', fields[name] || name); if (required && input.tagName !== 'SELECT') input.required = true; }
@@ -130,10 +129,10 @@ var WorldCockpit = (function () {
             }
             Object.entries(schema.properties || {}).forEach(function (entry) {
                 var name = entry[0], spec = entry[1], required = (schema.required || []).includes(name);
-                if (name === 'observationId' && tool.name === 'act') { readers.push(function (args) { if (data.observation) args.observationId = data.observation.observationId; }); return; }
+                if (name === 'observationId' && tool.name === 'act') return;
                 var control = controlFor(name, spec, values[name], required, name), row = el('label', { cls: 'journey-field' }, [el('span', { cls: 'journey-label', text: (timed && ['n', 'duration'].includes(name) ? '时长 · TU' : fields[name] || name) + (required ? '' : ' · 可选') }), control.node]);
                 if (spec.description) row.appendChild(el('details', { cls: 'cockpit-field-help' }, [el('summary', { text: '参数说明' }), note(spec.description)]));
-                (required ? primary : extras).appendChild(row);
+                (required || tool.name === 'observe' && name === 'intent' ? primary : extras).appendChild(row);
                 readers.push(function (args) { var value = control.read(); values[name] = value; if (value !== undefined) args[name] = value; });
             });
             var duration = el('input', { cls: 'journey-input', type: 'number', min: '0', step: 'any', value: values.__estimate || '0', 'data-cockpit-field': 'duration', 'aria-label': '预计时长（世界秒）', oninput: function () { values.__estimate = duration.value; } });
@@ -193,7 +192,7 @@ var WorldCockpit = (function () {
         }
         panel.update = update;
         panel.select = select;
-        panel.setTarget = function (target) { draft.values.act = draft.values.act || {}; draft.values.act.target = target; if (!selected || selected.name !== 'act') select('act'); var input = panel.querySelector('[data-cockpit-field="act:target"]'); if (input) { input.value = JSON.stringify(target); input.dispatchEvent(new Event('change', { bubbles: true })); } };
+        panel.setTarget = function (target) { draft.values.act = draft.values.act || {}; draft.values.act.target = target; if (!selected || selected.name !== 'act') select('act'); var input = panel.querySelector('[data-cockpit-field="act:target"]'); if (input) { input.value = target; input.dispatchEvent(new Event('change', { bubbles: true })); } };
         update(initial); return panel;
     }
     return { mount: mount, label: label };

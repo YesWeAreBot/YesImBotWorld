@@ -96,6 +96,8 @@ export interface BotEvent {
   originEventIds?: string[];
   source: EventSource;
   content: string;
+  /** Frozen model-facing prose for a newly persisted narrative-world event. Raw content stays intact. */
+  contextText?: string;
   /** 事件进入上下文时的世界时刻（Time Unit） */
   worldTime: number;
   /** 若此事件是某个工具调用的结果，指向该调用 */

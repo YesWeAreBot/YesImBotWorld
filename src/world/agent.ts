@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { StructuredWorld } from "./runtime.js";
-import { presentObservation } from "./scene.js";
+import { NarrativeWorld } from "./runtime.js";
+import type { NarrativeObservation } from "./narrative-types.js";
 import type { WorldObservation } from "./state.js";
 import type { Logger } from "koishi";
 import { type CalendarSpec, describeCalendar, gregorian, parseCalendarSpec } from "../calendar.js";
@@ -17,7 +17,7 @@ import {
   type PhoneResolution,
 } from "../phone.js";
 import { fill, type Prompts } from "../prompts.js";
-import type { CompressionResult, ToolCallRecord } from "../types.js";
+import type { CompressionResult, RichText, ToolCallRecord } from "../types.js";
 import type { PlayerMode } from "../crossing/protocol.js";
 import { debug } from "../webui/debug.js";
 
@@ -25,19 +25,19 @@ import { debug } from "../webui/debug.js";
 export interface PresentVisitor {
   id?: string;
   name: string;
-  /** 状态档案（会注入系统提示的 <visitors> 区 */
+  /** 提供给世界裁定的角色档案。 */
   persona: string;
   /** 真人玩家的进入语义（cross=穿越/avatar=扮演/puppet=操纵）；Bot 访客恒为 cross */
   mode?: PlayerMode;
   /** 事件送达访客 */
   deliver: (content: string) => void;
-  /** 状态写回访客世界（update_visitor_status 工具） */
+  /** 向访客传递状态变化说明，不覆盖作者设定。 */
   updateStatus: (content: string) => void;
   /** 强行驱逐该访客（角色死亡/消散/升天等，切断其后续主动互动能力） */
   expel: (reason: string) => void;
 }
 
-/** 接待任务里的访客引用（穿越服务传入；状态写回通道统一走 WorldInvocation.visitors） */
+/** 穿越服务传入的接待身份与档案。 */
 export interface VisitorRef {
   id?: string;
   name: string;
@@ -52,7 +52,9 @@ export interface VisitorRef {
 export interface RemoteWorldLink {
   worldName: string;
   adjudicateAct(call: ToolCallRecord, deliver: (content: string) => void, signal?: AbortSignal, beforeCommit?: () => boolean): Promise<boolean>;
-  observe?(args?: { target?: string; modality?: string }): Promise<WorldObservation>;
+  observe?(args?: { intent?: string; target?: string; modality?: string }): Promise<WorldObservation>;
+  observeVirtualApp?(task: string): Promise<RichText>;
+  executeVirtualApp?(task: string, signal?: AbortSignal): Promise<RichText>;
   resolveWait(call: ToolCallRecord, deliver: (content: string) => void): Promise<boolean>;
   resolveCheckTime(deliver: (content: string) => void): Promise<boolean>;
   query(task: string): Promise<string>;
@@ -62,25 +64,103 @@ export interface RemoteWorldLink {
  * World-LLM：无持续上下文的世界模拟 Agent。
  *
  * 每次被调用（响应 Bot 的工具调用 / Tingle / 初始化 / 定义变更）时，
- * 只通过 StructuredWorld 提出结构化事务；世界内核负责校验、提交和角色观测。
- * 此适配层保留元数据生成、只读呈现及上下文摘要服务。
+ * 使用当前自然语言世界状态与本次任务裁定，不保存自己的调用对话历史。
+ * NarrativeWorld 原子保存最新状态及角色实际感知；本层负责分发、元数据和 Bot 记忆整理。
  */
 export class WorldAgent {
   private client: ChatClient;
   private maintenanceAbort = new AbortController();
-  stop(): void { this.maintenanceAbort.abort(); this.structured.stop(); }
-  readonly structured: StructuredWorld;
-  async ensureStructuredWorld(): Promise<void> { if (this.maintenanceAbort.signal.aborted) this.maintenanceAbort = new AbortController(); this.structured.resume(); await this.structured.ensure(); }
-  async observe(actorId = "bot", args: {target?: string; modality?: string} = {}): Promise<WorldObservation> { if (this.remote && actorId === "bot") { if (!this.remote.observe) throw new Error("远方世界不支持结构化观测"); return this.remote.observe(args); } return this.structured.observe(actorId, args); }
-  private visitorId(v: VisitorRef): string { return "visitor:" + (v.id ?? v.name); }
-  private async publishVisitors(): Promise<void> { for (const v of this.visitorsProvider?.() ?? []) { try { await this.emitIfChanged(this.visitorId(v), v.deliver); } catch (e) { this.logger.warn("访客观测交付失败: %s", e); } } }
-  private async emitIfChanged(actorId: string, deliver: (content: string) => void): Promise<void> {
-    const kernel = await this.structured.kernel();
-    const previous = kernel.latestObservation(actorId), current = await kernel.peek(actorId);
-    if (previous && !current.utterances.length && !current.experiences?.length && perceptionKey(previous) === perceptionKey(current)) return;
-    deliver(JSON.stringify(presentObservation(await this.structured.observe(actorId))));
+  stop(): void { this.maintenanceAbort.abort(); this.runtime.stop(); }
+  readonly runtime: NarrativeWorld;
+  private perceptionCursors = new Map<string, number>();
+  private directlyObserved = new Map<string, Set<string>>();
+  private pendingReceiptActions = new Map<string, string>();
+  private deliveryTails = new Map<string, Promise<void>>();
+  async ensureWorld(): Promise<void> { if (this.maintenanceAbort.signal.aborted) this.maintenanceAbort = new AbortController(); this.runtime.resume(); await this.runtime.ensure(); }
+  /** Used after an explicit world reset/reload; old sequence cursors cannot address a new journal. */
+  resetPerceptionDelivery(): void { this.perceptionCursors.clear(); this.directlyObserved.clear(); }
+  /** Resume after the last known delivered cause, without replaying an entire compressed lifetime. */
+  async restorePerceptions(actorId: string, deliver: (content: string) => void, knownSourceIds: string[] = []): Promise<void> {
+    const observations = await this.runtime.perceptionsSince(actorId, 0);
+    const known = new Set(knownSourceIds);
+    let anchor = -1;
+    for (let i = 0; i < observations.length; i++) {
+      const roots = observations[i]!.sourceEventIds;
+      if (roots.length && roots.every(id => known.has(id))) anchor = i;
+    }
+    if (anchor >= 0) {
+      this.perceptionCursors.set(actorId, observations[anchor]!.worldSequence);
+      await this.publishActor(actorId, deliver);
+      return;
+    }
+    // A migrated world may have no matching source IDs in the old Bot archive. Its saved current
+    // view is a safe baseline; replaying every old scene would turn a summary into repeated life.
+    const latest = observations.at(-1) ?? await this.runtime.latestObservation(actorId);
+    if (latest) {
+      deliver(JSON.stringify({ recovered: true, observation: latest }));
+      this.perceptionCursors.set(actorId, latest.worldSequence);
+    }
   }
-  /** 写状态任务的可抢占队列：玩家 act 等高优先级任务会插到队头（在未开始的普通任务之前） */
+  async observe(actorId = "bot", args: {intent?: string; target?: string; modality?: string} = {}): Promise<WorldObservation> {
+    if (this.remote && actorId === "bot") {
+      if (!this.remote.observe) throw new Error("远方世界不支持主动观察");
+      return this.remote.observe(args);
+    }
+    const observation = await this.runtime.observe(actorId, args);
+    // A concurrently committed passive event may precede this observation. Acknowledge only
+    // this exact result; advancing the entire cursor here would silently drop that earlier event.
+    const observed = this.directlyObserved.get(actorId) ?? new Set<string>();
+    observed.add(observation.observationId); this.directlyObserved.set(actorId, observed);
+    await this.publishAll(actorId);
+    return observation;
+  }
+  private visitorId(v: VisitorRef): string { return "visitor:" + (v.id ?? v.name); }
+  /** Read already committed perceptions; passive delivery must never invoke observe or the model. */
+  private async publishActor(actorId: string, deliver: (content: string) => void, receipt?: string): Promise<void> {
+    const prior = this.deliveryTails.get(actorId) ?? Promise.resolve();
+    const run = prior.catch(() => {}).then(async () => {
+      let receiptObservation: NarrativeObservation | undefined;
+      if (receipt) {
+        try { const parsed = JSON.parse(receipt); receiptObservation = parsed.observation ?? parsed; } catch { /* preserve a readable remote/error receipt below */ }
+      }
+      const cursor = this.perceptionCursors.get(actorId) ?? 0;
+      const pending = await this.runtime.perceptionsSince(actorId, cursor);
+      const deliveredAhead = this.directlyObserved.get(actorId) ?? new Set<string>();
+      this.directlyObserved.set(actorId, deliveredAhead);
+      let receiptDelivered = false;
+      let waitingForReceipt = false;
+      for (const observation of pending) {
+        const isReceipt = receiptObservation?.observationId === observation.observationId;
+        const wasObserved = deliveredAhead.delete(observation.observationId);
+        // An action is delivered through its tool call so puppet/avatar agency and the full
+        // acknowledgement remain intact. A simultaneous heartbeat must not publish it early.
+        const ownedByAction = observation.scene?.actionId && this.pendingReceiptActions.get(observation.scene.actionId) === actorId;
+        if (ownedByAction && !wasObserved && !isReceipt) { waitingForReceipt = true; continue; }
+        if (isReceipt || (!wasObserved && !ownedByAction)) deliver(isReceipt ? receipt! : JSON.stringify(observation));
+        if (isReceipt) receiptDelivered = true;
+        if (waitingForReceipt) deliveredAhead.add(observation.observationId);
+        else this.perceptionCursors.set(actorId, observation.worldSequence);
+      }
+      // A retried action still needs its execution acknowledgement even when the underlying
+      // perception was already delivered. Stable source IDs prevent it becoming new evidence.
+      if (receipt && !receiptDelivered) {
+        deliver(receipt);
+        if (receiptObservation?.actorId === actorId && receiptObservation.worldSequence > (this.perceptionCursors.get(actorId) ?? 0)) deliveredAhead.add(receiptObservation.observationId);
+      }
+    });
+    this.deliveryTails.set(actorId, run);
+    try { await run; } finally { if (this.deliveryTails.get(actorId) === run) this.deliveryTails.delete(actorId); }
+  }
+  private async publishAll(skipActor?: string, botDeliver = this.hostBotDeliver): Promise<void> {
+    if (!this.remote && botDeliver && skipActor !== "bot") await this.publishActor("bot", botDeliver);
+    for (const visitor of this.visitorsProvider?.() ?? []) {
+      const actorId = this.visitorId(visitor);
+      if (actorId === skipActor) continue;
+      try { await this.publishActor(actorId, visitor.deliver); }
+      catch (error) { this.logger.warn("访客感知交付失败: %s", error); }
+    }
+  }
+  /** 元数据生成与记忆维护的队列；世界裁定由 runtime 独立串行。 */
   private queue: { fn: () => Promise<unknown>; priority: number; cancelKey?: string; resolve: (v: unknown) => void; reject: (e: unknown) => void }[] = [];
   private draining = false;
   private pending = 0;
@@ -90,17 +170,11 @@ export class WorldAgent {
    * 只保留上下文压缩等 Bot 私有的记忆工作）；本地 Tingle 静默。
    */
   private remote: RemoteWorldLink | null = null;
-  /** 穿越：本世界在场访客的提供者（穿越服务注册；系统提示 <visitors> 区 + send_event 定向 + 状态写回） */
+  /** 穿越服务注册的在场访客和定向感知通道。 */
   private visitorsProvider: (() => PresentVisitor[]) | null = null;
-  /** 常驻 Bot 的实时事件通道（service 注册；接待访客的任务用 send_event to="bot" 送达它） */
+  /** service 注册的常驻 Bot 实时感知通道。 */
   private hostBotDeliver: ((content: string) => void) | null = null;
-  /**
-   * 访客状态档案的放置方式（crossing.visitorPersonaMode，service 同步）：
-   * - pinned：档案常驻系统提示 <visitors> 区（缓存命中率最优）；
-   * - check：系统提示只放名单，档案用 check_visitor 工具按需查看（省上下文窗口）。
-   */
-  visitorPersonaMode: "pinned" | "check" = "pinned";
-  /** 常驻 Bot 的名字（创世判定，内存缓存，供 visitor prompt 硬区分；systemPrompt 每次读 meta 刷新） */
+  /** 常驻 Bot 的身份名字缓存，供接管入口区分常驻角色与独立访客。 */
   private botName = "";
   /** 供 service/BotContext 读取的常驻 Bot 名字（可能为空=尚未判定） */
   get residentBotName(): string {
@@ -175,19 +249,18 @@ export class WorldAgent {
     const trimmed = name.trim().slice(0, 64);
     const meta = await this.files.readMeta();
     await this.files.writeMeta({ ...meta, botName: trimmed || undefined });
-    const kernel = await this.structured.kernel();
-    const actor = kernel.snapshot().entities.bot;
-    if (trimmed && actor && actor.name !== trimmed) await kernel.commit({ idempotencyKey: randomUUID(), source: "administrator", operations: [{ op: "update", id: "bot", changes: { name: trimmed } }] });
+    const actor = (await this.runtime.store()).snapshot().actors.bot;
+    if (trimmed && actor && actor.name !== trimmed) await this.runtime.rename(trimmed);
     this.botName = trimmed || actor?.name || "";
     this.logger.info("常驻 Bot 名字（用户设置）：%s", trimmed || "（清空）");
   }
 
   /**
    * 用户手动改名后，通知 World：这是同一个角色改名（不是新角色），
-   * 让 World 同步 bot_status / world_status 里的名字，并 send_event 告知 Bot 本人。
+   * 名字及说明已随 runtime.rename 保存，此处分发身份更正的感知。
    * deliver = 常驻 Bot 的实时事件通道（service 传入）；世界未运行时跳过。
    */
-  async notifyBotRename(oldName: string, newName: string, deliver: (content: string) => void): Promise<void> { deliver(JSON.stringify(await this.observe())); }
+  async notifyBotRename(oldName: string, newName: string, deliver: (content: string) => void): Promise<void> { await this.publishAll(undefined, deliver); }
 
   constructor(
     private cfg: WorldModelConfig,
@@ -208,8 +281,8 @@ export class WorldAgent {
       stream: cfg.stream,
       label: "World",
     });
-    this.structured = new StructuredWorld(files, clock, (messages, tools, signal) => withEndpointLock(cfg.baseURL, () => this.client.complete(messages, {
-      tools, signal, toolChoice: { type: "function", function: { name: "propose_world" } },
+    this.runtime = new NarrativeWorld(files, clock, (messages, tools, signal) => withEndpointLock(cfg.baseURL, () => this.client.complete(messages, {
+      tools, signal, toolChoice: { type: "function", function: { name: "resolve_world" } },
     }), signal), prompts);
   }
 
@@ -220,8 +293,7 @@ export class WorldAgent {
    * 排队等待，避免跨模型并发把请求饿死或把推理进程搞崩；不同源时无影响。
    */
   /**
-   * 写状态任务入队。priority 越大越靠前（0=普通如 Tingle；数字越大越优先）。
-   * 真人玩家的 act/到达/离开最优先（避免交互饿死），Bot 的 act 次之，普通后台任务最低。
+   * 维护任务入队。priority 越大越靠前，同优先级保持先后顺序。
    * 正在执行中的任务不会被抢占（LLM 推理无法安全中断）。
    */
   private enqueue<T>(fn: () => Promise<T>, priority = 0, cancelKey?: string): Promise<T> {
@@ -250,10 +322,9 @@ export class WorldAgent {
   }
 
   /**
-   * 取消队列里「尚未开始执行」的、带指定 cancelKey 的任务（如某访客离开时清掉它未开始的 act）。
-   * 正在执行中的任务无法取消（已 shift 出队列）。
+   * 访客离开时中止其尚未提交结果的行动；已经提交的世界事实不能回滚。
    */
-  cancelPending(cancelKey: string): void { this.structured.cancel(cancelKey.startsWith('visitor:') ? cancelKey : 'visitor:' + cancelKey); }
+  cancelPending(cancelKey: string): void { this.runtime.cancel(cancelKey.startsWith('visitor:') ? cancelKey : 'visitor:' + cancelKey); }
 
   /** 串行排空写队列（队头优先，高优先任务已在队头） */
   private async drain(): Promise<void> {
@@ -278,44 +349,49 @@ export class WorldAgent {
   /** 裁定 Bot 的 act 动作。产出的事件通过 deliver 交付（由调度器压到期望完成时刻） */
   async adjudicateAct(call: ToolCallRecord, deliver: (content: string) => void, signal?: AbortSignal, beforeCommit?: () => boolean): Promise<boolean> {
     if (this.remote) return this.remote.adjudicateAct(call, deliver, signal, beforeCommit);
+    const actionId = `bot:${call.id}`;
+    this.pendingReceiptActions.set(actionId, "bot");
     try {
-      return await this.structured.act("bot", call, content => { deliver(content); void this.publishVisitors().catch(e => this.logger.warn("观测分发失败: %s", e)); }, signal, beforeCommit);
+      const receipts: string[] = [];
+      const ok = await this.runtime.act("bot", call, content => receipts.push(content), signal, beforeCommit);
+      for (const receipt of receipts) await this.publishActor("bot", deliver, receipt);
+      await this.publishAll("bot");
+      return ok;
     } catch (error) {
       // Detailed world diagnostics can contain entities or attributes the actor cannot see.
       this.logger.warn("动作裁定失败 (%s): %s", call.id, error);
-      throw new Error("动作未完成或被取消；当前结果未确认，请重新观察。诊断已记录。");
-    }
+      throw new Error(`行动“${String(call.arguments.description ?? "")}”未完成或被取消；当前结果未确认。诊断已记录。`);
+    } finally { this.pendingReceiptActions.delete(actionId); }
   }
 
-  /** wait 补叙：等待即将结束（由计时器准时唤醒），提前生成期间发生的事 */
+  /** 等待结束时补交已保存而未送达的感知，不调用模型制造等待经历。 */
   async resolveWait(call: ToolCallRecord, deliver: (content: string) => void): Promise<boolean> {
     if (this.remote) return this.remote.resolveWait(call, deliver);
-    deliver(JSON.stringify(await this.observe())); return true;
+    await this.publishActor("bot", deliver); return true;
   }
 
   /** 主动查看时间：由世界裁定它此刻能否得知时间（允许失败）。只读任务，走并行队列 */
   async resolveCheckTime(deliver: (content: string) => void): Promise<boolean> {
     if (this.remote) return this.remote.resolveCheckTime(deliver);
-    deliver(JSON.stringify({ observation: await this.observe(), clockReading: null, reason: "需要实际可见的时钟或手机工具获得钟表读数" })); return true;
+    deliver(JSON.stringify(await this.observe("bot", { target: "看看当前可见的时钟能否读出时间；没有可见钟表就说明无法得知，真实手机或电脑时间需通过设备工具读取。", modality: "sight" }))); return true;
   }
 
   /** Tingle：世界心跳，推进世界演化。返回 World 为下一次心跳设定的间隔（TU），未设定则返回 null */
   async tingle(deliver: (content: string) => void): Promise<number | null> {
     if (this.remote && !(this.visitorsProvider?.().length)) { this.notePresenceChange(); return null; }
-    await this.structured.evolve("世界心跳：按距离快照时刻的实际经过时间，结算自然过程及NPC的自主行动。承接正在进行的工作、交谈、等待和角色行动造成的影响，让NPC依据已有目标与处境作出合理回应；按发生顺序记录经过，不能只把所有变化压成最后一个属性值。常驻角色及玩家的主动选择由他们自己决定。没有合理变化时可保持安静，不强制制造冲突或奇遇。");
-    if (!this.remote) await this.emitIfChanged("bot", deliver);
-    await this.publishVisitors(); return null;
+    await this.runtime.evolve("世界心跳：按距离当前状态时刻的实际经过时间，结算自然过程及 NPC 的自主行动。承接正在进行的工作、交谈、等待和角色行动造成的影响，以自然语言写明真正发生的经过，分别向在场角色提供他们实际能感知的新动静。常驻角色及玩家的主动选择由他们自己决定。没有合理变化时保持安静，不强制制造冲突或奇遇，也不要重播旧场景。");
+    await this.publishAll(undefined, deliver); return null;
   }
 
-  /** 插件离线期间世界时间照常流逝：补叙这段时间世界发生了什么，并告知刚恢复意识的 Bot */
+  /** 补叙离线期间的自然演化，向恢复连接的角色交付当前可感知变化。 */
   async resolveOfflineGap(fromTU: number, deliver: (content: string) => void): Promise<boolean> {
-    await this.structured.evolve('结算离线期间自然过程：fromTU=' + fromTU + '，现在=' + this.clock.now() + '。禁止替受控角色编造离线期间的决定、发言或经历。');
-    deliver(JSON.stringify(await this.observe())); return true;
+    await this.runtime.evolve('结算离线期间自然过程：fromTU=' + fromTU + '，现在=' + this.clock.now() + '。禁止替受控角色编造离线期间的决定、发言或主观经历。只把恢复感知时实际可知的变化送给角色。');
+    await this.publishAll(undefined, deliver); return true;
   }
 
   /**
    * 世界查询：仅基于角色观测进行无工具的只读呈现，返回文本回答。
-   * 用于天气应用等"以世界视角回答问题"的场景。
+   * 仅解释角色最近已经知道的内容；虚构应用既有记录另走 observeVirtualApp。
    * Bot 在异世界作客时转发给所在世界（它的手机连的是那个世界的"互联网"）。
    */
   async query(task: string): Promise<string> {
@@ -323,9 +399,25 @@ export class WorldAgent {
     return this.queryLocal(task);
   }
 
+  /** Only explicitly virtual app branches use this entry; real device tools keep their own IO. */
+  async observeVirtualApp(task: string, actorId = "bot"): Promise<RichText> {
+    if (this.remote && actorId === "bot") {
+      if (!this.remote.observeVirtualApp) throw new Error("远方世界暂不支持读取虚构应用的既有内容。");
+      return this.remote.observeVirtualApp(task);
+    }
+    const observation = await this.runtime.observeVirtualApp(actorId, task);
+    // The caller's device-control gate decides who may perceive this read (including stealth).
+    // Do not update world perceptions or publish it. Re-peeking could also substitute an NPC event.
+    return { text: observation.narrative, originEventIds: observation.sourceEventIds.slice() };
+  }
+
   /** 本地世界查询（穿越服务处理访客 query 时用，绕过远程路由防止转发链） */
   private async queryLocal(task: string): Promise<string> {
-    const observation = await this.structured.query("bot", task);
+    return this.presentQuery("bot", task);
+  }
+
+  private async presentQuery(actorId: string, task: string): Promise<string> {
+    const observation = await this.runtime.query(actorId, task);
     const signal = AbortSignal.any([AbortSignal.timeout(60_000), this.maintenanceAbort.signal]);
     const result = await withEndpointLock(this.cfg.baseURL, () => this.client.complete([
       { role: "system", content: this.prompts.world.presentationSystem },
@@ -335,44 +427,52 @@ export class WorldAgent {
     return result.content;
   }
 
-  async executeAppAction(intent: string): Promise<string> {
-    const now = this.clock.now(), results: string[] = [];
-    await this.adjudicateAct({ id: randomUUID(), role: "agent", name: "act", arguments: { description: intent }, duration: 0, issuedAt: now, expectedAt: now }, text => results.push(text));
-    return results.join("\n");
+  async executeAppAction(intent: string, actorId = "bot", signal?: AbortSignal): Promise<RichText> {
+    if (this.remote && actorId === "bot") {
+      if (!this.remote.executeVirtualApp) throw new Error("远方世界暂不支持虚构应用操作。");
+      return this.remote.executeVirtualApp(intent, signal);
+    }
+    // App output is private until the existing BotAgent device gate chooses to perceive it.
+    return this.runtime.executeVirtualApp(actorId, intent, signal);
   }
 
   /** 访客到达：生成到达场景（deliver 送达访客）并记录进 World_Status */
   async visitorArrive(v: VisitorRef, deliver: (content: string) => void, signal?: AbortSignal): Promise<boolean> {
-    await this.structured.arrive(this.visitorId(v), v.name, v.persona, signal);
-    deliver(JSON.stringify(await this.structured.observe(this.visitorId(v))));
-    if (!this.remote && this.hostBotDeliver) this.hostBotDeliver(JSON.stringify(await this.observe())); return true;
+    const actorId = this.visitorId(v);
+    await this.runtime.arrive(actorId, v.name, v.persona, signal);
+    await this.publishActor(actorId, deliver);
+    await this.publishAll(actorId); return true;
   }
 
-  /** 访客离开：按进入语义分化——穿越则彻底离场；扮演/操纵则角色留在世界由世界继续演化 */
-  async visitorLeave(v: VisitorRef): Promise<boolean> { await this.structured.leave(this.visitorId(v)); if (!this.remote && this.hostBotDeliver) this.hostBotDeliver(JSON.stringify(await this.observe())); return true; }
+  /** 独立访客离场；常驻角色的扮演/操纵由控制会话管理，不进入此路径。 */
+  async visitorLeave(v: VisitorRef): Promise<boolean> { await this.runtime.leave(this.visitorId(v)); await this.publishAll(this.visitorId(v)); return true; }
 
   /** 裁定访客的 act 动作（时刻按本世界时钟换算） */
-  async visitorAct(v: VisitorRef, desc: string, duration: number, deliver: (content: string) => void, signal?: AbortSignal, taskId?: string, options: { speech?: string; target?: string; observationId?: string } = {}): Promise<boolean> {
-    await this.structured.arrive(this.visitorId(v), v.name, v.persona, signal);
+  async visitorAct(v: VisitorRef, desc: string, duration: number, deliver: (content: string) => void, signal?: AbortSignal, taskId?: string, options: { speech?: string; target?: string } = {}): Promise<boolean> {
+    const actorId = this.visitorId(v);
     const at = this.clock.now();
+    const callId = taskId ?? randomUUID(), actionId = `${actorId}:${callId}`;
+    this.pendingReceiptActions.set(actionId, actorId);
     try {
-      const ok = await this.structured.act(this.visitorId(v), { id: taskId ?? randomUUID(), name: 'act', role: 'world', arguments: { description: desc, ...options }, duration, issuedAt: at, expectedAt: at + duration }, deliver, signal);
-      if (!this.remote && this.hostBotDeliver) await this.emitIfChanged("bot", this.hostBotDeliver);
+      const receipts: string[] = [];
+      const ok = await this.runtime.act(actorId, { id: callId, name: 'act', role: 'world', arguments: { description: desc, ...options }, duration, issuedAt: at, expectedAt: at + duration }, content => receipts.push(content), signal);
+      for (const receipt of receipts) await this.publishActor(actorId, deliver, receipt);
+      await this.publishAll(actorId);
       return ok;
     } catch (error) {
       this.logger.warn("访客动作裁定失败 (%s): %s", v.id, error);
-      throw new Error("动作未完成或被取消；当前结果未确认，请重新观察。");
-    }
+      throw new Error(`行动“${desc}”未完成或被取消；当前结果未确认。`);
+    } finally { this.pendingReceiptActions.delete(actionId); }
   }
 
   /** 访客 wait 补叙 */
-  async visitorWait(v: VisitorRef, n: number, deliver: (content: string) => void, signal?: AbortSignal, taskId?: string, options: { speech?: string; target?: string; observationId?: string } = {}): Promise<boolean> { return this.visitorAct(v, "保持当前位置等待，不代替角色决定其他行为。", n, deliver, signal, taskId, options); }
+  async visitorWait(v: VisitorRef, n: number, deliver: (content: string) => void, signal?: AbortSignal, taskId?: string, options: { speech?: string; target?: string } = {}): Promise<boolean> { return this.visitorAct(v, "保持当前位置等待，不代替角色决定其他行为。", n, deliver, signal, taskId, options); }
 
   /** 访客查看时间（按本世界的时钟与历法） */
-  async visitorCheckTime(v: VisitorRef, deliver: (content: string) => void): Promise<boolean> { deliver(await this.structured.query(this.visitorId(v), "可见的计时设备")); return true; }
+  async visitorCheckTime(v: VisitorRef, deliver: (content: string) => void): Promise<boolean> { deliver(JSON.stringify(await this.observe(this.visitorId(v), { target: "看看当前可见的时钟能否读出时间；没有可见钟表就说明无法得知。", modality: "sight" }))); return true; }
 
   /** 访客的世界查询（天气 / 虚构网页等——访客的手机连的是这个世界的"互联网"） */
-  async visitorQuery(v: VisitorRef, task: string): Promise<string> { return this.structured.query(this.visitorId(v), task); }
+  async visitorQuery(v: VisitorRef, task: string): Promise<string> { return this.presentQuery(this.visitorId(v), task); }
 
   // ---------- 创世 ----------
 
@@ -551,18 +651,18 @@ export class WorldAgent {
   /** 初始化：判定世界性质、生成历法（同步模式跳过）、判定手机规格，再根据用户定义生成状态文件 */
   async initialize(botDef: string, worldDef: string): Promise<void> {
     if (this.maintenanceAbort.signal.aborted) this.maintenanceAbort = new AbortController();
-    this.structured.resume();
+    this.runtime.resume();
     await this.enqueue(() => this.setupWorldMeta(worldDef));
     if (!this.clock.syncRealTime) await this.enqueue(() => this.setupCalendar(worldDef));
-    await this.structured.ensure(botDef, worldDef);
-    await this.setBotName((await this.structured.kernel()).snapshot().entities.bot!.name);
+    await this.runtime.ensure(botDef, worldDef);
+    await this.setBotName((await this.runtime.store()).snapshot().actors.bot!.name);
     await this.enqueue(() => this.setupPhone(botDef, worldDef));
   }
 
   /** 用户修改了定义文件：世界据此调整状态，并告知 Bot 能感知到的变化 */
   async reconcileDefinitions(botDef: string, worldDef: string, deliver: (content: string) => void): Promise<void> {
-    await this.structured.evolve('管理员更新世界定义。只应用与现有状态兼容的环境变化，不重写角色记忆、已发生事件或身份。定义=' + JSON.stringify({botDef, worldDef}));
-    deliver(JSON.stringify(await this.observe()));
+    await this.runtime.evolve('管理员更新世界定义。只应用与现有状态兼容的环境变化，不重写角色记忆、已发生事件或身份。定义=' + JSON.stringify({botDef, worldDef}));
+    await this.publishAll(undefined, deliver);
   }
 
   // ---------- 上下文压缩（rest 时由 World-LLM 执行） ----------
@@ -688,14 +788,4 @@ function parseCompression(content: string): CompressionResult {
     return { historySummary: content.trim().slice(0, 4000), memoryDigest: "（压缩输出格式异常，摘要缺失）" };
   }
   return { historySummary, memoryDigest: memoryDigest ?? "（无）" };
-}
-
-/** Compare perceived facts without fresh capability IDs, metadata clocks or hidden revisions. */
-function perceptionKey(observation: WorldObservation): string {
-  const names = new Map(observation.entities.map(entity => [entity.observedId, entity.name]));
-  return JSON.stringify(observation.entities.map(entity => ({
-    name: entity.name, kind: entity.kind, self: entity.self, attributes: entity.attributes,
-    location: entity.locationObservedId ? names.get(entity.locationObservedId) : null,
-    owner: entity.ownerObservedId ? names.get(entity.ownerObservedId) : null,
-  })));
 }

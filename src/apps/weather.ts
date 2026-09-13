@@ -3,7 +3,7 @@
  *
  * - 现实世界设定（创世时由 World-LLM 判定，持久化在 meta.json）：
  *   走 Open-Meteo（免费、无需 API key）查询真实天气；
- * - 虚构世界设定：由 World-LLM 只读呈现当前观测中的天气记录，缺失时显示未知。
+ * - 虚构世界设定：由 World-LLM 只读查询角色可用的虚构应用中已有天气记录，缺失时显示未知。
  */
 
 import type { Logger } from "koishi";
@@ -11,6 +11,7 @@ import type { WorldClock } from "../clock.js";
 import type { AppsConfig } from "../config.js";
 import type { WorldFiles } from "../files.js";
 import type { WorldAgent } from "../world/agent.js";
+import type { RichText } from "../types.js";
 import type { AppRawTool, WorldApp } from "./app.js";
 
 const GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search";
@@ -62,7 +63,7 @@ export class WeatherApp implements WorldApp {
     };
   }
 
-  async call(tool: string, args: Record<string, unknown>): Promise<string> {
+  async call(tool: string, args: Record<string, unknown>): Promise<string | RichText> {
     if (tool !== "query_weather") throw new Error(`天气应用没有 ${tool} 这个操作`);
     const city = args.city != null && String(args.city).trim() ? String(args.city).trim() : undefined;
     // 现实/虚构由创世时的判定决定；旧世界没有判定记录时按时钟同步模式推断
@@ -148,17 +149,17 @@ export class WeatherApp implements WorldApp {
     return lines.join("\n");
   }
 
-  // ---------- 虚构天气（只读呈现已有观测） ----------
+  // ---------- 虚构天气（只读查询已有应用记录） ----------
 
-  private async virtualWeather(city?: string): Promise<string> {
+  private async virtualWeather(city?: string): Promise<string | RichText> {
     const where = city ? `「${city}」` : "它当前所在的地区";
     const task =
       `Bot 打开了手机上的天气应用，查询${where}的天气（当前 ${this.clock.timeLine()}）。\n` +
       `请扮演这个天气应用给出查询结果：\n` +
-      `仅使用提供的角色观测中已存在的天气或预报；缺少记录、地点不明或资料过时就说明未知/不可用。\n` +
+      `仅查询角色可用的虚构天气应用中已确立的天气或预报；缺少记录、地点不明或资料过时就说明未知/不可用。\n` +
       `这是只读查询，不修改世界，不新增天气，也不编造未来预报。只输出有来源支持的应用结果。`;
     try {
-      return await this.world.query(task);
+      return await this.world.observeVirtualApp(task);
     } catch (err) {
       this.logger.warn("虚构天气生成失败: %s", err);
       return "（天气应用转了半天圈，加载失败了。稍后再试试。）";

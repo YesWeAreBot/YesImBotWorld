@@ -6,7 +6,7 @@ var Studio = (function () {
     var routes = [
         { group: '探索世界' },
         ['overview', '世界总览', 'gauge', ['overview']],
-        ['world', '世界关系图', 'world'],
+        ['world', '世界实况', 'world'],
         ['growth', '角色与成长', 'growth', ['notes']],
         ['devices', '设备工作台', 'monitor', ['devices']],
         ['player', '走进世界', 'door', ['__player__']],
@@ -207,7 +207,7 @@ var Studio = (function () {
     function fetchGrowth() { return api('GET', '/api/bot/growth').then(function (r) { cache.growth = r.growth || []; return cache.growth; }); }
     function inspectEntity(id) { selectedEntity = id; navigate('world'); }
     function commandPalette() {
-        var input = el('input', { cls: 'studio-search-input', placeholder: '搜索页面、角色、地点、物件…', 'aria-label': '搜索页面和实体' });
+        var input = el('input', { cls: 'studio-search-input', placeholder: '搜索页面与角色…', 'aria-label': '搜索页面与角色' });
         var list = el('div', { cls: 'studio-search-results' });
         var holder = el('div', null, [input, list]);
         function results() {
@@ -217,11 +217,11 @@ var Studio = (function () {
                 list.appendChild(el('button', { cls: 'studio-search-result', onclick: function () { hideModal(); navigate(r[0]); } }, [el('span', { html: icon(r[2]) }), el('span', { text: r[1] }), el('small', { text: '页面' })]));
             });
             if (!isVisitor() && q && cache.world)
-                Object.values(cache.world.snapshot.entities).filter(function (e) { return (e.id + e.name).toLowerCase().includes(q); }).slice(0, 12).forEach(function (entity) {
-                    list.appendChild(el('button', { cls: 'studio-search-result', onclick: function () { hideModal(); inspectEntity(entity.id); } }, [el('span', { html: icon(entity.kind === 'actor' ? 'user' : entity.kind === 'place' ? 'world' : 'box') }), el('span', { text: entity.name }), el('small', { text: entity.id })]));
+                Object.values(cache.world.mode === 'narrative' ? cache.world.snapshot.actors || {} : cache.world.snapshot.entities || {}).filter(function (e) { return (e.id + e.name).toLowerCase().includes(q); }).slice(0, 12).forEach(function (entity) {
+                    list.appendChild(el('button', { cls: 'studio-search-result', onclick: function () { hideModal(); inspectEntity(entity.id); } }, [el('span', { html: icon(entity.kind === 'actor' || cache.world.mode === 'narrative' ? 'user' : entity.kind === 'place' ? 'world' : 'box') }), el('span', { text: entity.name }), el('small', { text: entity.id })]));
                 });
             if (!list.childElementCount)
-                list.appendChild(empty('没有找到匹配项', '试试页面名称，或已加载实体的名称与 ID。'));
+                list.appendChild(empty('没有找到匹配项', '试试页面名称，或已加载角色的名字。'));
         }
         input.addEventListener('input', results);
         input.addEventListener('keydown', function (e) { if (e.key === 'Enter')
@@ -248,7 +248,7 @@ var Studio = (function () {
     function row(key, value) { return el('div', { cls: 'studio-detail-row' }, [el('span', { text: key }), el('span', { text: value })]); }
     function panel() { return el('section', { cls: 'studio-panel' }); }
     function renderOverviewView(holder) {
-        var alive = true, refreshing = false;
+        var alive = true, refreshing = false, narrativeReadState = {}, actorReadState = {};
         var liveHost = can('live') && window.LiveCalls ? el('div', { cls: 'studio-live-overview' }) : null;
         var liveCleanup = liveHost ? window.LiveCalls.mount(liveHost, { compact: true }) : null;
         // Keep the welcome actions and their open popover connected during live refreshes.
@@ -264,7 +264,7 @@ var Studio = (function () {
             api('POST', '/api/world/' + (o.worldRunning ? 'stop' : 'start'), {}).then(function (r) { toast(r.text || '已完成', 'ok'); refresh(); }).catch(showErr).finally(function () { worldActionPending = false; updateWorldButton(); });
         }, true) : null;
         if (worldButton) actions.appendChild(worldButton);
-        if (can('world')) actions.appendChild(button('探索关系图', 'arrow', function () { navigate('world'); }));
+        if (can('world')) actions.appendChild(button('探索世界', 'arrow', function () { navigate('world'); }));
         else if (can('devices')) actions.appendChild(button('打开设备', 'phone', function () { navigate('devices'); }));
         var commandCleanup = !isVisitor() && window.WorldCommands ? window.WorldCommands.mount(actions) : null;
         heroCopy.appendChild(actions);
@@ -291,7 +291,7 @@ var Studio = (function () {
                 error(bodyHost, e, refresh); }).finally(function () { refreshing = false; });
         }
         function draw(o, world, growth) {
-            var snapshot = world?.snapshot, entities = Object.values(snapshot?.entities || {}), events = world?.events || [], bot = snapshot?.entities.bot;
+            var snapshot = world?.snapshot, narrative = world?.mode === 'narrative', actors = Object.values(snapshot?.actors || {}), entities = Object.values(snapshot?.entities || {}), events = world?.events || [], bot = narrative ? snapshot?.actors?.bot : snapshot?.entities?.bot;
             var running = Object.values(snapshot?.actions || {}).filter(function (a) { return a.status === 'pending'; });
             headingHost.replaceChildren(title('AN OPEN WORLD, ALWAYS BECOMING', '世界总览', '看见世界如何变化，也参与角色的每一个当下。', [button('走进世界', 'door', function () { navigate('player'); }, true)].filter(function () { return can('player'); })));
             currentOverview = o;
@@ -302,30 +302,31 @@ var Studio = (function () {
             if (!heroHost.contains(hero)) heroHost.appendChild(hero);
             bodyHost.replaceChildren();
             bodyHost.appendChild(el('div', { cls: 'studio-kpi-row' }, [
-                kpi('世界实体', snapshot ? entities.length : '—', snapshot ? entities.filter(function (e) { return e.kind === 'place'; }).length + ' 个地点 · ' + entities.filter(function (e) { return e.kind === 'object'; }).length + ' 件物品' : '完整世界仅管理员可见', 'world'),
+                kpi(narrative ? '世界角色' : '世界实体', snapshot ? narrative ? actors.length : entities.length : '—', narrative ? '以文字记录当前处境与未完的故事' : snapshot ? entities.filter(function (e) { return e.kind === 'place'; }).length + ' 个地点 · ' + entities.filter(function (e) { return e.kind === 'object'; }).length + ' 件物品' : '完整世界仅管理员可见', 'world'),
                 kpi('正在行动', snapshot ? running.length : o.worldQueue, snapshot ? '已开始、尚未结束的动作' : '等待世界裁定的任务', 'activity'),
                 kpi('角色认识', can('growth') ? growth.length : '—', growth.filter(function (g) { return g.status === 'contested'; }).length + ' 条认识存在反证', 'growth'),
                 kpi('世界版本', snapshot ? '#' + snapshot.sequence : '—', '每次提交留下可追溯记录', 'layers')
             ]));
             var left = el('div', { cls: 'studio-stack' }), right = el('div', { cls: 'studio-stack' });
             var map = panel();
-            map.appendChild(section('世界关系', '', can('world') ? button('展开地图', 'arrow', function () { navigate('world'); }) : null));
-            var mapView = el('div', { cls: 'studio-topology-preview' });
-            if (snapshot && entities.length && Studio.drawWorldPreview)
+            map.appendChild(section(narrative ? '世界此刻' : '世界关系', '', can('world') ? button(narrative ? '阅读全文' : '展开地图', 'arrow', function () { navigate('world'); }) : null));
+            var mapView = el('div', { cls: narrative ? 'world-narrative-preview' : 'studio-topology-preview' });
+            if (narrative) mapView.appendChild(ReadableData.render(snapshot.worldState || '还没有记录当前情境。世界初始化后会出现在这里。', { raw: false, textLimit: 1100, state: narrativeReadState }));
+            else if (snapshot && entities.length && Studio.drawWorldPreview)
                 Studio.drawWorldPreview(mapView, snapshot);
             else
                 mapView.appendChild(empty(!o.initialized ? '这里还没有实体' : isVisitor() ? '以角色的视角看世界' : '暂时没有结构化状态', isVisitor() ? '进入世界后，观察你所在的地点与身边事物。' : '世界完成初始化或旧数据迁移后，关系会出现在这里。'));
             map.appendChild(mapView);
-            map.appendChild(el('div', { cls: 'studio-topology-caption' }, [el('span', { html: '<i class="studio-dot"></i>地点' }), el('span', { html: '<i class="studio-dot orange"></i>角色' }), el('span', { html: '<i class="studio-dot blue"></i>物件' })]));
+            if (!narrative) map.appendChild(el('div', { cls: 'studio-topology-caption' }, [el('span', { html: '<i class="studio-dot"></i>地点' }), el('span', { html: '<i class="studio-dot orange"></i>角色' }), el('span', { html: '<i class="studio-dot blue"></i>物件' })]));
             left.appendChild(map);
             var activity = panel();
             activity.appendChild(section('最近发生', 'COMMITTED EVENTS', can('debug') ? button('查看记录', 'arrow', function () { navigate('debug'); }) : null));
             var list = el('div', { cls: 'studio-activity' });
-            var items = events.filter(function (e) { return e.kind === 'event'; }).slice(-5).reverse();
+            var items = events.filter(function (e) { return e.kind === 'event' || narrative && e.kind === 'observation' && e.topic === 'world.perception'; }).slice(-5).reverse();
             if (items.length)
                 items.forEach(function (e) {
-                    var p = e.payload || {}, label = e.topic === 'world.speech' ? '一句新的话' : e.topic === 'world.committed' ? '世界状态已更新' : e.topic === 'action.completed' ? '行动完成' : e.topic;
-                    var desc = p.text || (e.actorId && snapshot.entities[e.actorId]?.name) || ('事务 #' + e.sequence + ' · ' + e.source);
+                    var p = e.payload || {}, label = e.topic === 'world.perception' ? p.intent || '此刻所见所闻' : e.topic === 'world.speech' ? '一句新的话' : e.topic === 'world.committed' ? '世界状态已更新' : e.topic === 'action.completed' ? '行动完成' : e.topic;
+                    var desc = p.narrative || p.text || p.result || (e.actorId && (snapshot.actors?.[e.actorId]?.name || snapshot.entities[e.actorId]?.name)) || ('事务 #' + e.sequence + ' · ' + e.source);
                     list.appendChild(el('div', { cls: 'studio-activity-item' }, [el('span', { cls: 'studio-activity-mark', html: icon(e.topic === 'world.speech' ? 'message' : 'activity') }), el('div', null, [el('strong', { text: label }), el('p', { text: desc })]), el('time', { text: fmtTime(e.emittedAt) })]));
                 });
             else
@@ -337,7 +338,8 @@ var Studio = (function () {
             var character = panel();
             character.appendChild(section('常驻角色', 'RESIDENT'));
             character.appendChild(el('div', { cls: 'studio-bot-card' }, [botAvatar(o.botIdentity), el('div', null, [el('h3', { text: bot?.name || RESIDENT_BOT_NAME || '常驻 Bot' }), el('span', { cls: 'studio-badge', text: o.bot?.paused ? '手动接管中' : o.bot?.running ? '正在自主行动' : o.initialized ? '等待下一刻' : '尚未初始化' })])]));
-            character.appendChild(row('所在位置', bot?.location ? snapshot.entities[bot.location]?.name || bot.location : '未知'));
+            if (narrative) character.appendChild(ReadableData.render(bot?.state || '当前还没有角色处境记录。', { raw: false, textLimit: 800, state: actorReadState }));
+            else character.appendChild(row('所在位置', bot?.location ? snapshot.entities[bot.location]?.name || bot.location : '未知'));
             character.appendChild(row('当前状态', o.bot?.waiting || (running[0]?.intent) || '暂无进行中的意图'));
             var attrs = Object.entries(bot?.attributes || {}).filter(function (a) { return ['posture', 'energy', 'hunger', 'health', 'consciousness'].includes(a[0]); }).slice(0, 3);
             attrs.forEach(function (a) { character.appendChild(row({ posture: '姿态', energy: '精力', hunger: '饥饿', health: '健康', consciousness: '意识状态' }[a[0]], ReadableData.text(a[1].value))); });
@@ -366,10 +368,10 @@ var Studio = (function () {
         return function () { alive = false; if (liveCleanup) liveCleanup(); if (commandCleanup) commandCleanup(); clearInterval(timer); window.removeEventListener('studio:refresh', onRefresh); };
     }
     register('overview', renderOverviewView);
-    // Definitions remain authored text; authoritative structured state lives in its own views.
+    // Definitions are author settings; the world's current narrative has its own view.
     register('state', function (holder) {
         var alive = true;
-        holder.appendChild(title('AUTHORING THE WORLD', '世界设定', '维护角色定义与世界规则。当前实体状态由世界事务维护。'));
+        holder.appendChild(title('AUTHORING THE WORLD', '世界设定', '维护角色定义与世界规则。世界实况记录当前情境与角色处境。'));
         var content = el('div');
         holder.appendChild(content);
         content.appendChild(el('div', { cls: 'studio-skeleton' }));
@@ -386,7 +388,7 @@ var Studio = (function () {
             if (!defs.length)
                 content.appendChild(empty('该账号没有编辑设定的权限', '可从导航中查看已授权的世界内容。'));
             if (!s.initialized && !isVisitor())
-                content.appendChild(el('div', { cls: 'studio-panel' }, [el('h3', { text: '准备好开始了吗？' }), el('p', { cls: 'studio-description', text: '先保存上方两份设定，再让 World 模型创建第一组结构化事实。' }), button('创建世界', 'play', function () { worldAction('init', true); }, true)]));
+                content.appendChild(el('div', { cls: 'studio-panel' }, [el('h3', { text: '准备好开始了吗？' }), el('p', { cls: 'studio-description', text: '先保存上方两份设定，再让 World 模型写下世界的初始情境。' }), button('创建世界', 'play', function () { worldAction('init', true); }, true)]));
         }).catch(function (e) { if (alive)
             error(content, e, function () { navigate('state'); }); });
         return function () { alive = false; };

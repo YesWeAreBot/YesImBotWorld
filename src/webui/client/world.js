@@ -1,8 +1,8 @@
-/* Authoritative entity relations and evidence-based subjective growth. */
+/* Current narrative, optional legacy entity views, and evidence-based growth. */
 (function () {
     var kinds = { place: '地点', actor: '角色', object: '物件' };
     var symbols = { place: 'world', actor: 'user', object: 'box' };
-    var statuses = { pending: '进行中', completed: '已完成', failed: '未完成', cancelled: '已取消' };
+    var statuses = { pending: '进行中', completed: '已完成', failed: '未完成', cancelled: '已取消', needs_input: '等待下一步' };
     var nodeGlyph = {
         place: '<path d="m4 8 8-5 8 5v10l-8 5-8-5Z"/><path d="m4 8 8 5 8-5M12 13v10"/>',
         actor: '<circle cx="12" cy="8" r="4"/><path d="M5 22v-2a7 7 0 0 1 14 0v2"/>',
@@ -86,7 +86,8 @@
         var alive = true, busy = false, data = null, selected = Studio.takeSelectedEntity(), query = '', filter = 'all', mode = 'graph', showLocation = true, showOwner = true, viewBox = null, chosenEvent = null, pendingFocus = null, readableStates = Object.create(null);
         function readState(key) { return readableStates[key] || (readableStates[key] = {}); }
         var controls = el('div', { cls: 'world-controls' }), content = el('div'), actions = el('div', { cls: 'world-actions' }), eventsPanel = el('div', { cls: 'world-actions' });
-        holder.append(Studio.title('THE SHAPE OF YOUR WORLD', '世界关系图', '连接地点、角色与物件。选择一个实体，查看它在哪里、属于谁，以及它的当前状态。', [Studio.button('刷新状态', 'refresh', refresh)]), controls, content, actions, eventsPanel);
+        var heading = Studio.title('THE WORLD, NOW', '世界实况', '阅读当前情境、角色处境与最近发生的事。', [Studio.button('刷新状态', 'refresh', refresh)]);
+        holder.append(heading, controls, content, actions, eventsPanel);
         content.appendChild(el('div', { cls: 'studio-skeleton' }));
         var search = el('input', { cls: 'world-search', placeholder: '查找实体名称或 ID', 'aria-label': '搜索实体' });
         search.addEventListener('input', function () { query = search.value.trim().toLowerCase(); viewBox = null; draw(); });
@@ -97,6 +98,26 @@
         var toggles = el('div', { cls: 'world-view-toggle' });
         ['graph', 'list'].forEach(function (m) { var b = Studio.button(m === 'graph' ? '关系图' : '实体列表', m === 'graph' ? 'world' : 'file', function () { mode = m; toggles.querySelectorAll('button').forEach(function (n) { n.classList.toggle('primary', n === b); }); draw(); }); b.classList.toggle('primary', mode === m); toggles.appendChild(b); });
         controls.appendChild(toggles);
+        function drawNarrative(snapshot) {
+            var page = el('div', { cls: 'world-narrative', 'data-world-mode': 'narrative' });
+            var scene = el('section', { cls: 'studio-panel world-current-scene' }, [Studio.section('当前情境', '版本 #' + snapshot.sequence + ' · 世界 T=' + Number(snapshot.effectiveAt || 0).toFixed(1))]);
+            scene.appendChild(ReadableData.render(snapshot.worldState || '世界还没有初始情境，请先保存设定并创建世界。', { raw: false, textLimit: 5000, state: readState('world:narrative') }));
+            page.appendChild(scene);
+            var actors = Object.entries(snapshot.actors || {}), actorPanel = el('section', { cls: 'studio-panel' }, [Studio.section('角色的处境', actors.length + ' 位角色')]);
+            var list = el('div', { cls: 'world-narrative-actors' });
+            actors.forEach(function (entry) {
+                var actor = entry[1], card = el('article', { cls: 'world-narrative-actor', 'data-world-actor': entry[0] }, [el('h3', { text: actor.name || entry[0] })]);
+                card.appendChild(ReadableData.render(actor.state || actor.narrative || '尚无处境记录。', { raw: false, textLimit: 1600, state: readState('actor:' + entry[0]) }));
+                list.appendChild(card);
+            });
+            if (actors.length) { actorPanel.appendChild(list); page.appendChild(actorPanel); }
+            // Historic entity graphs remain inspectable only when actual entities exist.
+            if (Object.keys(snapshot.entities || {}).length) {
+                var graph = el('details', { cls: 'studio-panel' }, [el('summary', { text: '辅助关系图' })]);
+                graph.appendChild(makeGraph(Object.values(snapshot.entities), { owner: false }).svg); page.appendChild(graph);
+            }
+            content.replaceChildren(page);
+        }
         function select(id) { selected = id; chosenEvent = null; draw(); if (window.innerWidth <= 1100)
             content.querySelector('.world-inspector')?.scrollIntoView({ behavior: 'smooth', block: 'start' }); }
         function refresh() { if (!alive || busy)
@@ -114,7 +135,9 @@
         function draw() {
             if (!data || !alive)
                 return;
-            var snapshot = data.snapshot, all = Object.values(snapshot.entities);
+            var snapshot = data.snapshot, all = Object.values(snapshot.entities || {});
+            controls.hidden = data.mode === 'narrative';
+            if (data.mode === 'narrative') { drawNarrative(snapshot); drawActions(snapshot); drawEvents(); return; }
             var found = all.filter(function (e) { return (filter === 'all' || e.kind === filter) && (!query || (e.id + ' ' + e.name).toLowerCase().includes(query)); });
             content.replaceChildren();
             var wrap = el('div', { cls: 'world-workspace' }), graphPanel = el('div', { cls: 'world-canvas-panel' });
@@ -216,17 +239,18 @@
             section.appendChild(Studio.section(selected ? '关联行动' : '行动进程', all.length + ' 条记录'));
             if (!all.length)
                 section.appendChild(Studio.empty('当前没有行动记录', '行动开始、完成、失败或取消都会留下明确状态。'));
-            all.slice(0, 12).forEach(function (a) { section.appendChild(el('div', { cls: 'world-action-row' }, [el('span', { cls: 'studio-badge ' + (a.status === 'failed' ? 'orange' : a.status === 'pending' ? '' : 'muted'), text: statuses[a.status] || a.status }), el('span', { cls: 'intent' }, [el('span', { text: a.intent }), el('small', { text: a.reason || a.id })]), el('span', { cls: 'actor', text: snapshot.entities[a.actorId]?.name || a.actorId }), el('time', { text: 'T ' + Number(a.startedAt || 0).toFixed(1) })])); });
+            all.slice(0, 12).forEach(function (a) { section.appendChild(el('div', { cls: 'world-action-row' }, [el('span', { cls: 'studio-badge ' + (a.status === 'failed' ? 'orange' : a.status === 'pending' ? '' : 'muted'), text: statuses[a.status] || a.status }), el('span', { cls: 'intent' }, [el('span', { text: a.intent }), el('small', { text: a.reason || (data.mode === 'narrative' ? a.status === 'pending' ? '世界正在回应这一意图' : '经过已保存到世界记录' : a.id) })]), el('span', { cls: 'actor', text: snapshot.actors?.[a.actorId]?.name || snapshot.entities?.[a.actorId]?.name || a.actorId }), el('time', { text: 'T ' + Number(a.startedAt || 0).toFixed(1) })])); });
             actions.appendChild(section);
         }
         function showEvent(event) { chosenEvent = event; drawEvents(); eventsPanel.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); }
         function drawEvents() {
             eventsPanel.replaceChildren();
             var panel = el('section', { cls: 'studio-panel' });
-            var events = (data.events || []).filter(function (e) { return e.kind === 'event'; }).slice(-10).reverse();
-            panel.appendChild(Studio.section('事务与因果', '最近 ' + events.length + ' 个已提交事件'));
+            var events = (data.events || []).filter(function (e) { return e.kind === 'event' || data.mode === 'narrative' && e.kind === 'observation' && e.topic === 'world.perception'; }).slice(-10).reverse();
+            panel.appendChild(Studio.section(data.mode === 'narrative' ? '最近发生' : '事务与因果', '最近 ' + events.length + ' 个已提交事件'));
             var list = el('div', { cls: 'world-event-list' });
-            events.forEach(function (e) { list.appendChild(el('div', { cls: 'world-event-item' }, [el('span', { text: '#' + e.sequence }), el('span', null, [el('span', { text: e.topic }), el('small', { text: (e.actorId || e.source) + ' · ' + fmtTime(e.emittedAt) })]), Studio.button('查看关联', 'link', function () { showEvent(e); })])); });
+            events.forEach(function (e) { list.appendChild(el('div', { cls: 'world-event-item' }, [el('span', { text: '#' + e.sequence }), el('span', null, [el('span', { text: e.payload?.intent || ({ 'world.perception': '此刻所见所闻', 'world.committed': '世界继续向前', 'world.observed': '看见新的细节', 'world.speech': '听见一句话' }[e.topic] || e.topic) }), el('small', { text: (e.actorId || e.source) + ' · ' + fmtTime(e.emittedAt) })]), Studio.button(data.mode === 'narrative' ? '阅读经过' : '查看关联', 'link', function () { showEvent(e); })]));
+                if (data.mode === 'narrative') { var prose = e.payload?.narrative || e.payload?.text || e.payload?.result; if (typeof prose === 'string') list.lastElementChild.appendChild(ReadableData.render(prose, { raw: false, textLimit: 1300, state: readState('event-prose:' + e.id) })); } });
             if (!events.length)
                 list.appendChild(Studio.empty('还没有提交事件', '观察与执行记录会随着世界运转出现。'));
             panel.appendChild(list);

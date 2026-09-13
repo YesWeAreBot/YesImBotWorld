@@ -233,7 +233,6 @@ export class WorldService extends Service<Config> {
       resolution: this.config.apps.phoneResolution,
       generateShell: this.config.apps.browserEnabled,
     });
-    this.world.visitorPersonaMode = this.config.crossing.visitorPersonaMode;
     // 先启动 WebUI（初始化 usageStore 并确保 webui 目录存在），再自动恢复世界运行。
     // 否则 autoStart 时 Bot 会先发出 LLM 请求，而 usageStore 尚未 init / 目录未建，
     // 这些用量既写不进文件、也加载不到历史，导致重启后数据不连贯。
@@ -348,7 +347,7 @@ export class WorldService extends Service<Config> {
     await context.persistPinned();
 
     this.logger.info("创世完成");
-    return `创世完成，结构化世界已写入 ${this.files.worldJournal}。\n使用 world.start 让世界开始运转。`;
+    return `创世完成，自然语言世界已保存至 ${this.files.narrativeJournal}。\n使用 world.start 让世界开始运转。`;
   }
 
   async startWorld(): Promise<string> {
@@ -357,7 +356,7 @@ export class WorldService extends Service<Config> {
       return "世界尚未初始化。请先编写定义文件并执行 world.init。";
     }
 
-    await this.world.ensureStructuredWorld();
+    await this.world.ensureWorld();
 
     // 实际可用的工具集（如未配置 TTS 则没有 send_voice；平台扩展操作按配置开关）。
     // 置顶列表只放 core 层常驻工具；chat/channel/group 层在打开应用/进入频道时以事件展开
@@ -548,13 +547,17 @@ export class WorldService extends Service<Config> {
       );
     }
 
-    // Recover the last durable perception before taking a fresh one. Source IDs make
-    // this a reread of prior evidence, even if the prior response was lost at shutdown.
-    const kernel = await this.world.structured.kernel();
-    const previousObservation = kernel.latestObservation("bot");
-    if (previousObservation) this.bot.pushEvent("world", JSON.stringify({ recovered: true, observation: previousObservation }));
-    this.bot.pushEvent("world", JSON.stringify(await this.world.observe()));
-    this.bot.pushEvent("system", "可以继续先前的生活。以上 recovered 观测是先前保存的记录；最新处境以随后观测为准。未完成动作需要根据实际回执确认，系统暂停本身不代表角色睡眠或失神。");
+    // Locate the latest delivered world cause even after context compression. Read-only archive
+    // queries select world envelopes before limiting results, so unrelated chat cannot displace them.
+    const archivedPerceptions = (await Promise.all(["world", "tool"].map(source => this.bot!.growth.recallEvidence({
+      source: source as "world" | "tool", keyword: '"mode":"narrative"', n: 50,
+    })))).flat();
+    const knownWorldSources = [...new Set([
+      ...this.botContext.stream.flatMap(entry => entry.kind === "event" ? entry.event.originEventIds ?? [] : []),
+      ...archivedPerceptions.flatMap(entry => entry.rootEventIds),
+    ])];
+    await this.world.restorePerceptions("bot", content => this.bot!.pushEvent("world", content), knownWorldSources);
+    this.bot.pushEvent("system", "可以继续先前的生活。recovered 标记表示已保存处境的回读，不是新发生的行动，也不证明这些动作出于你的自主意图。未完成动作以实际回执为准；系统暂停本身不代表角色睡眠或失神。");
     const offline = this.clock.consumeOfflineGap();
     const min = this.config.clock.offlineNarrateMinUnits;
     if (offline && min > 0 && offline.gapTU >= min) {
@@ -566,7 +569,7 @@ export class WorldService extends Service<Config> {
     const toolsNotice = this.botContext.toolsChangeNotice();
     if (toolsNotice) this.bot.pushEvent("system", toolsNotice);
 
-    // 世界内核提交后，按常驻角色的可见性投递互动观测。
+    // 世界提交后，只向常驻角色投递其实际感知；完整世界状态留在 World 一侧。
     this.world.setHostBotDeliver((content) => this.bot?.pushEvent("world", content, { wake: true }));
 
     // 旧世界 meta.json 缺 botName（新字段）：从定义补判一次（不阻塞启动，失败下次启动再试）
@@ -618,7 +621,7 @@ export class WorldService extends Service<Config> {
     await this.bot?.stop();
     await this.deviceTail;
     await this.crossingServer?.disconnectVisitors("世界暂停或正在切换存档");
-    await this.world.structured.shutdown();
+    await this.world.runtime.shutdown();
     if (!wasActive) return "世界并未在运行。";
     // Bot 还在异世界：礼貌地离开。标记文件保留——下次启动时向 Bot 解释"你回到了自己的世界"
     if (this.crossingClient) {
@@ -1152,9 +1155,7 @@ export class WorldService extends Service<Config> {
   }
 
   async getStructuredWorld(): Promise<unknown> {
-    const kernel = await this.world.structured.kernel();
-    const snapshot = kernel.snapshot();
-    return { snapshot, events: kernel.readEvents(Math.max(0, snapshot.sequence - 100), 1000) };
+    return this.world.runtime.inspect();
   }
 
   async getGrowth(): Promise<unknown> { return new GrowthLedger(this.files.base).recall({ n: 50 }); }
@@ -1341,7 +1342,8 @@ export class WorldService extends Service<Config> {
     const backup = await this.files.snapshot("回档前");
     await this.files.restoreFrom(snapDir);
     await this.clock.load();
-    await this.world.structured.reload();
+    await this.world.runtime.reload();
+    this.world.resetPerceptionDelivery();
     await this.focus.load();
     await this.notifyMgr.load();
     this.phoneStatus.down = false;

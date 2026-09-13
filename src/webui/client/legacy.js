@@ -1077,7 +1077,7 @@ function descOf(key, prefix){
       lifestyleNoWait: '心态段收尾（wait 被移除时）'
     },
     world: {
-      adjudicationSystem: '结构化世界裁定 · system。只声明 propose_world；世界规则、快照和任务由运行时附加。',
+      narrativeSystem: '自然语言世界裁定 · system。世界规则、当前情境、角色处境和本次操作由运行时附加；只把角色能感知的结果交给角色。',
       presentationSystem: '只读界面呈现 · system。只接收角色观测，无工具和写入权限。',
       compressSystem: '上下文压缩 · system',
       compressUser: '上下文压缩 · user。{{timeLine}} {{persona}} {{historySummary}} {{memoryDigest}} {{streamText}}',

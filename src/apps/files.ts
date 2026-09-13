@@ -3,7 +3,7 @@
  *
  * 双模式（创世时判定的世界性质，meta.json）：
  * - 现实世界：文件真的存在这台电脑（Docker 容器）里，操作通过容器执行，与主机隔离；
- * - 虚构世界：World-LLM 扮演这台电脑，直接生成符合世界观的目录/文件内容与操作结果。
+ * - 虚构世界：World-LLM 读取这台电脑已经确立的目录与文件原文；写入操作经世界裁定更新。
  *
  * 与终端共用同一台电脑、同一个主目录：写出来的文件在终端里也能看到。
  */
@@ -15,6 +15,7 @@ import type { WorldClock } from "../clock.js";
 import type { AppsConfig } from "../config.js";
 import type { WorldFiles } from "../files.js";
 import type { WorldAgent } from "../world/agent.js";
+import type { RichText } from "../types.js";
 import type { AppRawTool, WorldApp } from "./app.js";
 
 const MAX_LIST_ITEMS = 200;
@@ -159,11 +160,11 @@ export class FileManagerApp implements WorldApp {
     }
     return {
       tools: TOOLS,
-      opening: "虚构文件资源管理器已打开，只能查看已建模的设备与文件。",
+      opening: "虚构文件资源管理器已打开，依据虚构电脑中已经确立的目录和文件进行操作。",
     };
   }
 
-  async call(tool: string, args: Record<string, unknown>): Promise<string> {
+  async call(tool: string, args: Record<string, unknown>): Promise<string | RichText> {
     const real = await this.isRealWorld();
     switch (tool) {
       case "list":
@@ -447,41 +448,42 @@ export class FileManagerApp implements WorldApp {
 
   // ---------- 虚构模式：World-LLM 扮演这台电脑 ----------
 
-  private async virtualList(args: Record<string, unknown>): Promise<string> {
+  private async virtualList(args: Record<string, unknown>): Promise<string | RichText> {
     const where = args.path != null && String(args.path).trim() ? `目录 ${String(args.path).trim()}` : "主目录";
     const task =
       `Bot 打开了自己电脑上的文件资源管理器，查看${where}（当前 ${this.clock.timeLine()}）。\n` +
       `请扮演这台电脑，输出资源管理器窗口里显示的目录内容：\n` +
-      `1. 只读使用提供的角色观测，不调用工具、不改变世界；设备或目录未被观测时显示未知/不可用，不把未知当作空目录；\n` +
+      `1. 只读查看角色可用的虚构电脑中已确立的目录记录，不调用工具、不改变世界；没有设备或目录记录时显示未知/不可用，不把未知当作空目录；\n` +
       `2. 一行一个条目，目录以 / 结尾，文件可附大小；最多列 ${MAX_LIST_ITEMS} 条；与世界状态中已有的设定保持一致，不要凭空出现这个世界不该有的文件；\n` +
       `3. 只输出资源管理器屏幕上的内容，不要任何解释、旁白或代码围栏。`;
     try {
-      return await this.world.query(task);
+      return await this.world.observeVirtualApp(task);
     } catch (err) {
       this.logger.warn("虚构资源管理器目录生成失败: %s", err);
       return "（目录查询失败，未取得结果。）";
     }
   }
 
-  private async virtualShow(args: Record<string, unknown>): Promise<string> {
+  private async virtualShow(args: Record<string, unknown>): Promise<string | RichText> {
     const file = String(args.path ?? args.file ?? "");
     if (!file.trim()) return "（show 需要 path 参数。）";
     const task =
       `Bot 在自己电脑上的资源管理器里打开了文件 ${file.trim()}（当前 ${this.clock.timeLine()}）。\n` +
       `请扮演这台电脑，输出文件在屏幕上显示的内容：\n` +
-      `1. 只读使用提供的角色观测；有明确证据才显示文件不存在或非文本，未观测的内容显示未知/不可用，禁止补写文件；\n` +
+      `1. 只读查看角色可用的虚构电脑中已确立的文件原文；有明确证据才显示文件不存在或非文本，没有记录的内容显示未知/不可用，禁止补写文件；\n` +
       `2. 这是只读查看；仅将已提供的文件原文加行号，不得续写或补全。按请求的 start/max_lines 取窗口，请求为 ${JSON.stringify({ start: args.start ?? 1, max_lines: args.max_lines ?? 200 })}；\n` +
       `3. 只输出屏幕上显示的内容，不要解释或旁白。`;
     try {
-      return (await this.world.query(task)) + READ_ONLY_HINT;
+      const result = await this.world.observeVirtualApp(task);
+      return { ...result, text: result.text + READ_ONLY_HINT };
     } catch (err) {
       this.logger.warn("虚构资源管理器文件内容生成失败: %s", err);
-      return "（文件打不开，窗口里什么都没有。）" + READ_ONLY_HINT;
+      return "（文件内容查询失败，未取得结果。）" + READ_ONLY_HINT;
     }
   }
 
-  private async virtualWrite(args: Record<string, unknown>, action: string): Promise<string> {
-    return this.world.executeAppAction("在角色实际可用的虚构电脑上执行文件操作；只能改变已存在设备内的结构化文件，保留精确文件内容。请求=" + JSON.stringify({ ...args, action }));
+  private async virtualWrite(args: Record<string, unknown>, action: string): Promise<string | RichText> {
+    return this.world.executeAppAction("在角色实际可用的虚构电脑上执行文件操作；依据该设备的能力模拟，保留既定目录、路径和精确文件内容；创建或编辑的结果必须记入自然语言状态供后续读取。请求=" + JSON.stringify({ ...args, action }));
   }
 
   private async isRealWorld(): Promise<boolean> {

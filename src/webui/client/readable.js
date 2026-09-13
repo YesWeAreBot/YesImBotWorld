@@ -2,7 +2,7 @@
 (function () {
     'use strict';
     var labels = {
-        id: '编号', name: '名称', type: '类型', kind: '类别', role: '角色', content: '内容', text: '正文', description: '说明', desc: '意图', reason: '原因', message: '消息', messages: '消息列表',
+        mode: '运行方式', narrative: '所见所闻', worldState: '世界当前情境', actors: '角色处境', perception: '角色感知', present: '是否在场', scene: '场景', intent: '行动意图', id: '编号', name: '名称', type: '类型', kind: '类别', role: '角色', content: '内容', text: '正文', description: '说明', desc: '意图', reason: '原因', message: '消息', messages: '消息列表',
         arguments: '调用参数', parameters: '参数定义', properties: '字段', required: '必填字段', tools: '可用工具', tool_calls: '工具调用', toolCalls: '工具调用', function: '函数', result: '结果', response: '返回内容', request: '请求内容',
         status: '状态', ok: '是否成功', error: '错误', detail: '详情', payload: '事件内容', topic: '事件主题', sequence: '序列', emittedAt: '发生时间戳', ts: '时间戳',
         actorId: '行动角色', causationId: '上游事件', correlationId: '关联链路', ref: '关联编号', refToolCallId: '关联工具调用', sourceEventIds: '来源事件', action: '行动', actionId: '行动编号',

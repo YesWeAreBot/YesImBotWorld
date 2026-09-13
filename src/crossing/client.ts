@@ -51,6 +51,8 @@ export class CrossingClient implements RemoteWorldLink {
   private sseAbort: AbortController | null = null;
   private _worldName: string;
   private hostUnitWorldSeconds: number | null = null;
+  private lastPerceptionId = "";
+  private seenPerceptions = new Set<string>();
 
   constructor(
     private target: CrossingWorldConfig,
@@ -84,6 +86,8 @@ export class CrossingClient implements RemoteWorldLink {
       throw new Error(String(r.error ?? "对方世界拒绝了到达请求"));
     }
     this.token = r.token;
+    this.lastPerceptionId = "";
+    this.seenPerceptions.clear();
     const hostUnit = Number(r.unitWorldSeconds);
     this.hostUnitWorldSeconds = Number.isFinite(hostUnit) && hostUnit > 0 ? hostUnit : null;
     if (typeof r.worldName === "string" && r.worldName.trim()) this._worldName = r.worldName.trim();
@@ -108,7 +112,8 @@ export class CrossingClient implements RemoteWorldLink {
   // ---------- RemoteWorldLink（本地 WorldAgent 转发到这里） ----------
 
   async adjudicateAct(call: ToolCallRecord, deliver: (content: string) => void, signal?: AbortSignal, beforeCommit?: () => boolean): Promise<boolean> {
-    const desc = String(call.arguments.description ?? call.arguments.str ?? JSON.stringify(call.arguments));
+    const desc = typeof call.arguments.description === "string" ? call.arguments.description.trim() : "";
+    if (!desc) throw new Error("act.description 必须是非空的具体行动");
     const localDuration = call.duration ?? 0;
     const durationWorldSeconds = localDuration * (this.hooks.unitWorldSeconds?.() ?? 1);
     return this.runTask("act", {
@@ -116,7 +121,6 @@ export class CrossingClient implements RemoteWorldLink {
       duration: this.hostUnitWorldSeconds ? durationWorldSeconds / this.hostUnitWorldSeconds : localDuration,
       ...(typeof call.arguments.speech === "string" ? { speech: call.arguments.speech } : {}),
       ...(typeof call.arguments.target === "string" ? { target: call.arguments.target } : {}),
-      ...(typeof call.arguments.observationId === "string" ? { observationId: call.arguments.observationId } : {}),
     }, deliver, { taskId: call.id, signal, beforeCommit });
   }
 
@@ -126,19 +130,43 @@ export class CrossingClient implements RemoteWorldLink {
     return this.runTask("wait", { waitWorldSeconds, n: this.hostUnitWorldSeconds ? waitWorldSeconds / this.hostUnitWorldSeconds : n }, deliver, { taskId: call.id });
   }
 
-  async observe(args: { target?: string; modality?: string } = {}): Promise<WorldObservation> {
+  async observe(args: { intent?: string; target?: string; modality?: string } = {}): Promise<WorldObservation> {
     let text = "";
     const ok = await this.runTask("observe", args, (content) => { text = content; });
-    if (!ok) throw new Error(text || "远方世界不支持结构化观测");
-    const observation = JSON.parse(text) as WorldObservation;
-    if (!observation || typeof observation.observationId !== "string" || typeof observation.actorId !== "string" || !Array.isArray(observation.entities)) {
-      throw new Error("远方世界返回了无效的结构化观测");
+    if (!ok) throw new Error(text || "远方世界未能完成观察");
+    let observation: WorldObservation & { mode?: string; narrative?: string };
+    try { observation = JSON.parse(text); }
+    catch { throw new Error("远方世界返回了无效的角色感知"); }
+    // The wire envelope remains compatible with older hosts; narrative hosts use the same
+    // actor/provenance fields and an empty entity list, without capability-handle semantics.
+    if (!observation || typeof observation.observationId !== "string" || typeof observation.actorId !== "string" || !Array.isArray(observation.entities)
+      || !Array.isArray(observation.sourceEventIds) || !observation.sourceEventIds.every(id => typeof id === "string")
+      || (observation.mode === "narrative" && typeof observation.narrative !== "string")) {
+      throw new Error("远方世界返回了无效的角色感知");
     }
     return observation;
   }
 
   async resolveCheckTime(deliver: (content: string) => void): Promise<boolean> {
     return this.runTask("checkTime", {}, deliver);
+  }
+
+  async observeVirtualApp(task: string): Promise<import("../types.js").RichText> {
+    return this.virtualAppTask("observeVirtualApp", task);
+  }
+
+  async executeVirtualApp(task: string, signal?: AbortSignal): Promise<import("../types.js").RichText> {
+    return this.virtualAppTask("executeVirtualApp", task, signal);
+  }
+
+  private async virtualAppTask(kind: "observeVirtualApp" | "executeVirtualApp", task: string, signal?: AbortSignal): Promise<import("../types.js").RichText> {
+    let content = "";
+    const ok = await this.runTask(kind, { task }, text => { content = text; }, { signal });
+    if (!ok) throw new Error(content || "远方世界未能完成虚构应用请求");
+    let result: { text?: unknown; originEventIds?: unknown };
+    try { result = JSON.parse(content); } catch { throw new Error("远方世界返回了无效的应用内容"); }
+    if (!result || typeof result.text !== "string" || !Array.isArray(result.originEventIds) || !result.originEventIds.every(id => typeof id === "string")) throw new Error("远方世界返回了无效的应用内容");
+    return { text: result.text, originEventIds: result.originEventIds };
   }
 
   async query(task: string): Promise<string> {
@@ -218,6 +246,7 @@ export class CrossingClient implements RemoteWorldLink {
       try {
         const res = await llmFetch(`${this.base()}/crossing/events?token=${encodeURIComponent(this.token)}`, {
           signal: abort.signal,
+          ...(this.lastPerceptionId ? { headers: { "Last-Event-ID": this.lastPerceptionId } } : {}),
         });
         if (res.status === 403) {
           this.lost("会话已被主世界终止");
@@ -261,7 +290,15 @@ export class CrossingClient implements RemoteWorldLink {
 
   private receiveMessage(msg: CrossingSseMsg): string | null {
     if (msg.type === "event") {
-      if (msg.content?.trim()) this.hooks.onEvent(msg.content);
+      if (msg.eventId && this.seenPerceptions.has(msg.eventId)) return null;
+      if (msg.content?.trim()) {
+        this.hooks.onEvent(msg.content);
+        if (msg.eventId && !/[\r\n\0]/.test(msg.eventId)) {
+          this.lastPerceptionId = msg.eventId;
+          this.seenPerceptions.add(msg.eventId);
+          if (this.seenPerceptions.size > 256) this.seenPerceptions.delete(this.seenPerceptions.values().next().value!);
+        }
+      }
     } else if (msg.type === "status_update") {
       if (msg.content?.trim()) this.hooks.onEvent(`你在「${this.worldName}」经历的状态变化：${msg.content}`);
     } else if (msg.type === "task_result") {

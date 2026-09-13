@@ -15,7 +15,7 @@
 export type PlayerMode = "cross" | "avatar" | "puppet";
 
 /** 访客提交给主世界的任务类型 */
-export type CrossingTaskKind = "act" | "wait" | "checkTime" | "query" | "observe";
+export type CrossingTaskKind = "act" | "wait" | "checkTime" | "query" | "observe" | "observeVirtualApp" | "executeVirtualApp";
 
 export interface CrossingTaskPayload {
   /** act：动作描述 */
@@ -30,11 +30,12 @@ export interface CrossingTaskPayload {
   n?: number;
   /** query：世界查询任务文本 */
   task?: string;
-  /** observe：只能引用该访客自身已有的观测句柄。 */
+  /** observe：本次想了解的自然语言问题。 */
+  intent?: string;
+  /** observe / act：目标名字、描述或观察意图，不需要实体句柄。 */
   target?: string;
   modality?: string;
   speech?: string;
-  observationId?: string;
 }
 
 export interface CrossingTimeUnits {
