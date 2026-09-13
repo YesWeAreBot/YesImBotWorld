@@ -7,14 +7,14 @@
  * - Bot-LLM 开启了图片多模态（bot.modalities.image），否则截屏注入不了，模式不可用。
  *
  * KV cache 说明：每次 screen 的截图都作为**新的事件**追加在工作窗口末尾（原生附件），
- * 之前的内容（置顶区 + 历史）逐字节不变——前缀缓存持续命中；旧截图随媒体预算
- * 锚点批量淘汰（水位降到一半，缓存重算被摊薄到每 N/2 张新图一次）。这里绝不改写历史。
+ * 之前的内容（置顶区 + 历史）保持不变；媒体预算不足时请求压缩，再观察新截图。
  */
 
 import type { Logger } from "koishi";
 import type { RemoteDesktopConfig } from "../config.js";
 import type { MediaStore } from "../media/store.js";
-import type { MediaRef, RichText } from "../types.js";
+import { mediaPart, richPartsText } from "../media/presentation.js";
+import type { MediaRef, RichText, RichTextPart } from "../types.js";
 import { charKey, namedKey } from "../remote/keysyms.js";
 import { MOUSE, RfbSession } from "../remote/rfb.js";
 import type { AppRawTool, WorldApp } from "./app.js";
@@ -128,7 +128,8 @@ export class RemoteDesktopApp implements WorldApp {
     const row = id === null ? null : await this.media.get(id);
     if (epoch !== this.epoch || session !== this.session || !session?.connected) throw new Error("读取画面期间远程桌面已断开");
     if (!row) throw new Error("当前屏幕图像无法保存");
-    return { text: `当前屏幕图像（${shot.width}x${shot.height}）。`, attachments: [row.ref] };
+    const parts: RichTextPart[] = [{ kind: "text", text: `当前屏幕图像（${shot.width}x${shot.height}）。` }, mediaPart(row.ref, { name: "当前远程桌面截图" })];
+    return { text: richPartsText(parts), attachments: [row.ref], parts };
   }
 
   /** 交还控制/关机时释放真人按住的输入，避免远端遗留 Ctrl 或鼠标拖动。 */
@@ -180,14 +181,12 @@ export class RemoteDesktopApp implements WorldApp {
     const row = await this.media.get(id);
     if (!row) return "（你抬头看向屏幕，但截图保存不下来。）" + HINT;
     const ref: MediaRef = row.ref;
-    return {
-      text:
-        `你抬头看了看远程桌面的屏幕（${shot.width}x${shot.height}），画面如下。` +
-        `看清界面后决定下一步，操作完再 screen 看变化。` +
-        HINT,
-      attachments: [ref],
-      parts: [{ kind: "text", text: `你抬头看了看远程桌面的屏幕（${shot.width}x${shot.height}），画面如下。` }, { kind: "media", ref, marker: `[图片#${id}]` }, { kind: "text", text: `看清界面后决定下一步，操作完再 screen 看变化。${HINT}` }],
-    };
+    const parts: RichTextPart[] = [
+      { kind: "text", text: `你抬头看了看远程桌面的屏幕（${shot.width}x${shot.height}），画面如下。` },
+      mediaPart(ref, { name: "远程桌面屏幕截图" }),
+      { kind: "text", text: `看清界面后决定下一步，操作完再 screen 看变化。${HINT}` },
+    ];
+    return { text: richPartsText(parts), attachments: [ref], parts };
   }
 
   private async mouse(args: Record<string, unknown>): Promise<string> {

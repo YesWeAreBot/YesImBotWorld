@@ -43,7 +43,7 @@
     } }
     Studio.register('devices', function (container) {
         var live = true, synced = false, session = null, tab = 'phone', selected = null, busy = 0, refreshing = false, polling = null, generation = 0, operationMode = 'stealth';
-        var results = {}, drafts = {}, noteList = null, noteDraft = null, screenUrl = null, screenAbort = null, screenTimer = null, screenBusy = false, screenGeneration = 0, clickTimer = null, clickPoint = null, appViewStamp = '', computerViewStamp = '';
+        var results = {}, drafts = {}, noteList = null, noteDraft = null, repaintNotes = null, reloadNotes = null, screenUrl = null, screenAbort = null, screenTimer = null, screenBusy = false, screenGeneration = 0, clickTimer = null, clickPoint = null, appViewStamp = '', computerViewStamp = '';
         var screenWidth = 0, screenHeight = 0, pointer = null, remoteReady = false, terminalEntries = [], history = [], historyIndex = 0, remoteQueue = Promise.resolve(), remotePending = 0, inputEpoch = 0;
         var root = el('section', { cls: 'device-studio' }), header = el('div', { cls: 'device-heading' }), control = el('div', { cls: 'device-control' }), workspace = el('div', { cls: 'device-workspace' }), status = el('div', { cls: 'device-live-status', 'aria-live': 'polite' });
         var phoneBody = null, appBody = null, remoteImage = null, remoteStatus = null, terminalLog = null, viewKey = '', lastChat = '';
@@ -499,33 +499,38 @@
         }
         function renderNotes() {
             var heading = el('div', { cls: 'app-notes-heading' }, [el('span', { cls: 'app-kicker', text: '随手记，也认真记' }), el('h2', { text: '我的笔记' })]);
-            var list = el('div', { cls: 'app-note-list' }), editor = el('div', { cls: 'app-note-editor' });
-            var add = mutation(button('新笔记', function () { noteDraft = { original: null, title: '', content: '' }; editNote(editor); }, 'app-notes-add', 'plus'), 'write_note');
+            var list = el('div', { cls: 'app-note-list' }), editor = el('div', { cls: 'app-note-editor' }), order=noteSortOrder();
+            var add = mutation(button('新笔记', function () { noteDraft = { original: null, title: '', content: '' }; editNote(editor, true); }, 'app-notes-add', 'plus'), 'write_note');
+            var sorting=noteSortSelect(function(value){order=value; listNotes();}), hint=el('p',{cls:'note-sort-hint'});
             heading.append(add);
-            appBody.append(heading, list, editor);
+            appBody.append(heading, el('div',{cls:'app-note-sort'},[sorting,hint]), list, editor);
             function listNotes() {
                 if (!live || !list.isConnected)
                     return;
                 list.replaceChildren();
+                hint.textContent=noteSortNotice(noteList,order); hint.hidden=!hint.textContent;
                 if (!noteList || !noteList.length) {
                     list.appendChild(el('p', { cls: 'app-subtle', text: noteList ? '还没有笔记。写下第一件想记住的事。' : '正在读取笔记…' }));
                     return;
                 }
-                noteList.forEach(function (note) { var b = button(note.title, function () { noteDraft = { original: note.title, title: note.title, content: note.content || '' }; editNote(editor); }, 'app-note-row'); b.replaceChildren(el('strong', { text: note.title }), el('p', { text: (note.content || '').slice(0, 100) })); list.appendChild(b); });
+                sortNotes(noteList,order).forEach(function (note) { var b = button(note.title, function () { noteDraft = { original: note.title, title: note.title, content: note.content || '', metadata: note }; editNote(editor); editor.scrollIntoView({behavior:'smooth',block:'nearest'}); }, 'app-note-row'); b.replaceChildren(el('strong', { text: note.title }), noteTimes(note), el('p', { text: (note.content || '').slice(0, 100) })); list.appendChild(b); });
             }
+            repaintNotes=listNotes;
             listNotes();
-            api('GET', '/api/notes').then(function (data) { if (!live)
+            reloadNotes=function(){return api('GET', '/api/notes').then(function (data) { if (!live || !list.isConnected)
                 return; noteList = data.notes || []; listNotes(); }).catch(function (err) { if (list.isConnected)
-                list.replaceChildren(empty('笔记没有加载成功', err.message, 'notes')); });
+                list.replaceChildren(empty('笔记没有加载成功', err.message, 'notes')); });};
+            reloadNotes();
             if (noteDraft)
                 editNote(editor);
         }
-        function editNote(editor) {
+        function editNote(editor, focusNew) {
             editor.replaceChildren();
             var draft = noteDraft, title = field('标题', draft.title, { 'aria-label': '笔记标题' }), content = el('textarea', { cls: 'app-note-paper', placeholder: '写下想记住的事…', 'aria-label': '笔记正文' });
             content.value = draft.content;
             title.addEventListener('input', function () { draft.title = title.value; });
             content.addEventListener('input', function () { draft.content = content.value; });
+            var times=noteTimes(draft.metadata, 'app-note-times');
             var result = el('div', { cls: 'app-note-result', 'aria-live': 'polite' }), save = mutation(button('保存笔记', async function () {
                 if (!draft.title.trim() || !draft.content.trim()) {
                     toast('请填写标题和正文', 'err');
@@ -542,6 +547,9 @@
                     var stored = noteList.find(function (n) { return n.title === draft.title; });
                     if (stored && stored.content === draft.content) {
                         draft.original = stored.title;
+                        draft.metadata=stored;
+                        var nextTimes=noteTimes(stored, 'app-note-times'); times.replaceWith(nextTimes); times=nextTimes;
+                        repaintNotes?.();
                         toast('笔记已保存', 'ok');
                     }
                 }
@@ -572,8 +580,8 @@
                 } }, 'app-text-button app-delete'), 'delete_note');
                 row.prepend(del);
             }
-            editor.append(title, content, row, result);
-            title.focus();
+            editor.append(title, times, content, row, result);
+            if(focusNew) title.focus();
         }
         function renderNews() {
             var output = appOutput(selected.id), query = field('搜索新闻', drafts.newsQuery, { 'aria-label': '新闻关键词' });
@@ -963,9 +971,11 @@
         } if (remoteStatus)
             remoteStatus.hidden = false; }
         workspace.appendChild(empty('正在连接设备', '读取当前设备与应用状态…', 'phone'));
+        function onNotesChanged(event){if(event.detail?.file === 'notes' && selected && appKind(selected)==='notes') reloadNotes?.();}
+        window.addEventListener('studio:refresh',onNotesChanged);
         refresh(true);
         polling = setInterval(function () { if (!document.hidden && !busy && !remotePending)
             refresh(false); }, 5000);
-        return function () { live = false; generation++; clearInterval(polling); stopScreen(); root.remove(); };
+        return function () { live = false; generation++; clearInterval(polling); window.removeEventListener('studio:refresh',onNotesChanged); stopScreen(); root.remove(); };
     });
 })();

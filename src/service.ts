@@ -13,6 +13,7 @@ import { FileManagerApp } from "./apps/files.js";
 import { McpApp } from "./apps/mcp.js";
 import { NewsApp } from "./apps/news.js";
 import { NotesApp } from "./apps/notes.js";
+import { compareNotes, noteStamp, readNoteFile, sanitizeNoteTitle, saveNoteFile } from "./notes.js";
 import { RemoteDesktopApp } from "./apps/remoteDesktop.js";
 import { TerminalApp } from "./apps/terminal.js";
 import { WeatherApp } from "./apps/weather.js";
@@ -37,6 +38,7 @@ import { MessageStore } from "./koishi/messages.js";
 import { KoishiMessenger } from "./koishi/messenger.js";
 import { ChannelNameResolver } from "./koishi/names.js";
 import { parseChannelKey } from "./koishi/channels.js";
+import { conversationKind, conversationLabel } from "./koishi/conversation.js";
 import { deviceTools, type DeviceSession, type DeviceControlResult, type DeviceOperationMode } from "./webui/device.js";
 import { NotifyManager } from "./koishi/notify.js";
 import { OwnSendTracker } from "./koishi/ownsends.js";
@@ -46,9 +48,10 @@ import { CaptionService } from "./media/captioner.js";
 import { GalleryStore } from "./media/gallery.js";
 import { createAttachmentLoader } from "./media/parts.js";
 import { MediaRenderer, nativeSafeMime } from "./media/render.js";
+import { richPartsText } from "./media/presentation.js";
 import { MediaStore } from "./media/store.js";
 import { TtsClient } from "./media/tts.js";
-import type { MediaRef, PhoneStatus } from "./types.js";
+import type { MediaRef, PhoneStatus, RichTextPart } from "./types.js";
 import { WorldAgent } from "./world/agent.js";
 import { TingleTimer } from "./world/tingle.js";
 
@@ -368,20 +371,18 @@ export class WorldService extends Service<Config> {
       const ids = [...new Set(this.ctx.bots.filter((b) => b.selfId).map((b) => `${b.platform}:${b.selfId}`))];
       return ids.sort().join("、");
     };
-    // 常驻 Bot 名字：渲染时实时取值（世界演化改名前/后都会反映到 prompt）
+    // 名字和账号在当前请求前缀首次投影后冻结，下一次压缩才刷新。
     this.botContext.botNameProvider = () => this.world.residentBotName;
     // TU 换算锚点：Bot 估算 duration / wait 时长的依据（如「1 TU = 1 秒」）
     this.botContext.timeInfo =
       `1 TU = ${this.clock.unitWorldSeconds} 秒` +
       (this.clock.syncRealTime ? "（世界时间与现实同步）" : `（现实中 ${this.clock.unitRealSeconds} 秒）`);
     await this.botContext.load();
-    // Stable authored identity; physical state comes exclusively from observe.
-    this.botContext.pinned.persona = await this.files.readText(this.files.botDef);
-    this.botContext.pinned.botDefinition = this.botContext.pinned.persona;
-    await this.botContext.persistPinned();
+    // A resumed timeline retains its prefix. Announce authored changes as a new event.
+    const authoredDefinition = await this.files.readText(this.files.botDef);
+    const definitionChanged = authoredDefinition !== this.botContext.pinned.botDefinition;
     // 原生多模态：附件 → content part。
-    // 加载时按【当前】模态配置与格式白名单过滤：用户纠正配置后，历史事件里
-    // 已不支持的附件（关掉的模态 / GIF 表情等）不再注入请求，避免持续 400。
+    // 首次投影使用当前配置；已投影的历史分段冻结到下一次成功压缩。
     // 新会话：有效模态从配置重置（上次会话的运行时降级不跨会话生效）
     Object.assign(this.effectiveModalities, this.config.bot.modalities);
     const modalities = this.effectiveModalities;
@@ -393,7 +394,7 @@ export class WorldService extends Service<Config> {
     this.botContext.attachmentLoader = async (ref) =>
       allowed(ref) && nativeSafeMime(ref) ? loader(ref) : null;
     // 运行时降级：服务端 400 拒收 video_url / input_audio 时只关对应模态，
-    // 附件缓存重建（GIF 从 video_url 改为拼帧图的 image_url）
+    // 新分段的加载缓存重建；已有请求分段在压缩前保持原字节。
     this.botContext.degradeModalities = (kinds) => {
       for (const k of kinds) modalities[k] = false;
       loader.clearCache();
@@ -446,6 +447,7 @@ export class WorldService extends Service<Config> {
       new Set(tools.map((t) => t.name)),
       this.logger,
       () => this.appManager?.activeToolNames() ?? [],
+      (await this.files.readMeta()).realWorld ?? this.clock.syncRealTime,
     );
     // 手机应用（Apps / MCP）：内置天气/浏览器 + 外接 MCP Server（电脑不在手机里，是平级的另一台设备）
     const worldApps = [
@@ -500,7 +502,7 @@ export class WorldService extends Service<Config> {
             location: () => this.crossingLocation,
             voluntaryWorlds: () =>
               this.config.crossing.worlds
-                .filter((w) => w.allowVoluntary && w.name.trim() && w.url.trim())
+                .filter((w) => w.allowVoluntary && w.name.trim() && w.url.trim() && w.inviteCode.trim())
                 .map((w) => w.name.trim()),
             travelTo: (name) => this.crossingTravelTo(name),
             goHome: () => this.crossingGoHome(),
@@ -515,13 +517,26 @@ export class WorldService extends Service<Config> {
           const channel = key ? parseChannelKey(key) : null;
           if (channel && !channel.error) {
             const messages = await this.store.channelMessages(channel.platform, channel.channelId, 12, channel.selfId);
-            return { text: messages.map(row => `${row.username || row.userId}: ${row.content}`).join("\n") };
+            const last = messages.at(-1);
+            const kind = conversationKind(last?.isDirect, channel.channelId, last?.guildId);
+            const parts: RichTextPart[] = [{ kind: "text", text: `会话 ${key}（${kind === "direct" ? "私聊" : kind === "group" ? "群聊" : "会话类型未知"}）当前显示的消息：\n` }];
+            const attachments: MediaRef[] = [];
+            for (const row of messages) {
+              const address = row.self ? "本账号发出的消息，账号身份本身不证明是你亲自发送" : conversationLabel(row.conversation, channel.selfId);
+              // Render only stored message content: names/IDs cannot forge internal media markers.
+              const rendered = await this.renderer.render(row.content);
+              parts.push({ kind: "text", text: `${row.self ? "本账号" : row.username || row.userId}（账号 ${JSON.stringify(row.userId)}；${address}）${row.messageId ? ` (msg:${row.messageId})` : ""}: ` });
+              parts.push(...(rendered.parts?.length ? rendered.parts : [{ kind: "text" as const, text: rendered.text }]), { kind: "text", text: "\n" });
+              attachments.push(...(rendered.attachments ?? []));
+            }
+            return { text: richPartsText(parts), parts, attachments };
           }
         }
         return null;
       },
     );
 
+    if (definitionChanged) this.bot.pushEvent("system", `（角色定义已由世界管理者更新。以下是新的作者定义，从现在起据此行动；固定定义会在下次记忆整理时同步。）\n${authoredDefinition}`);
     await this.clock.resume();
 
     // 上次运行时 Bot 还在异世界（进程崩溃/重启）：告知它已被拉回自己的世界
@@ -800,6 +815,8 @@ export class WorldService extends Service<Config> {
   async playerCockpit(token: string) {
     const session = this.crossingServer?.residentSession(token), bot = this.bot;
     if (!session || !bot || this.residentSession?.id !== session.id) throw new Error("常驻角色接管会话不存在或已结束");
+    const [evidence, claims] = session.mode === "avatar"
+      ? await Promise.all([bot.growth.recallEvidence({ n: 30 }), bot.growth.recall({ n: 50 })]) : [[], []];
     return {
       mode: session.mode, running: this.worldActive && bot.status().running,
       control: { paused: bot.manualMode, busy: this.devicePending > 0 || bot.residentBusy },
@@ -808,6 +825,10 @@ export class WorldService extends Service<Config> {
         return { ...tool, ...(device ? { device: device.device, effect: device.effect } : {}), requiresSendConfirmation: device?.effect === "send" };
       }), pending: bot.pendingManualCalls(),
       time: { unitWorldSeconds: this.clock?.unitWorldSeconds ?? 1, unitRealSeconds: this.clock?.unitRealSeconds ?? 1 },
+      choices: {
+        evidence: evidence.map(item => ({ id: item.eventId, label: `T=${item.observedAt.toFixed(1)} · ${perceptionLabel(item.text)}` })),
+        claims: claims.map(item => ({ id: item.claimId, label: `${item.subject} · ${item.statement}` })),
+      },
     };
   }
 
@@ -873,7 +894,7 @@ export class WorldService extends Service<Config> {
       if (!resident && mode === "takeover" && (!bot.manualMode || bot.manualBusy)) return { ok: false, text: "请先强制接管并等待现有操作完成。" };
       if (!resident && mode === "stealth" && (name === "pick_up_phone" || name === "put_down_phone")) return { ok: false, text: "偷偷操作改变设备界面，不代替角色拿起或放下手机。" };
       const tool = this.deviceToolDefs().find(tool => tool.name === name);
-      if (!tool) return { ok: false, text: "此设备工具当前不可用，请先打开对应应用或进入频道。" };
+      if (!tool) return { ok: false, text: "此设备工具当前不可用，本次操作没有执行。请刷新设备状态后选择当前可用操作。" };
       if (tool.effect === "send" && !confirmSend) return { ok: false, text: "发送需由用户明确点击发送（confirmSend=true）。" };
       if (!args || typeof args !== "object" || Array.isArray(args)) return { ok: false, text: "args 必须为 JSON 对象。" };
       if (duration !== undefined && (!Number.isFinite(duration) || duration < 0)) return { ok: false, text: "duration 必须为有限非负数。" };
@@ -1339,23 +1360,23 @@ export class WorldService extends Service<Config> {
       return [];
     }
     const out: NoteEntry[] = [];
-    for (const name of names.sort()) {
-      const content = await fs.readFile(path.join(this.files.notesDir, name), "utf8").catch(() => "");
-      // 与 NotesApp 一致：剥掉 frontmatter 元数据，只留正文
-      const body = content.replace(/^---\n[\s\S]*?\n---\n?/, "").trim();
-      out.push({ title: name.replace(/\.md$/i, ""), content: body });
+    for (const name of names) {
+      const note = await readNoteFile(path.join(this.files.notesDir, name)).catch(() => null);
+      if (note) out.push({ title: name.replace(/\.md$/i, ""), ...note });
     }
-    return out;
+    return out.sort(compareNotes);
   }
 
   async writeNote(name: string, content: string): Promise<void> {
-    const title = (name ?? "").trim().replace(/[/\\:*?"<>|\u0000-\u001f]/g, " ").slice(0, 60).trim();
+    const title = sanitizeNoteTitle(name ?? "");
     if (!title) throw new Error("标题不能为空");
     const file = path.join(this.files.notesDir, `${title}.md`);
-    await fs.mkdir(this.files.notesDir, { recursive: true });
-    const stamp = this.clock?.clockString(this.clock.now());
-    const fm = `---\ncreated: ${stamp}\nupdated: ${stamp}\n---\n\n`;
-    await fs.writeFile(file, fm + String(content ?? "").trim() + "\n");
+    const previous = await readNoteFile(file).catch(error => {
+      if (error.code === "ENOENT") return null;
+      throw error;
+    });
+    const now = noteStamp(this.clock);
+    await saveNoteFile(file, String(content ?? ""), previous ? previous.created : now, now);
   }
 
   async deleteNote(name: string): Promise<void> {
@@ -1374,4 +1395,15 @@ export class WorldService extends Service<Config> {
   private registerCommands(ctx: Context): void {
     registerWorldCommands(ctx, this);
   }
+}
+/** A compact label for evidence choices; IDs remain machine values, not form input. */
+function perceptionLabel(text: string): string {
+  try {
+    const parsed = JSON.parse(text), observation = parsed.observation ?? parsed;
+    if (Array.isArray(observation.entities)) {
+      const names = observation.entities.map((entity: { name?: string }) => entity.name).filter(Boolean);
+      return names.length ? `观察到 ${names.join("、").slice(0, 140)}` : "一次当前环境的观察";
+    }
+  } catch { /* Message and ordinary tool results are text. */ }
+  return text.replace(/\s+/g, " ").slice(0, 140);
 }

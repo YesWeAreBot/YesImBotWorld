@@ -15,7 +15,7 @@ Bot 可以用核心只读工具 `observe_device(device:"phone"|"computer")` 主�
 
 只有 Bot 当时关注的设备发生变化，才投递中性的当前界面变化与可见内容；真实远程桌面可补充一帧当前图像。事件不指认操作者，不替角色写疑惑、恐惧或因果解释。未关注时，不注入偷偷操作事件，也不通过模型工具声明提前透露新开的应用；既有消息通知与手机振动继续走原来的感知规则。Bot 下一次主动查看设备时会同步它实际看到的状态。
 
-偷偷模式可在手机已放下时操作应用，但不能代理角色的 `pick_up_phone/put_down_phone` 身体动作。发送必须明确确认，并在 `send` 中提供完整 `msg` 和可选 `media`；不接续 Bot 私有的 `pick_media`/`<img>` 多步草稿。强制接管保留原工具能力。
+偷偷模式可在手机已放下时操作应用，但不能代理角色的 `pick_up_phone/put_down_phone` 身体动作。发送必须明确确认，并在 `send` 中提供完整 `msg` 和可选 `media`；图文混排使用 `<media ref="media:12"/>` 指定插入位置。`pick_media` 只解析媒体引用，不保存待发草稿，也不自动发送。强制接管保留当前可用的工具能力。
 
 ## 角色接管时的设备语义
 
@@ -76,7 +76,7 @@ GET 不打开应用、不连接 VNC、不调用模型、不刷新 Bot 观测或�
 
 设备 API 不开放 `act`、世界管理或任意记忆工具。已知聊天发送工具要求 `confirmSend:true`，前端仅在用户明确点击发送时传入；刷新、应用导航、键盘 Enter 不自动发送聊天。`effect` 为 `read|action|send`，这是设备表单提示与已知发送校验，不是第三方 MCP 的安全沙箱：任意 MCP 工具仍可能有外部副作用，必须由用户明确执行，并展示实际工具说明与参数。
 
-`/api/player/tool` 仍是管理员通用 Bot 工具入口，权限范围大于设备 API；设备前端不要用它绕过设备白名单或发送确认。
+`/api/player/tool` 是持有效常驻角色接管 token 的 Bot 工具入口；设备前端不要用它绕过设备白名单或发送确认。
 
 ## 电脑实际模式
 
@@ -116,12 +116,14 @@ y = (clientY - top)  / height * desktopHeight
 
 | 请求 | 用途 |
 | --- | --- |
-| `GET /api/player/cockpit?ctoken=...` | 当前 mode、control、完整 tools Schema、pending 与 time 单位；只读，不消费观测 |
+| `GET /api/player/cockpit?ctoken=...` | 当前 mode、control、完整 tools Schema、pending 与 time 单位，以及完全入替时可选择的证据和认识；只读，不消费观测 |
 | `POST /api/player/tool {token,name,arguments,duration?,confirmSend?}` | 通过真实 Bot 调用路径执行；来源由有效会话推导 |
 | `POST /api/player/tool/cancel {token,callId}` | 取消本会话尚未提交的调用；callId 从 pending 的 id 获取 |
 | `POST /api/player/leave {token}` | 等待工作完成后归还角色控制 |
 
-`/api/player/tool` 必须带有效接管 token，仅有管理员身份或同名字符串不足以代理角色。返回 `{ok,text,content?,callId?}`，发送工具的 `requiresSendConfirmation` 为 true 时需明确确认。`duration` 为 TU；wait 传 `arguments.n`，rest 传 `arguments.duration`，不要另给冲突的外层估时。puppet 不开放代替意识的 reflect/recall/wait/rest 等操作。
+`/api/player/tool` 必须带有效接管 token，仅有管理员身份或同名字符串不足以代理角色。返回 `{ok,text,content?,callId?}`，发送工具的 `requiresSendConfirmation` 为 true 时需明确确认。`duration` 为 TU；wait 传 `arguments.n`，rest 传 `arguments.duration`，不要另给冲突的外层估时。puppet 不开放代替意识的 reflect/recall_growth/wait/rest 等操作。
+
+驾驶舱与独立玩家页面保留固定、可收起的操作台。状态流更新不重建当前输入节点；应用、会话、消息、媒体与观测目标按名称或摘要点选。目标选择携带对应的 `observationId`，观测过期时需重新选择。下方以最新在前的顺序展示可读回执，有权限时展示两个 LLM 的实时输出；原始复杂参数和回执保留在折叠视图中。
 
 常驻角色的观察必须走 `observe` 工具，确保它看到的世界也进入自身经历；入场和只读目录不会私自消费角色的台词游标。旧 `/api/player/task` 仅用于独立玩家，常驻角色的请求会被拒绝。
 

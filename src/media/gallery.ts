@@ -164,8 +164,8 @@ export class GalleryStore {
   }
 
   /**
-   * 解析收藏夹文件引用："分类/文件名" 或裸 "文件名"（按分类顺序搜索，含根目录兜底）。
-   * 找不到返回 null；引用不合法（路径穿越等）返回 null。
+   * 解析收藏夹文件引用："分类/文件名" 或唯一匹配的裸 "文件名"。
+   * 找不到、名称有歧义或路径不合法时返回 null。
    */
   async resolve(refText: string): Promise<GalleryEntry | null> {
     const raw = refText.trim();
@@ -181,15 +181,17 @@ export class GalleryStore {
     }
     const name = sanitizeFileName(raw);
     if (!name) return null;
+    const matches: GalleryEntry[] = [];
     for (const cat of ALL_CATEGORIES) {
       const file = path.join(this.dirOf(cat), name);
       const ok = await fs.stat(file).then((s) => s.isFile()).catch(() => false);
-      if (ok) return { category: cat, name, file };
+      if (ok) matches.push({ category: cat, name, file });
     }
     // 根目录兜底（尚未清扫的散落文件）
     const rootFile = path.join(this.baseDir, name);
     const ok = await fs.stat(rootFile).then((s) => s.isFile()).catch(() => false);
-    return ok ? { category: "", name, file: rootFile } : null;
+    if (ok) matches.push({ category: "", name, file: rootFile });
+    return matches.length === 1 ? matches[0]! : null;
   }
 
   /**
@@ -197,9 +199,11 @@ export class GalleryStore {
    * （用户手动移动/改名过的条目自动修正路径；同图复制则借用描述）。
    */
   async findMeta(category: string, name: string, sha256?: string): Promise<WorldGalleryRow | null> {
-    const byPath = await this.ctx.database.get("yesimbot_world_gallery", { category, name }, { limit: 1 });
-    if (byPath.length) return byPath[0]!;
+    // A file may be replaced in place. Names alone must never attach the old image's description.
+    sha256 ??= await this.hashFile(path.join(this.dirOf(category), name)).catch(() => undefined);
     if (!sha256) return null;
+    const byPath = await this.ctx.database.get("yesimbot_world_gallery", { category, name }, { limit: 1 });
+    if (byPath[0]?.sha256 === sha256) return byPath[0];
     const bySha = await this.ctx.database.get("yesimbot_world_gallery", { sha256 });
     for (const row of bySha) {
       const exists = await fs
@@ -212,20 +216,18 @@ export class GalleryStore {
         return { ...row, category, name };
       }
     }
-    return bySha[0] ?? null;
+    return bySha[0] ? { ...bySha[0], category, name } : null;
   }
 
   /** 仅按 sha256 查找（不做路径修正）：反查某个媒体是否已被收藏过 */
   async findBySha(sha256: string): Promise<WorldGalleryRow | null> {
-    const rows = await this.ctx.database.get("yesimbot_world_gallery", { sha256 }, { limit: 1 });
-    const row = rows[0];
-    if (!row) return null;
-    // 文件可能已被用户删掉：确认还在才算数
-    const exists = await fs
-      .stat(path.join(this.dirOf(row.category), row.name))
-      .then((s) => s.isFile())
-      .catch(() => false);
-    return exists ? row : null;
+    const rows = await this.ctx.database.get("yesimbot_world_gallery", { sha256 });
+    for (const row of rows) {
+      // Check bytes as well as existence: manual replacement must not impersonate the old asset.
+      const current = await this.hashFile(path.join(this.dirOf(row.category), row.name)).catch(() => null);
+      if (current === sha256) return row;
+    }
+    return null;
   }
 
   /** 写入/更新条目描述 */

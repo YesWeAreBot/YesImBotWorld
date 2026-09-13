@@ -944,7 +944,7 @@ export const Config: Schema<Config> = Schema.intersect([
         .default(8)
         .description(
           "单次生成请求注入的原生附件**总数**上限：工作窗口里的历史附件每次请求都会重发，必须设预算。" +
-            "越限时较早的附件被整批淘汰为文字标记（水位降到一半，保护前缀缓存）。生成请求报 413（请求体过大）时调小",
+            "历史媒体在本次上下文内保持不变；新媒体超限时保留身份和摘要，并在整理记忆后再查看。生成请求报 413（请求体过大）时调小",
         ),
       maxAttachmentMbPerRequest: Schema.number()
         .default(6)

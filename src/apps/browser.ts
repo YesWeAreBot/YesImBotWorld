@@ -27,7 +27,8 @@ import type { WorldFiles } from "../files.js";
 import type { CaptionService } from "../media/captioner.js";
 import type { GalleryStore } from "../media/gallery.js";
 import type { MediaStore } from "../media/store.js";
-import type { MediaRef, RichText } from "../types.js";
+import { mediaPart, mediaText, richPartsText } from "../media/presentation.js";
+import type { MediaRef, RichText, RichTextPart } from "../types.js";
 import type { WorldAgent } from "../world/agent.js";
 import type { AppRawTool, WorldApp } from "./app.js";
 import { fetchWithProxy } from "../fetch.js";
@@ -359,7 +360,7 @@ export class BrowserApp implements WorldApp {
     if (ctype.startsWith("image/")) {
       const id = await this.media.ingest(res.url || url, "image", undefined, this.cfg.browserProxy);
       return id !== null
-        ? `这个网址是一张图片，已存入你的媒体缓存（图片#${id}，可用 pick_media 插入发送，喜欢可 gallery_save 收藏）。`
+        ? `这个网址是一张图片，已存入你的媒体缓存（图片 media:${id}，可用 pick_media 插入发送，喜欢可 gallery_save 收藏）。`
         : "（这个网址是一张图片，但下载失败了。）";
     }
     if (ctype && !ctype.includes("html") && !ctype.startsWith("text/")) {
@@ -386,17 +387,15 @@ export class BrowserApp implements WorldApp {
     const row = await this.media.get(id);
     if (!row) return "（图片加载失败。）";
     const label = `{图${n}} ${img.alt ? `（${img.alt}）` : ""}`;
-    if (this.canAttach(row.ref)) {
-      return {
-        text: `你点开了 ${label}，图就在下面。（想保存/发送就 save_image 或记住编号 pick_media 插入）`,
-        attachments: [row.ref],
-        parts: [{ kind: "text", text: `你点开了 ${label}，图就在下面。` }, { kind: "media", ref: row.ref, marker: `[图片#${id}]` }],
-      };
-    }
-    const detail = await this.captioner.describeDetailed(row.ref);
-    return detail
-      ? `你点开了 ${label}，仔细看了看：${detail}\n（想保存/发送就 save_image 或记住编号 pick_media 插入）`
-      : `（你点开了 ${label}，但没有可用的识图能力，看不清内容。）`;
+    const native = this.canAttach(row.ref);
+    const summary = native ? await this.captioner.describe(row.ref) : await this.captioner.describeDetailed(row.ref);
+    const part = mediaPart(row.ref, { name: img.alt || `网页图 ${n}`, summary: summary || undefined });
+    const parts: RichTextPart[] = [
+      { kind: "text", text: `你点开了 ${label}：\n` },
+      native ? part : { kind: "text", text: mediaText(part) },
+      { kind: "text", text: `\n（选择/发送引用 media:${id}，收藏用 gallery_save；网页图序号 ${n} 仅供浏览当前网页，不能当媒体编号。）` },
+    ];
+    return { text: richPartsText(parts), attachments: native ? [row.ref] : undefined, parts };
   }
 
   private async saveImage(img: { url: string; alt: string }): Promise<string> {
@@ -408,8 +407,8 @@ export class BrowserApp implements WorldApp {
       if (row && !row.summary) await this.media.setSummary(id, `网页图片：${img.alt}`);
     }
     return (
-      `图片已保存到你的媒体缓存：图片#${id}${img.alt ? `（${img.alt}）` : ""}。` +
-      `想发就 pick_media 用这个编号插入；想长期留着就 gallery_save 收藏（记得选分类、写描述）。`
+      `图片已保存到你的媒体缓存：图片 media:${id}${img.alt ? `（${img.alt}）` : ""}。` +
+      `想发先用 pick_media 确认这个引用，再在 send 中明确发送；想长期留着就 gallery_save 收藏（记得选分类、写描述）。`
     );
   }
 
@@ -571,8 +570,8 @@ export class BrowserApp implements WorldApp {
       description,
     );
     return (
-      `咔嚓——截图已存进收藏夹 截图/${name}：图片#${id}（${description}）。` +
-      `想发就 pick_media 用这个编号插入。`
+      `咔嚓——截图已存进收藏夹 截图/${name}：图片 media:${id}（${description}）。` +
+      `想发先用 pick_media 确认这个引用，再在 send 中明确发送。`
     );
   }
 

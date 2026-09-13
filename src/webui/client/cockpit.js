@@ -1,7 +1,9 @@
-/* The server supplies the same live tool schemas used by BotAgent. */
+/* A persistent, schema-driven human controller for the same tools used by BotAgent. */
 var WorldCockpit = (function () {
-    var labels = { observe: '观察世界', observe_device: '看向设备', act: '身体行动', reflect: '整理认识', recall_growth: '回顾成长', recall: '回忆', wait: '等待', rest: '休息', time: '查看时间', status: '查看状态', check_time: '查看时间', check_status: '查看状态', read_channel: '阅读会话', check_msg: '查看消息', pick_up_phone: '拿起手机', put_down_phone: '放下手机', open_app: '打开应用', close_app: '关闭应用', open_computer: '打开电脑', close_computer: '关闭电脑', run_command: '运行终端命令', screen: '查看屏幕', keyboard: '使用键盘', mouse: '使用鼠标', travel: '前往其他世界', go_home: '回家' };
-    var fields = { description: '动作描述', speech: '说出的原话', target: '目标', observationId: '观测编号', device: '设备', scope: '观察范围', modality: '感知方式', query: '检索内容', text: '文字', app: '应用', command: '命令', channel: '会话', channelId: '会话编号', content: '内容', name: '名称', path: '路径', title: '标题', url: '网址' };
+    'use strict';
+    var labels = { observe: '观察世界', observe_device: '看向设备', act: '身体行动', reflect: '整理认识', recall_growth: '回顾成长', wait: '等待', rest: '休息', check_time: '查看时间', read_channel: '阅读会话', check_msg: '查看消息', select_channel: '进入会话', pick_up_phone: '拿起手机', put_down_phone: '放下手机', open_app: '打开应用', close_app: '关闭应用', open_computer: '打开电脑', close_computer: '关闭电脑', run_command: '运行终端命令', screen: '查看屏幕', keyboard: '使用键盘', mouse: '使用鼠标', travel: '前往其他世界', go_home: '回家', send: '发送消息', view_media: '查看媒体', pick_media: '选择媒体', check_gallery: '翻看收藏', check_media: '查看媒体缓存' };
+    var fields = { description: '动作描述', speech: '说出的原话', target: '目标', observationId: '观测依据', device: '设备', scope: '观察范围', modality: '感知方式', query: '检索内容', text: '文字', app: '应用', command: '命令', channel: '会话', channelId: '会话', content: '内容', name: '名称', path: '路径', title: '标题', url: '网址', n: '数量', kind: '认识类别', subject: '关于谁或什么', statement: '你的认识', event_ids: '亲历证据', claim_id: '已有认识', relation: '更新方式', msg: '消息正文', msg_id: '消息', msg_ids: '消息', reply_to: '回复哪条消息', id: '对象', media: '媒体', repeat: '允许重复动作', duration: '时长', full: '完整信息' };
+    var words = { phone: '手机', computer: '电脑', self: '自己', all: '周围与自己', sight: '眼前景象', relationship: '关系', commitment: '承诺', preference: '偏好', support: '补充证据', counter: '记录反例', revise: '修正判断' };
     function label(tool) { return labels[tool.name] || tool.title || tool.name; }
     function note(text) { return el('p', { cls: 'journey-note', text: text }); }
     function button(text, run, cls) { return el('button', { type: 'button', cls: cls || 'journey-button', text: text, onclick: run }); }
@@ -10,98 +12,189 @@ var WorldCockpit = (function () {
         if (/reflect|recall|remember|note/.test(tool.name)) return '意识与记忆';
         return '世界与行动';
     }
-    function mount(data, draft, actions) {
-        var tools = data.tools || [], pending = data.pending || [], panel = el('section', { cls: 'journey-card cockpit', 'aria-label': '角色驾驶舱' });
-        panel.append(el('div', { cls: 'journey-section-kicker', text: 'BOT / 人类驾驶舱' }), el('h2', { text: '使用角色此刻的能力' }), note(data.mode === 'puppet' ? '你操纵身体，Bot 保留自己的意识。这里开放实际动作与观察；回忆和反思由 Bot 自己决定。' : '你正在替角色决定意图。这些调用经过与 Bot 相同的执行路径，结果会成为角色自己的经历。'));
-        var links = el('div', { cls: 'cockpit-links' }, [button('操作手机与电脑 ↗', function () { Studio.navigate('devices'); }), button('查看实时思考与调用 ↗', function () { Studio.navigate('live'); })]);
-        panel.appendChild(links);
-        if (!data.synced) panel.appendChild(note('正在同步当前能力和控制状态…'));
-        if (pending.length) {
-            var queue = el('div', { cls: 'cockpit-queue', 'aria-label': '执行中的工具' });
-            pending.forEach(function (call) {
-                var id = call.callId || call.id;
-                queue.appendChild(el('div', { cls: 'cockpit-pending' }, [el('span', { cls: 'journey-pulse' }), el('div', {}, [el('strong', { text: call.name }), note(call.committed ? '变化已提交，等待最终回执' : '正在执行 · ' + (call.status || '等待回执'))]), button('请求取消', function () { actions.cancel(id); })]));
-            });
-            panel.appendChild(queue);
-        }
-        if (!tools.length) { panel.appendChild(note(data.synced ? '当前没有可用能力；世界或设备状态更新后会自动刷新。' : '能力目录尚未加载。')); return panel; }
-        if (!tools.some(function (t) { return t.name === draft.selected; })) draft.selected = (tools.find(function (t) { return t.name === 'observe'; }) || tools[0]).name;
-        var tool = tools.find(function (t) { return t.name === draft.selected; }), timed = tool.name === 'wait' || tool.name === 'rest';
-        var list = el('div', { cls: 'cockpit-tool-list', role: 'group', 'aria-label': '可用能力' });
-        ['世界与行动', '设备', '意识与记忆'].forEach(function (category) {
-            var members = tools.filter(function (t) { return group(t) === category; });
-            if (!members.length) return;
-            list.appendChild(el('h3', { text: category }));
-            members.forEach(function (t) {
-                var b = button(label(t), function () { draft.selected = t.name; actions.redraw(); }, 'cockpit-tool' + (t === tool ? ' selected' : ''));
-                b.dataset.cockpitTool = t.name;
-                b.setAttribute('aria-pressed', String(t === tool));
-                b.appendChild(el('small', { text: t.name }));
-                list.appendChild(b);
-            });
-        });
+    function mount(initial, draft, actions) {
+        var data = initial, selected = null, schemaStamp = '', fieldUpdaters = [], form = null, submit = null, error = null, confirmSend = null;
         draft.values = draft.values || Object.create(null);
-        var values = draft.values[tool.name] || (draft.values[tool.name] = Object.create(null)), schema = tool.inputSchema || { type: 'object', properties: {} }, readers = [];
-        var form = el('form', { cls: 'cockpit-form' }), error = el('div', { cls: 'journey-error', role: 'alert', hidden: true });
-        form.noValidate = true;
-        form.append(el('h3', { text: label(tool) }), el('code', { text: tool.name }), note(tool.description || '以角色当前能力执行。'));
-        function field(name, spec, required) {
-            var value = values[name], type = Array.isArray(spec.type) ? spec.type.find(function (t) { return t !== 'null'; }) : spec.type, control;
-            if (value === undefined && spec.default !== undefined) value = values[name] = spec.default;
-            if (spec.enum || type === 'boolean') {
-                control = el('select', { cls: 'journey-input' }, [el('option', { value: '', text: required ? '请选择' : '使用默认值' })]);
-                (spec.enum || [true, false]).forEach(function (v) { control.appendChild(el('option', { value: JSON.stringify(v), text: v === true ? '是' : v === false ? '否' : String(v) })); });
-                control.value = value === undefined ? '' : JSON.stringify(value);
-                control.onchange = function () { values[name] = control.value === '' ? undefined : JSON.parse(control.value); };
-                readers.push(function (args) { if (control.value !== '') args[name] = JSON.parse(control.value); });
-            } else if (type === 'number' || type === 'integer') {
-                control = el('input', { cls: 'journey-input', type: 'number', step: type === 'integer' ? '1' : 'any', value: value === undefined ? '' : String(value) });
-                if (spec.minimum !== undefined) control.min = spec.minimum;
-                if (spec.maximum !== undefined) control.max = spec.maximum;
-                control.oninput = function () { values[name] = control.value; };
-                readers.push(function (args) { if (control.value !== '') args[name] = Number(control.value); });
-            } else {
-                var structured = type !== 'string';
-                control = el('textarea', { cls: 'journey-input', rows: structured ? '4' : '2', placeholder: structured ? (type === 'array' ? '[]' : '{}') : '' });
-                control.value = value === undefined ? '' : typeof value === 'string' ? value : JSON.stringify(value, null, 2);
-                control.oninput = function () { values[name] = control.value; };
-                readers.push(function (args) { if (control.value !== '') { try { args[name] = structured ? JSON.parse(control.value) : control.value; } catch (_) { throw new Error(name + ' 需要有效的 JSON。'); } } });
-            }
-            control.required = required;
-            control.dataset.cockpitField = tool.name + ':' + name;
-            form.appendChild(el('label', { cls: 'journey-field' }, [el('span', { cls: 'journey-label', text: (timed && ['n', 'duration'].includes(name) ? '时长 · TU' : fields[name] || name) + (required ? ' *' : ' · 可选') }), control, spec.description ? note(spec.description) : null]));
+        var panel = el('section', { cls: 'cockpit', 'aria-label': '角色驾驶舱' }), head = el('div', { cls: 'cockpit-bar' }), choice = button('选择能力', function () { picker.hidden = !picker.hidden; formHost.hidden = !picker.hidden; choice.textContent = picker.hidden ? '选择能力' : '返回操作'; choice.setAttribute('aria-expanded', String(!picker.hidden)); }, 'journey-button cockpit-choice');
+        choice.setAttribute('aria-expanded', 'false');
+        var heading = el('strong', { cls: 'cockpit-current' }), count = el('span', { cls: 'cockpit-count' });
+        head.append(heading, count, choice);
+        var picker = el('div', { cls: 'cockpit-picker', hidden: true }), list = el('div', { cls: 'cockpit-tool-list', role: 'group', 'aria-label': '可用能力' });
+        var search = el('input', { type: 'search', cls: 'journey-input', placeholder: '搜索能力或应用', 'aria-label': '搜索能力' });
+        search.oninput = function () { list.querySelectorAll('[data-cockpit-tool]').forEach(function (node) { node.hidden = !node.textContent.toLowerCase().includes(search.value.trim().toLowerCase()); }); };
+        picker.append(search, list);
+        var queue = el('div', { cls: 'cockpit-queue', 'aria-label': '执行中的工具' }), status = el('p', { cls: 'journey-note cockpit-control-note', role: 'status' }), formHost = el('div', { cls: 'cockpit-form-host' });
+        var recovery = button('恢复输入，结果留待核对', function () { if (actions.recover) actions.recover(); }, 'journey-button cockpit-recover'); recovery.hidden = true;
+        panel.append(head, picker, status, recovery, queue, formHost);
+        function candidates(name, tool) {
+            var context = data.choices || {}, devices = data.deviceSession || {}, chat = devices.chat || {}, result = null;
+            if (name === 'target' && (tool.name === 'act' || tool.name === 'observe')) {
+                result = ((data.observation && data.observation.entities) || []).filter(function (e) { return tool.name === 'observe' || !e.self; }).map(function (e) { return { value: e.observedId, text: e.self ? '自己 · ' + e.name : e.name }; });
+                if (tool.name === 'observe') result.unshift({ value: 'self', text: '自己' });
+            } else if (tool.name === 'open_app' && name === 'name') result = (devices.apps || []).map(function (a) { return { value: a.id, text: a.name || a.title || a.id }; });
+            else if (['channel', 'channelId', 'id'].includes(name) && /^(select_channel|send|channel_notify|unsend|react|get_emoji_likes|forward_msgs)$/.test(tool.name)) result = (chat.channels || []).map(function (c) { return { value: c.key, text: c.name || c.title || (c.participants || []).map(function (p) { return p.username; }).filter(Boolean).join('、') || c.channelId || c.key }; });
+            else if (['msg_id', 'msg_ids', 'reply_to'].includes(name) && /^(send|unsend|react|get_emoji_likes|forward_msgs|view_forward|set_essence)$/.test(tool.name)) result = (chat.messages || []).filter(function (m) { return m.messageId; }).map(function (m) { return { value: String(m.messageId), text: (m.username || m.userName || m.senderName || '消息') + ' · ' + ReadableData.text(m.content || m.text || '').slice(0, 95) }; });
+            else if (name === 'event_ids' && /^(reflect|recall_growth)$/.test(tool.name)) result = (context.evidence || []).map(function (e) { return { value: e.id, text: e.label || e.text || e.id }; });
+            else if (name === 'claim_id' && /^(reflect|recall_growth)$/.test(tool.name)) result = (context.claims || []).map(function (c) { return { value: c.id, text: c.label || c.statement || c.id }; });
+            else if (name === 'media' && /^(view_media|pick_media|send)$/.test(tool.name)) result = (context.mediaCache || []).concat(context.galleryMedia || []);
+            else if (name === 'media_id' && tool.name === 'gallery_save') result = context.mediaCache || [];
+            else if (name === 'name' && /^gallery_(move|remove)$/.test(tool.name)) result = (context.galleryMedia || []).map(function (c) { return Object.assign({}, c, { value: c.value.replace(/^gallery:/, '') }); });
+            else if (name === 'title' && /^(view_note|edit_note|delete_note)$/.test(tool.name)) result = context.noteTitles || [];
+            else if (context[name] && Array.isArray(context[name])) result = context[name].map(function (c) { return { value: c.value === undefined ? c.id : c.value, text: c.label || c.name || String(c.value === undefined ? c.id : c.value) }; });
+            return result;
         }
-        Object.entries(schema.properties || {}).forEach(function (entry) { field(entry[0], entry[1], (schema.required || []).includes(entry[0])); });
-        // Conditional or open schemas remain fully usable through the exact JSON schema.
-        var advanced = el('details', { cls: 'cockpit-schema', open: !!values.__advanced }), raw = el('textarea', { cls: 'journey-input cockpit-json', rows: '6', 'data-cockpit-field': tool.name + ':raw', placeholder: '留空使用上方表单；填写后以这里的完整参数为准' });
-        raw.value = values.__raw || '';
-        raw.oninput = function () { values.__raw = raw.value; };
-        advanced.ontoggle = function () { values.__advanced = advanced.open; };
-        advanced.append(el('summary', { text: '完整 Schema / 高级 JSON 参数' }), el('pre', { text: JSON.stringify(schema, null, 2) }), raw);
-        form.appendChild(advanced);
-        var duration = el('input', { cls: 'journey-input', type: 'number', min: '0', step: 'any', value: values.__estimate || '0', 'data-cockpit-field': 'duration', oninput: function () { values.__estimate = duration.value; } });
-        duration.required = true;
-        if (timed) form.appendChild(note('这里的时长参数单位为 TU，1 TU = ' + (data.unitWorldSeconds || '?') + ' 世界秒。' + (tool.name === 'rest' ? '未指定或非正数时，休息计时为 300 TU；重要动静可提前打断。' : '等待可被重要通知提前打断。')));
-        else form.appendChild(el('label', { cls: 'journey-field' }, [el('span', { cls: 'journey-label', text: '预计时长 · 世界秒' }), duration, note('1 TU = ' + (data.unitWorldSeconds || '?') + ' 世界秒；表单会换算后提交。0 表示完成即返回。')]));
-        var confirmSend = el('input', { type: 'checkbox', 'data-cockpit-confirm-send': '' });
-        if (tool.requiresSendConfirmation) form.appendChild(el('label', { cls: 'cockpit-confirm' }, [confirmSend, el('span', { text: '确认把这次填写的内容发送到聊天平台' })]));
-        var submit = el('button', { type: 'submit', cls: 'journey-button journey-primary', text: data.submitting ? '正在等待回执…' : '执行 ' + label(tool), disabled: !data.synced || !!data.blocked || !!data.submitting || !data.unitWorldSeconds });
-        form.append(error, submit, note('打开应用、观察和移动等操作可能更新能力目录；每次以实际回执为准。'));
-        form.onsubmit = function (event) {
-            event.preventDefault();
-            try {
-                if (!raw.value.trim() && !form.reportValidity()) return;
-                if (tool.requiresSendConfirmation && !confirmSend.checked) throw new Error('请先确认本次发送的内容和目标会话。');
-                var args = {};
-                if (raw.value.trim()) args = JSON.parse(raw.value); else readers.forEach(function (read) { read(args); });
-                if (!args || typeof args !== 'object' || Array.isArray(args)) throw new Error('工具参数必须是 JSON 对象。');
-                var seconds = timed ? 0 : Number(duration.value);
-                if (!Number.isFinite(seconds) || seconds < 0) throw new Error('预计时长需要为非负的世界秒。');
-                actions.call(tool.name, args, seconds / data.unitWorldSeconds, confirmSend.checked);
-            } catch (e) { error.hidden = false; error.textContent = e.message; }
-        };
-        panel.appendChild(el('div', { cls: 'cockpit-layout' }, [list, form]));
-        return panel;
+        function select(toolName) {
+            if (!data.tools.some(function (t) { return t.name === toolName; })) return;
+            if (selected && selected.name === toolName && schemaStamp !== JSON.stringify(data.tools.find(function (t) { return t.name === toolName; }).inputSchema || {})) selected = null;
+            draft.selected = toolName; picker.hidden = true; formHost.hidden = false; choice.textContent = '选择能力'; choice.setAttribute('aria-expanded', 'false'); update(data);
+            if (actions.resize) actions.resize();
+        }
+        function build(tool) {
+            selected = tool; schemaStamp = JSON.stringify(tool.inputSchema || {}); fieldUpdaters = [];
+            if (actions.prepare) actions.prepare(tool);
+            var values = draft.values[tool.name] || (draft.values[tool.name] = Object.create(null)), schema = tool.inputSchema || { type: 'object', properties: {} }, timed = tool.name === 'wait' || tool.name === 'rest', readers = [];
+            form = el('form', { cls: 'cockpit-form' }); form.noValidate = true;
+            error = el('div', { cls: 'journey-error', role: 'alert', hidden: true });
+            var primary = el('div', { cls: 'cockpit-primary-fields' }), optional = el('details', { cls: 'cockpit-options', open: !!values.__options }), extras = el('div', { cls: 'cockpit-extra-fields' });
+            optional.append(el('summary', { text: tool.name === 'act' ? '说话与选项' : '选项与预计时长' }), extras);
+            optional.ontoggle = function () { values.__options = optional.open; if (actions.resize) actions.resize(); };
+            function controlFor(name, spec, value, required, path) {
+                spec = spec || {}; var type = Array.isArray(spec.type) ? spec.type.find(function (t) { return t !== 'null'; }) : spec.type || (spec.properties ? 'object' : 'string');
+                var holder = el('div', { cls: 'cockpit-control' }), input, read, update = function () {};
+                if (value === undefined && spec.default !== undefined) value = spec.default;
+                var choices = candidates(name, tool), enumValues = spec.enum || (type === 'boolean' ? [true, false] : null);
+                if (type === 'array') {
+                    var rows = el('div', { cls: 'cockpit-array' }), items = [], counter = 0;
+                    function add(item) {
+                        var index = counter++, child = controlFor(name, spec.items || { type: 'string' }, item, true, path + '.' + index), row = el('div', { cls: 'cockpit-array-row' }), entry = { control: child, row: row };
+                        row.append(child.node, button('移除', function () { items.splice(items.indexOf(entry), 1); row.remove(); save(); }, 'cockpit-remove')); rows.appendChild(row); items.push(entry);
+                    }
+                    holder.append(rows, button('＋ 添加' + (fields[name] || '一项'), function () { add(undefined); save(); if (actions.resize) actions.resize(); }, 'cockpit-add'));
+                    (Array.isArray(value) ? value : []).forEach(add);
+                    read = function () { var result = items.map(function (item) { return item.control.read(); }).filter(function (item) { return item !== undefined; }); if (required && !result.length) throw Error((fields[name] || name) + '至少选择一项。'); return result.length ? result : undefined; };
+                } else if (type === 'object') {
+                    var nested = [], props = spec.properties || {};
+                    Object.entries(props).forEach(function (entry) { var child = controlFor(entry[0], entry[1], value && value[entry[0]], false, path + '.' + entry[0]); nested.push({ name: entry[0], field: child, required: (spec.required || []).includes(entry[0]) }); holder.append(el('label', { cls: 'journey-field' }, [el('span', { cls: 'journey-label', text: fields[entry[0]] || entry[0] }), child.node])); });
+                    if (!nested.length) { input = el('textarea', { cls: 'journey-input cockpit-json', rows: '2', placeholder: '此扩展字段没有定义结构，可填写 JSON' }); input.value = value === undefined ? '' : JSON.stringify(value, null, 2); holder.appendChild(input); }
+                    read = function () { var result = {}; if (input) { if (!input.value.trim()) return undefined; try { result = JSON.parse(input.value); } catch (_) { throw Error((fields[name] || name) + '需要有效的 JSON 对象。'); } if (!result || typeof result !== 'object' || Array.isArray(result)) throw Error((fields[name] || name) + '需要对象。'); return result; } nested.forEach(function (entry) { var v = entry.field.read(); if (v !== undefined) result[entry.name] = v; }); if (required || Object.keys(result).length) { nested.forEach(function (entry) { if (entry.required && result[entry.name] === undefined) throw Error((fields[entry.name] || entry.name) + '不能为空。'); }); return result; } };
+                } else if (enumValues || choices !== null) {
+                    input = el('select', { cls: 'journey-input' }); var manual = null, selectedValue = value, lastOptions = '', preview = el('div', { cls: 'cockpit-choice-preview' }), previewKey = '';
+                    var observedHandle = name === 'target' && ['act', 'observe'].includes(tool.name), evidenceHandle = ['event_ids', 'claim_id'].includes(name) && ['reflect', 'recall_growth'].includes(tool.name);
+                    if (!enumValues && !observedHandle && !evidenceHandle) {
+                        manual = el('input', { cls: 'journey-input cockpit-manual', type: 'text', placeholder: '填写已知编号', hidden: true, 'aria-label': (fields[name] || name) + '的已知编号' });
+                        manual.value = value === undefined ? '' : String(value); holder.appendChild(manual);
+                    }
+                    function updatePreview() {
+                        var value = input.value && input.value !== '__manual__' ? JSON.parse(input.value) : null, choice = (candidates(name, tool) || []).find(function (c) { return c.value === value; }), key = choice && choice.preview || '';
+                        if (key === previewKey) return; previewKey = key; preview.replaceChildren();
+                        if (key && key.startsWith('/api/')) preview.appendChild(el('a', { href: withToken(key), target: '_blank', rel: 'noopener noreferrer', 'aria-label': '查看所选媒体原图' }, [el('img', { src: withToken(key), alt: choice.text, loading: 'lazy' })]));
+                    }
+                    update = function () {
+                        var list = enumValues ? enumValues.map(function (v) { return { value: v, text: v === true ? '是' : v === false ? '否' : words[v] || String(v) }; }) : candidates(name, tool) || [];
+                        var next = JSON.stringify(list); if (next === lastOptions) return; lastOptions = next;
+                        var wasManual = input.value === '__manual__', old = input.value && !wasManual ? JSON.parse(input.value) : selectedValue;
+                        input.replaceChildren(el('option', { value: '', text: required ? (list.length ? '点选' : '暂无可选') + (fields[name] || name) : '不指定 · 使用默认值' }));
+                        list.forEach(function (c) { input.appendChild(el('option', { value: JSON.stringify(c.value), text: String(c.text).replace(/\s+/g, ' ').slice(0, 180) })); });
+                        if (manual) input.appendChild(el('option', { value: '__manual__', text: '填写其他已知编号…' }));
+                        if (wasManual) input.value = '__manual__';
+                        else if (old !== undefined && list.some(function (c) { return c.value === old; })) input.value = JSON.stringify(old);
+                        else if (old !== undefined && !enumValues && !observedHandle) {
+                            // Restore the reference without turning an asynchronously
+                            // loaded name picker into a field asking humans for IDs.
+                            input.appendChild(el('option', { value: JSON.stringify(old), text: '上次选择 · 尚未读取到名称' })); input.value = JSON.stringify(old);
+                        }
+                        else input.value = '';
+                        if (manual) manual.hidden = input.value !== '__manual__';
+                        updatePreview();
+                    };
+                    update(); fieldUpdaters.push(update);
+                    input.onchange = function () { if (manual) manual.hidden = input.value !== '__manual__'; selectedValue = input.value && input.value !== '__manual__' ? JSON.parse(input.value) : undefined; if (observedHandle && input.value === '') values[name] = undefined; updatePreview(); save(); };
+                    read = function () {
+                        if (observedHandle && input.value === '' && values[name] !== undefined && !(candidates(name, tool) || []).some(function (c) { return c.value === values[name]; })) throw Error('之前选择的目标已不在最新观测中。请重新点选，或明确选择“不指定”。');
+                        return input.value === '__manual__' ? manual.value.trim() || undefined : input.value === '' ? undefined : JSON.parse(input.value);
+                    };
+                    holder.prepend(input); holder.appendChild(preview);
+                } else if (type === 'number' || type === 'integer') {
+                    input = el('input', { cls: 'journey-input', type: 'number', step: type === 'integer' ? '1' : 'any', value: value === undefined ? '' : String(value), inputmode: 'decimal' });
+                    if (spec.minimum !== undefined) input.min = spec.minimum;
+                    if (spec.maximum !== undefined) input.max = spec.maximum;
+                    holder.appendChild(input); read = function () { if (input.value === '') return undefined; var number = Number(input.value); if (!Number.isFinite(number) || type === 'integer' && !Number.isInteger(number)) throw Error((fields[name] || name) + '需要有效数字。'); if (spec.minimum !== undefined && number < spec.minimum || spec.maximum !== undefined && number > spec.maximum) throw Error((fields[name] || name) + '超出了此能力支持的范围。'); return number; };
+                } else {
+                    input = el('textarea', { cls: 'journey-input', rows: tool.name === 'act' && name === 'description' ? '2' : '2', placeholder: tool.name === 'act' && name === 'description' ? '想做什么？例如走到窗边，把窗户推开。' : '' });
+                    input.value = value === undefined ? '' : String(value); holder.appendChild(input); read = function () { return input.value === '' ? undefined : input.value; };
+                }
+                if (input) { input.dataset.cockpitField = tool.name + ':' + path; input.setAttribute('aria-label', fields[name] || name); if (required && input.tagName !== 'SELECT') input.required = true; }
+                function save() { try { var result = read(); if (!path.includes('.')) values[name] = result; } catch (_) {} }
+                holder.addEventListener('input', save); holder.addEventListener('change', save);
+                return { node: holder, read: function () { var result = read(); if (required && result === undefined) throw Error((fields[name] || name) + '不能为空。'); return result; } };
+            }
+            Object.entries(schema.properties || {}).forEach(function (entry) {
+                var name = entry[0], spec = entry[1], required = (schema.required || []).includes(name);
+                if (name === 'observationId' && tool.name === 'act') { readers.push(function (args) { if (data.observation) args.observationId = data.observation.observationId; }); return; }
+                var control = controlFor(name, spec, values[name], required, name), row = el('label', { cls: 'journey-field' }, [el('span', { cls: 'journey-label', text: (timed && ['n', 'duration'].includes(name) ? '时长 · TU' : fields[name] || name) + (required ? '' : ' · 可选') }), control.node]);
+                if (spec.description) row.appendChild(el('details', { cls: 'cockpit-field-help' }, [el('summary', { text: '参数说明' }), note(spec.description)]));
+                (required ? primary : extras).appendChild(row);
+                readers.push(function (args) { var value = control.read(); values[name] = value; if (value !== undefined) args[name] = value; });
+            });
+            var duration = el('input', { cls: 'journey-input', type: 'number', min: '0', step: 'any', value: values.__estimate || '0', 'data-cockpit-field': 'duration', 'aria-label': '预计时长（世界秒）', oninput: function () { values.__estimate = duration.value; } });
+            if (!timed) extras.appendChild(el('label', { cls: 'journey-field' }, [el('span', { cls: 'journey-label', text: '预计时长 · 世界秒' }), duration]));
+            var help = el('details', { cls: 'cockpit-help' }, [el('summary', { text: '这项能力如何工作' }), note(tool.description || '以角色当前能力执行。'), note(timed ? '这里的时长使用 TU。1 TU = ' + (data.unitWorldSeconds || '?') + ' 世界秒。' : '预计时长以世界秒填写，提交时自动换算为 TU。0 表示完成即返回。')]);
+            var advanced = el('details', { cls: 'cockpit-schema', open: !!values.__advanced }), raw = el('textarea', { cls: 'journey-input cockpit-json', rows: '5', 'data-cockpit-field': tool.name + ':raw', placeholder: '留空使用表单；填写后以完整参数为准' });
+            raw.value = values.__raw || ''; raw.oninput = function () { values.__raw = raw.value; }; advanced.ontoggle = function () { values.__advanced = advanced.open; };
+            advanced.append(el('summary', { text: '高级参数与原始 Schema' }), ReadableData.raw(schema, { label: '工具参数定义' }), raw); extras.append(help, advanced);
+            if (actions.prepare && /^(view_media|pick_media|send|gallery_(save|move|remove)|view_note|edit_note|delete_note)$/.test(tool.name)) extras.appendChild(button('刷新可选内容', function () { actions.prepare(tool, true); }, 'cockpit-add'));
+            confirmSend = el('input', { type: 'checkbox', 'data-cockpit-confirm-send': '' });
+            if (tool.requiresSendConfirmation) primary.appendChild(el('label', { cls: 'cockpit-confirm' }, [confirmSend, el('span', { text: '确认把本次内容发送到所选聊天会话' })]));
+            submit = el('button', { type: 'submit', cls: 'journey-button journey-primary cockpit-submit' });
+            form.append(primary, optional, error, submit);
+            form.onsubmit = function (event) {
+                event.preventDefault(); error.hidden = true;
+                try {
+                    if (submit.disabled) return;
+                    if (tool.requiresSendConfirmation && !confirmSend.checked) throw Error('请先确认本次发送的内容和目标会话。');
+                    var args = {}; if (raw.value.trim()) args = JSON.parse(raw.value); else readers.forEach(function (read) { read(args); });
+                    if (!args || typeof args !== 'object' || Array.isArray(args)) throw Error('工具参数必须是对象。');
+                    var seconds = timed ? 0 : Number(duration.value); if (!Number.isFinite(seconds) || seconds < 0) throw Error('预计时长需要为非负的世界秒。');
+                    actions.call(tool.name, args, seconds / data.unitWorldSeconds, confirmSend.checked); confirmSend.checked = false;
+                } catch (e) { error.hidden = false; error.textContent = e.message; }
+            };
+            formHost.replaceChildren(form);
+        }
+        var toolStamp = '', queueStamp = '';
+        function update(next) {
+            data = next; data.tools = data.tools || [];
+            if (!draft.selected) draft.selected = (data.tools.find(function (t) { return t.name === 'act'; }) || data.tools[0] || {}).name;
+            var tool = data.tools.find(function (t) { return t.name === draft.selected; }), changed = JSON.stringify(data.tools.map(function (t) { return [t.name, t.title, t.device]; }));
+            if (toolStamp !== changed) {
+                toolStamp = changed; list.replaceChildren();
+                ['世界与行动', '设备', '意识与记忆'].forEach(function (category) {
+                    var members = data.tools.filter(function (t) { return group(t) === category; }); if (!members.length) return;
+                    list.appendChild(el('h3', { text: category }));
+                    members.forEach(function (t) { var b = button(label(t), function () { select(t.name); }, 'cockpit-tool'); b.dataset.cockpitTool = t.name; b.appendChild(el('small', { text: t.name })); list.appendChild(b); });
+                }); search.oninput();
+            }
+            list.querySelectorAll('[data-cockpit-tool]').forEach(function (b) { b.classList.toggle('selected', b.dataset.cockpitTool === draft.selected); b.setAttribute('aria-pressed', String(b.dataset.cockpitTool === draft.selected)); });
+            if (tool && (!selected || selected.name !== tool.name)) build(tool);
+            // Changes from polling never replace an input node. A changed schema is
+            // applied only after the user switches away and selects the tool again.
+            var schemaChanged = !!tool && !!selected && schemaStamp !== JSON.stringify(tool.inputSchema || {});
+            fieldUpdaters.forEach(function (update) { update(); });
+            panel.dataset.tool = selected ? selected.name : '';
+            heading.textContent = selected ? label(selected) : '角色能力'; count.textContent = data.tools.length + ' 项可用';
+            status.textContent = data.uncertain ? '请求结果尚未确认，不会自动重发。可保留执行记录并恢复输入。' : !data.synced ? '正在同步控制状态' : !tool ? '这项能力已不可用。草稿已保留，请选择当前可用能力。' : schemaChanged ? '能力参数已更新，请重新选择这项能力后执行。' : data.blocked ? data.blockedReason || '暂时不能操作角色，请检查控制状态。' : data.submitting ? '正在执行，你可以继续查看状态与准备下一步。' : '';
+            recovery.hidden = !data.uncertain;
+            status.classList.toggle('journey-pending', !!data.submitting);
+            status.hidden = !status.textContent;
+            if (submit) { submit.disabled = !tool || schemaChanged || !data.synced || !!data.blocked || !!data.submitting || !data.unitWorldSeconds; submit.textContent = data.submitting ? '等待执行回执' : '执行 ' + label(selected); }
+            var pending = data.pending || [], nextQueue = JSON.stringify(pending);
+            if (nextQueue !== queueStamp) { queueStamp = nextQueue; queue.replaceChildren(); pending.forEach(function (call) { queue.appendChild(el('div', { cls: 'cockpit-pending' }, [el('span', { cls: 'journey-pulse' }), el('div', {}, [el('strong', { text: label(call) }), note(call.committed ? '变化已提交，等待最终回执' : '执行中 · 可请求取消')]), button('请求取消', function () { actions.cancel(call.callId || call.id); })])); }); }
+            if (!selected && data.synced) formHost.textContent = '当前没有可用能力。世界与设备状态改变后，这里会自动更新。';
+            if (actions.resize) actions.resize();
+        }
+        panel.update = update;
+        panel.select = select;
+        panel.setTarget = function (target) { draft.values.act = draft.values.act || {}; draft.values.act.target = target; if (!selected || selected.name !== 'act') select('act'); var input = panel.querySelector('[data-cockpit-field="act:target"]'); if (input) { input.value = JSON.stringify(target); input.dispatchEvent(new Event('change', { bubbles: true })); } };
+        update(initial); return panel;
     }
-    return { mount: mount };
+    return { mount: mount, label: label };
 })();

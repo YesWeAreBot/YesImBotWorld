@@ -1044,6 +1044,27 @@
 .app-note-list {
   padding:0 15px 20px
 }
+.app-note-sort {
+  padding:0 19px 8px;
+  color:inherit
+}
+.app-note-sort select {
+  width:100%;
+  min-height:38px;
+  border-color:#b8994640;
+  background:#fffdf5;
+  color:inherit;
+  border-radius:9px
+}
+.app-note-row .note-timestamps {
+  font-size:10px;
+  opacity:.8
+}
+.app-note-times {
+  padding:0 16px 8px;
+  font-size:10px
+}
+.app-note-times small { opacity:.75 }
 .app-note-row {
   width:100%;
   display:block;
@@ -1101,6 +1122,7 @@
 }
 .app-note-actions {
   display:flex;
+  flex-wrap:wrap;
   justify-content:flex-end;
   gap:4px;
   padding:9px;

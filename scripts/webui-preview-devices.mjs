@@ -12,9 +12,12 @@ export function createDeviceFixture() {
     { id:'news', name:'新闻', kind:'app', description:'开发样本：新闻界面的布局验证。' },
     { id:'studio_mcp', name:'创意工具', kind:'app', description:'开发样本 MCP：验证类型、枚举和结构化参数表单。' },
   ];
+  let noteTime = 40;
+  const noteStamp = value => ({label:'预览世界（T='+value+'.0）',value,clock:'world',source:'recorded'});
   const notes = [
-    {title:'关于这个预览',content:'这是本地开发预览。\n所有内容都是用于界面测试的开发样本。\n笔记写入、消息发送、工具执行都只改变内存，不触及运行中的世界。'},
-    {title:'一些界面想法',content:'让设备有各自的性格。\n\n手机：随身而轻盈。\n电脑：有空间，也有工具。'},
+    {title:'关于这个预览',content:'这是本地开发预览。\n所有内容都是用于界面测试的开发样本。\n笔记写入、消息发送、工具执行都只改变内存，不触及运行中的世界。',created:noteStamp(10),updated:noteStamp(30)},
+    {title:'一些界面想法',content:'让设备有各自的性格。\n\n手机：随身而轻盈。\n电脑：有空间，也有工具。',created:noteStamp(20),updated:noteStamp(20)},
+    {title:'导入的样本笔记',content:'没有世界时间的笔记使用明确标注的文件时间。',created:{label:'2026-01-01T09:00:00.000Z',value:1767258000000,clock:'real',source:'file'},updated:{label:'2026-01-02T09:00:00.000Z',value:1767344400000,clock:'real',source:'file'}},
   ];
   const channels = [
     {key:'fixture:studio',platform:'fixture',channelId:'本地工作室',selfId:'preview-bot',isDirect:false,participants:[{userId:'dev',username:'开发者'},{userId:'preview-bot',username:'预览 Bot'}]},
@@ -93,8 +96,8 @@ export function createDeviceFixture() {
         case 'screenshot':return {ok:false,text:'开发预览没有浏览器截图服务，不生成模拟截图。'};
         case 'list_notes':return result(notes.map(n=>n.title).join('\n') || '还没有笔记。',name);
         case 'view_note':{const note=notes.find(n=>n.title===args.title);return note?result(note.content,name):{ok:false,text:'笔记不存在。'};}
-        case 'write_note':if(!args.title || !args.content)return {ok:false,text:'请填写标题和正文。'};if(notes.some(n=>n.title===args.title))return {ok:false,text:'同名笔记已经存在。'};notes.unshift({title:String(args.title),content:String(args.content)});return result('已保存到本地预览内存。',name);
-        case 'edit_note':{const note=notes.find(n=>n.title===args.title);if(!note)return {ok:false,text:'笔记不存在。'};if(args.new_title)note.title=String(args.new_title);if(args.content!==undefined)note.content=String(args.content);return result('已更新本地预览笔记。',name);}
+        case 'write_note':if(!args.title || !args.content)return {ok:false,text:'请填写标题和正文。'};if(notes.some(n=>n.title===args.title))return {ok:false,text:'同名笔记已经存在。'};notes.unshift({title:String(args.title),content:String(args.content),created:noteStamp(++noteTime),updated:noteStamp(noteTime)});return result('已保存到本地预览内存。',name);
+        case 'edit_note':{const note=notes.find(n=>n.title===args.title);if(!note)return {ok:false,text:'笔记不存在。'};if(args.new_title)note.title=String(args.new_title);if(args.content!==undefined)note.content=String(args.content);note.updated=noteStamp(++noteTime);return result('已更新本地预览笔记。',name);}
         case 'delete_note':{const index=notes.findIndex(n=>n.title===args.title);if(index<0)return {ok:false,text:'笔记不存在。'};notes.splice(index,1);return result('已删除本地预览笔记。',name);}
         case 'headlines':return result(headlines,name);
         case 'search_news':return result('开发样本搜索 · '+String(args.keyword || '')+'\n\n'+headlines,name);

@@ -2,6 +2,19 @@
  * 聊天记录/事件里的标记文本（[...] 包裹的纯函数生成），不依赖 koishi，便于冒烟测试。
  */
 
+/** Preserve an opaque platform ID; never extract a number from another identifier or prose. */
+export function normalizeMsgId(value: unknown): string | undefined {
+  if (typeof value !== "string" && !(typeof value === "number" && Number.isSafeInteger(value))) return undefined;
+  let id = String(value).trim();
+  if (/^\(msg:/i.test(id) && id.endsWith(")")) id = id.slice(5, -1);
+  else if (/^msg:/i.test(id)) id = id.slice(4);
+  if (!id || /^-?0+$/.test(id) || /^(?:media|gallery|msg):/i.test(id)) return undefined;
+  // Platform IDs may contain letters, negative numbers, UUIDs, colons, slashes,
+  // base64 punctuation and Unicode. Whitespace, markup and broken wrappers are not IDs.
+  if (/[\s\p{Cc}\p{Cf}<>"'`()\[\]{}\\]/u.test(id)) return undefined;
+  return id;
+}
+
 /**
  * 撤回动态的描述文本（入库时以 [...] 包裹成标记；关注事件里直接使用）。
  * Bot 自己在文本里以第二人称「你」出现（与戳一戳/禁言标记的惯例一致）。

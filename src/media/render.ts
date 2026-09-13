@@ -1,11 +1,17 @@
 import type { MediaRef, MediaType, RichText, RichTextPart } from "../types.js";
 import type { CaptionService } from "./captioner.js";
 import type { MediaStore } from "./store.js";
+import { mediaPart, mediaText } from "./presentation.js";
 
 export const MEDIA_PLACEHOLDER = /<media id="(\d+)" type="(image|audio|video)"\/>/g;
 
 export function mediaPlaceholder(id: number, type: MediaType): string {
   return `<media id="${id}" type="${type}"/>`;
+}
+
+/** User-authored text must not masquerade as a persisted asset downloaded from the platform. */
+export function escapeMediaStorageText(text: string): string {
+  return text.replace(/<media(?=\s|>)/g, "&lt;media");
 }
 
 const TYPE_LABEL: Record<MediaType, string> = { image: "图片", audio: "音频", video: "视频" };
@@ -25,10 +31,8 @@ export function nativeSafeMime(ref: MediaRef): boolean {
 /**
  * 把含媒体占位符的文本渲染为 Bot 可感知的形式：
  *
- * - Bot-LLM 原生支持该模态 → 文本**不留占位符**（图片位置由 content part 精确表达），
- *   parts 里放 media 段；media 段额外带一个「降级描述」，供附件超预算被裁时退化用；
- * - 否则若配置了外挂解释器 → 就地渲染 `[图片#12：解释文本]`（解释结果缓存）；
- * - 否则 → 就地渲染 `[图片#12（无法查看内容）]`。
+ * 媒体身份、摘要与原始内容绑定在同一 media 段内。纯文本/压缩也保留该身份和摘要，
+ * 不以「附件第几张」建立对应关系；存储占位只在此处解析，绝不直接暴露给模型。
  * 图片/媒体的**相对位置绝不变动**：文字与媒体按原文顺序交错。
  */
 export class MediaRenderer {
@@ -68,8 +72,7 @@ export class MediaRenderer {
       const type = match[2] as MediaType;
       const seg = await this.renderOneParts(id, type, attachments);
       if (seg.kind === "media") {
-        // 原生支持：text 字段该位置留空（图片由 content part 表达，不写占位符、不写「见附件」）；
-        // media 段的 marker 已存成「降级描述」，供附件超预算被裁时纯文本退化。
+        result += mediaText(seg);
         parts.push(seg);
       } else {
         // 走解释器/无法查看：退化成纯文本（就地，不动位置）
@@ -97,20 +100,16 @@ export class MediaRenderer {
     attachments: MediaRef[],
   ): Promise<RichTextPart> {
     const row = await this.store.get(id);
-    if (!row) return { kind: "text", text: `[${TYPE_LABEL[type]}#${id}（已丢失）]` };
+    if (!row) return { kind: "text", text: `（${TYPE_LABEL[type]} media:${id} 已丢失，无法查看或发送。）` };
+
+    const caption = await this.captioner.describe(row.ref);
+    const part = mediaPart(row.ref, { summary: caption ?? undefined });
 
     if (this.nativeSupport(row.ref) && attachments.length < this.maxAttachments) {
       attachments.push(row.ref);
-      // marker（降级描述）：附件超预算被裁时，退化成「[图片#12：描述]」就地呈现，而不是骗人的「见附件」
-      const caption = await this.captioner.describe(row.ref);
-      const marker = caption
-        ? `[${TYPE_LABEL[type]}#${id}：${caption}]`
-        : `[${TYPE_LABEL[type]}#${id}]`;
-      return { kind: "media", ref: row.ref, marker };
+      return part;
     }
 
-    const caption = await this.captioner.describe(row.ref);
-    if (caption) return { kind: "text", text: `[${TYPE_LABEL[type]}#${id}：${caption}]` };
-    return { kind: "text", text: `[${TYPE_LABEL[type]}#${id}（无法查看内容）]` };
+    return { kind: "text", text: mediaText(part, caption ? "当前通过文字摘要了解内容，未展开原始媒体" : "当前无法查看内容") };
   }
 }

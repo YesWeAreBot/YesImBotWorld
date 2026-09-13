@@ -4,7 +4,7 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { GrowthLedger } from "../src/bot/growth.js";
-import type { BotEvent } from "../src/types.js";
+import type { BotEvent, StreamEntry } from "../src/types.js";
 
 async function main() {
   const base = await fs.mkdtemp(path.join(os.tmpdir(), "yesimbot-test-growth-"));
@@ -38,9 +38,57 @@ async function main() {
     assert.equal(revision.view.evidence[0]!.text, "喝了一杯苦咖啡");
     const reloaded = await new GrowthLedger(base).recall({ claimId });
     assert.deepEqual(reloaded, [revision.view]);
+    assert.deepEqual(await ledger.stats(), { perceivedEvents: 4, uniqueRoots: 3, claims: 1, records: 3 });
     assert.deepEqual(await new GrowthLedger(base, "visitor").recall(), []);
     await assert.rejects(new GrowthLedger(base, "visitor").reflect(input, 5), /未感知/);
-    console.log("PASS growth: perception boundary, provenance deduplication, counterevidence, revision history, persistence, actor isolation");
+
+    // Compression can remove every stream entry; original evidence remains queryable and referenceable.
+    const stored = await new GrowthLedger(base).recallEvidence({ keyword: "咖啡", n: 50 });
+    assert.equal(stored.length, 4);
+    assert.deepEqual(stored[0]!.rootEventIds, ["world_original_3"]);
+    stored[0]!.text = "tampered client view";
+    assert.equal((await ledger.recallEvidence({ eventIds: ["ev_3"] }))[0]!.text, "主动选择另一种咖啡豆");
+    assert.deepEqual(await new GrowthLedger(base, "visitor").recallEvidence(), []);
+
+    const recoveredBase = path.join(base, "interrupted");
+    const recovered = new GrowthLedger(recoveredBase);
+    const delivered: StreamEntry[] = [
+      { kind: "event", event: { ...event("ev_delivered", "一次实际聊天"), originEventIds: ["chat_original"] } },
+      { kind: "tool_call", call: { id: "tc_recall", role: "agent", name: "recall_growth", arguments: {}, issuedAt: 1, expectedAt: 1 } },
+      { kind: "event", event: { ...event("ev_recall", "重复读到旧认识", "tool"), refToolCallId: "tc_recall" } },
+      { kind: "event", event: { ...event("ev_empty_roots", "压缩摘要", "tool"), originEventIds: [] } },
+      { kind: "event", event: event("ev_system", "系统要求产生偏好", "system") },
+    ];
+    await recovered.restorePerceptions(delivered);
+    await recovered.restorePerceptions(delivered);
+    assert.deepEqual((await recovered.recallEvidence()).map(e => e.eventId), ["ev_delivered"]);
+    const repairedReflection = await recovered.reflect({ kind: "relationship", subject: "对话者", statement: "我们聊过一次", evidenceIds: ["ev_delivered"] }, 2);
+    assert.deepEqual(repairedReflection.view.records[0]!.rootEventIds, ["chat_original"]);
+
+    const invitations = new GrowthLedger(path.join(base, "invitations"));
+    for (let i = 1; i <= 23; i++) await invitations.perceive(event(`ev_${i}`, `亲历 ${i}`), [`origin_${i}`]);
+    await invitations.perceive(event("ev_reread", "重复的亲历"), ["origin_23"]);
+    assert.equal(await invitations.reflectionOpportunity(), null, "re-reading is not a new experience");
+    await invitations.perceive(event("ev_24", "第 24 个不同来源的亲历"), ["origin_24"]);
+    const opportunity = await invitations.reflectionOpportunity();
+    assert.equal(opportunity?.rootCount, 24);
+    assert.equal(opportunity?.eventIds.length, 6);
+    assert.equal(opportunity?.eventIds[0], "ev_24");
+    assert.ok(!opportunity?.eventIds.includes("ev_23"), "one representative for each original cause");
+    assert.deepEqual(await invitations.recall(), [], "an invitation must not manufacture a subjective claim");
+    await invitations.markReflectionOffered(opportunity!);
+    const resumedInvitations = new GrowthLedger(path.join(base, "invitations"));
+    assert.equal(await resumedInvitations.reflectionOpportunity(), null, "restart must not repeat an already delivered invitation");
+    for (let i = 25; i <= 48; i++) await resumedInvitations.perceive(event(`ev_${i}`, `亲历 ${i}`), [`origin_${i}`]);
+    assert.equal((await resumedInvitations.reflectionOpportunity())?.rootCount, 48);
+
+    // A crash halfway through the last JSONL write must not eat the next complete event.
+    const interruptedFile = path.join(base, "broken", "growth.jsonl");
+    await fs.mkdir(path.dirname(interruptedFile), { recursive: true });
+    await fs.writeFile(interruptedFile, '{"type":"perceived","evidence":');
+    await new GrowthLedger(path.dirname(interruptedFile)).perceive(event("ev_after_crash", "重新开始保存的亲历"));
+    assert.deepEqual((await new GrowthLedger(path.dirname(interruptedFile)).recallEvidence()).map(e => e.eventId), ["ev_after_crash"]);
+    console.log("PASS growth: perception boundary, source deduplication, revision history, persistence, compressed evidence recall, crash recovery, bounded reflection invitations and actor isolation");
   } finally { await fs.rm(base, { recursive: true, force: true }); }
 }
 main().catch((err) => { console.error(err); process.exitCode = 1; });

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { BOT_TOOLS } from "../src/bot/tools.js";
 import { BotAgent } from "../src/bot/agent.js";
 import { BotContext } from "../src/bot/context.js";
 import { WorldFiles } from "../src/files.js";
@@ -24,7 +25,7 @@ async function fixture(overrides: Record<string, unknown> = {}, world: any = {})
   const epoch = Date.now();
   const clock = { now: () => (Date.now() - epoch) / 1000, unitRealSeconds: 1, timeLine: () => "T", realMsUntil: (t: number) => Math.max(0, (t - (Date.now() - epoch) / 1000) * 1000) } as any;
   const config = { bot: { baseURL: "http://invalid", model: "fake", nativeToolCalls: false, repeatThresholds: [2], repeatExclude: [], maxTokens: 100, minIntervalMs: 3, maxWindowChars: 100000, restCompressMinChars: 0, retryDelayMs: 1, breakLoop: false, spillMinChars: 0, waitRateThreshold: 0, ...overrides }, world: { waitNarrateMinRealSeconds: 0 }, platformOps: {} } as any;
-  const agent = new BotAgent(config, clock, files, context, world, {} as any, null, null, null, { down: false }, logger, []) as any;
+  const agent = new BotAgent(config, clock, files, context, world, {} as any, null, null, null, { down: false }, logger, BOT_TOOLS) as any;
   return { agent, context, files, clock };
 }
 async function lifecycle() {
@@ -70,7 +71,7 @@ async function contextWrites() {
   assert.equal(f.context.stream.length, 40);
   const snapshot = await f.context.compressionSnapshot();
   const next = { id: f.context.nextEventId(), source: "koishi" as const, content: "retain after snapshot", worldTime: 41 };
-  await Promise.all([f.context.appendEvent(next), f.context.persistPinned(), f.context.downgradeLastStatusEcho()]);
+  await Promise.all([f.context.appendEvent(next), f.context.persistPinned(), f.context.settled()]);
   await f.context.applyCompression({ historySummary: "summary", memoryDigest: "digest" }, 42, snapshot);
   assert.deepEqual(f.context.stream.map((e: any) => e.event.id), [next.id]);
   const restored = new BotContext(f.files, ""); await restored.load();
@@ -100,7 +101,7 @@ async function observationProvenance() {
   const received: any[] = [];
   const observation = { actorId: "visitor:authenticated-session", observationId: "obs_remote", sourceEventIds: ["original_speech"], entities: [], utterances: [], worldSequence: 1, observedAt: 0 };
   const f = await fixture({}, { observe: async (_actor: string, args: any) => { received.push(args); return observation; } });
-  const result = await f.agent.readStatus(call("self", "check_status", { target: "self" }));
+  const result = await f.agent.observe(call("self", "observe", { target: "self" }));
   assert.deepEqual(received[0], { target: undefined, modality: "self" });
   assert.deepEqual(result.originEventIds, ["original_speech"]);
   f.agent.pushEvent("world", JSON.stringify(observation));
@@ -167,7 +168,7 @@ async function lateReceipts() {
   assert.ok(!f.context.stream.some((entry: any) => entry.kind === "event" && entry.event.content === "外部动作已完成。"), "stopped context must not receive late writes");
   const inboxFiles = await fs.readdir(path.join(f.files.base, "bot-receipts")); assert.equal(inboxFiles.filter(name => name.endsWith(".json")).length, 1);
   const restored = new BotContext(f.files, ""); await restored.load();
-  const restarted = new BotAgent(f.agent.config, f.clock, f.files, restored, {}, {} as any, null, null, null, { down: false }, logger, []) as any;
+  const restarted = new BotAgent(f.agent.config, f.clock, f.files, restored, {}, {} as any, null, null, null, { down: false }, logger, BOT_TOOLS) as any;
   restarted.backend = f.agent.backend; restarted.start();
   await until(() => restored.stream.some((entry: any) => entry.kind === "event" && entry.event.content === "外部动作已完成。"));
   await restarted.draining;

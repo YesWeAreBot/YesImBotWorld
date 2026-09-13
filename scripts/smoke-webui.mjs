@@ -14,6 +14,7 @@ import smokeCockpit from './webui-smoke-cockpit.mjs';
 import smokeCommands from './webui-smoke-commands.mjs';
 import smokeAttachments from './webui-smoke-attachments.mjs';
 import smokeLayout from './webui-smoke-layout.mjs';
+import smokeNotes from './webui-smoke-notes.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const children = [];
@@ -134,6 +135,7 @@ try {
   console.log('PASS', await smokeLive(helpers));
   console.log('PASS', await smokeAttachments(helpers));
   console.log('PASS', await smokeCharts(helpers));
+  console.log('PASS', await smokeNotes(helpers));
   console.log('PASS', await smokeDevices(helpers));
   console.log('PASS', await smokeJourney(helpers));
   console.log('PASS', await smokeCockpit(helpers));

@@ -94,7 +94,7 @@ export class StructuredWorld {
       if (epoch !== this.epoch) return completed;
       const k = await this.kernel(); const action = k.snapshot().actions[id];
       const observation = await k.observe(actorId);
-      if (epoch === this.epoch) deliver(JSON.stringify({ observation, action: { id, status: action?.status, ...(action?.status === "failed" ? { reason: "动作未完成，请依据当前观测重新判断条件。" } : action?.status === "cancelled" ? { reason: "动作已取消。" } : {}) } }));
+      if (epoch === this.epoch) deliver(JSON.stringify({ observation, action: { id, intent: call.arguments.description, status: action?.status, ...(action?.status === "failed" ? { reason: "动作未完成，请依据当前观测重新判断条件。" } : action?.status === "cancelled" ? { reason: "动作已取消。" } : {}) } }));
       return completed;
     });
   }

@@ -69,12 +69,6 @@ export const BOT_TOOLS: BotToolDef[] = [
       "主动暂停自主思考一段时间，duration 以 TU 为单位，缺省或非正数使用 300 TU。有重要动静可提前恢复。此工具是休息计时，不提交睡姿或体力恢复；身体动作需要 act，身体状态以 observe 为准。记忆整理独立进行。",
   },
   {
-    name: "check_status",
-    signature: 'check_status(target: "self" | "world", full?: boolean)',
-    description:
-      "兼容旧用法：self 观察自身，world 观察周围；与 observe 一样只提供你此刻能感知到的信息。不会提供世界全局状态或他人的秘密。",
-  },
-  {
     name: "observe",
     signature: 'observe(target?: string, modality?: "all" | "sight" | "self")',
     description: "观察自己或周围。target 可填 self 或最近观察到的 observedId；modality 可选 all（默认，周围视觉与台词）、sight（视觉）或 self（自身状态）。返回可感知实体、属性及观察句柄；看不到的对象和秘密不会出现。行动时可把 observedId 交给 act 的 target。",
@@ -91,14 +85,8 @@ export const BOT_TOOLS: BotToolDef[] = [
   },
   {
     name: "recall_growth",
-    signature: 'recall_growth(kind?: "relationship" | "commitment" | "preference", subject?: string, keyword?: string, claim_id?: string, n?: number)',
-    description: "回顾自己的关系、承诺和偏好，包括原始感知证据、反例与过去的修正。它们是可修正的主观认识，不是世界真相或不可改变的性格。",
-  },
-  {
-    name: "check_time",
-    signature: "check_time()",
-    description:
-      "查询当前可见的计时信息，不自动掏手机或寻找时钟。本地返回结构化观测；没有可用读数时返回未知，不保证给出钟表时间。",
+    signature: 'recall_growth(scope?: "claims" | "evidence" | "all", event_ids?: string[], kind?: "relationship" | "commitment" | "preference", subject?: string, keyword?: string, claim_id?: string, n?: number)',
+    description: "回顾已经记录的认识与亲历。scope 默认 claims：关系、承诺、偏好及其证据；evidence：尚未整理或已归档的亲历，可用 event_ids 精确重读；all：两者。压缩后仍可找到原始事件 ID 并交给 reflect。keyword 与 n 两者通用，kind/subject/claim_id 仅筛选认识。主观认识可被修正，回忆本身不构成新证据。",
   },
   {
     name: "check_msg",
@@ -182,7 +170,7 @@ export const BOT_TOOLS: BotToolDef[] = [
     signature: "check_gallery(category?: string)",
     description:
       "翻看你的收藏夹。收藏夹按分类存放：表情包、meme、截图、照片、未整理。不带参数看总览（各分类的数量），" +
-      "带 category 打开某一类，列出每项的内容和描述（挑中后用 pick_media 插入输入框）。" +
+      "带 category 打开某一类，列出每项的内容和描述（挑中后用 pick_media 确认明确的媒体引用）。" +
       "发图先来这里挑；「未整理」里是主人放进来还没归类的东西，有空时看看（view_media）并用 gallery_move 整理。",
   },
   {
@@ -196,14 +184,14 @@ export const BOT_TOOLS: BotToolDef[] = [
     name: "view_media",
     signature: 'view_media(media: string[])',
     description:
-      '把几张图/几段媒体拿起来仔细看看。media 填媒体编号或收藏夹文件（如 ["12", "gallery:表情包/xx.png"]，最多 6 个）。' +
+      '把几张图/几段媒体拿起来仔细看看。media 填媒体编号或收藏夹文件（如 ["media:12", "gallery:表情包/xx.png"]，最多 6 个）。' +
       "**发图前拿不准内容时，先用它确认再发**——光凭文件名和一句摘要挑图很容易发错。整理「未整理」时也先用它看清内容。",
   },
   {
     name: "gallery_save",
     signature: 'gallery_save(media_id: string, category: string, description: string, name?: string)',
     description:
-      '把缓存里的媒体存进你的收藏夹（比如看到喜欢的表情包就存下来）。media_id 为媒体编号（如 "12"）；' +
+      '把缓存里的媒体存进你的收藏夹（比如看到喜欢的表情包就存下来）。media_id 为媒体编号（如 "media:12"）；' +
       "category 必须是：表情包 / meme / 截图 / 照片；description 用你自己的话写清这是什么、什么梗/情绪、适合什么场合发" +
       "——以后挑图全靠这段描述，别偷懒。name 可选，给它起个好记的文件名。",
   },
@@ -225,16 +213,17 @@ export const BOT_TOOLS: BotToolDef[] = [
     signature: 'send(msg: string, id?: string, media?: string[], reply_to?: string, at_sender?: boolean, resend?: boolean, confirm_long?: boolean, insist?: boolean)',
     description:
       "发送消息。id 缺省为当前所在频道页；要发给别的频道就给出完整频道 id（格式 \"platform:channelId\"）。" +
-      "要发**图文混排**时，在 msg 里要插图的位置写 `<img>` 占位符（几张图写几个 `<img>`）——" +
-      "这样消息不会立刻发出，而是提示你选图；你再用 pick_media 按占位符顺序选出对应张图，选满后尝试发送，仍受发送确认与限制约束，以成功回执为准。" +
-      "若只是想单纯发文字/在末尾附一张图，也可用 media 参数直接给媒体编号。",
+      '图文混排在 msg 原位置使用明确引用，如「先看这张 <media ref="media:12"/> 再看这张 <media ref="media:27"/>」。' +
+      "名称、摘要、原图属于同一个 media:N；不能把消息 msg:编号当成媒体编号。media 参数中的引用只在正文末尾追加，不填充槽位。reply_to 使用完整平台消息 ID（可能包含字母或符号），也可照抄 msg:ID；禁止从媒体引用或句子里抽数字。" +
+      "send 会尝试发送完整消息，仍受耗时、确认和频率限制；以发送回执为准。pick_media 只确认引用，不会自动发送。",
   },
   {
     name: "pick_media",
     signature: 'pick_media(media: string[])',
     description:
-      "按 msg 里 `<img>` 占位符的顺序选图填充（结合 send 的图文混排用）。media 为媒体编号或收藏夹文件的列表（如 [\"12\", \"gallery:表情包/xx.png\"]）。" +
-      "发图务必先用 check_gallery / check_media / view_media 看清内容——光凭编号随手选很容易发出不相关的图。选了 N 张就填 N 个占位符，填满后尝试发送，仍可能要求确认，以成功回执为准。",
+      '确认所选媒体的明确引用。media 填 media:N 或 gallery:分类/文件名，如 ["media:12", "gallery:表情包/xx.png"]，最多 9 项。' +
+      '返回可放入 send.msg 的 <media ref="media:N"/>，或在 send.media 末尾追加。此操作不会发送、创建待填槽草稿或自动触发 send。' +
+      "内容不确定时先用 view_media 查看对应原图；收藏夹同名文件要带完整分类。",
   },
   {
     name: "unsend",
@@ -278,7 +267,7 @@ export const BOT_TOOLS: BotToolDef[] = [
     name: "ocr_image",
     signature: 'ocr_image(image: string)',
     description:
-      '仔细辨认一张图片里的文字（逐字识别，适合看清截图、菜单、告示上的字）。image 填图片编号（如 "12"）或收藏夹文件（如 "gallery:menu.png"）。',
+      '仔细辨认一张图片里的文字（逐字识别，适合看清截图、菜单、告示上的字）。image 填图片编号（如 "media:12"）或收藏夹文件（如 "gallery:menu.png"）。',
   },
   {
     name: "poke",
@@ -317,7 +306,7 @@ export const BOT_TOOLS: BotToolDef[] = [
     name: "set_profile",
     signature: 'set_profile(nickname?: string, signature?: string, avatar?: string)',
     description:
-      '修改你的聊天账号资料：昵称、个性签名、头像。avatar 填图片编号（如 "12"）或收藏夹文件（如 "gallery:me.png"）。至少给一个参数。',
+      '修改你的聊天账号资料：昵称、个性签名、头像。avatar 填图片编号（如 "media:12"）或收藏夹文件（如 "gallery:me.png"）。至少给一个参数。',
   },
   {
     name: "set_model_show",
@@ -378,7 +367,7 @@ export const BOT_TOOLS: BotToolDef[] = [
   {
     name: "set_group_portrait",
     signature: 'set_group_portrait(id: string, image: string)',
-    description: '修改群头像（需要管理员权限）。image 填图片编号（如 "12"）或收藏夹文件。',
+    description: '修改群头像（需要管理员权限）。image 填图片编号（如 "media:12"）或收藏夹文件。',
   },
   {
     name: "send_group_notice",
@@ -430,18 +419,6 @@ export const BOT_TOOLS: BotToolDef[] = [
     name: "cancel",
     signature: "cancel(id: string)",
     description: '取消尚未提交的工具调用（如还没开始发送的消息）。已提交的操作不能保证撤销，真实结果仍会返回。id 是工具调用编号（形如 "tc_12"）。',
-  },
-  {
-    name: "recall",
-    signature: "recall(keyword?: string, since?: number, until?: number, n?: number, important?: boolean)",
-    description:
-      "查看旧版世界作者留下的私人资料（facts.jsonl）。这些记录未经当前感知核实，可能不完整或过时，不能当作新的成长证据；可验证的关系、承诺与偏好请用 recall_growth。\n" +
-      "- keyword：按关键词回想（模糊匹配内容），如 recall(keyword: \"童年\")；\n" +
-      "- since / until：只回想 T（时间单位）落在该范围内的往事，填 T 的数值（可在结果里的「T=12.5」或 check_time 里看到），可只给一端；\n" +
-      "- important: true：只回想那些刻骨铭心、对你影响深远的重要回忆；\n" +
-      "- n：最多回想多少条（默认 10）。\n" +
-      "不确定从哪想起时可先不带参数，看看近来的过往；被问起经历、要说自己的过去、或感到自己可能" +
-      "忘了什么时，用它确认记忆，别乱编。",
   },
 ];
 
@@ -585,7 +562,7 @@ export function availableTools(opts: {
           `已安装的应用：${opts.apps.map((a) => `${a.name}（${a.description}）`).join("、")}。`,
       };
     }
-    if (["send", "pick_media"].includes(def.name) && opts.ignoreSendDuration) {
+    if (def.name === "send" && opts.ignoreSendDuration) {
       def = { ...def, description: def.description + "当前配置忽略发送耗时：一旦满足发送条件就立即发送，duration 不会延后发送或提供取消窗口。" };
     }
     // travel 的描述里列出可去的世界

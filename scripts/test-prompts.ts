@@ -83,7 +83,11 @@ async function main() {
       backend.client = { complete: async (messages: any[], options: any) => {
         count++;
         const system = messages[0].content;
-        if (nativeToolCalls) { assert.equal(options.tools[0].function.name, "observe"); assert.match(system, /调用接口（function calling）/); }
+        if (nativeToolCalls) {
+          assert.equal(options.tools[0].function.name, "observe");
+          assert.match(system, /已有原生声明的能力使用 function calling/);
+          assert.match(system, /尚未包含在固定原生声明中.*完整正文 JSON/);
+        }
         else { assert.equal(options.tools, undefined); assert.match(system, /本次使用正文 JSON 协议/); }
         return { content: '{"name":"observe","arguments":{},"duration":0}', toolCalls: [] };
       } };

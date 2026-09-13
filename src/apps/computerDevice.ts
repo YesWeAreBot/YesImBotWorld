@@ -51,7 +51,13 @@ export class ComputerDevice {
     private reserved: Set<string>,
     private logger: Logger,
     private otherToolNames: () => string[] = () => [],
+    private realWorld: boolean = clock.syncRealTime,
   ) {}
+
+  /** Configured capability, without starting a container or connecting to the desktop. */
+  get available(): boolean {
+    return !this.realWorld || (this.cfg.mode !== "off" && (this.cfg.mode !== "remote_desktop" || !!this.remote));
+  }
 
   /** 电脑是否已开机 */
   get isOpen(): boolean {
@@ -98,12 +104,12 @@ export class ComputerDevice {
 
   /** 当前展开的电脑工具名（供动态加入允许列表 / GBNF 语法） */
   activeToolNames(): string[] {
-    return this.active ? [...this.active.toolMap.keys()] : [];
+    return this.active ? [...this.active.toolMap].filter(([, entry]) => entry.app.connected !== false).map(([name]) => name) : [];
   }
 
   /** 当前展开的电脑工具完整定义（供原生 tools 声明） */
   activeToolDefs(): AppToolDef[] {
-    return this.active?.defs ?? [];
+    return this.active?.defs.filter(def => this.active?.toolMap.get(def.name)?.app.connected !== false) ?? [];
   }
 
   view(): { lastTool?: string; result?: string | RichText } | null {
@@ -111,7 +117,8 @@ export class ComputerDevice {
   }
 
   hasTool(name: string): boolean {
-    return this.active?.toolMap.has(name) ?? false;
+    const entry = this.active?.toolMap.get(name);
+    return !!entry && entry.app.connected !== false;
   }
 
   /** 调用电脑的一个工具 */
@@ -119,6 +126,7 @@ export class ComputerDevice {
     if (!this.active) throw new Error("当前没有打开电脑");
     const entry = this.active.toolMap.get(exposed);
     if (!entry) throw new Error(`电脑没有 ${exposed} 这个操作`);
+    if (entry.app.connected === false) throw new Error("电脑组件连接已断开，请重新打开电脑会话后查看可用操作");
     const active = this.active;
     const result = await entry.app.call(entry.tool, args);
     if (this.active === active) { active.lastTool = exposed; active.result = result; }
@@ -129,7 +137,7 @@ export class ComputerDevice {
 
   private async isRealWorld(): Promise<boolean> {
     const meta = await this.files.readMeta();
-    return meta.realWorld ?? this.clock.syncRealTime;
+    return this.realWorld = meta.realWorld ?? this.clock.syncRealTime;
   }
 
   /** 打开一组电脑组件（终端/资源管理器，或远程桌面），收集并展开它们的工具 */

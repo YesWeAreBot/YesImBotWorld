@@ -16,25 +16,15 @@ import type { Logger } from "koishi";
 import type { WorldClock } from "../clock.js";
 import type { WorldFiles } from "../files.js";
 import type { AppRawTool, WorldApp } from "./app.js";
+import { compareNotes, noteStamp, noteTimeText, readNoteFile, sanitizeNoteTitle, saveNoteFile, type NoteDocument } from "../notes.js";
 
 /** 单条笔记的内容上限（防止 Bot 无限往一条日记里追加，最终撑爆上下文） */
 const MAX_NOTE_CHARS = 20_000;
 const PREVIEW_CHARS = 40;
-/** 文件名（标题）长度上限 */
-const MAX_TITLE_CHARS = 60;
 
-interface NoteMeta {
-  created?: string;
-  updated?: string;
-  /** 用于排序的世界时刻（从 frontmatter 的 T=xx 解析；没有则退回文件 mtime 的负数区分） */
-  sortKey: number;
-}
-
-interface NoteFile {
+interface NoteFile extends NoteDocument {
   title: string;
   file: string;
-  meta: NoteMeta;
-  content: string;
 }
 
 export class NotesApp implements WorldApp {
@@ -52,7 +42,7 @@ export class NotesApp implements WorldApp {
     const notes = await this.loadAll();
     const recent = notes
       .slice(0, 5)
-      .map((n) => `- 「${n.title}」${n.meta.updated ? `（更新于 ${n.meta.updated}）` : ""}`);
+      .map((n) => `- 「${n.title}」（更新于 ${noteTimeText(n.updated)}）`);
     const opening = notes.length
       ? `你打开了记事本，里面有 ${notes.length} 篇笔记。最近更新：\n${recent.join("\n")}`
       : "你打开了记事本，里面还是空的。值得记住的事、备忘、对人的印象、日记，都可以随手记下来。";
@@ -60,8 +50,8 @@ export class NotesApp implements WorldApp {
       tools: [
         {
           name: "list_notes",
-          description: "列出记事本里的全部笔记（标题、更新时间与开头预览）",
-          inputSchema: { type: "object", properties: {} },
+          description: "列出笔记的标题、创建时间、最近编辑时间与开头预览。sort 可选 updated（最近编辑倒序，默认）或 created（创建倒序）；世界时间与仅有文件时间的笔记分别排序，不混用 TU 和现实时间。",
+          inputSchema: { type: "object", properties: { sort: { type: "string", enum: ["updated", "created"], default: "updated" } } },
         },
         {
           name: "view_note",
@@ -117,7 +107,7 @@ export class NotesApp implements WorldApp {
   async call(tool: string, args: Record<string, unknown>): Promise<string> {
     switch (tool) {
       case "list_notes":
-        return this.listNotes();
+        return this.listNotes(args);
       case "view_note":
         return this.viewNote(args);
       case "write_note":
@@ -137,37 +127,29 @@ export class NotesApp implements WorldApp {
 
   // ---------- 操作 ----------
 
-  private async listNotes(): Promise<string> {
-    const notes = await this.loadAll();
+  private async listNotes(args: Record<string, unknown>): Promise<string> {
+    if (args.sort != null && args.sort !== "updated" && args.sort !== "created") throw new Error("sort 须为 updated 或 created");
+    const order = args.sort === "created" ? "created" : "updated";
+    const notes = (await this.loadAll()).sort((a, b) => compareNotes(a, b, order));
     if (!notes.length) {
       return "记事本还是空的。（用 write_note 记下第一篇吧）";
     }
     const lines = notes.map(
       (n) =>
-        `「${n.title}」${n.meta.updated ? ` [更新于 ${n.meta.updated}]` : ""} ${preview(n.content)}`,
+        `「${n.title}」[创建 ${noteTimeText(n.created)}；最近编辑 ${noteTimeText(n.updated)}] ${preview(n.content)}`,
     );
-    return `你的笔记（${notes.length} 篇，按最近更新排序）：\n${lines.join("\n")}`;
+    return `你的笔记（${notes.length} 篇，按${order === "created" ? "创建" : "最近编辑"}时间倒序；世界时间优先，文件/现实时间另组排序）：\n${lines.join("\n")}`;
   }
 
   private async viewNote(args: Record<string, unknown>): Promise<string> {
     const note = await this.find(args.title);
     if (!note) return this.notFound(args.title);
-    const when =
-      note.meta.created || note.meta.updated
-        ? `（${[
-            note.meta.created ? `写于 ${note.meta.created}` : "",
-            note.meta.updated && note.meta.updated !== note.meta.created
-              ? `最后更新于 ${note.meta.updated}`
-              : "",
-          ]
-            .filter(Boolean)
-            .join("，")}）\n`
-        : "";
+    const when = `（创建 ${noteTimeText(note.created)}；最近编辑 ${noteTimeText(note.updated)}）\n`;
     return `「${note.title}」\n${when}\n${note.content}`;
   }
 
   private async writeNote(args: Record<string, unknown>): Promise<string> {
-    const title = sanitizeTitle(String(args.title ?? ""));
+    const title = sanitizeNoteTitle(String(args.title ?? ""));
     if (!title) return "（标题不能为空，也不能全是特殊字符。）";
     const content = String(args.content ?? "").trim();
     if (!content) return "（正文是空的，没有记下。）";
@@ -178,8 +160,8 @@ export class NotesApp implements WorldApp {
     if (await exists(file)) {
       return `（已经有一篇叫「${title}」的笔记了。换个标题，或者用 edit_note 修改它。）`;
     }
-    const now = this.stamp();
-    await this.save(file, { created: now, updated: now }, content);
+    const now = noteStamp(this.clock);
+    await saveNoteFile(file, content, now, now);
     return `已记下「${title}」。`;
   }
 
@@ -187,7 +169,7 @@ export class NotesApp implements WorldApp {
     const note = await this.find(args.title);
     if (!note) return this.notFound(args.title);
 
-    const newTitle = args.new_title != null ? sanitizeTitle(String(args.new_title)) : "";
+    const newTitle = args.new_title != null ? sanitizeNoteTitle(String(args.new_title)) : "";
     const content = args.content != null ? String(args.content) : "";
     const append = args.append === true || args.append === "true";
     if (!newTitle && !content.trim()) {
@@ -217,7 +199,7 @@ export class NotesApp implements WorldApp {
       changes.push(`标题（原「${note.title}」）`);
     }
 
-    await this.save(file, { created: note.meta.created, updated: this.stamp() }, body);
+    await saveNoteFile(file, body, note.created, noteStamp(this.clock));
     return `「${title}」已更新：${changes.join("、")}。`;
   }
 
@@ -234,12 +216,7 @@ export class NotesApp implements WorldApp {
     return path.join(this.files.notesDir, `${title}.md`);
   }
 
-  private stamp(): string {
-    const t = this.clock.now();
-    return `${this.clock.clockString(t)}（T=${t.toFixed(1)}）`;
-  }
-
-  /** 读取全部笔记，按最近更新排序（frontmatter 的 T 优先，用户手动放入的文件退回 mtime） */
+  /** Share timestamp handling with the WebUI; never sort world TU against Unix milliseconds. */
   private async loadAll(): Promise<NoteFile[]> {
     let entries: string[] = [];
     try {
@@ -251,19 +228,12 @@ export class NotesApp implements WorldApp {
     for (const name of entries) {
       const file = path.join(this.files.notesDir, name);
       try {
-        const raw = await fs.readFile(file, "utf8");
-        const { meta, content } = parseNote(raw);
-        if (meta.sortKey < 0) {
-          // frontmatter 里没有世界时刻（用户手动放入的文件）：用 mtime 排序，但排在有 T 的笔记之后
-          const stat = await fs.stat(file).catch(() => null);
-          meta.sortKey = stat ? -1 / Math.max(1, stat.mtimeMs) : -1;
-        }
-        notes.push({ title: name.replace(/\.md$/i, ""), file, meta, content });
+        notes.push({ title: name.replace(/\.md$/i, ""), file, ...await readNoteFile(file) });
       } catch (err) {
         this.logger.warn("笔记读取失败（%s）: %s", name, err);
       }
     }
-    return notes.sort((a, b) => b.meta.sortKey - a.meta.sortKey);
+    return notes.sort(compareNotes);
   }
 
   /** 按标题找笔记（精确匹配优先，容忍大小写与首尾空白差异） */
@@ -278,17 +248,6 @@ export class NotesApp implements WorldApp {
     );
   }
 
-  private async save(file: string, meta: { created?: string; updated?: string }, content: string): Promise<void> {
-    const fm =
-      `---\n` +
-      (meta.created ? `created: ${meta.created}\n` : "") +
-      (meta.updated ? `updated: ${meta.updated}\n` : "") +
-      `---\n\n`;
-    const tmp = `${file}.tmp`;
-    await fs.writeFile(tmp, fm + content + "\n");
-    await fs.rename(tmp, file);
-  }
-
   private async notFound(rawTitle: unknown): Promise<string> {
     const notes = await this.loadAll();
     const hint = notes.length
@@ -296,34 +255,6 @@ export class NotesApp implements WorldApp {
       : "记事本还是空的";
     return `（记事本里没有叫「${String(rawTitle ?? "?")}」的笔记。${hint}。）`;
   }
-}
-
-/** 标题 → 安全的文件名：去掉路径分隔与文件系统非法字符，限长 */
-function sanitizeTitle(raw: string): string {
-  return raw
-    .trim()
-    .replace(/[/\\:*?"<>|\u0000-\u001f]/g, " ")
-    .replace(/\s+/g, " ")
-    .slice(0, MAX_TITLE_CHARS)
-    .replace(/^[\s.]+/, "") // 最后去前导点/空白：防止隐藏文件与相对路径伪装
-    .trim();
-}
-
-/** 解析笔记文件：frontmatter（可选）→ 元数据 + 正文 */
-function parseNote(raw: string): { meta: NoteMeta; content: string } {
-  const meta: NoteMeta = { sortKey: -1 };
-  let content = raw;
-  const m = raw.match(/^---\n([\s\S]*?)\n---\n?/);
-  if (m) {
-    content = raw.slice(m[0].length);
-    for (const line of m[1]!.split("\n")) {
-      const kv = line.match(/^(created|updated):\s*(.+)$/);
-      if (kv) meta[kv[1] as "created" | "updated"] = kv[2]!.trim();
-    }
-    const t = meta.updated?.match(/T=([\d.]+)/) ?? meta.created?.match(/T=([\d.]+)/);
-    if (t) meta.sortKey = Number(t[1]);
-  }
-  return { meta, content: content.trim() };
 }
 
 function preview(content: string): string {

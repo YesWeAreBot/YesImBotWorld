@@ -43,30 +43,6 @@ export interface MediaRef {
   file: string;
 }
 
-/**
- * 待填充的图文混排发送缓冲：send 的 msg 里带了 `<img>` 占位符时，不立即发出，
- * 而是暂存这条消息，等 Bot 用 pick_media 逐个/批量选图填充占位符，填满后自动发送。
- * 这是给「图文混排」轻量用的缓冲，只存 msg 文本 + 占位符位置 + 已选图，不是完整的光标输入框。
- */
-export interface PendingImageFill {
-  /** 目标频道 key（send 时确定） */
-  channelKey: string;
-  /** 引用回复目标（可选） */
-  replyTo?: string;
-  /** 引用时是否自动 @ 原发送人 */
-  atSender: boolean;
-  /** 原始 msg 文本（含 `<img>` 占位符） */
-  msg: string;
-  /** `<img>` 占位符数量 */
-  placeholderCount: number;
-  /** 已选定并按占位符顺序填充的媒体（每个元素：媒体引用 + 是否表情包） */
-  filled: { ref: MediaRef; sticker: boolean }[];
-  /** 发送时透传的参数 */
-  insist: boolean;
-  confirmLong: boolean;
-  resend: boolean;
-}
-
 /** 选图解析成功：得到具体媒体引用 + 是否表情包 */
 export interface PickResult {
   ok: true;
@@ -84,7 +60,7 @@ export interface PickFailure {
 /** RichText 的一个有序分段：文本段 或 原生媒体段（图文混排按此顺序铺开） */
 export type RichTextPart =
   | { kind: "text"; text: string }
-  | { kind: "media"; ref: MediaRef; marker: string };
+  | { kind: "media"; ref: MediaRef; name?: string; summary?: string; marker: string };
 
 /** 带附件的富文本（附件 = Bot-LLM 原生支持的模态，以 content part 注入） */
 export interface RichText {
@@ -95,7 +71,7 @@ export interface RichText {
   /**
    * 图文有序分段（含原生附件时提供）：按此顺序把文字与媒体交错呈现，
    * 使聊天记录等场景能"图文按位置混排"而非"文字在前、图片堆在后"。
-   * 缺省时回退到旧的 text + attachments 拼接行为。
+   * 媒体身份、名称、摘要与原始内容必须在同一分段内绑定；新事件不可用附件顺序猜测位置。
    */
   parts?: RichTextPart[];
   /**
@@ -133,10 +109,7 @@ export interface BotEvent {
   parts?: RichTextPart[];
   /**
    * act 结果后的当前状态回显（Bot_Status.md 全文）。
-   * 仅最新一处 act 结果事件携带完整回显；新 act 结果追加前，上一处的完整回显会
-   * 退化为一句轻提示（见 BotContext.downgradeLastStatusEcho）。这样历史里永远只有
-   * 最新一处是完整状态，既给模型"现状感"（消除结果丢失焦虑、抑制复读），又避免
-   * 过时状态误导 + 每次 act 的 token 无限累积。
+   * 历史回显是发生时的观测，追加新回显不能删改旧条目；仅压缩时整理历史。
    */
   statusEcho?: string;
 }

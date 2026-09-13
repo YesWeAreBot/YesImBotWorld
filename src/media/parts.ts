@@ -74,6 +74,9 @@ export function createAttachmentLoader(
     return mediaToContentPart(ref, data);
   };
   const loader = (async (ref: MediaRef) => {
+    const supported = ref.type === "image" && ref.mime === "image/gif"
+      ? modalities.image || modalities.video : modalities[ref.type];
+    if (!supported) return null;
     const cached = cache.get(ref.id);
     if (cached) return cached;
     try {

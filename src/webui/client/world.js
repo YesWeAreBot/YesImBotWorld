@@ -278,7 +278,7 @@
             content.replaceChildren();
             var found = rows.filter(function (r) { return (kind === 'all' || r.kind === kind) && (!q || (r.subject + ' ' + r.statement).toLowerCase().includes(q)); });
             if (!found.length) {
-                content.appendChild(el('section', { cls: 'studio-panel growth-empty' }, [Studio.empty(rows.length ? '没有匹配的认识' : '经历，会慢慢留下痕迹', rows.length ? '尝试其他关键词或成长类型。' : '角色需要先观察世界、经历事件，再引用这些证据形成认识。这里会展示真实产生的关系、承诺与偏好。')]));
+                content.appendChild(el('section', { cls: 'studio-panel growth-empty' }, [Studio.empty(rows.length ? '没有匹配的认识' : '尚未形成成长记录', rows.length ? '尝试其他关键词或成长类型。' : '聊天、日记和上下文压缩不会自动生成认识。角色需要引用亲身经历，主动整理关系、承诺或偏好；没有记录不代表没有经历，也不需要为填满这里而制造结论。')]));
                 return;
             }
             if (!found.some(function (r) { return r.claimId === selected; }))

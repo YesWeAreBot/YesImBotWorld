@@ -37,6 +37,10 @@ export async function smokeJourney({ evaluate, wait, assert, navigate }) {
       const call = { method, path, body: body === undefined ? undefined : structuredClone(body) };
       record.calls.push(call);
       call.promise = record.api(method, path, body);
+      if (record.delayNextActResponse && path === '/api/player/task' && body?.kind === 'act') {
+        record.delayNextActResponse = false;
+        call.promise = call.promise.then(result => new Promise(resolve => { record.releaseActResponse = () => resolve(result); }));
+      }
       return call.promise;
     };
   });
@@ -67,7 +71,18 @@ export async function smokeJourney({ evaluate, wait, assert, navigate }) {
       document.querySelectorAll('.journey-two-fields select option').length > 1),
     'An observation presents the actor and observed action targets.');
 
+    assert(await run(()=>document.querySelectorAll('.journey-live-status [data-live-source]').length === 2), 'Independent actors see both permitted LLM status lanes.');
+    await run(async()=>{
+      const input=document.querySelector('.journey-action-input'); window.__journeySmoke.imeNode=input; input.focus(); input.value='尚在编写';input.dispatchEvent(new Event('input',{bubbles:true}));input.dispatchEvent(new CompositionEvent('compositionstart',{bubbles:true}));
+      const arrive=window.__journeySmoke.calls.find(c=>c.path==='/api/player/arrive');
+      const token=(await arrive.promise).token;
+      await api('POST','/api/player/task',{token,taskId:'observe_ime_test',kind:'observe',payload:{}});
+    });
+    await run(()=>new Promise(resolve=>setTimeout(resolve,300)));
+    assert(await run(()=>window.__journeySmoke.imeNode===document.querySelector('.journey-action-input')&&document.activeElement===window.__journeySmoke.imeNode&&window.__journeySmoke.imeNode.value==='尚在编写'), 'Crossing SSE updates preserve the actual composing input node.');
+    await run(()=>{const n=window.__journeySmoke.imeNode;n.dispatchEvent(new CompositionEvent('compositionend',{bubbles:true}));n.blur();});
     await run(() => {
+      document.querySelector('.journey-action .cockpit-options').open=true;
       const input = (selector, value) => {
         const node = document.querySelector(selector);
         node.value = value;
@@ -92,6 +107,18 @@ export async function smokeJourney({ evaluate, wait, assert, navigate }) {
         typeof call.body.payload.observationId === 'string' && !!call.body.payload.observationId;
     }), 'Action preserves separate intent, speech, duration, and observation handles.');
     checks.push('player arrival, observation, action payload and terminal receipt');
+
+    await run(()=>{
+      window.__journeySmoke.delayNextActResponse=true;
+      const input=document.querySelector('.journey-action-input');input.value='再次看看窗外';input.dispatchEvent(new Event('input',{bubbles:true}));
+      document.querySelector('.journey-action').requestSubmit();
+    });
+    await wait(`!document.querySelector('.journey-pending') && !!window.__journeySmoke.releaseActResponse`);
+    await run(()=>{
+      const input=document.querySelector('.journey-action-input');input.value='再次看看窗外';input.dispatchEvent(new Event('input',{bubbles:true}));
+      window.__journeySmoke.releaseActResponse();return new Promise(resolve=>setTimeout(resolve,0));
+    });
+    assert(await run(()=>document.querySelector('.journey-action-input').value==='再次看看窗外'),'A delayed HTTP receipt does not erase a newly edited draft, even when its text equals the previous action.');
 
     // Submit, await HTTP acceptance, and cancel in one browser evaluation so the
     // fixture's delayed SSE receipt cannot race between several CDP round trips.

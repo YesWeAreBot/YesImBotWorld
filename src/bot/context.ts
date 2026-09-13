@@ -1,4 +1,5 @@
 import { promises as fs } from "node:fs";
+import { appendJsonLine } from "../jsonl.js";
 import type { WorldFiles } from "../files.js";
 import type { ChatMessage, ContentPart } from "../llm/chat.js";
 import type { AttachmentLoadFn } from "../media/parts.js";
@@ -6,13 +7,14 @@ import { BOT_PROMPT_DEFAULTS, type Prompts } from "../prompts.js";
 import type {
   BotEvent,
   CompressionResult,
-  MediaRef,
+  RichTextPart,
   PinnedContext,
   StreamEntry,
   ToolCallRecord,
 } from "../types.js";
 import { renderToolsText } from "./tools.js";
 import { canonicalizeArgs } from "./repeatGuard.js";
+import { mediaOpen, mediaPart, mediaText, richPartsText } from "../media/presentation.js";
 
 export interface CompressionSnapshot {
   entries: StreamEntry[];
@@ -67,17 +69,21 @@ export class BotContext {
   maxAttachmentsPerRequest = 8;
   /** 单次请求注入的附件总体积预算（base64 后的字符数） */
   maxAttachmentBytesPerRequest = 6 * 1024 * 1024;
-  /**
-   * 附件注入锚点：锚点之前的附件永久退化为文字（仅内存态，压缩/重启后自然重置）。
-   *
-   * 预算控制采用"锚点 + 批量淘汰"而非滑动窗口：滑动窗口每来一张新图就会改动一条旧消息
-   * （最老的入选附件被挤出），前缀缓存从那里断裂、几乎每次生成都要重算；
-   * 锚点方案只在越限时整批前移一次（水位降到一半），其余时间允许集只增不改，
-   * 新附件全部出现在流的末尾——前缀稳定，缓存重算被摊薄到每 N/2 张新图一次。
-   */
-  private attachAnchor = { pos: 0, skip: 0 };
+  /** Freeze admission and bytes for each event until compression; new images never evict old ones. */
+  private mediaWindow = this.newMediaWindow();
+  private newMediaWindow() {
+    return { events: new Map<string, Promise<ContentPart[]>>(), count: 0, bytes: 0, exceeded: false };
+  }
+  /** Ask the runtime to compact before the next generation if new images cannot fit. */
+  get attachmentBudgetExceeded(): boolean { return this.mediaWindow.exceeded; }
+  /** A rejected immutable media prefix must remain scheduled for compaction even if that attempt fails. */
+  requestAttachmentCompaction(): void { this.mediaWindow.exceeded = true; }
   private counters = { tool: 0, event: 0 };
   private toolsText: string;
+  private frozenSystemText: string | null = null;
+  private renderingRevision = 0;
+  /** Native declarations and rendered messages must start the same committed working window. */
+  get windowRevision(): number { return this.renderingRevision; }
   private mutationTail: Promise<void> = Promise.resolve();
   private needsRecovery = true;
 
@@ -90,7 +96,8 @@ export class BotContext {
     return next;
   }
 
-  async settled(): Promise<void> { await this.mutationTail; }
+  /** A rejected mutation leaves the queue usable, but an unfinished cutover still blocks generation. */
+  async settled(): Promise<void> { await this.mutate(async () => {}); }
 
   constructor(
     private files: WorldFiles,
@@ -101,7 +108,7 @@ export class BotContext {
     this.pinned.toolsText = this.toolsText;
   }
 
-  /** 当前生效的行为准则段（WebUI 覆盖后即时生效，无需重载） */
+  /** 最新行为准则；WebUI 覆盖将在下一次建立固定提示块时生效。 */
   private get constitution(): import("../prompts.js").BotPromptSet {
     return this.prompts?.bot ?? BOT_PROMPT_DEFAULTS;
   }
@@ -133,16 +140,20 @@ export class BotContext {
     // Identity is owner-authored; world snapshots are observations, never a system persona.
     this.pinned.persona = this.pinned.botDefinition;
     this.stream = [];
-    this.attachAnchor = { pos: 0, skip: 0 };
+    this.frozenSystemText = null;
+    this.mediaWindow = this.newMediaWindow();
     const raw = await this.files.readText(this.files.stream);
+    const seenIds = new Set<string>();
     for (const line of raw.split("\n")) {
       if (!line.trim()) continue;
       try {
         const entry = JSON.parse(line) as StreamEntry;
+        const id = entry.kind === "tool_call" ? entry.call?.id : entry.kind === "event" ? entry.event?.id : undefined;
+        if (typeof id !== "string" || !id || seenIds.has(id)) continue;
+        seenIds.add(id);
         this.stream.push(entry);
         // A crash between the append and counter save must not reuse an event ID.
-        const id = entry.kind === "tool_call" ? entry.call.id : entry.event.id;
-        const n = Number(id.split("_").at(-1));
+        const n = Number(id.match(entry.kind === "tool_call" ? /^tc_(\d+)$/ : /^ev_(\d+)$/)?.[1]);
         if (Number.isSafeInteger(n)) {
           const counter = entry.kind === "tool_call" ? "tool" : "event";
           this.counters[counter] = Math.max(this.counters[counter], n);
@@ -163,7 +174,13 @@ export class BotContext {
   }
 
   private async appendEntry(entry: StreamEntry): Promise<void> {
-    await fs.appendFile(this.files.stream, JSON.stringify(entry) + "\n");
+    const id = entry.kind === "tool_call" ? entry.call.id : entry.event.id;
+    const existing = this.stream.find(item => item.kind === "tool_call" ? item.call.id === id : item.event.id === id);
+    if (existing) {
+      if (JSON.stringify(existing) !== JSON.stringify(entry)) throw new Error(`上下文记录 ${id} 已存在且内容不同，拒绝覆盖历史`);
+      return; // The append succeeded earlier but the following pinned/counter save may have failed.
+    }
+    await appendJsonLine(this.files.stream, entry);
     this.stream.push(entry);
   }
 
@@ -191,56 +208,37 @@ export class BotContext {
     });
   }
 
-  /**
-   * 把「最近一处带完整状态回显的 act 结果事件」退化为轻提示：删除该事件的
-   * statusEcho（完整 Bot_Status.md 原文），改在正文末尾追加一句「你的状态已随之更新」。
-   *
-   * 用途：act 结果后回显的完整 bot_status 只在「最新一处」保留（给模型现状感、抑制复读），
-   * 更早的会退化为轻提示——既避免过时的状态误导模型，也避免每次 act 的 token 无限累积。
-   * 新 act 结果追加完整回显之前调用本方法（见 dispatchAct）。
-   *
-   * 注意：stream.jsonl 是 append-only，这里需要整体重写该文件以落地退化结果；
-   * 内存中的 stream 同步修改，保证本次与后续渲染一致。
-   */
-  async downgradeLastStatusEcho(): Promise<void> {
-    return this.mutate(() => this.downgradeLastStatusEchoUnlocked());
-  }
-
-  private async downgradeLastStatusEchoUnlocked(): Promise<void> {
-    let idx = -1;
-    for (let i = this.stream.length - 1; i >= 0; i--) {
-      const entry = this.stream[i]!;
-      if (entry.kind === "event" && entry.event.statusEcho) {
-        idx = i;
-        break;
-      }
-    }
-    if (idx < 0) return;
-    const entry = this.stream[idx]!;
-    if (entry.kind !== "event") return;
-    entry.event.statusEcho = undefined;
-    entry.event.content += "\n\n（你的状态已随之更新。）";
-    await this.rewriteStream();
-  }
-
-  /** 把内存中的 stream 整体重写回 stream.jsonl（原子写），用于"改写历史条目"类操作 */
-  private async rewriteStream(): Promise<void> {
-    const lines = this.stream.map((e) => JSON.stringify(e)).join("\n");
-    await this.files.atomicWrite(this.files.stream, lines ? lines + "\n" : "");
-  }
-
   // ---------- 渲染 ----------
 
   /** TU 换算说明（由 service 按时钟配置注入，如 "1 TU = 1 秒"）。Bot 估算 duration/wait 的锚点 */
   timeInfo = "";
   /** 聊天账号列表提供者（service 注入）：只含 platform:id，保持前缀稳定 */
   accountsProvider: (() => string) | null = null;
-  /** 常驻 Bot 名字提供者（service 注入）：运行时可变（世界演化可改名），渲染时实时取值 */
+  /** 常驻 Bot 名字提供者：只在建立新固定前缀时读取。 */
   botNameProvider: (() => string) | null = null;
   /** wait 工具被移除（service 按 bot.disableWait 注入）：行为准则不再提及等待 */
   waitRemoved = false;
 
   renderSystemText(timeLine: string, nativeToolCalls = true): string {
+    return this.frozenSystemText ??= this.buildSystemText(timeLine, nativeToolCalls);
+  }
+
+  /** Projection changes become a new prefix only after the previous window has been summarized. */
+  resetRenderingAfterCompression(): void {
+    this.frozenSystemText = null;
+    this.mediaWindow = this.newMediaWindow();
+    this.renderingRevision++;
+  }
+
+  /** Update the next compression's tool block. A brand-new, unused world may initialize it now. */
+  setCurrentToolsText(text: string): void {
+    this.toolsText = text;
+    if (!this.frozenSystemText && !this.stream.length && this.counters.tool === 0 && this.counters.event === 0 && this.pinned.updatedAt === 0) {
+      this.pinned.toolsText = text;
+    }
+  }
+
+  private buildSystemText(timeLine: string, nativeToolCalls = true): string {
     const accounts = this.accountsProvider?.() ?? "";
     const botName = this.botNameProvider?.()?.trim() ?? "";
     const c = this.constitution;
@@ -289,68 +287,60 @@ export class BotContext {
 
   static renderEventLine(event: BotEvent): string {
     const ref = event.refToolCallId ? ` ref="${event.refToolCallId}"` : "";
-    const echo = event.statusEcho ? `\n\n（你此刻的状态：\n${event.statusEcho}\n）` : "";
-    return `<event id="${event.id}" t="${event.worldTime.toFixed(1)}" src="${event.source}"${ref}>${event.content}${echo}</event>`;
+    const echo = event.statusEcho ? `\n\n（这条事件发生时你的状态：\n${event.statusEcho}\n）` : "";
+    return `<event id="${event.id}" t="${event.worldTime.toFixed(1)}" src="${event.source}"${ref}>${event.parts?.length ? richPartsText(event.parts) : event.content}${echo}</event>`;
   }
 
-  /**
-   * 把一个事件渲染成 chat 模式的 content parts。
-   * - 有原生附件且支持注入时，按 event.parts 的图文顺序交错（文字段 + image_url 段），
-   *   使聊天记录里的图片出现在对应位置，而不是全部堆在文字之后；
-   * - 无 parts / 无 loader / 附件越预算时，回退到"整段文字 + 平铺附件"的旧行为。
-   */
+  /** Render one immutable event, keeping each asset beside its own identity/summary. */
   private async renderEventChatParts(
     event: BotEvent,
     loader: AttachmentLoadFn | null,
-    allowed: Set<number>,
+    window: ReturnType<BotContext["newMediaWindow"]>,
   ): Promise<ContentPart[]> {
-    const refAttr = event.refToolCallId ? ` ref="${event.refToolCallId}"` : "";
-    const open = `<event id="${event.id}" t="${event.worldTime.toFixed(1)}" src="${event.source}"${refAttr}>`;
-    const echo = event.statusEcho ? `\n\n（你此刻的状态：\n${event.statusEcho}\n）` : "";
-    const close = `</event>`;
-
-    if (!event.parts || !loader) {
-      const parts: ContentPart[] = [{ type: "text", text: open + event.content + echo + close }];
-      if (loader && event.attachments) {
-        for (const ref of event.attachments) {
-          if (!allowed.has(ref.id)) continue;
-          const part = await loader(ref);
-          if (part) {
-            parts.push(part);
-            this.lastAttachmentPartTypes.add(part.type);
-          }
+    const existing = window.events.get(event.id);
+    if (existing) return structuredClone(await existing);
+    const task = (async () => {
+      const refAttr = event.refToolCallId ? ` ref="${event.refToolCallId}"` : "";
+      let buf = `<event id="${event.id}" t="${event.worldTime.toFixed(1)}" src="${event.source}"${refAttr}>`;
+      const out: ContentPart[] = [];
+      const flush = () => { if (buf) { out.push({ type: "text", text: buf }); buf = ""; } };
+      const eligible = new Set(event.attachments?.map(ref => ref.id) ?? []);
+      // Legacy events without ordered parts cannot establish image positions. Keep their text and
+      // explicitly identify the remaining media instead of pretending array order is message order.
+      const segments: RichTextPart[] = event.parts?.length ? event.parts : [
+        { kind: "text", text: event.content },
+        ...(event.attachments?.length ? [
+          { kind: "text" as const, text: "\n（以下为旧事件独立保存的媒体；原始插入位置未记录，不能据排列推断对应文字。）\n" },
+          ...event.attachments.map(ref => mediaPart(ref)),
+        ] : []),
+      ];
+      for (const seg of segments) {
+        if (seg.kind === "text") { buf += seg.text; continue; }
+        let part = loader && eligible.has(seg.ref.id) ? await loader(seg.ref) : null;
+        let reason = "当前未展开原始媒体；仅有此条目的身份与文字摘要";
+        if (part) {
+          const size = partPayloadSize(part);
+          if (window.count + 1 > this.maxAttachmentsPerRequest || window.bytes + size > this.maxAttachmentBytesPerRequest) {
+            part = null;
+            // A single asset larger than the whole budget cannot be fixed by repeated compaction.
+            if (window.count && size <= this.maxAttachmentBytesPerRequest && this.maxAttachmentsPerRequest > 0) window.exceeded = true;
+            reason = "本次媒体预算已满，尚未展开此媒体；整理记忆后可再次 view_media 查看，不能将摘要当作已看见原图";
+          } else { window.count++; window.bytes += size; }
         }
+        if (part) {
+          buf += mediaOpen(seg);
+          if (seg.ref.mime === "image/gif" && part.type === "image_url" && part.image_url.url.startsWith("data:image/png;")) {
+            buf += "这是同一动图按时间顺序抽帧的拼图，格子不是独立的多张图片。\n";
+          }
+          flush(); out.push(part); buf += "\n</media>";
+        } else buf += mediaText(seg, reason);
       }
-      return parts;
-    }
-
-    // 有 parts：按顺序把文字与图片交错成 content parts
-    const out: ContentPart[] = [];
-    let buf = open;
-    const flush = () => {
-      if (buf) {
-        out.push({ type: "text", text: buf });
-        buf = "";
-      }
-    };
-    for (const seg of event.parts) {
-      if (seg.kind === "text") {
-        buf += seg.text;
-        continue;
-      }
-      // media 段：预算内且可附 → image_url；否则退化为 marker 文本（[图片#x（见附件）]）
-      const part = allowed.has(seg.ref.id) ? await loader(seg.ref) : null;
-      if (part) {
-        flush();
-        out.push(part);
-        this.lastAttachmentPartTypes.add(part.type);
-      } else {
-        buf += seg.marker;
-      }
-    }
-    buf += echo + close;
-    flush();
-    return out;
+      if (event.statusEcho) buf += `\n\n（这条事件发生时你的状态：\n${event.statusEcho}\n）`;
+      buf += "</event>"; flush(); return out;
+    })();
+    window.events.set(event.id, task);
+    try { return structuredClone(await task); }
+    catch (error) { window.events.delete(event.id); throw error; }
   }
 
   renderStreamText(): string {
@@ -364,58 +354,20 @@ export class BotContext {
   }
 
   /**
-   * chat 模式：置顶区为 system，工具调用为 assistant，事件为 user（连续同角色合并）。
+   * chat 模式：置顶区为 system，工具调用为 assistant，事件为 user。
+   * 每条记录独立保留消息边界；后来同角色的事件也不能重开上次请求的末条消息。
    * 事件的原生多模态附件通过 attachmentLoader 转为 content part 注入。
    *
    * 附件按**每次请求的总预算**（数量 + 体积）注入：历史事件的附件每次请求都会重发，
    * 不设总预算的话 base64 会无限累积，最终撑爆服务端的请求体上限（413）。
-   * 预算从最新的事件往前分配，更早的附件退化为纯文字标记。
+   * 每个事件首次渲染时冻结其媒体内容与预算决策。新媒体超限只能追加说明，不能淘汰历史媒体。
    */
   async toChatMessages(timeLine: string, nativeToolCalls = true): Promise<ChatMessage[]> {
     await this.settled();
     const entries = structuredClone(this.stream);
     const loader = this.attachmentLoader && !this.attachmentsDisabled ? this.attachmentLoader : null;
-    const allowed = new Set<number>();
+    const window = this.mediaWindow;
     this.lastAttachmentPartTypes = new Set();
-    if (loader) {
-      // 1. 收集锚点之后的候选附件（单个超预算的永久跳过——决策稳定，不影响前缀）
-      const cands: { pos: number; skip: number; ref: MediaRef; size: number }[] = [];
-      for (let i = this.attachAnchor.pos; i < entries.length; i++) {
-        const entry = entries[i]!;
-        if (entry.kind !== "event" || !entry.event.attachments?.length) continue;
-        const from = i === this.attachAnchor.pos ? this.attachAnchor.skip : 0;
-        for (let k = from; k < entry.event.attachments.length; k++) {
-          const ref = entry.event.attachments[k]!;
-          const part = await loader(ref);
-          if (!part) continue;
-          const size = partPayloadSize(part);
-          if (size > this.maxAttachmentBytesPerRequest) continue;
-          cands.push({ pos: i, skip: k, ref, size });
-        }
-      }
-      // 2. 越限时整批前移锚点：把水位降到一半，换取之后一段时间允许集只增不改
-      const total = cands.reduce((s, c) => s + c.size, 0);
-      if (cands.length > this.maxAttachmentsPerRequest || total > this.maxAttachmentBytesPerRequest) {
-        const halfCount = Math.max(1, Math.floor(this.maxAttachmentsPerRequest / 2));
-        const halfBytes = Math.max(1, Math.floor(this.maxAttachmentBytesPerRequest / 2));
-        let keep = 0;
-        let bytes = 0;
-        for (let j = cands.length - 1; j >= 0; j--) {
-          if (keep + 1 > halfCount || bytes + cands[j]!.size > halfBytes) break;
-          keep++;
-          bytes += cands[j]!.size;
-        }
-        if (keep === 0 && cands.length) keep = 1; // 至少保留最新一个（其体积已 ≤ 总预算）
-        const kept = cands.slice(cands.length - keep);
-        const first = kept[0];
-        this.attachAnchor = first
-          ? { pos: first.pos, skip: first.skip }
-          : { pos: entries.length, skip: 0 };
-        for (const c of kept) allowed.add(c.ref.id);
-      } else {
-        for (const c of cands) allowed.add(c.ref.id);
-      }
-    }
 
     const built: { role: ChatMessage["role"]; parts: ContentPart[] }[] = [
       { role: "system", parts: [{ type: "text", text: this.renderSystemText(timeLine, nativeToolCalls) }] },
@@ -426,21 +378,10 @@ export class BotContext {
       if (entry.kind === "tool_call") {
         parts = [{ type: "text", text: BotContext.renderToolCallLine(entry.call) }];
       } else {
-        parts = await this.renderEventChatParts(entry.event, loader, allowed);
+        parts = await this.renderEventChatParts(entry.event, loader, window);
+        for (const part of parts) if (part.type !== "text") this.lastAttachmentPartTypes.add(part.type);
       }
-      const last = built[built.length - 1]!;
-      if (last.role === role) {
-        const lastPart = last.parts[last.parts.length - 1];
-        const first = parts[0]!;
-        if (lastPart?.type === "text" && first.type === "text") {
-          lastPart.text += "\n" + first.text;
-          last.parts.push(...parts.slice(1));
-        } else {
-          last.parts.push(...parts);
-        }
-      } else {
-        built.push({ role, parts });
-      }
+      built.push({ role, parts });
     }
     return built.map((m) => ({
       role: m.role,
@@ -456,7 +397,7 @@ export class BotContext {
         attachmentCost += entry.event.attachments.length * 2000;
       }
     }
-    return this.renderSystemText("").length + this.renderStreamText().length + attachmentCost;
+    return (this.frozenSystemText ?? this.buildSystemText("")).length + this.renderStreamText().length + attachmentCost;
   }
 
   /** 供压缩用：序列化当前工作窗口（把连续重复的工具调用折叠成一条汇总，避免千篇一律的历史占满压缩输入） */
@@ -497,11 +438,6 @@ export class BotContext {
       i = j;
     }
     return lines.join("\n");
-  }
-
-  /** 工作窗口中是否存在原生附件（400 熔断的判定条件之一） */
-  hasAttachments(): boolean {
-    return this.stream.some((e) => e.kind === "event" && !!e.event.attachments?.length);
   }
 
   /**
@@ -582,13 +518,19 @@ export class BotContext {
     await this.files.atomicWrite(this.files.stream, lines(commit.previousStream));
     await this.files.archiveStream();
     await this.files.atomicWrite(this.files.stream, lines(commit.stream));
+    const counters = {
+      tool: Math.max(this.counters.tool, commit.counters.tool),
+      event: Math.max(this.counters.event, commit.counters.event),
+    };
+    const persisted: PinnedPersist = { pinned: commit.pinned, counters };
+    await this.files.atomicWrite(this.files.pinned, JSON.stringify(persisted, null, 2));
+    await fs.rm(this.compressionCommitPath, { force: true });
+    // Publish one complete window only after both files and the recovery marker are committed.
+    // On any failure, reads keep the old coherent view and settled() must recover before rendering.
     this.stream = commit.stream;
     this.pinned = commit.pinned;
-    this.attachAnchor = { pos: 0, skip: 0 };
-    this.counters.tool = Math.max(this.counters.tool, commit.counters.tool);
-    this.counters.event = Math.max(this.counters.event, commit.counters.event);
-    await this.persistPinnedUnlocked();
-    await fs.rm(this.compressionCommitPath, { force: true });
+    this.counters = counters;
+    this.resetRenderingAfterCompression();
     this.needsRecovery = false;
   }
 

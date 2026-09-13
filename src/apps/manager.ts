@@ -100,21 +100,22 @@ export class AppManager {
 
   /** 当前展开的工具名（供动态加入允许列表/GBNF 语法） */
   activeToolNames(): string[] {
-    return this.current ? [...this.current.toolMap.keys()] : [];
+    return this.current && this.current.app.connected !== false ? [...this.current.toolMap.keys()] : [];
   }
 
   /** 当前展开的工具定义（用于打开时的用法说明） */
   activeToolDefs(): AppToolDef[] {
-    return this.current?.defs ?? [];
+    return this.current && this.current.app.connected !== false ? this.current.defs : [];
   }
 
   hasTool(name: string): boolean {
-    return this.current?.toolMap.has(name) ?? false;
+    return this.current?.app.connected !== false && (this.current?.toolMap.has(name) ?? false);
   }
 
   /** 调用当前 App 的一个工具 */
   async call(exposedName: string, args: Record<string, unknown>): Promise<string | RichText> {
     if (!this.current) throw new Error("当前没有打开的应用");
+    if (this.current.app.connected === false) throw new Error("当前应用的连接已断开，请重新打开应用后查看可用操作");
     const real = this.current.toolMap.get(exposedName);
     if (!real) throw new Error(`当前应用没有 ${exposedName} 这个操作`);
     const current = this.current;

@@ -1,7 +1,9 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import type { BotEvent } from "../types.js";
+import type { BotEvent, StreamEntry } from "../types.js";
+import { richPartsText } from "../media/presentation.js";
+import { appendJsonLine } from "../jsonl.js";
 
 export type GrowthKind = "relationship" | "commitment" | "preference";
 export type ReflectionRelation = "support" | "counter" | "revise";
@@ -51,13 +53,23 @@ export interface ReflectionInput {
   claimId?: string;
 }
 
-type LedgerLine = { type: "perceived"; evidence: PerceivedEvidence } | { type: "reflection"; record: GrowthRecord };
+export interface ReflectionOpportunity {
+  afterRootCount: number;
+  /** A stable checkpoint, so a restart does not repeat the same reminder. */
+  rootCount: number;
+  eventIds: string[];
+}
+
+type LedgerLine = { type: "perceived"; evidence: PerceivedEvidence } | { type: "reflection"; record: GrowthRecord }
+  | { type: "review_offered"; actorId: string; rootCount: number };
 
 /** Append-only subjective growth. This class deliberately has no access to the world event store. */
 export class GrowthLedger {
   readonly file: string;
   private evidence = new Map<string, PerceivedEvidence>();
   private records: GrowthRecord[] = [];
+  private roots = new Set<string>();
+  private reviewedRootCount = 0;
   private loaded: Promise<void> | null = null;
   private tail: Promise<void> = Promise.resolve();
 
@@ -77,8 +89,11 @@ export class GrowthLedger {
           try { item = JSON.parse(line); } catch { continue; } // tolerate an interrupted final append
           if (item.type === "perceived" && item.evidence?.actorId === this.actorId) {
             this.evidence.set(item.evidence.eventId, item.evidence);
+            item.evidence.rootEventIds.forEach(id => this.roots.add(id));
           } else if (item.type === "reflection" && item.record?.actorId === this.actorId) {
             this.records.push(item.record);
+          } else if (item.type === "review_offered" && item.actorId === this.actorId && Number.isSafeInteger(item.rootCount)) {
+            this.reviewedRootCount = Math.max(this.reviewedRootCount, item.rootCount);
           }
         }
       })();
@@ -94,20 +109,85 @@ export class GrowthLedger {
 
   private async append(item: LedgerLine): Promise<void> {
     await fs.mkdir(path.dirname(this.file), { recursive: true });
-    await fs.appendFile(this.file, JSON.stringify(item) + "\n");
+    await appendJsonLine(this.file, item);
   }
 
   async perceive(event: BotEvent, rootEventIds: string[] = [event.id]): Promise<void> {
+    return this.serial(() => this.perceiveUnlocked(event, rootEventIds));
+  }
+
+  private async perceiveUnlocked(event: BotEvent, rootEventIds: string[]): Promise<void> {
+    if (event.source === "system" || this.evidence.has(event.id)) return;
+    const roots = [...new Set(rootEventIds.filter((id) => typeof id === "string" && id.trim()))];
+    if (!roots.length) return; // derived memory/tool output cannot manufacture a fresh experience
+    const evidence: PerceivedEvidence = {
+      eventId: event.id, actorId: this.actorId, source: event.source,
+      observedAt: event.worldTime, text: event.parts?.length ? richPartsText(event.parts) : event.content, rootEventIds: roots,
+    };
+    await this.append({ type: "perceived", evidence });
+    this.evidence.set(event.id, evidence);
+    roots.forEach(id => this.roots.add(id));
+  }
+
+  /** Repair a crash between durable context delivery and the evidence append. Never read world history. */
+  async restorePerceptions(entries: readonly StreamEntry[]): Promise<void> {
     return this.serial(async () => {
-      if (event.source === "system" || this.evidence.has(event.id)) return;
-      const roots = [...new Set(rootEventIds.filter((id) => typeof id === "string" && id.trim()))];
-      if (!roots.length) return; // derived memory/tool output cannot manufacture a fresh experience
-      const evidence: PerceivedEvidence = {
-        eventId: event.id, actorId: this.actorId, source: event.source,
-        observedAt: event.worldTime, text: event.content, rootEventIds: roots,
-      };
-      await this.append({ type: "perceived", evidence });
-      this.evidence.set(event.id, evidence);
+      const derivedCalls = new Set(entries.flatMap(entry => entry.kind === "tool_call" &&
+        ["reflect", "recall_growth", "recall"].includes(entry.call.name) ? [entry.call.id] : []));
+      for (const entry of entries) {
+        if (entry.kind !== "event") continue;
+        const event = entry.event;
+        await this.perceiveUnlocked(event, event.refToolCallId && derivedCalls.has(event.refToolCallId)
+          ? [] : event.originEventIds ?? [event.id]);
+      }
+    });
+  }
+
+  /** These are original delivered experiences, including ones no longer in the working context. */
+  async recallEvidence(query: { eventIds?: string[]; source?: BotEvent["source"]; keyword?: string; n?: number } = {}): Promise<PerceivedEvidence[]> {
+    return this.serial(async () => {
+      const keyword = query.keyword?.trim().toLowerCase();
+      const ids = query.eventIds ? new Set(query.eventIds) : null;
+      const n = Math.max(1, Math.min(50, Math.floor(query.n ?? 10)));
+      return structuredClone([...this.evidence.values()].reverse().filter(e =>
+        (!ids || ids.has(e.eventId)) && (!query.source || query.source === e.source) &&
+        (!keyword || e.text.toLowerCase().includes(keyword)),
+      ).slice(0, n));
+    });
+  }
+
+  async stats(): Promise<{ perceivedEvents: number; uniqueRoots: number; claims: number; records: number }> {
+    return this.serial(async () => ({
+      perceivedEvents: this.evidence.size, uniqueRoots: this.roots.size,
+      claims: new Set(this.records.map(record => record.claimId)).size, records: this.records.length,
+    }));
+  }
+
+  /** A bounded invitation to deliberate; accumulating observations never manufactures a claim. */
+  async reflectionOpportunity(minimumFreshRoots = 24): Promise<ReflectionOpportunity | null> {
+    return this.serial(async () => {
+      if (this.roots.size - this.reviewedRootCount < minimumFreshRoots) return null;
+      const claimed = new Set(this.records.flatMap(record => record.rootEventIds));
+      const candidateRoots = new Set<string>();
+      const eventIds: string[] = [];
+      for (const evidence of [...this.evidence.values()].reverse()) {
+        const fresh = evidence.rootEventIds.filter(id => !claimed.has(id) && !candidateRoots.has(id));
+        if (!fresh.length) continue;
+        eventIds.push(evidence.eventId);
+        fresh.forEach(id => candidateRoots.add(id));
+        if (eventIds.length >= 6) break;
+      }
+      return eventIds.length ? { afterRootCount: this.reviewedRootCount, rootCount: this.roots.size, eventIds } : null;
+    });
+  }
+
+  /** Call only after the invitation itself has been appended to the actor's context. */
+  async markReflectionOffered(opportunity: ReflectionOpportunity): Promise<void> {
+    return this.serial(async () => {
+      const rootCount = Math.min(opportunity.rootCount, this.roots.size);
+      if (rootCount <= this.reviewedRootCount) return;
+      await this.append({ type: "review_offered", actorId: this.actorId, rootCount });
+      this.reviewedRootCount = rootCount;
     });
   }
 

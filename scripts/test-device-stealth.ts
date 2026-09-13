@@ -51,11 +51,9 @@ async function main() {
     }
     bot.scheduler.schedule({ id: "pending-wait", role: "agent", name: "wait", arguments: {}, issuedAt: 1, expectedAt: 60 }, { executeAt: "expected", run: async () => "wait receipt" });
     bot.waiting = { callId: "pending-wait", kind: "wait", startedTU: 1 };
-    const drafts = { msg: "Bot private unfinished draft" }; bot.pendingImageFill = drafts;
     assert.equal((await stealth("open_app", { name: "notes" })).ok, true);
     assert.equal(bot.manualMode, false); assert.equal(opens, 1);
     assert.equal(bot.scheduler.isPending("pending-wait"), true); assert.equal(bot.waiting.callId, "pending-wait");
-    assert.equal(bot.pendingImageFill, drafts);
     assert.equal(context.stream.length, 0, "stealth is never represented as Bot's own tool call");
     assert.equal(bot.mailbox.length, 0); assert.equal(peeks, 0, "unattended device does not capture or disclose content");
     bot.refreshToolGate();
@@ -73,7 +71,7 @@ async function main() {
     assert.ok(declared.includes("read_note"), "explicit observation restores the actual visible app tools");
     assert.equal(peeks, 1, "Bot sees the actual device when it next looks, without a hidden-operation history");
     assert.ok(bot.mailbox.some((event: any) => /当前可见界面.*记事本/.test(event.content)));
-    for (const [name, args] of [["check_time", {}], ["check_status", { target: "self" }], ["observe", { target: "self" }]] as const) {
+    for (const [name, args] of [["observe", { modality: "self" }], ["observe", { target: "self" }]] as const) {
       const id = await autonomous(name, args); await until(() => !bot.scheduler.isPending(id));
       assert.equal(bot.deviceAttention, "phone", `${name} must not invent looking away`);
     }
@@ -81,11 +79,14 @@ async function main() {
     const before = context.stream.length;
     await stealth("open_app", { name: "chat" });
     assert.equal(context.stream.length, before);
-    assert.equal(peeks, 2); assert.equal(bot.mailbox.length, 1);
-    assert.match(bot.mailbox[0].content, /当前可见界面.*聊天应用/);
-    assert.match(bot.mailbox[0].content, /actual visible screen/);
-    assert.doesNotMatch(bot.mailbox[0].content, /管理员|偷偷|人类|黑客|你打开了|疑惑|感到/);
+    assert.equal(peeks, 2);
+    const screen = bot.mailbox.filter((event: any) => /当前可见界面/.test(event.content));
+    assert.equal(screen.length, 1);
+    assert.match(screen[0].content, /当前可见界面.*聊天应用/);
+    assert.match(screen[0].content, /actual visible screen/);
+    assert.doesNotMatch(screen[0].content, /管理员|偷偷|人类|黑客|你打开了|疑惑|感到/);
     assert.equal(bot.scheduler.isPending("pending-wait"), true, "visible changes do not cancel unrelated autonomous tasks");
+    const pickUp = await autonomous("pick_up_phone"); await until(() => !bot.scheduler.isPending(pickUp));
     const putDown = await autonomous("put_down_phone"); await until(() => !bot.scheduler.isPending(putDown));
     bot.mailbox = []; const priorPeeks = peeks;
     await stealth("open_app", { name: "notes" });
@@ -100,6 +101,7 @@ async function main() {
     assert.equal(bot.deviceAttention, null, "explicitly observing surroundings changes the focus without guessing prose");
 
     // Bot operation -> human close -> stale Bot operation. Only individual effects hold the queue.
+    const lookAgain = await autonomous("observe_device", { device: "phone" }); await until(() => !bot.scheduler.isPending(lookAgain));
     phone.down = false; block = true; order.length = 0; calls = 0;
     await autonomous("read_note"); await entered.promise;
     const close = stealth("close_app"); await tick();
@@ -122,7 +124,6 @@ async function main() {
     assert.equal((await stealth("send", { msg: "explicit fixture message" }, true)).ok, true); assert.equal(sends, 1);
     assert.equal(bot.manualMode, false);
     assert.equal((await stealth("send", { msg: "unfinished <img>" }, true)).ok, false);
-    assert.equal(bot.pendingImageFill, drafts, "human sends cannot replace Bot's pending media draft");
 
     await stealth("open_app", { name: "notes" });
     const previousCalls = calls;

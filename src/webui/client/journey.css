@@ -659,3 +659,67 @@
     padding-top:14px
   }
 }
+/* Session views keep the operator at the bottom and let the world flow behind it. */
+.journey-in-session { padding-bottom:var(--journey-dock-space,250px); }
+.journey-in-session .journey-page-head { margin-bottom:18px; }
+.journey-session-shortcuts { display:flex; flex-wrap:wrap; gap:8px; margin:12px 0 18px; }
+.journey-live-status { min-width:0; }
+.journey-live-status .live-compact { margin:0; }
+.journey-live-status .live-lane-preview { max-height:125px; }
+.journey-stream-layout { display:grid; grid-template-columns:minmax(0,1.4fr) minmax(0,1fr); align-items:start; gap:20px; }
+.journey-stream-layout>* { min-width:0; }
+.journey-stream-layout .journey-history { margin:0; padding:20px; }
+.journey-stream-layout .journey-feed { max-height:none; overflow:visible; }
+.journey-stream-layout .journey-entities { grid-template-columns:1fr; gap:12px; }
+.journey-stream-layout .journey-entity { padding:16px; }
+.journey-stream-layout .journey-entity-top { margin-bottom:8px; }
+.journey-stream-layout .journey-entity h3 { margin-bottom:8px; font-size:15px; }
+.journey-stream-layout .journey-observation-head h2 { font-size:18px; }
+.journey-stream-layout .journey-observation-head { gap:10px; }
+.journey-event-result { overflow-wrap:anywhere; min-width:0; }
+.journey-event-result .readable-data { margin-top:10px; }
+.journey-event-result .readable-original-key { display:none; }
+.journey-feed-row .readable-prose { font-family:inherit; }
+.journey-dock { position:fixed; z-index:42; bottom:calc(var(--mobile-nav-height,0px) + 12px); left:12px; width:calc(100% - 24px); max-height:65dvh; overflow:auto; overscroll-behavior:contain; background:color-mix(in srgb,var(--surface) 96%,transparent); border:1px solid color-mix(in srgb,var(--accent) 35%,var(--line)); border-radius:16px; box-shadow:0 10px 45px color-mix(in srgb,var(--fg) 14%,transparent),0 2px 6px color-mix(in srgb,var(--fg) 6%,transparent); backdrop-filter:blur(18px); scrollbar-width:thin; }
+.journey-dock .journey-action { position:static; display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:end; gap:10px 14px; padding:16px; margin:0; }
+.journey-dock .journey-action>.cockpit-bar,.journey-dock .journey-action>.journey-action-input,.journey-dock .journey-action>.journey-error,.journey-dock .journey-action>.journey-pending-host { grid-column:1/-1; }
+.journey-dock .journey-action>.cockpit-options[open]~button { grid-column:2; }
+.journey-dock .journey-action-input { min-height:66px; max-height:160px; margin:0; resize:vertical; }
+.journey-dock .journey-speech-input { min-height:66px; max-height:140px; }
+.journey-dock .journey-pending { margin:0; padding:10px; }
+.journey-dock .journey-pending .journey-note { margin-bottom:8px; }
+.journey-dock .journey-pending-host:empty { display:none; }
+.journey-dock .journey-error { margin:0; }
+.journey-dock-grip { width:100%; min-height:32px; margin:0; padding:5px 10px; border:0; border-bottom:1px solid var(--line); border-radius:0; background:var(--panel2); color:var(--fg-dim); font-size:10px; }
+.journey-keyboard .journey-dock-grip { position:sticky; top:0; z-index:1; min-height:24px; padding:2px 6px; }
+.journey-keyboard .cockpit-bar { display:none; }
+.journey-keyboard .cockpit,.journey-keyboard .journey-action { padding:8px; }
+.journey-keyboard .cockpit-form textarea,.journey-keyboard .journey-action-input,.journey-keyboard .journey-speech-input { min-height:50px; }
+@media(max-width:780px) {
+  .journey-stream-layout { grid-template-columns:1fr; gap:16px; }
+  .journey-stream-layout .journey-observations { grid-row:1; }
+  .journey-stream-layout .journey-entities { display:flex; gap:12px; overflow-x:auto; scroll-snap-type:x proximity; overscroll-behavior-x:contain; padding:2px 2px 10px; }
+  .journey-stream-layout .journey-entity { min-width:220px; max-width:270px; flex:0 0 78%; scroll-snap-align:start; }
+  .journey-stream-layout .journey-facts { margin-bottom:8px; }
+  .journey-stream-layout .journey-facts>div:nth-child(n+4) { display:none; }
+  .journey-live-status .live-compact .live-lanes { grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px; }
+  .journey-live-status .live-lane { padding:12px; min-width:0; }
+  .journey-live-status .live-source-mark { display:none; }
+  .journey-live-status .live-lane-heading { flex-wrap:wrap; gap:5px; font-size:12px; }
+  .journey-live-status .live-lane-model { font-size:10px; overflow-wrap:anywhere; }
+  .journey-live-status .live-lane-preview { max-height:105px; font-size:10px; }
+  .journey-live-status .live-lane-footer { flex-wrap:wrap; gap:6px; font-size:9px; }
+  .journey-live-status .live-lane-links { flex-wrap:wrap; }
+  .journey-live-status .live-lane-links button { min-height:32px; font-size:10px; }
+  .journey-in-session .journey-session-bar { padding:14px; margin-bottom:18px; }
+  .journey-in-session .journey-session-controls { gap:8px; }
+  .journey-in-session .journey-page-head h1 { font-size:27px; }
+  .journey-stream-layout .journey-history { padding:17px; }
+}
+@media(max-width:700px) {
+  .journey-input { font-size:16px; }
+  .journey-dock { border-radius:13px; }
+  .journey-dock .journey-action { padding:12px; gap:8px; }
+  .journey-dock .journey-action>.cockpit-options[open]~button { position:sticky; bottom:0; }
+  .journey-dock .journey-two-fields { grid-template-columns:minmax(0,1.2fr) minmax(0,1fr); }
+}

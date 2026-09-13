@@ -2,7 +2,7 @@ import { h, type Context, type Session } from "koishi";
 import { channelKey } from "./channels.js";
 import { needsMsgIds, type MessagingConfig, type PlatformOpsConfig } from "../config.js";
 import type { MediaRenderer } from "../media/render.js";
-import { MEDIA_PLACEHOLDER, mediaPlaceholder } from "../media/render.js";
+import { MEDIA_PLACEHOLDER, mediaPlaceholder, escapeMediaStorageText } from "../media/render.js";
 import type { MediaStore } from "../media/store.js";
 import type { PhoneStatus, RichText } from "../types.js";
 import type { FocusManager } from "./focus.js";
@@ -435,7 +435,7 @@ export class Gateway {
     for (const el of elements) {
       switch (el.type) {
         case "text":
-          out += String(el.attrs.content ?? "");
+          out += escapeMediaStorageText(String(el.attrs.content ?? ""));
           break;
         case "img":
         case "image": {
@@ -642,12 +642,10 @@ export function formatBanDuration(
   return parts.join(" ") || `${seconds} 秒`;
 }
 
-const MARKER_LABEL: Record<string, string> = { image: "图片", audio: "音频", video: "视频" };
-
-/** 媒体占位符 → Bot 的内联标记形式（[图片#12]），用于伪装 send 工具调用的 msg 参数 */
+/** Convert persisted media positions to explicit references for same-account message observations. */
 function toMarkerText(content: string): string {
   return content.replace(
     MEDIA_PLACEHOLDER,
-    (_, id, type) => `[${MARKER_LABEL[type as string] ?? type}#${id}]`,
+    (_, id) => `<media ref="media:${id}"/>`,
   );
 }

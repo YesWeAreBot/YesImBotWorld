@@ -58,7 +58,7 @@ export function extractToolCall(raw: string, allowedNames: string[]): ParsedTool
 }
 
 export function validateToolCall(parsed: unknown, allowedNames: string[]): ParsedToolCall {
-  if (typeof parsed !== "object" || parsed === null) {
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
     throw new ToolCallParseError("工具调用必须是 JSON 对象");
   }
   const obj = parsed as Record<string, unknown>;
@@ -69,7 +69,7 @@ export function validateToolCall(parsed: unknown, allowedNames: string[]): Parse
     );
   }
   let args: Record<string, unknown> = {};
-  if (obj.arguments !== undefined && obj.arguments !== null) {
+  if (obj.arguments !== undefined) {
     if (typeof obj.arguments === "string") {
       // 有些模型会把 arguments 序列化成字符串
       try {
@@ -82,6 +82,9 @@ export function validateToolCall(parsed: unknown, allowedNames: string[]): Parse
     } else {
       throw new ToolCallParseError("arguments 必须是对象");
     }
+  }
+  if (typeof args !== "object" || args === null || Array.isArray(args)) {
+    throw new ToolCallParseError("arguments 必须是 JSON 对象，不能是 null、数组或单个值");
   }
   let duration: number | undefined;
   if (obj.duration !== undefined && obj.duration !== null) {

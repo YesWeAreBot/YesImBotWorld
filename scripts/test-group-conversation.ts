@@ -9,12 +9,14 @@ import { WorldFiles } from "../src/files.js";
 import { Prompts } from "../src/prompts.js";
 import { BotContext } from "../src/bot/context.js";
 import { BotAgent } from "../src/bot/agent.js";
+import { BOT_TOOLS } from "../src/bot/tools.js";
 import { Gateway } from "../src/koishi/gateway.js";
 import { KoishiMessenger, rawGroupConversation } from "../src/koishi/messenger.js";
 import { MessageStore, type WorldMessageRow } from "../src/koishi/messages.js";
 import { OwnSendTracker } from "../src/koishi/ownsends.js";
 import { conversationKind } from "../src/koishi/conversation.js";
 import { MediaRenderer } from "../src/media/render.js";
+import { richPartsText } from "../src/media/presentation.js";
 import type { RichText } from "../src/types.js";
 
 async function main() {
@@ -71,7 +73,10 @@ async function main() {
     const context = new BotContext(files, "", prompts); await context.load();
     context.attachmentLoader = async () => ({ type: "image_url", image_url: { url: "data:image/png;base64,AA==" } });
     async function requestParts(value: RichText, attachments = true) {
+      // Independent projection scenarios: start a new window instead of mutating an
+      // already-rendered event under the same ID (production history is immutable).
       context.stream = [];
+      context.resetRenderingAfterCompression();
       context.attachmentsDisabled = !attachments;
       await context.appendEvent({ id: "ev-" + seq, source: "phone" as any, worldTime: seq, content: value.text, parts: value.parts, attachments: value.attachments });
       const messages = await context.toChatMessages("T=1");
@@ -86,9 +91,13 @@ async function main() {
     assert.match(JSON.stringify(await requestParts(plainSticker, false)), /朋友群.*小明/s);
     // Exercise the real forwarding dispatch branch while replacing only scheduling and the platform fetch.
     let forwarded: RichText | undefined;
-    const forwardingAgent: any = Object.assign(Object.create(BotAgent.prototype), {
-      phoneUi: { forwardStack: [] },
-      messenger: { viewForward: async () => plainSticker },
+    const forwardingAgent: any = Object.assign(new BotAgent(cfg,
+      { now: () => seq, timeLine: () => "T=1", realMsUntil: () => 0 } as any,
+      files, context, {} as any, { viewForward: async () => plainSticker } as any,
+      null, null, null, phone, { info() {}, warn() {}, error() {}, debug() {} } as any,
+      BOT_TOOLS.filter(tool => ["view_forward", "exit_forward"].includes(tool.name))), {
+      phoneUi: { chatOpen: true, channelKey: "fixture@bot-a:group", channelIsGroup: true, forwardStack: [] },
+      attention: "phone",
       dispatchLocal: async (_call: unknown, run: () => Promise<RichText>) => { forwarded = await run(); },
     });
     for (let depth = 1; depth <= 2; depth++) {
@@ -161,7 +170,7 @@ async function main() {
     assert.match(full, /引用其他账号/);
     assert.match(full, /最后一条来自本账号/);
     assert.ok(!full.includes("隔离账号"));
-    const allText = history.parts!.filter(p => p.kind === "text").map(p => p.text).join("");
+    const allText = richPartsText(history.parts!);
     assert.equal(allText, history.text, "history prose and ordered media parts preserve identical contextual framing");
     console.log("PASS group conversation: sender/channel retained in actual multimodal requests, scoped quote attribution, mentions/DM/stickers, history framing and notification privacy");
   } finally { await fs.rm(dir, { recursive: true, force: true }); }

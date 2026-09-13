@@ -1588,6 +1588,32 @@ function loadMedia(){
 }
 
 // ---------- 数据 ----------
+function noteSortOrder(){ try { return localStorage.getItem('studio_note_sort') === 'created' ? 'created' : 'updated'; } catch(_){ return 'updated'; } }
+function sortNotes(notes, order){
+  function rank(t){ return !t ? 3 : t.clock === 'world' ? (t.value == null ? 1 : 0) : 2; }
+  return (notes || []).slice().sort(function(a,b){ var x=a[order], y=b[order]; return rank(x)-rank(y) || (x && y && x.value != null && y.value != null ? y.value-x.value : 0) || a.title.localeCompare(b.title); });
+}
+function noteTimeText(time){
+  if(!time) return '未记录';
+  var label=time.label;
+  if(time.clock === 'real' && Number.isFinite(time.value)) label=new Date(time.value).toLocaleString([], {year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'});
+  return label + (time.clock === 'real' ? time.source === 'file' ? ' · 文件时间' : ' · 现实时间' : time.value == null ? ' · 旧世界时间，无 TU' : '');
+}
+function noteTimes(note, cls){
+  var box=el('div',{cls:'note-timestamps'+(cls?' '+cls:'')});
+  [['created','创建'],['updated','最近编辑']].forEach(function(pair){ var t=note && note[pair[0]], node=el('time',{text:noteTimeText(t)}); if(t && t.clock==='real' && Number.isFinite(t.value)) node.dateTime=new Date(t.value).toISOString(); box.appendChild(el('span',{},[el('small',{text:pair[1]}),node])); });
+  return box;
+}
+function noteSortSelect(change){
+  var select=el('select',{'aria-label':'笔记排序',cls:'note-sort-select'},[el('option',{value:'updated',text:'最近编辑 · 倒序'}),el('option',{value:'created',text:'创建时间 · 倒序'})]);
+  select.value=noteSortOrder();
+  select.addEventListener('change',function(){ try { localStorage.setItem('studio_note_sort',select.value); } catch(_){} change(select.value); });
+  return select;
+}
+function noteSortNotice(notes, order){
+  var clocks=new Set((notes || []).map(function(n){return n[order]?.clock;}).filter(Boolean));
+  return clocks.size > 1 ? '世界时间优先；现实和文件时间另组倒序排列。' : '';
+}
 function refreshData(){
   if(activeView !== 'data') return;
   var main = $('#main');
@@ -1616,24 +1642,26 @@ function refreshData(){
     var notesSec = el('div', {cls:'section'});
     notesSec.appendChild(el('h3', {html:'记事本 Notes/ <span class="hint">Bot 的私人笔记（文件名即标题）</span>'}));
     var nbody = el('div', {cls:'body'});
-    var nlist = el('div');
+    var nlist = el('div', {cls:'data-note-list'}), noteRows=[], noteOrder=noteSortOrder();
+    var sortHint=el('p',{cls:'note-sort-hint'}), sort=noteSortSelect(function(value){noteOrder=value; drawNotes();});
+    nbody.appendChild(el('div',{cls:'note-sort-toolbar'},[el('span',{text:'排列笔记'}),sort]));
+    function drawNotes(){
+      nlist.replaceChildren(); sortHint.textContent=noteSortNotice(noteRows,noteOrder); sortHint.hidden=!sortHint.textContent;
+      sortNotes(noteRows,noteOrder).forEach(function(n){
+        var vnode = el('span', {cls:'v'}, [el('button', {text:'打开', onclick:function(){ openNote(n.title); }})]);
+        if(!isVisitor()) vnode.appendChild(el('button', {cls:'danger', text:'删除', onclick:function(){
+          if(!confirm('删除笔记「' + n.title + '」？')) return;
+          api('DELETE', '/api/notes?name=' + encodeURIComponent(n.title)).then(function(){ toast('已删除', 'ok'); refreshData(); }).catch(showErr);
+        }}));
+        nlist.appendChild(el('div', {cls:'data-note-row'}, [el('div', {cls:'data-note-info'},[el('strong',{text:n.title}),noteTimes(n)]), vnode]));
+      });
+      if(!noteRows.length) nlist.appendChild(el('p', {cls:'empty', text:'（记事本是空的）'}));
+    }
     api('GET', '/api/notes').then(function(nr){
       if(activeView !== 'data' || !holder.isConnected) return;
-      (nr.notes || []).forEach(function(n){
-        var vnode = el('span', {cls:'v'}, [
-          el('button', {text:'打开', style:'padding:2px 9px;font-size:11.5px', onclick:function(){ openNote(n.title); }})
-        ]);
-        if(!isVisitor()){
-          vnode.appendChild(el('button', {cls:'danger', text:'删除', style:'margin-left:6px;padding:2px 9px;font-size:11.5px', onclick:function(){
-            if(!confirm('删除笔记「' + n.title + '」？')) return;
-            api('DELETE', '/api/notes?name=' + encodeURIComponent(n.title)).then(function(){ toast('已删除', 'ok'); refreshData(); }).catch(showErr);
-          }}));
-        }
-        nlist.appendChild(el('div', {cls:'kv'}, [el('span', {cls:'k', text: n.title}), vnode]));
-      });
-      if(!nr.notes || !nr.notes.length) nlist.appendChild(el('p', {cls:'empty', text:'（记事本是空的）'}));
+      noteRows=nr.notes || []; drawNotes();
     }).catch(function(){});
-    nbody.appendChild(nlist);
+    nbody.append(sortHint,nlist);
     if(!isVisitor()){
       nbody.appendChild(el('div', {cls:'toolbar'}, [el('button', {text:'新建笔记…', onclick:function(){
         var name = prompt('笔记标题（将创建为 Notes/<标题>.md）：');
@@ -1761,7 +1789,9 @@ function openNote(title){
     var ta = el('textarea', {rows: 22});
     ta.value = note ? note.content : '';
     if(isVisitor()) ta.readOnly = true;
-    showModal('笔记：' + title, el('div', null, isVisitor() ? [ta] : [
+    var times=noteTimes(note);
+    showModal('笔记：' + title, el('div', {cls:'data-note-editor'}, isVisitor() ? [times,ta] : [
+      times,
       ta,
       el('div', {cls:'toolbar', style:'margin:8px 0 0'}, [
         el('button', {cls:'primary', text:'保存', onclick:function(){

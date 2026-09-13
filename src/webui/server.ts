@@ -53,6 +53,8 @@ export interface BotStatusSummary {
 export interface NoteEntry {
   title: string;
   content: string;
+  created?: import("../notes.js").NoteTime | null;
+  updated?: import("../notes.js").NoteTime | null;
 }
 
 /** 「设备」页聚合信息：电脑（docker 管理 / 远程桌面）+ 手机 */

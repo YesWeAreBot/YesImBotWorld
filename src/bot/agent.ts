@@ -9,15 +9,16 @@ import { needsMsgIds, type Config } from "../config.js";
 import type { WorldFiles } from "../files.js";
 import { RepeatGuard, type ObserveResult } from "./repeatGuard.js";
 import { ToolCallParseError } from "../llm/parse.js";
-import type { BotEvent, CompressionResult, EventSource, MediaRef, ParsedToolCall, PendingImageFill, PhoneStatus, PickFailure, PickResult, RichText, RichTextPart, ToolCallRecord } from "../types.js";
+import type { BotEvent, CompressionResult, EventSource, MediaRef, ParsedToolCall, PhoneStatus, PickFailure, PickResult, RichText, RichTextPart, ToolCallRecord } from "../types.js";
 import type { WorldAgent } from "../world/agent.js";
 import type { NotifyManager } from "../koishi/notify.js";
+import { normalizeMsgId } from "../koishi/markers.js";
 import { debug } from "../webui/debug.js";
 import { createBackend, type BotBackend } from "./backend.js";
 import type { BotContext } from "./context.js";
-import { Scheduler, type ScheduleOptions } from "./scheduler.js";
+import { describeToolCall, Scheduler, type ScheduleOptions } from "./scheduler.js";
 import { deviceKind, type DeviceKind } from "../apps/deviceTools.js";
-import { GrowthLedger, type GrowthKind, type ReflectionRelation } from "./growth.js";
+import { GrowthLedger, type GrowthKind, type ReflectionOpportunity, type ReflectionRelation } from "./growth.js";
 import { ReceiptInbox } from "./receipts.js";
 import type { WorldObservation } from "../world/state.js";
 import { typingSlackTU } from "./typing.js";
@@ -106,6 +107,9 @@ export interface MessengerApi {
 }
 
 interface MailboxItem {
+  /** Retry the same durable IDs when an append/counter checkpoint fails. */
+  event?: BotEvent;
+  toolCallRecord?: ToolCallRecord;
   originEventIds?: string[];
   source: EventSource;
   content: string;
@@ -152,6 +156,8 @@ export class BotAgent {
   private retired = false;
   private receiptsPending = false;
   private draining: Promise<void> | null = null;
+  private growthRestored = false;
+  private reflectionPending: { opportunity: ReflectionOpportunity; event: BotEvent; appended: boolean } | null = null;
   private compressionRequested: "overflow" | "breakLoop" | "rest" | null = null;
   private compressionPromise: Promise<void> | null = null;
   private generationAbort: AbortController | null = null;
@@ -224,6 +230,7 @@ export class BotAgent {
   private concealedDevices = new Set<DeviceKind>();
   private perceivedToolNames: string[] = [];
   private perceivedAppDefs: AppToolDef[] = [];
+  private announcedToolDefs: Map<string, string> | null = null;
   /**
    * 外部注入（管理员代理）工具调用的结果回传表：callId → 解析器。
    * 结果经 scheduler 的 deliver 通道（source=tool）回传；校验拒绝时的 system 提示在此暂存，
@@ -248,11 +255,6 @@ export class BotAgent {
     /** 正在逐层查看的合并转发聊天记录（view_forward 压栈 / exit_forward 出栈） */
     forwardStack: string[];
   } = { chatOpen: false, channelKey: null, channelIsGroup: false, forwardStack: [] };
-  /**
-   * 待填充的图文混排缓冲：send 的 msg 带 `<img>` 占位符时暂存于此，等 pick_media 选图填满后自动发送。
-   * null 表示当前没有待填充的消息。
-   */
-  private pendingImageFill: PendingImageFill | null = null;
   /**
    * 最近一次有外部消息动静的频道 key（通知快捷回复的锚点）：
    * 手机即使没点进任何频道页，只要最近有频道来了新消息，send 系工具就能解锁快捷回复——
@@ -293,9 +295,8 @@ export class BotAgent {
       JSON.stringify(config.bot.repeatThresholds ?? [3, 5, 8]),
       JSON.stringify(config.bot.repeatExclude ?? ["rest", "wait"]),
     );
-    // 原生声明用全量内置工具（稳定，不随界面状态变）；允许集另行按分层控制
+    // 原生声明在第一次生成时冻结；实时允许集通过追加的能力事件更新。
     this.backend = createBackend(config.bot, this.layerNames("core"), this.toolDefs);
-    this.perceivedToolNames = this.currentToolNames();
     this.scheduler = new Scheduler(
       clock,
       (content, ref, outcome) => {
@@ -328,9 +329,11 @@ export class BotAgent {
         }
         this.pushEvent("tool", gated, { ref });
         if (ref) this.puppetCalls.delete(ref);
+        this.refreshToolGate();
       },
       logger,
     );
+    this.refreshToolGate(false);
   }
 
   // ---------- 工具分层 ----------
@@ -345,9 +348,9 @@ export class BotAgent {
 
   /**
    * 手机界面状态 / App 打开状态变化后：重算**允许集**并同步进后端（GBNF 语法 / 解析校验）。
-   * 原生 tools 声明同步当前允许集；应用参数保留原始 schema。
+   * 原生声明保留到压缩边界；新工具及参数变化通过追加事件呈现。
    */
-  private currentToolNames(): string[] {
+  private currentToolNames(excludeCallId?: string, includeBanned = false): string[] {
     const names = [...this.layerNames("core")];
     if (this.phoneUi.chatOpen) {
       names.push(...this.layerNames("chat"));
@@ -357,27 +360,70 @@ export class BotAgent {
       } else if (this.lastNotifyKey) {
         // 未点进频道页，但有最近通知源（收到过外部消息）→ 允许 send/pick_media 带 id 快捷回复
         // 其余 channel 工具（unsend/react/poke 等）仍需真正进入频道页。
-        names.push("send", "pick_media");
+        names.push(...this.layerNames("channel").filter(name => name === "send" || name === "pick_media"));
       }
     }
     const appDefs = [...(this.apps?.activeToolDefs() ?? []), ...(this.computer?.activeToolDefs() ?? [])];
     names.push(...appDefs.map((d) => d.name));
+    const pending = this.scheduler?.pending().filter(task => task.id !== excludeCallId && !this.stealthCalls.has(task.id)) ?? [];
+    const travelling = pending.some(task => task.name === "travel" || task.name === "go_home");
+    const location = this.crossing?.location();
+    const meaningful = (name: string): boolean => {
+      switch (name) {
+        case "pick_up_phone": return this.phone.down;
+        case "put_down_phone": return !this.phone.down;
+        case "open_app": return !!this.apps;
+        case "close_app": return this.phoneUi.chatOpen || !!this.apps?.currentName;
+        case "open_computer": return !!this.computer && this.computer.available !== false && (!this.computer.isOpen || !this.computer.activeToolDefs().length);
+        case "close_computer": return !!this.computer?.isOpen;
+        case "exit_forward": return this.phoneUi.forwardStack.length > 0;
+        case "channel_notify": return !!this.notifyList;
+        case "cancel": return pending.some(task => !task.committed);
+        case "travel": return !travelling && !!this.crossing?.voluntaryWorlds().some(name => name !== location);
+        case "go_home": return !travelling && !!location;
+        default: return true;
+      }
+    };
     // 打破死循环：临时禁用被判定为「反复调用」的工具（下次压缩后自然恢复）
-    return names.filter((n) => !this.tempBannedTools.has(n));
+    return [...new Set(names)].filter((n) => (includeBanned || !this.tempBannedTools.has(n)) && meaningful(n));
   }
 
-  private refreshToolGate(): void {
+  private refreshToolGate(notify = true): void {
     if (this.deviceExecution.getStore()?.stealth) return;
-    let allowed = this.currentToolNames();
+    let allowed = this.currentToolNames(undefined, true);
     let appDefs = [...(this.apps?.activeToolDefs() ?? []), ...(this.computer?.activeToolDefs() ?? [])];
     for (const name of allowed) { const kind = this.classifyDevice(name); if (kind) this.knownDeviceTools.set(name, kind); }
-    const hidden = (name: string) => { const kind = this.classifyDevice(name); return !!kind && this.concealedDevices.has(kind); };
+    // An unattended screen is not an omniscient connection monitor. Body/phone posture
+    // is immediately felt, while hidden app changes wait until the next actual look/touch.
+    const hidden = (name: string) => {
+      if (!this.announcedToolDefs || name === "pick_up_phone" || name === "put_down_phone") return false;
+      const kind = this.classifyDevice(name);
+      return !!kind && (this.concealedDevices.has(kind) || (this.deviceAttention !== kind && !(this.deviceOperations > 0 && this.attention === kind)));
+    };
     allowed = [...allowed.filter(name => !hidden(name)), ...this.perceivedToolNames.filter(hidden)];
     appDefs = [...appDefs.filter(def => !hidden(def.name)), ...this.perceivedAppDefs.filter(def => hidden(def.name))];
-    this.perceivedToolNames = [...allowed];
-    this.perceivedAppDefs = [...appDefs];
-    this.backend.setToolNames(this.residentControl?.mode === "puppet" ? allowed.filter(name => this.autonomousDuringPuppet(name)) : allowed);
+    this.perceivedToolNames = [...new Set(allowed)];
+    this.perceivedAppDefs = structuredClone(appDefs);
+    allowed = this.perceivedToolNames.filter(name => !this.tempBannedTools.has(name) && (this.residentControl?.mode !== "puppet" || this.autonomousDuringPuppet(name)));
+    this.backend.setToolNames(allowed);
     this.backend.setToolDefs?.([...this.toolDefs, ...appDefs]);
+    const defs = [...this.toolDefs, ...appDefs].filter(def => allowed.includes(def.name));
+    this.context.setCurrentToolsText(renderToolsText(defs));
+    const next = new Map(defs.map(def => [def.name, JSON.stringify(def)]));
+    if (notify && this.announcedToolDefs) {
+      const removed = [...this.announcedToolDefs.keys()].filter(name => !next.has(name));
+      const added = defs.filter(def => !this.announcedToolDefs!.has(def.name));
+      const changed = defs.filter(def => this.announcedToolDefs!.has(def.name) && this.announcedToolDefs!.get(def.name) !== next.get(def.name));
+      if (removed.length || added.length || changed.length) {
+        const lines = ["（当前能力发生变化，立即生效；之前的工具说明保留为历史记录，以本事件为准。"];
+        if (removed.length) lines.push(`现在不可用：${removed.join("、")}。调用这些工具不会执行操作。`);
+        if (added.length) lines.push(`现在新增可用：\n${renderToolsText(added)}`);
+        if (changed.length) lines.push(`以下工具的参数或语义已更新：\n${renderToolsText(changed)}`);
+        if (this.config.bot.nativeToolCalls && (added.length || changed.length)) lines.push('原生 function 声明会在整理记忆后更新；新能力或新参数尚未出现在声明中时，可在正文输出单个 {"name":"工具名","arguments":{},"duration":0} 调用。');
+        this.pushEvent("system", lines.join("\n") + "）");
+      }
+    }
+    this.announcedToolDefs = next;
   }
 
   /**
@@ -409,7 +455,8 @@ export class BotAgent {
       this.interruptAllDeferred("你把注意力转去了别处");
     }
     if (toolsetChanged) {
-      const defs = [...this.layerDefs("channel"), ...(isGroup ? this.layerDefs("group") : [])];
+      const current = new Set(this.currentToolNames());
+      const defs = [...this.layerDefs("channel"), ...(isGroup ? this.layerDefs("group") : [])].filter(def => current.has(def.name));
       const lines: string[] = [];
       if (defs.length) {
         lines.push(
@@ -655,7 +702,6 @@ export class BotAgent {
     this.setManualPaused(true);
     await this.autonomousDispatch;
     this.interruptAllDeferred("管理员接管了设备");
-    this.pendingImageFill = null;
     const cancelled = this.scheduler.cancelUncommitted();
     if (this.waiting && cancelled.includes(this.waiting.callId)) { this.waiting = null; this.wakeFn?.(); }
     for (const id of cancelled) {
@@ -674,11 +720,11 @@ export class BotAgent {
 
   /** 身体受控不等于意识被替代；未知扩展工具按可能有副作用处理。 */
   private autonomousDuringPuppet(name: string): boolean {
-    return ["observe", "observe_device", "check_status", "check_time", "reflect", "recall_growth", "recall", "wait", "rest"].includes(name);
+    return ["observe", "observe_device", "reflect", "recall_growth", "wait", "rest"].includes(name);
   }
 
   private puppetToolAllowed(name: string): boolean {
-    return !["reflect", "recall_growth", "recall", "wait", "rest"].includes(name);
+    return !["reflect", "recall_growth", "wait", "rest"].includes(name);
   }
 
   async acquireResidentControl(mode: "avatar" | "puppet", sessionId: string): Promise<{ busy: boolean }> {
@@ -762,7 +808,7 @@ export class BotAgent {
   }
 
   /**
-   * 管理员代理 Bot 执行任意工具调用（send/act/check_status/check_time/wait/open_app/gallery 等）：
+   * 管理员代理 Bot 执行任意工具调用（send/act/observe/wait/open_app/gallery 等）：
    * 构造一个合法的 ToolCallRecord，append 进上下文后走 dispatch 真正执行（复用全部参数校验、
    * 调度与结果回显），结果经 Promise 回传。等价于「手动驾驶」Bot。
    *
@@ -798,9 +844,8 @@ export class BotAgent {
     if (opts.control && (this.residentClosing || this.residentControl?.sessionId !== opts.control.sessionId || this.residentControl.mode !== opts.control.mode)) return { ok: false, text: "角色接管会话已改变，此调用没有执行。" };
     if (opts.control?.mode === "puppet" && !this.puppetToolAllowed(name)) return { ok: false, text: "身体操纵不能代替角色思考、反思或休息；请使用观察与身体/设备能力。" };
     if (!args || typeof args !== "object" || Array.isArray(args) || (opts.duration !== undefined && (!Number.isFinite(opts.duration) || opts.duration < 0))) return { ok: false, text: "工具参数必须为对象，duration 必须为有限非负数。" };
-    if (!this.currentToolNames().includes(name)) return { ok: false, text: `（${name} 此刻不可用，请先打开对应应用或进入频道。）` };
+    if (!this.currentToolNames().includes(name)) return { ok: false, text: `（${name} 此刻不可用，本次操作没有执行。请从当前能力列表重新选择。）` };
     if (opts.stealth && (!this.classifyDevice(name) || name === "pick_up_phone" || name === "put_down_phone")) return { ok: false, text: "偷偷操作只能改变设备界面，不能代替角色拿起或放下手机。" };
-    if (opts.stealth && (name === "pick_media" || (name === "send" && this.countImgPlaceholders(String(args.msg ?? ""))))) return { ok: false, text: "偷偷发送请在 send 中提供完整 msg 和 media，不能接续角色尚未完成的选图草稿。" };
     const issuedAt = this.clock.now();
     let duration = opts.duration;
     // 与 finalize 一致：wait 以参数 n 为准（模型常输出 duration:0 + n:x 的组合）
@@ -878,6 +923,7 @@ export class BotAgent {
     this.logger.info("Bot-LLM 开始持续推理");
     while (this.running) {
       try {
+        this.refreshToolGate();
         await this.drainMailbox();
 
         // 手动驾驶（管理员扮演接管）：暂停自主生成，仅负责排空邮箱 + 处理外部注入的工具/事件。
@@ -888,7 +934,7 @@ export class BotAgent {
         }
 
         // Maintenance is independent of the character's sleep, physical condition, and device state.
-        if (this.context.stream.length && this.context.approxChars() > this.config.bot.maxWindowChars) this.compressionRequested ??= "overflow";
+        if (this.context.stream.length && (this.context.approxChars() > this.config.bot.maxWindowChars || this.context.attachmentBudgetExceeded)) this.compressionRequested ??= "overflow";
         if (this.compressionRequested) {
           const reason = this.compressionRequested;
           this.compressionRequested = null;
@@ -906,6 +952,7 @@ export class BotAgent {
 
         // throttle 睡眠期间（含上一个即时工具的执行窗口）可能有新事件到达：
         // 生成前再次排空，避免 Bot 看不到"就差一步"的结果而误以为调用无效、重复调用
+        this.refreshToolGate();
         await this.drainMailbox();
         if (!this.running || this.manualPaused || this.waiting || this.compressionRequested) continue;
 
@@ -934,7 +981,7 @@ export class BotAgent {
             const emphasis =
               this.parseFailures >= 3
                 ? (this.config.bot.nativeToolCalls
-                  ? "不要写正文或解释，通过 function calling 接口调用恰好一个工具。"
+                  ? '调用恰好一个工具：有当前原生声明时用 function calling；动态新增工具或更新参数用单个正文 JSON {"name":"工具名","arguments":{},"duration":0}，不附加解释。'
                   : '只输出一个工具 JSON 对象，格式为 {"name":"工具名","arguments":{},"duration":0}；不要解释或代码围栏。')
                 : "";
             // 关键：不要把原始错误输出（尤其是模型自己拼的 <event>…</event>）回灌进上下文——
@@ -951,11 +998,11 @@ export class BotAgent {
           //   （GIF 自动改走拼帧图的 image_url 通道），正常的图片附件不受牵连；
           //   纯图片附件仍 400 才整体熔断（模型实际不具备视觉能力）。
           // - 413：请求体超过服务端上限（base64 附件把请求撑爆了）→ 整体熔断并提示调预算。
-          // 处理后立即重试，否则同一附件会让之后每一次请求都失败。
+          // Append a capability event and compact before retrying; never rewrite the existing media prefix.
           if (
             !this.context.attachmentsDisabled &&
             /\((400|413)\)/.test(String(err)) &&
-            this.context.hasAttachments()
+            this.context.lastAttachmentPartTypes.size > 0
           ) {
             if (/\(400\)/.test(String(err))) {
               const kinds: ("video" | "audio")[] = [];
@@ -963,6 +1010,9 @@ export class BotAgent {
               if (this.context.lastAttachmentPartTypes.has("input_audio")) kinds.push("audio");
               if (kinds.length && this.context.degradeModalities) {
                 this.context.degradeModalities(kinds);
+                this.context.requestAttachmentCompaction();
+                this.pushEvent("system", `（本次含 ${kinds.join("、")} 原始媒体的生成请求被模型服务拒绝，没有执行动作。正在尝试停用这些原始输入并整理已有经历；整理完成后新媒体按剩余能力呈现，已记录的经历保持不变。）`);
+                this.compressionRequested = "overflow";
                 this.logger.warn(
                   "生成请求返回 400，失败请求含 %s 附件：服务端很可能不支持这类 content part，" +
                     "已降级停用对应模态（本次会话内；GIF 动图改用拼帧图注入，图片附件不受影响）。" +
@@ -975,6 +1025,9 @@ export class BotAgent {
               }
             }
             this.context.attachmentsDisabled = true;
+            this.context.requestAttachmentCompaction();
+            this.pushEvent("system", "（本次包含原始媒体的生成请求被模型服务拒绝，没有执行动作。正在尝试暂时停用原始媒体输入并整理已有经历，之后以媒体身份和文字摘要继续，不能把未展开的媒体当作已看见。）");
+            this.compressionRequested = "overflow";
             this.logger.warn(
               /\(413\)/.test(String(err))
                 ? "生成请求返回 413（请求体过大）：已停用附件注入（本次会话内）。" +
@@ -1029,20 +1082,25 @@ export class BotAgent {
   }
 
   private async drainMailboxUnlocked(): Promise<void> {
+    if (!this.growthRestored) {
+      await this.growth.restorePerceptions(this.context.stream);
+      this.growthRestored = true;
+    }
     await this.receipts.ready();
     this.receiptsPending = false;
     if (this.running) await this.receipts.drain(async (event) => {
       // If a process died after append but before removing the inbox file, replay the same ID once.
-      if (!this.context.stream.some(entry => entry.kind === "event" && entry.event.id === event.id)) await this.context.appendEvent(event);
+      await this.context.appendEvent(event);
       await this.growth.perceive(event, event.originEventIds ?? [event.id]);
       debug.emit("bot.event", `[tool receipt] ${event.id}`, { ...event, recovered: true });
     });
-    if (!this.mailbox.length) return;
-    const items = this.mailbox.splice(0);
-    for (const item of items) {
+    if (!this.mailbox.length) { await this.offerReflection(); return; }
+    const count = this.mailbox.length;
+    for (let index = 0; index < count; index++) {
+      const item = this.mailbox[0]!;
       // 伪装的工具调用（externalSelfMessages = simulate）：以 Bot 的口吻追加进流
       if (item.asToolCall) {
-        const call: ToolCallRecord = {
+        const call = item.toolCallRecord ??= {
           id: this.context.nextToolId(),
           role: "agent",
           name: item.asToolCall.name,
@@ -1057,10 +1115,10 @@ export class BotAgent {
           arguments: call.arguments,
           source: "external",
         });
-        if (!item.content) continue;
+        if (!item.content) { this.mailbox.shift(); continue; }
         item.refToolCallId = call.id;
       }
-      const event: BotEvent = {
+      const event = item.event ??= {
         id: this.context.nextEventId(),
         originEventIds: item.originEventIds,
         source: item.source,
@@ -1077,7 +1135,10 @@ export class BotAgent {
         : undefined;
       const derived = originCall?.kind === "tool_call" && ["reflect", "recall_growth", "recall"].includes(originCall.call.name);
       await this.growth.perceive(event, derived ? [] : event.originEventIds ?? [event.id]).catch((err) => {
-        this.logger.warn("感知证据保存失败（原始上下文仍保留）：%s", err);
+        // Retry from the durable context at the next boundary, before it can be compressed away.
+        this.growthRestored = false;
+        this.logger.warn("感知证据保存失败，保留当前事件与邮箱，写入恢复前暂停新的推理：%s", err);
+        throw err;
       });
       if (event.source === "koishi" || event.source === "world") {
         this.repeatGuard.reset();
@@ -1094,7 +1155,42 @@ export class BotAgent {
         ref: event.refToolCallId,
         attachments: event.attachments?.length ?? 0,
       });
+      this.mailbox.shift();
     }
+    await this.offerReflection();
+  }
+
+  private async offerReflection(): Promise<void> {
+    if (!this.currentToolNames().includes("reflect")) return;
+    if (!this.reflectionPending) {
+      const opportunity = await this.growth.reflectionOpportunity();
+      if (!opportunity) return;
+      // The cue is itself durable. On restart, finish its checkpoint instead of producing it again.
+      const prior = [...this.context.stream].reverse().find(entry => entry.kind === "event" &&
+        /^ev_growth_review_\d+$/.test(entry.event.id) && Number(entry.event.id.slice("ev_growth_review_".length)) > opportunity.afterRootCount);
+      if (prior?.kind === "event") {
+        this.reflectionPending = { opportunity: { ...opportunity, rootCount: Number(prior.event.id.slice("ev_growth_review_".length)) }, event: prior.event, appended: false };
+      } else {
+        const event: BotEvent = {
+          id: `ev_growth_review_${opportunity.rootCount}`, source: "system", worldTime: this.clock.now(),
+          content: "（亲历整理提示：最近积累了一些不同来源的经历。若某件事让你形成、兑现或修正了关系、承诺或偏好，可用 reflect 记录你的判断及实际证据；" +
+            "普通聊天、日记和上下文压缩不会自动写入成长账本。最近可引用的 event id：" + opportunity.eventIds.join("、") +
+            "。可用 recall_growth(scope=\"evidence\", event_ids=[...]) 重读原始感知，或 scope=\"claims\" 查看已有认识再决定是否修订。" +
+            "无需为填充账本而制造结论；没有值得记录的变化，就继续生活。这条系统提示本身不是亲历证据。）",
+        };
+        this.reflectionPending = { opportunity, event, appended: false };
+      }
+    }
+    const pending = this.reflectionPending;
+    if (!pending.appended) {
+      await this.context.appendEvent(pending.event);
+      pending.appended = true;
+      debug.emit("bot.event", `[growth review] ${pending.event.id}`, pending.event);
+    }
+    // Fail the boundary truthfully on storage errors. Neither generation nor compression proceeds
+    // until the checkpoint is durable, but retrying never adds another copy or alters character sleep.
+    await this.growth.markReflectionOffered(pending.opportunity);
+    this.reflectionPending = null;
   }
 
   private async sleepUntilWoken(): Promise<void> {
@@ -1142,6 +1238,15 @@ export class BotAgent {
       this.pushEvent("system", "（身体与设备当前受外部操纵，这次自主动作没有执行。你仍能观察、思考、回忆或等待。）", { ref: call.id });
       return;
     }
+    this.refreshToolGate();
+    // A device changed off screen is discovered when the scheduled interaction turns
+    // attention to it. Other stale capabilities are rejected before any side effect.
+    const allowed = call.role === "agent" && this.classifyDevice(call.name)
+      ? this.perceivedToolNames.filter(name => !this.tempBannedTools.has(name)) : this.currentToolNames();
+    if (!allowed.includes(call.name)) {
+      this.pushEvent("system", `（工具 ${call.name} 此刻不可用，这次调用没有执行。请依据最新能力变化事件和当前状态选择可用操作。）`, { ref: call.id });
+      return;
+    }
     if ((call.role === "agent" || call.control) && (["act", "rest", "nap", "travel", "go_home"].includes(call.name) ||
       (call.name === "observe" && call.arguments.target !== "self" && call.arguments.modality !== "self"))) {
       this.attention = null;
@@ -1174,8 +1279,6 @@ export class BotAgent {
         return this.dispatchAct(call);
       case "rest":
         return this.dispatchRest(call);
-      case "check_status":
-        return this.dispatchLocal(call, async () => this.readStatus(call));
       case "observe":
         return this.dispatchLocal(call, async () => this.observe(call));
       case "observe_device": {
@@ -1198,24 +1301,26 @@ export class BotAgent {
           return { text: JSON.stringify(result), originEventIds: [] };
         });
       case "recall_growth":
-        return this.dispatchLocal(call, async () => ({
-          text: JSON.stringify(await this.growth.recall({
+        return this.dispatchLocal(call, async () => {
+          const scope = call.arguments.scope ?? "claims";
+          if (!["claims", "evidence", "all"].includes(String(scope))) throw new Error('recall_growth 的 scope 须为 claims、evidence 或 all');
+          const n = clampInt(call.arguments.n, 1, 50, 10);
+          const keyword = typeof call.arguments.keyword === "string" ? call.arguments.keyword : undefined;
+          const claims = scope === "evidence" ? undefined : await this.growth.recall({
             kind: call.arguments.kind as GrowthKind | undefined,
             subject: typeof call.arguments.subject === "string" ? call.arguments.subject : undefined,
-            keyword: typeof call.arguments.keyword === "string" ? call.arguments.keyword : undefined,
+            keyword,
             claimId: typeof call.arguments.claim_id === "string" ? call.arguments.claim_id : undefined,
-            n: clampInt(call.arguments.n, 1, 50, 10),
-          })), originEventIds: [],
-        }));
-      case "check_time":
-        // Clock readings are observations; failures must not reveal a global clock.
-        return this.dispatchLocal(call, async () => {
-          const parts: string[] = [];
-          await this.world.resolveCheckTime((content) => parts.push(content));
-          return {
-            text: parts.length ? parts.join("\n") : "（目前没有观察到可确认的时间信息。）",
-            originEventIds: [...new Set(parts.flatMap((part) => observationOrigins(part) ?? []))],
-          };
+            n,
+          });
+          if (call.arguments.event_ids != null && (!Array.isArray(call.arguments.event_ids) ||
+            call.arguments.event_ids.length > 50 || call.arguments.event_ids.some(id => typeof id !== "string" || !id.trim()))) {
+            throw new Error("recall_growth 的 event_ids 须为不超过 50 个事件 id 的数组");
+          }
+          const evidence = scope === "claims" ? undefined : await this.growth.recallEvidence({
+            eventIds: call.arguments.event_ids as string[] | undefined, keyword, n,
+          });
+          return { text: JSON.stringify({ ...(claims ? { claims } : {}), ...(evidence ? { evidence } : {}) }), originEventIds: [] };
         });
       case "travel":
         return this.dispatchLocal(call, async () => {
@@ -1351,7 +1456,7 @@ export class BotAgent {
         if (!refs.length) {
           this.pushEvent(
             "system",
-            '（view_media 需要 media 参数：媒体编号或收藏夹文件的列表，如 ["12", "gallery:表情包/xx.png"]。）',
+            '（view_media 需要 media 参数：明确媒体引用的列表，如 ["media:12", "gallery:表情包/xx.png"]；不能使用 msg:消息编号。）',
             { ref: call.id },
           );
           return;
@@ -1779,8 +1884,6 @@ export class BotAgent {
       }
       case "cancel":
         return this.dispatchCancel(call);
-      case "recall":
-        return this.dispatchLocal(call, async () => this.recallFacts(call));
       default:
         // 当前打开的 App 展开的工具
         if (this.apps?.hasTool(call.name)) {
@@ -1820,13 +1923,13 @@ export class BotAgent {
     if (call.expectedAt - call.issuedAt > 0) {
       this.pushEvent(
         "system",
-        `${call.id} ${call.name} 已开始，预计 T=${call.expectedAt.toFixed(1)} 完成。`,
+        `${call.id} ${describeToolCall(call)} 已开始，预计 T=${call.expectedAt.toFixed(1)} 完成。`,
         { ref: call.id },
       );
     } else {
       this.pushEvent(
         "system",
-        `${call.id} ${call.name} 已开始执行，完成后结果会自动以事件形式送到你这里。`,
+        `${call.id} ${describeToolCall(call)} 已开始执行，完成后结果会自动以事件形式送到你这里。`,
         { ref: call.id },
       );
     }
@@ -1906,7 +2009,11 @@ export class BotAgent {
   }
 
   private dispatchAct(call: ToolCallRecord): void {
-    const desc = String(call.arguments.description ?? call.arguments.str ?? "");
+    const desc = typeof call.arguments.description === "string" ? call.arguments.description.trim() : "";
+    if (!desc) {
+      this.pushEvent("system", "（动作未提交：act.description 必须是非空的具体行动；target 和 speech 是可选补充，不能代替行动描述。）", { ref: call.id });
+      return;
+    }
     // blockingAct：一个人同时只能专注做一件事。上一个动作还没完成时，新的 act 直接拒绝并提示，
     // 不调用 World-LLM 裁定；也不像 repeat 那样给 Bot 留绕过口（专注模式不可无视）。
     if (this.config.bot.blockingAct) {
@@ -1939,9 +2046,11 @@ export class BotAgent {
     this.lastAct = { sig, callId: call.id };
     this.lastActBlock = null; // 成功发起（或重置）一个 act，重复计数归零
     this.ackStart(call);
+    let actionCompleted = false;
     this.schedule(call, {
       executeAt: "now",
       cancellation: "cooperative",
+      resultOk: () => actionCompleted,
       run: async (task) => {
         const parts: string[] = [];
         const ok = await this.world.adjudicateAct(call, (content) => parts.push(content), task.signal, task.beginCommit);
@@ -1949,6 +2058,7 @@ export class BotAgent {
         const adjudicatedFailure = parts.some((part) => {
           try { return JSON.parse(part)?.action?.status === "failed"; } catch { return false; }
         });
+        actionCompleted = ok && !adjudicatedFailure;
         if (!ok && !adjudicatedFailure) throw new Error("世界未能裁定此动作，结果尚未确认");
         if (!parts.length) throw new Error("世界未返回可感知的动作结果，不能认定动作成功");
         // A world snapshot is not a perception. Only return the adjudicator's actor-filtered receipt.
@@ -1993,7 +2103,7 @@ export class BotAgent {
         const unlock = firstOpen
           ? `（聊天应用已打开，新增可用操作（关闭应用后失效）：\n${renderToolsText(this.layerDefs("chat"))}\n` +
             `要**发消息**，先 select_channel 点进某个频道（进频道后才解锁频道内的完整操作），再用 send 发送；` +
-            `想发图文混排，在 msg 里写 <img> 占位符再用 pick_media 选图填充；` +
+            `想发图文混排，先查看/选定媒体，再在 msg 的原位置填写 <media ref="media:12"/>；` +
             `没点进频道时，若某频道刚来了新消息、收到它的提醒，也能 send 带上它的 id 直接快捷回复。）\n\n`
           : "";
         return typeof rich === "string"
@@ -2043,7 +2153,15 @@ export class BotAgent {
   /** Both autonomous and human calls serialize one side effect, then release the device. */
   private schedule(call: ToolCallRecord, opts: ScheduleOptions): void {
     const kind = call.name === "observe_device" ? call.arguments.device as DeviceKind : this.classifyDevice(call.name);
-    if (!kind) { this.scheduler.schedule(call, opts); return; }
+    if (!kind) {
+      this.scheduler.schedule(call, { ...opts, beforeStart: () => {
+        if (!this.currentToolNames(call.id).includes(call.name)) throw new Error(`工具 ${call.name} 此刻不可用，此操作没有执行；请依据最新能力变化事件选择操作`);
+        if (call.role === "agent" && this.residentControl?.mode === "puppet" && !this.autonomousDuringPuppet(call.name)) throw new Error("身体与设备正受外部操纵，此自主操作没有执行");
+        opts.beforeStart?.();
+      } });
+      this.refreshToolGate();
+      return;
+    }
     const phoneApp = this.apps?.hasTool(call.name) ? this.apps.view()?.id : null;
     const stealth = this.stealthCalls.has(call.id);
     let revealOnAttention = false;
@@ -2079,6 +2197,7 @@ export class BotAgent {
         } finally { this.deviceOperations--; }
       },
     });
+    this.refreshToolGate();
   }
 
   /** Read the current interface only. This cannot open, connect, or change device state. */
@@ -2091,10 +2210,12 @@ export class BotAgent {
     const label = kind === "phone"
       ? `手机当前显示：${this.phoneUi.chatOpen ? "聊天应用" + (this.phoneUi.channelKey ? `，频道 ${this.phoneUi.channelKey}` : "，消息列表") : this.apps?.currentName ?? "桌面"}`
       : !this.computer ? "当前没有可用电脑" : `电脑当前${this.computer.isOpen ? "处于打开状态" : "已关闭"}`;
+    const heading = `（你正看着${kind === "phone" ? "手机" : "电脑"}，当前可见界面：${label}。）` +
+      (visible?.text ? `\n${pixels ? "界面上显示的内容" : "已有界面回显"}（不是你的行动或心理记录）：\n` : "");
     return {
-      text: `（你正看着${kind === "phone" ? "手机" : "电脑"}，当前可见界面：${label}。）` +
-        (visible?.text ? `\n${pixels ? "界面上显示的内容" : "已有界面回显"}（不是你的行动或心理记录）：\n${truncate(visible.text, 3000)}` : ""),
+      text: heading + (visible?.text ? (visible.parts?.length ? visible.text : truncate(visible.text, 3000)) : ""),
       attachments: visible?.attachments,
+      parts: visible?.parts?.length ? [{ kind: "text", text: heading }, ...visible.parts] : undefined,
     };
   }
 
@@ -2176,27 +2297,28 @@ export class BotAgent {
    * <base>/spill/，模型上下文只保留裁剪预览。落盘失败静默降级为原样返回（不把成功的调用变成失败）。
    *
    * 注意：这里只裁剪 **模型可见** 的文本，原始结果仍由 scheduler 的结果语义保留；
-   * 裁剪让前缀缓存从被裁点起失效，但只发生在个别超大结果上，且换来上下文不被垃圾塞满。
+   * 裁剪只发生在新回执进入上下文之前，不改写任何已发送的历史前缀。
    */
   private spillResult(content: string | RichText, ref?: string): string | RichText {
     const threshold = this.config.bot.spillMinChars ?? 4000;
     if (threshold <= 0) return content;
-    if (typeof content !== "string") return content; // RichText（含附件/分段）不裁剪
-    if (content.length <= threshold) return content;
+    if (typeof content !== "string" && (content.parts?.length || content.attachments?.length)) return content;
+    const text = typeof content === "string" ? content : content.text;
+    if (text.length <= threshold) return content;
     // head/tail 各占约 45%，中间省略标记
     const headChars = Math.floor(threshold * 0.45);
     const tailChars = Math.floor(threshold * 0.45);
-    const head = sliceText(content, 0, headChars);
-    const tail = sliceText(content, content.length - tailChars);
-    const omitted = content.length - headChars - tailChars;
+    const head = sliceText(text, 0, headChars);
+    const tail = sliceText(text, text.length - tailChars);
+    const omitted = text.length - headChars - tailChars;
     const spillFile = this.files.spillPath(ref ? `${ref}.txt` : `result_${Date.now()}.txt`);
     const marker = `\n\n[... 中间 ${omitted} 字符已省略，完整结果见 ${spillFile} ...]\n\n`;
     const preview = head + marker + tail;
     // 落盘（异步、尽力而为）
     void this.files
-      .atomicWrite(spillFile, content)
+      .atomicWrite(spillFile, text)
       .catch(() => {/* spill 失败静默：模型仍拿到预览 */});
-    return preview;
+    return typeof content === "string" ? preview : { ...content, text: preview };
   }
 
   /** 记录一段实际发生的等待（从 fromTU 到现在），并顺手清理窗口外的旧区间 */
@@ -2409,18 +2531,18 @@ export class BotAgent {
    */
   private async echoChannelRecent(id: string, out: string, n?: number): Promise<string | RichText> {
     if (this.config.messaging.sendEcho === false) return out;
-    const recent = await this.messenger.channelMessages(id, n ?? this.config.messaging.sendEchoRecent, { intro: "echo" });
-    const recentText = recent.text.trim();
-    return recentText ? { text: `${out}\n\n${recentText}` } : out;
+    try {
+      const recent = await this.messenger.channelMessages(id, n ?? this.config.messaging.sendEchoRecent, { intro: "echo" });
+      const recentText = recent.text.trim();
+      return recentText ? { text: `${out}\n\n${recentText}` } : out;
+    } catch (error) {
+      this.logger.warn("发送后的聊天回显读取失败，保留原始发送回执：%s", error);
+      return `${out}\n（暂时读不到最新聊天记录；以上发送回执仍有效，不要因回显缺失重复发送。）`;
+    }
   }
 
 
-  // ---------- 发送（图文混排经 <img> 占位符） ----------
-
-  /** msg 里 <img> 占位符的数量（``<img>`` / ``<img/>`` / ``<IMG>`` 都算） */
-  private countImgPlaceholders(msg: string): number {
-    return (msg.match(/<img\s*\/?>/gi) ?? []).length;
-  }
+  // ---------- 发送（原位绑定媒体引用） ----------
 
   private dispatchSend(call: ToolCallRecord): void {
     // sendBlocking：上一条消息还没回显前，拒绝新的 send（避免连发相近/不连贯的消息）
@@ -2433,11 +2555,24 @@ export class BotAgent {
     }
     const id = this.channelArg(call) ?? "";
     const msg = String(call.arguments.msg ?? "");
-    const mediaRaw = call.arguments.media ?? call.arguments.images;
+    const aliases = ["images", "replyTo", "quote", "atSender", "at"].filter(key => Object.hasOwn(call.arguments, key));
+    if (aliases.length) {
+      this.pushEvent("system", `（消息没有发出：send 不接受旧参数 ${aliases.join("、")}。媒体使用 media，引用消息使用 reply_to，是否自动提醒被引用者使用 at_sender；请修正参数后重新发送。）`, { ref: call.id });
+      return;
+    }
+    const mediaRaw = call.arguments.media;
+    if (mediaRaw !== undefined && (!Array.isArray(mediaRaw) || mediaRaw.some(ref => typeof ref !== "string" && !(typeof ref === "number" && Number.isSafeInteger(ref))))) {
+      this.pushEvent("system", "（消息没有发出：media 必须是明确媒体引用的数组，例如 [\"media:12\", \"gallery:照片/猫.png\"]。）", { ref: call.id });
+      return;
+    }
     const media = Array.isArray(mediaRaw) ? (mediaRaw as (string | number)[]) : [];
-    const replyRaw = call.arguments.reply_to ?? call.arguments.replyTo ?? call.arguments.quote;
+    const replyRaw = call.arguments.reply_to;
     const replyTo = normalizeMsgId(replyRaw);
-    const atRaw = call.arguments.at_sender ?? call.arguments.atSender ?? call.arguments.at;
+    if (replyRaw !== undefined && !replyTo) {
+      this.pushEvent("system", "（消息没有发出：reply_to 必须是完整的平台消息 ID，或消息记录中的 msg:ID / (msg:ID)。media:N 和 gallery:路径是媒体引用，不能用作被回复的消息 ID；不要填写说明文字或只抽取其中的数字。）", { ref: call.id });
+      return;
+    }
+    const atRaw = call.arguments.at_sender;
     const atSender = !(atRaw === false || atRaw === "false" || atRaw === 0);
     if (!id) {
       this.pushEvent("system", "（send 现在没有可发的频道：你需要先用 select_channel 点进某个频道，或等某个频道来新消息后带上它的 id 快捷回复。）", { ref: call.id });
@@ -2454,58 +2589,33 @@ export class BotAgent {
       );
       return;
     }
-    // 统一走 finishSend：内部先过拦截，再按「有无 <img> 占位符」决定暂存或调度发送
+    if (/<img\b|\[(?:图片|视频|音频|语音)#\d+/i.test(msg)) {
+      this.pushEvent("system", '（消息没有发出：旧媒体占位格式已停用。先查看/选择媒体，再用 <media ref="media:12"/> 明确填入原位置；不会创建自动发送的待填充草稿。）', { ref: call.id });
+      return;
+    }
+    // Explicit references are complete messages; every send passes the same validation/scheduler.
     this.finishSend(call, id, msg, media, replyTo, atSender);
   }
 
-  /** 选图填充 <img> 占位符：按占位符顺序逐张填，填满后自动发送。 */
+  /** Resolve choices without sending. Explicit references remain valid independent of display order. */
   private dispatchPickMedia(call: ToolCallRecord): void {
     return this.dispatchLocal(call, async () => {
-      const pending = this.pendingImageFill;
-      if (!pending) {
-        return "（当前没有待填充的消息：先用 send 在 msg 里写 <img> 占位符，再 pick_media 选图填充。）";
-      }
-      const raw = call.arguments.media ?? call.arguments.media_ids ?? call.arguments.refs;
-      const refs = Array.isArray(raw) ? raw.map((r) => String(r)) : [];
-      if (!refs.length) return "（pick_media 需要 media 参数：要填充的媒体编号或收藏夹文件的列表。）";
+      const raw = call.arguments.media;
+      const refs = Array.isArray(raw) ? raw.map(String) : [];
+      if (!refs.length) return "（pick_media 需要 media 参数：media:N 或 gallery:分类/文件名的列表。）";
+      if (refs.length > 9) return "（一次最多选择 9 个媒体，请分批选择。）";
       const results = await this.messenger.resolveMediaRefs(refs);
-      for (const r of results) {
-        if (!r.ok) {
-          this.pushEvent("system", `（${r.refText}：${r.error}）`, { ref: call.id });
-          continue;
-        }
-        if (pending.filled.length < pending.placeholderCount) {
-          pending.filled.push({ ref: r.ref, sticker: r.sticker });
-        }
-      }
-      const remaining = pending.placeholderCount - pending.filled.length;
-      if (remaining > 0) {
-        return `（已填充 ${pending.filled.length} 张，还剩 ${remaining} 个占位符待填充，继续 pick_media 选图。）`;
-      }
-      // 填满：把 msg 里的每个 <img> 替换成 [图片#id]，走正常发送
-      const filled = pending.filled;
-      const msg = pending.msg;
-      this.pendingImageFill = null;
-      let filledMsg = msg;
-      let i = 0;
-      filledMsg = filledMsg.replace(/<img\s*\/?>/gi, () => {
-        const f = filled[i++]!;
-        const label = f.ref.type === "image" ? "图片" : f.ref.type === "video" ? "视频" : "音频";
-        return `[${label}#${f.ref.id}]`;
-      });
-      // 复用原 send 的拦截/发送：直接调 messenger.send（内联 [图片#id] 会被解析成图片）
-      const insist = pending.insist;
-      const replyTo = pending.replyTo;
-      const atSender = pending.atSender;
-      const id = pending.channelKey;
-      const media = filled.map((f) => String(f.ref.id));
-      // 记录防复读签名（fill 后消息按「频道 + 替换后文字 + 已选图」判重）
-      this.recordSendSig(JSON.stringify([id, filledMsg, media]));
-      return await this.deliverSend(id, filledMsg, media, replyTo, atSender, insist);
+      const failures = results.filter((r): r is PickFailure => !r.ok);
+      if (failures.length) return `（选图未完成，没有发送消息：${failures.map(r => `${r.refText}：${r.error}`).join("；")}）`;
+      const selected = results.filter((r): r is PickResult => r.ok);
+      const rows = selected.map((r, index) => r.ref.type === "audio"
+        ? `${refs[index]} → media:${r.ref.id}（音频；使用 send_file 发送，不能插入 send 图文）`
+        : `${refs[index]} → <media ref="media:${r.ref.id}"/>${r.sticker ? "（表情包，发送时在原位置独立成一条）" : ""}`);
+      return `已确认以下媒体引用；尚未发送任何消息：\n${rows.join("\n")}\n请先确认内容，再将明确的 media 标签放入 send.msg 对应位置，或放入 send.media 在末尾追加。选图本身不创建草稿，也不会自动发送。`;
     });
   }
 
-  /** 无占位符时的正常发送（或填满后调用）：走 duration/长文/防复读拦截，然后真正发出。 */
+  /** Every explicit send uses the same duration, confirmation, duplicate and platform checks. */
   private finishSend(call: ToolCallRecord, id: string, msg: string, media: (string | number)[], replyTo: string | undefined, atSender: boolean): void {
     const longLimit = this.config.messaging.longMessageChars;
     if (longLimit > 0 && msg.length > longLimit && !isTruthy(call.arguments.confirm_long)) {
@@ -2523,29 +2633,6 @@ export class BotAgent {
     const repeatThreshold = this.config.messaging.recentRepeatThreshold;
     if (repeatThreshold > 0 && recentRepeat >= repeatThreshold && !isTruthy(call.arguments.resend)) {
       this.pushEvent("system", `（你最近已经说过「${truncate(msg, 24)}」${recentRepeat} 次了。这句没有发出——换一种说法，或真的没有新内容就别说。）`, { ref: call.id });
-      return;
-    }
-    // <img> 占位符：拦截已过，但图还没选，暂存待 pick_media 填充
-    const imgCount = this.countImgPlaceholders(msg);
-    if (imgCount > 0) {
-      this.pendingImageFill = {
-        channelKey: id,
-        replyTo,
-        atSender,
-        msg,
-        placeholderCount: imgCount,
-        filled: [],
-        insist: isTruthy(call.arguments.insist),
-        confirmLong: isTruthy(call.arguments.confirm_long),
-        resend: isTruthy(call.arguments.resend),
-      };
-      this.pushEvent(
-        "system",
-        `（这条消息里有 ${imgCount} 个图片占位符 \`<img>\`，还没有选图，所以没有发出。` +
-          `请先用 check_gallery / check_media / view_media 看清要发的图，` +
-          `再用 pick_media 一次选出 ${imgCount} 张图（按占位符出现的顺序），选满后消息会自动发出。）`,
-        { ref: call.id },
-      );
       return;
     }
     this.recordSendSig(sig);
@@ -2603,47 +2690,6 @@ export class BotAgent {
     this.pushEvent("system", text, { ref: call.id });
   }
 
-  /**
-   * recall：回忆过往小事记（facts.jsonl）。
-   * 支持关键词检索（grep）、按 T（时间单位）范围、只回忆重要回忆（important，映射到 pinned 标记，对 Bot 透明）与条数上限。
-   * 结果按时间正序返回（旧的在前），便于按时间线连贯回忆。固定条目对 Bot 不显式标注，避免破坏沉浸感。
-   */
-  private async recallFacts(call: ToolCallRecord): Promise<string> {
-    const args = call.arguments;
-    const keyword = typeof args.keyword === "string" ? args.keyword.trim() : "";
-    const importantOnly = isTruthy(args.important);
-    const n = clampInt(args.n, 1, 50, 10);
-    const since = asFiniteNumber(args.since);
-    const until = asFiniteNumber(args.until);
-
-    let facts = await this.files.readFactsAll();
-    if (importantOnly) facts = facts.filter((e) => e.pinned === true);
-    if (since != null) facts = facts.filter((e) => e.t >= since);
-    if (until != null) facts = facts.filter((e) => e.t <= until);
-    if (keyword) {
-      const kw = keyword.toLowerCase();
-      facts = facts.filter((e) => e.content.toLowerCase().includes(kw));
-    }
-    // 默认取最近 n 条；范围检索时也取范围内最靠后的 n 条（更相关）
-    facts = facts.slice(-n);
-
-    if (!facts.length) {
-      const hint = keyword
-        ? `你努力回想「${keyword}」——但记事本里没有相关的内容。`
-        : importantOnly
-          ? "你努力回想那些刻骨铭心的往事——脑海里一时只有一片空白。"
-          : "你努力回想自己的过往——记事本里还是一片空白。";
-      return hint;
-    }
-
-    const keywordLabel = keyword ? `与「${keyword}」相关` : "";
-    return (
-      `旧资料${keywordLabel}（历史世界作者记录，未经本次感知核实，不能作为新的成长证据）：\n` +
-      facts.map((e) => `- [T=${e.t.toFixed(1)} ${e.clock}] ${e.content}`).join("\n") +
-      `\n（每条开头是它的 T 时刻：想按时间往前或往后继续回忆，就把 recall 的 since / until 填成对应的 T 数值。）`
-    );
-  }
-
   /** Observation is the only entry to physical/world state. */
   private async observe(call: ToolCallRecord): Promise<RichText> {
     const self = call.arguments.target === "self";
@@ -2653,14 +2699,6 @@ export class BotAgent {
     return { text: JSON.stringify(observation), originEventIds: observation.sourceEventIds };
   }
 
-  private async readStatus(call: ToolCallRecord): Promise<RichText> {
-    // Compatibility alias: neither world nor self may bypass the observation projection.
-    return this.observe({ ...call, arguments: {
-      ...call.arguments, target: undefined, modality: call.arguments.target === "world" ? undefined : "self",
-    } });
-  }
-
-  // ---------- rest 与独立记忆整理 ----------
 
   /** 角色休息与记忆维护分别调度；通知始终可以打断角色休息。 */
   private dispatchRest(call: ToolCallRecord): void {
@@ -2697,6 +2735,7 @@ export class BotAgent {
     await this.drainMailbox();
     const snapshot = await this.context.compressionSnapshot();
     if (!snapshot.entries.length) return;
+    await this.growth.restorePerceptions(snapshot.entries);
     this.logger.info("整理记忆（%s）：%d 条记录", reason ?? "rest", snapshot.entries.length);
     let result: CompressionResult;
     try {
@@ -2714,11 +2753,22 @@ export class BotAgent {
       return;
     }
     if (!this.running) return;
-    // Ignore any legacy BOT_STATUS output: the memory writer cannot mutate objective world state.
-    await this.context.applyCompression(result, this.clock.now(), snapshot);
+    // Stage the exact post-compression capability list before the durable prefix cutover.
+    // Failed writes retain the previous native snapshot and restore any temporary bans.
+    const previousBans = new Set(this.tempBannedTools);
+    this.tempBannedTools.clear();
+    this.refreshToolGate();
+    try {
+      // The memory writer cannot mutate objective world state.
+      await this.context.applyCompression(result, this.clock.now(), snapshot);
+    } catch (error) {
+      for (const name of previousBans) this.tempBannedTools.add(name);
+      this.refreshToolGate();
+      throw error;
+    }
+    this.backend.resetToolSnapshot?.();
     this.repeatGuard.reset();
     this.forceRestCount = 0;
-    this.tempBannedTools.clear();
     this.refreshToolGate();
     this.wakeTimeLine = this.clock.timeLine();
   }
@@ -2870,12 +2920,12 @@ function escalatingRepeatHint(repeatCount: number): string {
   ]);
 }
 
-/** send 系工具的名字集合（send 发送消息、pick_media 填充 <img> 占位符） */
-const SEND_TOOL_NAMES = ["send", "pick_media"];
+/** Only send submits a platform message; pick_media merely resolves stable references. */
+const SEND_TOOL_NAMES = ["send"];
 
 /** 打破死循环时不该被移除的"安全"工具：计时/书签类，移除它们反而会让模型无处安放、更疯狂 */
 function isBreakLoopSafeTool(name: string): boolean {
-  return name === "wait" || name === "rest" || name === "check_status" || name === "check_time" || name === "observe_device";
+  return name === "wait" || name === "rest" || name === "observe_device";
 }
 
 /**
@@ -2907,31 +2957,6 @@ function clampInt(value: unknown, min: number, max: number, fallback: number): n
 /** 宽松解析布尔参数（模型可能输出 true / "true" / 1） */
 function isTruthy(value: unknown): boolean {
   return value === true || value === "true" || value === 1;
-}
-
-/**
- * 归一化消息 id：Bot 可能照抄消息记录里的 "(msg:283828113)" 编号，
- * 把 "msg:283828113" 或 "283828113" 都归一到纯数字 "283828113"；
- * 空值 / 非数字（如 "msg:0" 这种无效值）返回 undefined（未引用）。
- */
-function normalizeMsgId(value: unknown): string | undefined {
-  if (value === undefined || value === null) return undefined;
-  let s = String(value).trim();
-  if (!s) return undefined;
-  // 去前缀：msg: 或带方括号 "(msg:xxx)" 之类
-  const m = s.match(/(?:msg\s*:\s*)?(\d+)/i);
-  if (!m) return undefined;
-  const id = m[1]!;
-  // "0" 是无效引用（Bot 幻觉或没拿到真实 id）
-  if (id === "0") return undefined;
-  return id;
-}
-
-/** 解析可选数字参数；非有限数值（含 undefined / null / 空串）返回 null（表示"没给"） */
-function asFiniteNumber(value: unknown): number | null {
-  if (value == null || value === "") return null;
-  const n = Number(value);
-  return Number.isFinite(n) ? n : null;
 }
 
 /**

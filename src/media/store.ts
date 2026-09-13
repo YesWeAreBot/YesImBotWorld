@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import type { Context, Logger } from "koishi";
 import type { MediaRef, MediaType } from "../types.js";
 import { fetchWithProxy } from "../fetch.js";
@@ -110,6 +111,14 @@ export class MediaStore {
 
       const existing = await this.ctx.database.get("yesimbot_world_media", { sha256 }, { limit: 1 });
       if (existing.length) {
+        // Re-receiving an asset must repair a missing/replaced cache file instead of returning a
+        // permanently broken ID. The incoming bytes have already passed the same hash check.
+        const storedFile = path.join(this.assetsDir, existing[0]!.file);
+        const stored = await fs.readFile(storedFile).catch(() => null);
+        if (!stored || createHash("sha256").update(stored).digest("hex") !== sha256) {
+          await this.ensureDir();
+          await fs.writeFile(storedFile, data);
+        }
         // 去重命中：若本次是表情包而旧记录未标，则补标（曾作为表情包出现 → 保留表情身份）
         if (sticker && !existing[0]!.sticker) {
           await this.ctx.database.set("yesimbot_world_media", { sha256 }, { sticker: true });
@@ -167,7 +176,11 @@ export class MediaStore {
   }
 
   async readFile(ref: MediaRef): Promise<Buffer> {
-    return fs.readFile(ref.file);
+    const row = await this.get(ref.id);
+    if (!row || row.ref.file !== ref.file || row.ref.type !== ref.type || row.ref.mime !== ref.mime) throw new Error(`媒体 media:${ref.id} 的引用与资产不匹配`);
+    const bytes = await fs.readFile(row.ref.file);
+    if (createHash("sha256").update(bytes).digest("hex") !== row.sha256) throw new Error(`媒体 media:${ref.id} 的文件已被替换，不能沿用旧摘要`);
+    return bytes;
   }
 
   private async fetchSource(
@@ -186,7 +199,7 @@ export class MediaStore {
       return { data, mime };
     }
     if (src.startsWith("file://")) {
-      const filePath = decodeURIComponent(src.slice("file://".length));
+      const filePath = fileURLToPath(src);
       const stat = await fs.stat(filePath);
       if (stat.size > this.maxBytes) return null;
       const data = await fs.readFile(filePath);

@@ -1,5 +1,6 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { h, Universal, type Bot, type Context } from "koishi";
 import type { MessengerApi } from "../bot/agent.js";
 import type { CaptionService } from "../media/captioner.js";
@@ -12,8 +13,9 @@ import {
   sanitizeFileName,
   type GalleryStore,
 } from "../media/gallery.js";
-import { MEDIA_PLACEHOLDER, mediaPlaceholder, type MediaRenderer } from "../media/render.js";
+import { MEDIA_PLACEHOLDER, mediaPlaceholder, escapeMediaStorageText, type MediaRenderer } from "../media/render.js";
 import type { MediaStore } from "../media/store.js";
+import { mediaPart, mediaText, parseMediaId, richPartsText } from "../media/presentation.js";
 import type { TtsClient } from "../media/tts.js";
 import type { MediaRef, MediaType, PickFailure, PickResult, RichText, RichTextPart } from "../types.js";
 import type { FocusManager } from "./focus.js";
@@ -26,9 +28,10 @@ import type { OwnSendTracker } from "./ownsends.js";
 import type { RequestStore } from "./requests.js";
 import { channelKey as makeChannelKey, parseChannelKey } from "./channels.js";
 import { conversationKind, conversationLabel, describeConversation, type ConversationContext } from "./conversation.js";
+import { normalizeMsgId } from "./markers.js";
 
-/** msg 中的内联媒体标记：Bot 会照抄事件里见到的 [图片#12]、[视频#3：描述] 等形式 */
-const INLINE_MEDIA = /\[(图片|视频|音频|语音)#(\d+)[^\]]*\]/g;
+/** Explicit stable references retain interleaved text/media order without ordinal placeholders. */
+const INLINE_MEDIA = /<media\s+ref=(["'])(media:[1-9]\d*|gallery:[^"'<>]+)\1\s*\/>/g;
 
 /**
  * 「表情包」分类图片的表情标记：OneBot image 段的 sub_type=1 表示表情（QQ 按表情包渲染，
@@ -256,65 +259,36 @@ export class KoishiMessenger implements MessengerApi {
     const names = await this.galleryStore.listNames(cat);
     if (!names.length) return { text: `「${cat}」分类是空的。` };
 
-    const lines: string[] = [];
     const attachments: MediaRef[] = [];
-    const parts: RichTextPart[] = [];
-    for (let idx = 0; idx < Math.min(names.length, 50); idx++) {
-      const name = names[idx]!;
+    const parts: RichTextPart[] = [{ kind: "text", text: `你打开了收藏夹的「${cat}」分类：\n` }];
+    for (const name of names.slice(0, 50)) {
       const file = path.join(this.galleryStore.dirOf(cat), name);
       const stat = await fs.stat(file).catch(() => null);
       if (!stat?.isFile()) continue;
       const type = typeByExt(name);
-      if (type === "image") {
-        const id = await this.media.ingest(`file://${file}`, "image");
-        if (id === null) {
-          const row = `- ${cat}/${name}（读取失败）`;
-          lines.push(row);
-          parts.push({ kind: "text", text: row + (idx < Math.min(names.length, 50) - 1 ? "\n" : "") });
-          continue;
-        }
-        const row = await this.media.get(id);
-        const meta = row ? await this.galleryStore.findMeta(cat, name, row.sha256) : null;
-        const desc = meta?.description || (row ? ((await this.captioner.describe(row.ref)) ?? "") : "");
-        const head = `- ${cat}/${name}${desc ? `：${truncate(desc, 120)}` : ""}`;
-        // 原生可附且预算内：图就位（parts 里 media 段紧跟这一行文字），不带 [图片#id] 占位、不写「原图见附件」
-        if (row && this.renderer.canAttach(row.ref) && attachments.length < this.renderer.maxAttach) {
-          attachments.push(row.ref);
-          lines.push(head);
-          parts.push({ kind: "text", text: head });
-          parts.push({ kind: "media", ref: row.ref, marker: `[图片#${id}]` });
-        } else {
-          // 不可附：就地给描述（desc 已有，或标注读不出内容）
-          const fallback = desc ? head : `- ${cat}/${name}（没有可用的识图能力，看不清内容）`;
-          lines.push(fallback);
-          parts.push({ kind: "text", text: fallback });
-        }
-      } else if (type === "audio" || type === "video") {
-        const id = await this.media.ingest(`file://${file}`, type);
-        const label = type === "audio" ? "音频" : "视频";
-        const meta = id !== null ? await this.galleryStore.findMeta(cat, name) : null;
-        const row = id !== null
-          ? `- ${cat}/${name}（${formatSize(stat.size)}）${meta?.description ? `：${truncate(meta.description, 120)}` : ""}`
-          : `- ${cat}/${name}（读取失败）`;
-        lines.push(row);
-        parts.push({ kind: "text", text: row });
-      } else {
-        const row = `- ${cat}/${name}（${formatSize(stat.size)}）`;
-        lines.push(row);
-        parts.push({ kind: "text", text: row });
+      if (type === "file") {
+        parts.push({ kind: "text", text: `- gallery:${cat}/${name}（文件，${formatSize(stat.size)}）\n` });
+        continue;
       }
-      if (idx < Math.min(names.length, 50) - 1) parts.push({ kind: "text", text: "\n" });
+      const id = await this.media.ingest(pathToFileURL(file).href, type);
+      const row = id === null ? null : await this.media.get(id);
+      if (!row) {
+        parts.push({ kind: "text", text: `- gallery:${cat}/${name}（读取失败）\n` });
+        continue;
+      }
+      const meta = await this.galleryStore.findMeta(cat, name, row.sha256);
+      const summary = meta?.description || await this.captioner.describe(row.ref) || undefined;
+      const part = mediaPart(row.ref, { name: `gallery:${cat}/${name}`, summary });
+      if (this.renderer.canAttach(row.ref) && attachments.length < this.renderer.maxAttach) {
+        attachments.push(row.ref); parts.push(part);
+      } else parts.push({ kind: "text", text: mediaText(part) });
+      parts.push({ kind: "text", text: "\n" });
     }
-    if (names.length > 50) lines.push(`（还有 ${names.length - 50} 项未显示）`);
-    const tail =
-      cat === UNSORTED_CATEGORY
-        ? "\n（这些是主人放进来还没整理的：先 view_media 看清内容，再用 gallery_move 移到合适的分类并写好描述。）"
-        : "\n（光看描述拿不准的图，发出前先 view_media 仔细看一眼；挑中后用 pick_media 插入输入框。）";
-    return {
-      text: `你打开了收藏夹的「${cat}」分类：\n${lines.join("\n")}${tail}`,
-      attachments: attachments.length ? attachments : undefined,
-      parts: parts.length ? parts : undefined,
-    };
+    if (names.length > 50) parts.push({ kind: "text", text: `（还有 ${names.length - 50} 项未显示）\n` });
+    parts.push({ kind: "text", text: cat === UNSORTED_CATEGORY
+      ? "（这些是主人放进来还没整理的：先 view_media 看清内容，再用 gallery_move 移到合适的分类并写好描述。）"
+      : "（发出前确认具体媒体内容；用 media:N 或完整 gallery:分类/文件名选择同一个媒体，不凭展示顺序猜编号。）" });
+    return { text: richPartsText(parts), attachments: attachments.length ? attachments : undefined, parts };
   }
 
   /**
@@ -333,7 +307,7 @@ export class KoishiMessenger implements MessengerApi {
         if (full) summary = (await this.captioner.describe(full.ref)) ?? "";
       }
       lines.push(
-        `- [${label}#${row.id}] ${formatSize(row.size)} ${formatTime(row.createdAt)}` +
+        `- ${label} media:${row.id} ${formatSize(row.size)} ${formatTime(row.createdAt)}` +
           (summary ? `：${truncate(summary, 100)}` : "（无内容摘要）"),
       );
     }
@@ -345,10 +319,10 @@ export class KoishiMessenger implements MessengerApi {
 
   /** 把缓存里的媒体存进收藏夹：必须选定分类并由 Bot 亲自写下描述（日后挑图全靠它） */
   async gallerySave(mediaId: string, category: string, description: string, name?: string): Promise<string> {
-    const match = mediaId.match(/(\d+)\s*$/);
-    if (!match) return `（无法理解的媒体编号："${mediaId}"）`;
-    const row = await this.media.get(Number(match[1]));
-    if (!row) return `（找不到媒体 #${match[1]}，可先用 check_media 查看缓存。）`;
+    const id = parseMediaId(mediaId);
+    if (id === null) return `（无法理解的媒体引用："${mediaId}"。请使用 check_media 展示的 media:N。）`;
+    const row = await this.media.get(id);
+    if (!row) return `（找不到媒体 media:${id}，可先用 check_media 查看缓存。）`;
 
     const cat = normalizeCategory(category);
     if (!cat || cat === UNSORTED_CATEGORY) {
@@ -375,7 +349,7 @@ export class KoishiMessenger implements MessengerApi {
     await fs.copyFile(row.ref.file, dest);
     await this.galleryStore.upsertMeta(cat, filename, row.sha256, desc);
     const label = LABEL[row.type as MediaType] ?? row.type;
-    return `你把${label}#${row.id} 存进了收藏夹 ${cat}/${filename}，并记下：${truncate(desc, 100)}`;
+    return `你把${label} media:${row.id} 存进了收藏夹 ${cat}/${filename}，并记下：${truncate(desc, 100)}`;
   }
 
   /** 整理收藏夹：把文件移到某个分类（主要用于「未整理」的归类），可顺带写描述 */
@@ -425,54 +399,37 @@ export class KoishiMessenger implements MessengerApi {
    * 同时带出收藏夹里已记下的描述（如果有）。
    */
   async viewMedia(refs: string[]): Promise<RichText> {
-    const list = refs.filter((r) => String(r).trim()).slice(0, 6);
-    if (!list.length) return { text: "（view_media 需要 media 参数：媒体编号或收藏夹文件名的列表。）" };
+    const list = refs.filter((r) => String(r).trim());
+    if (!list.length) return { text: "（view_media 需要 media 参数：media:N 或 gallery:分类/文件名的列表。）" };
+    if (list.length > 6) return { text: "（view_media 每次最多查看 6 个媒体，本次未查看；请拆成多次调用。）" };
 
-    const lines: string[] = [];
     const attachments: MediaRef[] = [];
-    const parts: RichTextPart[] = [];
+    const parts: RichTextPart[] = [{ kind: "text", text: "你把这些媒体逐一打开查看；每个条目的身份、摘要与原始内容位于同一 media 块内：\n" }];
     for (const refText of list) {
       const resolved = await this.resolveMediaRef(String(refText));
       if ("error" in resolved) {
-        const row = `- ${refText}：${resolved.error}`;
-        lines.push(row);
-        parts.push({ kind: "text", text: row });
+        parts.push({ kind: "text", text: `- ${refText}：${resolved.error}\n` });
         continue;
       }
       const { ref } = resolved;
-      // 收藏夹里已记下的描述（按 sha 反查，用户手动放的文件也能对上）
       const row = await this.media.get(ref.id);
-      const meta = row ? await this.galleryStore.findBySha(row.sha256) : null;
-      const noted = meta?.description
-        ? `你之前记下的描述：${truncate(meta.description, 100)}`
-        : "";
-      const savedAt = meta ? `（已收藏于 ${meta.category}/${meta.name}）` : "";
-
-      if (this.renderer.canAttach(ref) && attachments.length < this.renderer.maxAttach) {
-        attachments.push(ref);
-        // 原生可看：图就位（media 段紧跟这一行文字），不带 [图片#id] 占位、不写「原图见附件」
-        const head = `- ${savedAt}${noted}`;
-        lines.push(head);
-        parts.push({ kind: "text", text: head });
-        parts.push({ kind: "media", ref, marker: `[${LABEL[ref.type]}#${ref.id}]` });
-        continue;
-      }
-      const detail = await this.captioner.describeDetailed(ref);
-      const rowText =
-        `- ${savedAt}${detail ? `：${detail}` : "（没有可用的识图能力，看不清内容）"}` +
-        (noted ? `\n  ${noted}` : "");
-      lines.push(rowText);
-      parts.push({ kind: "text", text: rowText });
+      const meta = resolved.gallery
+        ? await this.galleryStore.findMeta(resolved.gallery.category, resolved.gallery.name, row?.sha256)
+        : row ? await this.galleryStore.findBySha(row.sha256) : null;
+      const native = this.renderer.canAttach(ref) && attachments.length < this.renderer.maxAttach;
+      const summary = native ? await this.captioner.describe(ref) : await this.captioner.describeDetailed(ref);
+      const description = [summary, meta?.description ? `收藏时记下的描述：${meta.description}` : ""].filter(Boolean).join("\n");
+      const name = resolved.gallery ?? meta;
+      const part = mediaPart(ref, { name: name ? `gallery:${name.category}/${name.name}` : undefined, summary: description || undefined });
+      if (native) { attachments.push(ref); parts.push(part); }
+      else parts.push({ kind: "text", text: mediaText(part, description ? "当前通过文字描述了解内容，未展开原始媒体" : "当前无法查看内容") });
+      parts.push({ kind: "text", text: "\n" });
     }
-    return {
-      text: `你把这几样东西拿起来仔细看了看：\n${lines.join("\n")}`,
-      attachments: attachments.length ? attachments : undefined,
-      parts: parts.length ? parts : undefined,
-    };
+    return { text: richPartsText(parts), attachments: attachments.length ? attachments : undefined, parts };
   }
 
   /**
-   * 选图：解析一串媒体引用（媒体编号 / gallery:分类/文件 / 图片#12）为具体的 MediaRef + sticker，
+   * 选图：解析一串媒体引用（media:N / gallery:分类/文件）为具体的 MediaRef + sticker，
    * 供 agent 的 pick_media 工具「选定并插入输入框」用。每项返回判别联合：解析成功或失败。
    */
   async resolveMediaRefs(
@@ -500,6 +457,16 @@ export class KoishiMessenger implements MessengerApi {
   ): Promise<string> {
     const target = await this.resolveBot(id);
     if ("error" in target) return target.error;
+    if (/<img\b|\[(?:图片|视频|音频|语音)#\d+/i.test(msg)) {
+      return '（消息没有发出：旧媒体占位格式已停用。请先 view_media 确认内容，再在原位置填写 <media ref="media:12"/>，或在 media 参数里给出明确引用。）';
+    }
+    if (/<media\b/i.test(msg.replace(INLINE_MEDIA, ""))) return '（消息没有发出：媒体标签格式无效。请使用 <media ref="media:12"/>；摘要或名称不能代替媒体引用。）';
+    if (media.length > 9) return "（消息没有发出：media 参数最多包含 9 个媒体，请分开选择。）";
+    if (replyTo !== undefined) {
+      const normalized = normalizeMsgId(replyTo);
+      if (!normalized) return "（消息没有发出：reply_to 必须是完整消息 ID 或 msg:ID / (msg:ID)，不能使用 media:N、gallery:路径或说明文字。）";
+      replyTo = normalized;
+    }
 
     // 冷频道刷屏拦截：最近 N 条消息全是自己发的（无人回应）时，继续发送需要 insist 确认。
     // 在实际发出时刻检查（而非生成时刻）——打字期间对方回复了就不拦。
@@ -515,14 +482,11 @@ export class KoishiMessenger implements MessengerApi {
       }
     }
 
-    const elements: h[] = [];
-    /** 表情包（「表情包」分类的图片）：单独作为平台表情发送，不与文字/普通图片/视频混在一条里 */
-    const stickerElements: h[] = [];
+    const ordered: { el: h; stored: string; sticker: boolean }[] = [];
+    const add = (el: h, stored: string, sticker = false) => ordered.push({ el, stored, sticker });
     const sentRefs: MediaRef[] = [];
     const problems: string[] = [];
     const inlineIds = new Set<number>();
-    let stored = "";
-    let stickerStored = "";
     let atNote = "";
 
     // 出站富文本解析：<at …/>、<face …/> 标签（入站渲染的照抄形式）与
@@ -547,39 +511,42 @@ export class KoishiMessenger implements MessengerApi {
       const parts = renderRichParts(text, isGroup ? await getParticipants() : [], { allowAt: isGroup });
       for (const part of parts) {
         if (typeof part === "string") {
-          elements.push(h.text(part));
-          stored += part;
+          add(h.text(part), part);
         } else {
-          elements.push(part.el);
-          stored += part.stored;
+          add(part.el, part.stored);
         }
       }
     };
 
-    // 引用标签（入站渲染的照抄形式）：<quote id="123" …/> → 等效 reply_to 参数。
-    // 未开启 reply 能力时静默剥离（避免把标签当文字发出去）
+    // A copied quote and reply_to use the same message-ID namespace and validation.
     let quoteFromTag: string | undefined;
+    let quoteError = false;
     msg = msg
       .replace(/<quote\s+([^<>]*?)\/?>(?:<\/quote>)?/g, (_whole, attrsRaw: string) => {
         const attrs = parseTagAttrs(attrsRaw);
-        if (!quoteFromTag && attrs.id) quoteFromTag = attrs.id;
+        const normalized = normalizeMsgId(attrs.id);
+        if (!normalized || (quoteFromTag && quoteFromTag !== normalized)) quoteError = true;
+        else quoteFromTag = normalized;
         return "";
       })
       .trimStart();
-    if (!replyTo && quoteFromTag && this.ops.reply) replyTo = quoteFromTag;
+    if (quoteError || /<quote\b/i.test(msg) || (replyTo && quoteFromTag && replyTo !== quoteFromTag)) {
+      return "（消息没有发出：引用标签必须指定同一条消息的完整 ID，且须与 reply_to 一致；media:N、gallery:路径和多个不同引用不能代替消息 ID。）";
+    }
+    replyTo ??= quoteFromTag;
+    if (replyTo && !this.ops.reply) return "（消息没有发出：当前未启用引用回复能力；若要发送普通消息，请移除 reply_to 和引用标签后重新决定。）";
 
     // 引用回复：模拟 QQ 客户端行为——群聊里引用时自动在开头 @ 原发送人 + 空格，
     // Bot 可用 at_sender: false 去掉（如同真人手动删掉自动加上的 @）。
     // 私聊没有 @ 的概念，强制不附加 at（QQ 私聊无法渲染 at，只会留下一个孤零零的空格）。
     if (replyTo) {
-      elements.push(h("quote", { id: replyTo }));
-      stored += `[引用 msg:${replyTo}] `;
+      add(h("quote", { id: replyTo }), `[引用 msg:${replyTo}] `);
       if (target.isDirect) atSender = false;
       if (atSender) {
         const quoted = await this.store.findByMessageId(target.platform, target.channelId, replyTo, target.bot.selfId);
         if (quoted && !quoted.self && quoted.userId) {
-          elements.push(h("at", { id: quoted.userId, name: quoted.username || undefined }), h.text(" "));
-          stored += `@${quoted.username || quoted.userId} `;
+          add(h("at", { id: quoted.userId, name: quoted.username || undefined }), `@${quoted.username || quoted.userId}`);
+          add(h.text(" "), " ");
           atNote = `，并 @ 了 ${quoted.username || quoted.userId}`;
           // 去重兜底：reply_to 已自动 @ 了原发送人，把 msg 里指向同一人的 <at id> 剥掉（避免连续重复 @）。
           // 只剥"恰好这个 user id"的标签，不伤及 @ 他人的正常写法。
@@ -588,7 +555,7 @@ export class KoishiMessenger implements MessengerApi {
       }
     }
 
-    // msg 中的内联媒体标记（[图片#12] / [视频#3]…）→ 在对应位置嵌入媒体，实现图文混排
+    // Explicit media references expand exactly where they occur in the outgoing message.
     let cursor = 0;
     for (const match of msg.matchAll(INLINE_MEDIA)) {
       const before = msg.slice(cursor, match.index);
@@ -599,16 +566,11 @@ export class KoishiMessenger implements MessengerApi {
         await pushText(before); // 标记未被替换：保留原空白，避免两侧文字粘连
         continue;
       }
-      // 标记被替换成媒体后，紧邻它的空格会孤立地留在相邻文本段的首尾——一并吃掉（换行保留，可能是有意排版）
-      await pushText(before.replace(/[ \t]+$/, ""));
-      while (cursor < msg.length && (msg[cursor] === " " || msg[cursor] === "\t")) cursor++;
+      await pushText(before);
       const mediaEl = await this.mediaElement(resolved.ref, resolved.sticker);
-      if (resolved.sticker) stickerElements.push(mediaEl);
-      else elements.push(mediaEl);
+      add(mediaEl, mediaPlaceholder(resolved.ref.id, resolved.ref.type), resolved.sticker);
       sentRefs.push(resolved.ref);
       inlineIds.add(resolved.ref.id);
-      if (resolved.sticker) stickerStored += mediaPlaceholder(resolved.ref.id, resolved.ref.type);
-      else stored += mediaPlaceholder(resolved.ref.id, resolved.ref.type);
     }
     await pushText(msg.slice(cursor));
 
@@ -621,42 +583,47 @@ export class KoishiMessenger implements MessengerApi {
       }
       if (inlineIds.has(resolved.ref.id)) continue;
       const mediaEl = await this.mediaElement(resolved.ref, resolved.sticker);
-      if (resolved.sticker) stickerElements.push(mediaEl);
-      else elements.push(mediaEl);
+      add(mediaEl, mediaPlaceholder(resolved.ref.id, resolved.ref.type), resolved.sticker);
       sentRefs.push(resolved.ref);
-      if (resolved.sticker) stickerStored += mediaPlaceholder(resolved.ref.id, resolved.ref.type);
-      else stored += mediaPlaceholder(resolved.ref.id, resolved.ref.type);
     }
-    const normalHasContent = elements.some((el) => el.type !== "quote");
-    if (!normalHasContent && !stickerElements.length) {
-      return `（消息没发出去：没有可发送的内容。${problems.join("；")}）`;
+    if (problems.length) return `（消息没有发出：媒体选择未通过验证。${problems.join("；")}）`;
+    if (!ordered.some(part => part.el.type !== "quote")) return "（消息没有发出：没有可发送的内容。）";
+    // Split only at sticker boundaries. Moving all stickers behind all text reverses the meaning
+    // of messages such as "第一张 <sticker A> 第二张 <image B>".
+    const batches: { elements: h[]; stored: string; sticker: boolean }[] = [];
+    for (const part of ordered) {
+      const last = batches.at(-1);
+      if (last && last.sticker === part.sticker) { last.elements.push(part.el); last.stored += part.stored; }
+      else batches.push({ elements: [part.el], stored: part.stored, sticker: part.sticker });
     }
-
-    // 普通内容（文字/普通图片/视频，含引用）与表情包分别发送：
-    // 表情包单独作为平台表情发一条，不与图文混排（适配器对表情段的处理与普通图片不同）。
-    const batches: h[][] = [];
-    if (normalHasContent) batches.push(elements);
-    if (stickerElements.length) batches.push(stickerElements);
+    // A quote-only prefix is metadata for the first actual batch, never a standalone message.
+    if (batches[0]?.elements.every(el => el.type === "quote") && batches[1]) {
+      const prefix = batches.shift()!;
+      batches[0]!.elements.unshift(...prefix.elements); batches[0]!.stored = prefix.stored + batches[0]!.stored;
+    }
 
     const sentMsgIds: string[] = [];
+    const receiptProblems: string[] = [];
     const channelKey = makeChannelKey(target.platform, target.channelId, target.bot.selfId);
     for (let bi = 0; bi < batches.length; bi++) {
       const batch = batches[bi]!;
-      const isStickerBatch = batch === stickerElements;
       this.ownSends.expect(channelKey);
+      let ids: string[];
       try {
-        const ids = await target.bot.sendMessage(target.channelId, batch);
-        if (ids[0]) sentMsgIds.push(ids[0]);
-        // 留痕：表情包批次记表情占位，普通批次记录组装好的 stored
-        await this.storeSelf(target, isStickerBatch ? (stickerStored || "[动画表情]") : stored, ids[0]);
+        ids = await target.bot.sendMessage(target.channelId, batch.elements);
       } catch (err) {
         this.ownSends.unexpect(channelKey);
         const mute = await this.muteHint(target);
-        if (mute) return `（消息没发出去：${mute}，禁言解除前没法在这个群里说话。）`;
-        return `（消息发送失败：${sendFailText(err)}）`;
+        if (mute) return bi > 0 ? `（消息前 ${bi} 批已发出；之后因${mute}未发出，禁言解除前不能继续。）` : `（消息没发出去：${mute}，禁言解除前没法在这个群里说话。）`;
+        return bi > 0 ? `（消息已部分发出：前 ${bi} 批成功，之后发送失败：${sendFailText(err)}。不要把已发送部分当成未发送。）` : `（消息发送失败：${sendFailText(err)}）`;
       }
+      if (ids[0]) sentMsgIds.push(ids[0]);
+      // Platform success is irreversible. A local record failure must never claim it did not send.
+      try { await this.storeSelf(target, batch.stored, ids[0]); }
+      catch { receiptProblems.push(`第 ${bi + 1} 批已由平台确认发送，但本地聊天记录保存失败`); }
     }
-    await this.focus.focus(channelKey);
+    try { await this.focus.focus(channelKey); }
+    catch { receiptProblems.push("消息已发送，但本地频道关注状态更新失败"); }
     // Bot 自己玩 Koishi 指令（可选）：消息以已注册指令名开头时，以它自己的身份执行
     if (this.messaging.selfCommands) {
       void this.tryExecuteSelfCommand(target, msg).catch((err) => {
@@ -666,9 +633,11 @@ export class KoishiMessenger implements MessengerApi {
     let result = `消息已发送到 ${id}。`;
     if (this.showMsgId && sentMsgIds[0]) result = `消息已发送到 ${id}（msg:${sentMsgIds.join("、")}）。`;
     if (replyTo) result += `（引用回复了 msg:${replyTo}${atNote}）`;
-    if (sentRefs.length) result += `（附 ${sentRefs.length} 个媒体）`;
-    if (stickerElements.length) result += `（其中 ${stickerElements.length} 个表情包单独发送）`;
+    if (sentRefs.length) result += `（附 ${sentRefs.length} 个媒体，依次为 ${sentRefs.map(ref => `media:${ref.id}`).join("、")}）`;
+    const stickerCount = ordered.filter(part => part.sticker).length;
+    if (stickerCount) result += `（其中 ${stickerCount} 个表情包按原顺序单独发送）`;
     if (problems.length) result += `注意：${problems.join("；")}`;
+    if (receiptProblems.length) result += `注意：${receiptProblems.join("；")}；不要重复发送。`;
     return result;
   }
 
@@ -947,8 +916,8 @@ export class KoishiMessenger implements MessengerApi {
       const time =
         typeof node.time === "number" && node.time > 0 ? `[${formatTime(new Date(node.time * 1000))}] ` : "";
       const segments = (Array.isArray(node.content) ? node.content : Array.isArray(node.message) ? node.message : []) as Record<string, unknown>[];
-      const body = typeof node.content === "string" ? String(node.content) : await this.serializeRawSegments(segments);
-      lines.push(`${time}${who}: ${truncate(body || "（空消息）", 200)}`);
+      const body = typeof node.content === "string" ? escapeMediaStorageText(node.content) : await this.serializeRawSegments(segments);
+      lines.push(`${time}${who}: ${body || "（空消息）"}`);
     }
     if (nodes.length > shown.length) lines.push(`（还有 ${nodes.length - shown.length} 条未显示）`);
 
@@ -964,7 +933,7 @@ export class KoishiMessenger implements MessengerApi {
       const d = (seg.data ?? {}) as Record<string, unknown>;
       switch (seg.type) {
         case "text":
-          out += String(d.text ?? "");
+          out += escapeMediaStorageText(String(d.text ?? ""));
           break;
         case "image": {
           const src = String(d.url ?? d.file ?? "");
@@ -1045,8 +1014,8 @@ export class KoishiMessenger implements MessengerApi {
         ? ((result as Record<string, unknown>).texts as Record<string, unknown>[])
         : [];
     const texts = items.map((t) => String(t.text ?? "").trim()).filter(Boolean);
-    if (!texts.length) return `你仔细看了看图片#${resolved.ref.id}，上面没认出什么文字。`;
-    return `你仔细辨认了图片#${resolved.ref.id} 上的文字：\n${texts.slice(0, 100).join("\n")}`;
+    if (!texts.length) return `你仔细看了看图片 media:${resolved.ref.id}，上面没认出什么文字。`;
+    return `你仔细辨认了图片 media:${resolved.ref.id} 上的文字：\n${texts.slice(0, 100).join("\n")}`;
   }
 
   /** 戳一戳（仅 OneBot，需实现端支持 friend_poke / group_poke） */
@@ -1947,36 +1916,36 @@ export class KoishiMessenger implements MessengerApi {
   }
 
   /**
-   * 解析媒体引用："12" / "media:12" / "图片#12" / "gallery:分类/name.png"，可限定允许的媒体类型。
+   * 解析媒体引用：media:N 或 gallery:分类/文件名；裸数字仅为界面输入便利，禁止末尾数字猜测。
    * sticker：图片是否属于收藏夹「表情包」分类（发送时应作为平台表情而非普通图片呈现）——
    * 收藏夹引用直接看分类；裸媒体编号按 sha256 反查收藏记录（同一张图无论怎么引用都一致）。
    */
   private async resolveMediaRef(
     refText: string,
     allowTypes?: MediaType[],
-  ): Promise<{ ref: MediaRef; sticker: boolean } | { error: string }> {
+  ): Promise<{ ref: MediaRef; sticker: boolean; gallery?: { category: string; name: string } } | { error: string }> {
     const galleryName = parseGalleryRef(refText);
     if (galleryName !== null) {
       const entry = await this.galleryStore.resolve(galleryName);
-      if (!entry) return { error: `（收藏夹里没有 "${galleryName}"，可先用 check_gallery 确认它存在。）` };
+      if (!entry) return { error: `（收藏夹里没有唯一匹配的 "${galleryName}"；先用 check_gallery 确认，并使用 gallery:分类/文件名。）` };
       const type = typeByExt(entry.name);
       if (type === "file") return { error: `（"${entry.name}" 不是图片/语音/视频，不能当作媒体插入。）` };
       if (allowTypes && !allowTypes.includes(type)) {
         return { error: `（"${entry.name}" 是${LABEL[type]}，不能放进这里。）` };
       }
-      const id = await this.media.ingest(`file://${entry.file}`, type);
+      const id = await this.media.ingest(pathToFileURL(entry.file).href, type);
       if (id === null) return { error: `（读取 "${entry.name}" 失败，可先用 check_gallery 确认它存在。）` };
       const row = await this.media.get(id);
       if (!row) return { error: `（读取 "${entry.name}" 失败。）` };
-      return { ref: row.ref, sticker: type === "image" && entry.category === STICKER_CATEGORY };
+      return { ref: row.ref, sticker: type === "image" && entry.category === STICKER_CATEGORY, gallery: { category: entry.category, name: entry.name } };
     }
-    const match = refText.match(/(\d+)\s*$/);
-    if (!match) return { error: `（无法理解的媒体引用："${refText}"）` };
-    const row = await this.media.get(Number(match[1]));
-    if (!row) return { error: `（找不到媒体 #${match[1]}，它可能未被收录。）` };
+    const id = parseMediaId(refText);
+    if (id === null) return { error: `（无法理解的媒体引用："${refText}"。请使用 media:N 或 gallery:分类/文件名，不能用 msg:消息编号。）` };
+    const row = await this.media.get(id);
+    if (!row) return { error: `（找不到媒体 media:${id}，它可能未被收录。）` };
     if (allowTypes && !allowTypes.includes(row.ref.type)) {
       return {
-        error: `（#${row.id} 是${LABEL[row.ref.type]}，不能放进这里。）`,
+        error: `（media:${row.id} 是${LABEL[row.ref.type]}，不能放进这里。）`,
       };
     }
     let sticker = false;

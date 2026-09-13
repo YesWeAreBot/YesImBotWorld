@@ -27,6 +27,7 @@ interface JsonRpcMessage {
 }
 
 interface McpTransport {
+  readonly connected?: boolean;
   request(method: string, params: unknown, timeoutMs: number): Promise<unknown>;
   notify(method: string, params?: unknown): Promise<void>;
   close(): Promise<void>;
@@ -40,6 +41,7 @@ class StdioTransport implements McpTransport {
   private pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> }>();
   private buffer = "";
   private dead: Error | null = null;
+  get connected(): boolean { return !this.dead; }
 
   constructor(command: string, args: string[], logger: Logger) {
     this.child = spawn(command, args, { stdio: ["pipe", "pipe", "pipe"] });
@@ -238,6 +240,7 @@ async function readSseResponse(res: Response, id: number, timeoutMs: number): Pr
 /** 把一个 MCP Server 包装成手机里的 App */
 export class McpApp implements WorldApp {
   private transport: McpTransport | null = null;
+  get connected(): boolean { return !!this.transport && this.transport.connected !== false; }
 
   constructor(
     private cfg: McpServerConfig,

@@ -30,6 +30,14 @@ export interface ScheduleOptions {
    * Cooperative operations must check signal and call beginCommit before changing state. */
   cancellation?: "before_start" | "cooperative";
   run: (task: TaskControl) => Promise<string | RichText | null>;
+  /** A completed request may report an unsuccessful action without throwing. */
+  resultOk?: (result: string | RichText | null) => boolean;
+}
+
+export function describeToolCall(call: ToolCallRecord): string {
+  if (call.name !== "act") return `工具 ${call.name}`;
+  const intent = typeof call.arguments.description === "string" ? call.arguments.description.trim() : "";
+  return intent ? `动作「${intent}」` : "未提供描述的动作";
 }
 
 /** Execution and delivery are separate; cancellation must never hide a committed action. */
@@ -93,11 +101,12 @@ export class Scheduler {
         opts.beforeStart?.();
         if (opts.cancellation !== "cooperative") control.beginCommit();
         result = await opts.run(control);
+        ok = opts.resultOk?.(result) ?? true;
       } catch (err) {
         if (task.abort.signal.aborted) return;
         this.logger.warn("工具 %s (%s) 执行失败: %s", call.name, call.id, err);
         ok = false;
-        result = `（动作 ${call.name} 执行失败：${(err as Error).message ?? err}）`;
+        result = `（${describeToolCall(call)} 执行失败（调用 ${call.id}）：${(err as Error).message ?? err}）`;
       }
       if (task.abort.signal.aborted) return;
       task.committed = true;
