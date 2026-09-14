@@ -1,0 +1,15 @@
+/** Local simulation samples for WebUI interaction; no LLM or world mutations. */
+export function createRegulationFixture() {
+  const needs = { recovery: .62, connection: .27, autonomy: .22, competence: .31, novelty: .18 };
+  const modulatorNames = ['dopamine','noradrenaline','serotonin','opioid','oxytocin'];
+  const stateAt = at => ({ version:1,at,options:{physiologyEnabled:false},needs:{...needs,recovery:.4+((at/30)%8)*.025},modulators:Object.fromEntries(modulatorNames.map((key,index)=>[key,{tonic:.5+Math.sin(at/70+index)*.17,phasic:Math.sin(at/30+index)*.35,adaptation:.13+index*.05}])),control:.7,uncertainty:.25,physiology:{excitation:0,inhibition:0,phase:'idle',peaks:0},learning:{}});
+  const contextKey='晚饭后，仍然有些疲倦，阿青问起明天的安排。';
+  const candidate=(id,call,score,effects,cost)=>({candidate:{id,call,settlement:call.name==='send'?'reply':'completion',contextKey,subjectIds:['chat-user:["preview","friend"]'],expectedEffects:effects,cost,risk:.05,commitment:.2},score,prediction:{expectedEffects:effects,expectedUtility:score},factors:{needValue:score+.1,cost,risk:.05,commitment:.2,exploration:.05,learnedSamples:3}});
+  const recent=Array.from({length:18},(_,index)=>({id:'regulation_sample_'+index,type:'appraisal',at:4200+index*30,summary:index%2?'感知到朋友认真回应，连接需要有所缓解。':'经历了一段安静的休息，恢复缺口减小。',state:stateAt(4200+index*30),appraisal:{eventIds:['perceived_'+index],needEffects:index%2?{connection:.18}:{recovery:.15},salience:.4,novelty:.1,control:.7,uncertainty:.25},effect:{applied:true,satisfaction:.08}}));
+  const decision={id:'regulation_decision',type:'decision',at:4750,summary:'在休息与回应朋友之间比较实际可用的行动。',selectedId:'reply_then_rest',candidates:[candidate('reply_then_rest',{name:'send',arguments:{msg:'明天下午可以，一会儿我先休息了，晚安。'}},.42,{connection:.2,recovery:-.03},.08),candidate('rest_now',{name:'rest',arguments:{duration:60}},.28,{recovery:.25,connection:-.05},.02)],state:stateAt(4750)};
+  const learning={key:'fixture_learning',settlement:'reply',contextKey,actionKey:'send:familiar-friend',toolName:'send',call:{name:'send',arguments:{msg:'明天下午可以，一会儿我先休息了，晚安。'}},subjectIds:['chat-user:["preview","friend"]'],expectedEffects:{connection:.18,recovery:-.02},samples:4,weight:.8,updatedAt:4780,last:{outcome:'completed',eventIds:['perceived_reply'],expected:.13,observed:.18,predictionError:.05,rootIds:['chat-root-fixture'],episodeId:'chat-episode-fixture'}};
+  recent.push(decision,{id:'regulation_outcome',type:'outcome',at:4780,summary:'实际回应比先前预计更积极，调整了对这段关系中类似行动的预期。',learning,eventIds:['perceived_reply'],state:stateAt(4780)});
+  const state=stateAt(4780);state.learning={fixture_learning:learning,execution_learning:{...learning,key:'execution_learning',settlement:'completion',updatedAt:4770}};
+  recent.push({id:'regulation_error',type:'error',at:4180,summary:'开发样本：评价超时，原候选保留，未虚构反馈。'});
+  return {enabled:true,decisionEnabled:true,worldSecondsPerUnit:1,learningCount:120,pendingExpectations:3,state,recent:recent.reverse().map(entry=>{const {appraisal,effect,learning,...rest}=entry;return {...rest,...(appraisal?{appraisals:[appraisal]}:{}),...(effect?{effects:[effect]}:{}),...(learning?{learning:[learning]}:{})};})};
+}

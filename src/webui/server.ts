@@ -105,6 +105,8 @@ export interface WebUIHost {
   getStructuredWorld?(): Promise<unknown>;
   /** 独立的成长记录，不包含置顶人设或内部上下文。 */
   getGrowth?(): Promise<unknown>;
+  /** Internal simulation and decision audit, administrator-only. */
+  getRegulation?(): Promise<unknown>;
   prompts(): Prompts;
   savePromptsOverrides(overrides: PromptOverrides): Promise<void>;
   initWorld(force: boolean): Promise<string>;
@@ -308,6 +310,9 @@ export class WebUIServer {
         break;
       case "facts.jsonl":
         signal = "facts";
+        break;
+      case "regulation.jsonl":
+        signal = "regulation";
         break;
       case "stream.jsonl":
         signal = "stream";
@@ -840,6 +845,13 @@ export class WebUIServer {
       if (grant && !this.visitors.can(access.session, grant)) {
         return void sendJSON(res, 403, { error: `访客无权访问该数据（需要 ${grant} 权限）` });
       }
+    }
+
+    if (pathname === "/api/regulation") {
+      if (access.kind !== "admin") return void sendJSON(res, 403, { error: "仅管理员可读取内在调节与行动审计" });
+      if (method !== "GET") return void sendJSON(res, 405, { error: "内在调节页面只提供读取" });
+      if (!host.getRegulation) return void sendJSON(res, 503, { error: "内在调节记录尚未就绪" });
+      return void sendJSON(res, 200, await host.getRegulation());
     }
 
     // ---------- 概览 / 状态 ----------

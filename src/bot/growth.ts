@@ -661,6 +661,8 @@ function normalizeMetadata(value: ExperienceMetadata): ExperienceMetadata {
     // read_channel can deliver 200 distinct participants in one real history snapshot.
     ...(value.subjectIds ? { subjectIds: stringList(value.subjectIds, "subjectIds", 200, 300) } : {}),
     ...(typeof value.opportunity === "boolean" ? { opportunity: value.opportunity } : {}),
+    ...(value.worldPerception === true ? { worldPerception: true } : {}),
+    ...(Array.isArray(value.responseToRoots) ? { responseToRoots: [...new Set(value.responseToRoots.filter((id): id is string => typeof id === "string" && !!id))] } : {}),
   };
 }
 

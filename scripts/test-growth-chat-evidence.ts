@@ -98,6 +98,16 @@ async function main() {
     assert.deepEqual(quote.experience?.subjectIds, [chatSubjectId("fixture", "alice")]);
     assert.equal(quote.originEventIds?.length, 1, "a quotation is not a new live message from its original author");
     assert.match(quote.text, /被引用的原话/);
+    const quoteRow = rows.at(-1)!;
+    const quotedOrigin = chatMessageEvidence({ ...quoteRow, messageId: "unseen-original", userId: "bob" }).originEventIds;
+    assert.deepEqual(quote.experience?.responseToRoots, quotedOrigin, "an explicit delivered quote links to the original message's exact platform/account/channel root");
+    assert.deepEqual((await messenger.channelMessages("fixture@a:quoted", 10)).experience?.responseToRoots, quotedOrigin, "a stored single-message reread retains explicit reply provenance");
+    for (const changed of [{ platform: "another-platform" }, { selfId: "b" }, { channelId: "another-channel" }]) {
+      assert.notDeepEqual(chatMessageEvidence({ ...quoteRow, ...changed }).experience?.responseToRoots, quotedOrigin, "same message IDs in a different identity scope never link a reply");
+    }
+    assert.equal(anonymousChatNoticeEvidence(quote).experience?.responseToRoots, undefined, "hearing an anonymous vibration does not reveal that a message answered a particular earlier send");
+    const adjacent = await incoming("adjacent-but-no-quote", "好的", { channelId: "quoted", timestamp: base.timestamp + 1 });
+    assert.equal(adjacent.experience?.responseToRoots, undefined, "a nearby message is not automatically interpreted as a response to the previous send");
 
     focused = false;
     messaging.notifyPolicy = "count" as any;

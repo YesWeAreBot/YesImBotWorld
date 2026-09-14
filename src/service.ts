@@ -1,5 +1,6 @@
 import { registerWorldCommands } from "./commands.js";
 import { GrowthLedger } from "./bot/growth.js";
+import { readRegulationView } from "./bot/regulation-runtime.js";
 import { BotIdentityResolver } from "./webui/avatar.js";
 import { callStore } from "./webui/calls.js";
 import { promises as fs } from "node:fs";
@@ -1179,6 +1180,8 @@ export class WorldService extends Service<Config> {
   async getStructuredWorld(): Promise<unknown> {
     return this.world.runtime.inspect();
   }
+
+  async getRegulation(): Promise<unknown> { return this.bot ? this.bot.regulation.view() : readRegulationView(this.files.base, this.config.bot, this.clock ?? undefined); }
 
   async getGrowth(): Promise<unknown> { return new GrowthLedger(this.files.base).recall({ n: 50, at: this.clock?.now() }); }
 

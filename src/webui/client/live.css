@@ -695,3 +695,6 @@
     font-size:25px
   }
 }
+
+.live-lane[data-live-source=Regulation] { grid-column:1 / -1; }
+.live-lane[data-live-source=Regulation] .live-source-mark { color:var(--accent2); background:color-mix(in srgb,var(--accent2) 12%,var(--surface)); }

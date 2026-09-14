@@ -132,8 +132,9 @@
         function worldTime(value) { return Number.isFinite(value) ? 'T ' + value.toFixed(1) + ' TU' : '时间未记录'; }
         function inactive(view) { return view.active === false || view.inactiveReason === 'expired' || view.inactiveReason === 'retired'; }
         function lifecycleText(view) { return view.inactiveReason === 'expired' ? '已到期' : inactive(view) ? '已停止沿用' : '当前有效'; }
-        var controls = el('div', { cls: 'world-controls' }), content = el('div');
-        holder.append(Studio.title('A CHARACTER, WITH A HISTORY', '角色与成长', '从亲历的事情中形成认识与习惯，理解它们如何改变，又在什么情境下被想起。', [Studio.button('刷新记录', 'refresh', refresh)]), controls, content);
+        var controls = el('div', { cls: 'world-controls' }), content = el('div'), regulationHolder = el('div');
+        holder.append(Studio.title('A CHARACTER, WITH A HISTORY', '角色与成长', '从亲历的事情中形成认识与习惯，理解它们如何改变，又在什么情境下被想起。', [Studio.button('刷新记录', 'refresh', refresh)]), regulationHolder, controls, content);
+        var regulation = InnerRegulation.mount(regulationHolder);
         var search = el('input', { cls: 'world-search', placeholder: '搜索对象、内容或适用情境', 'aria-label': '搜索成长记录', oninput: function () { q = search.value.toLowerCase().trim(); draw(); } });
         controls.appendChild(search);
         var group = el('div', { cls: 'world-filter-group growth-kind-filters', role: 'group', 'aria-label': '成长类型' });
@@ -143,7 +144,7 @@
         [['all', '全部历史'], ['active', '当前有效'], ['inactive', '已结束']].forEach(function (item) { var b = Studio.button(item[1], null, function () { lifecycle = item[0]; lifecycleGroup.querySelectorAll('button').forEach(function (node) { node.classList.toggle('active', node === b); node.setAttribute('aria-pressed', String(node === b)); }); draw(); }); b.classList.toggle('active', lifecycle === item[0]); b.setAttribute('aria-pressed', String(lifecycle === item[0])); lifecycleGroup.appendChild(b); });
         controls.appendChild(lifecycleGroup);
         content.appendChild(el('div', { cls: 'studio-skeleton' }));
-        function refresh() { if (busy || !alive)
+        function refresh() { regulation.refresh(); if (busy || !alive)
             return; busy = true; Studio.fetchGrowth().then(function (value) { if (!alive)
             return; var next = Array.isArray(value) ? value : [], stamp = JSON.stringify(next); if (stamp !== dataStamp) { rows = next; dataStamp = stamp; draw(); } }).catch(function (e) { if (alive) {
             dataStamp = null; Studio.error(content, e, refresh); } }).finally(function () { busy = false; }); }
@@ -243,6 +244,6 @@
         window.addEventListener('studio:debug', onDebug);
         var timer = setInterval(onRefresh, 15000);
         refresh();
-        return function () { alive = false; clearInterval(timer); window.removeEventListener('studio:refresh', onRefresh); window.removeEventListener('studio:debug', onDebug); };
+        return function () { alive = false; regulation.dispose(); clearInterval(timer); window.removeEventListener('studio:refresh', onRefresh); window.removeEventListener('studio:debug', onDebug); };
     });
 })();

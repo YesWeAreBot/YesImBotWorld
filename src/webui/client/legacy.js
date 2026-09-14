@@ -423,7 +423,7 @@ function gotoCfg(gkey){
   switchView('config');
 }
 var PRIMARY = {
-  bot: ['mode', 'baseURL', 'apiKey', 'model', 'stream', 'growth'],
+  bot: ['mode', 'baseURL', 'apiKey', 'model', 'stream', 'growth', 'regulation'],
   world: ['baseURL', 'apiKey', 'model', 'stream'],
   clock: ['syncRealTime', 'epoch', 'realSecondsPerUnit', 'tingleEveryUnits', 'tingleMode', 'tingleMinUnits', 'tingleMaxUnits'],
   apps: ['chatAppName', 'weatherEnabled', 'weatherDefaultCity', 'browserEnabled', 'phoneResolution', 'phoneShellImage', 'notesEnabled', 'computer'],
@@ -431,7 +431,8 @@ var PRIMARY = {
 };
 var CFG_ICONS = {root:'sliders', bot:'cpu', world:'gauge', clock:'activity', platformOps:'phone', apps:'monitor', captioners:'image', tts:'film', media:'folder', webui:'sliders', messaging:'edit'};
 var GROWTH_FIELD_LABELS = { enabled:'自动整理与回忆', minEpisodes:'积累几段经历后整理', reviewIntervalMs:'整理间隔（现实毫秒）', reviewTimeoutMs:'等待与生成超时（毫秒）', maxInputChars:'每次整理的输入字符预算', recallCount:'每次最多唤起几条认识' };
-function cfgFieldName(path){ return path[0] === 'bot' && path[1] === 'growth' ? GROWTH_FIELD_LABELS[path[2]] || path[path.length-1] : path[path.length-1]; }
+var REGULATION_FIELD_LABELS = { enabled:'启用内在调节（实验性）', decisionEnabled:'让评分参与实际选择', timeoutMs:'评价与选择超时（毫秒）', maxInputChars:'每次调用的输入字符预算', candidateCount:'最多比较几个候选行动', learningRate:'经历学习速率', driftRate:'需要自然变化速率', sexualResponseEnabled:'启用阶段性生理反射模拟' };
+function cfgFieldName(path){ if(path[0] === 'bot' && path[1] === 'regulation') return REGULATION_FIELD_LABELS[path[2]] || path[path.length-1]; return path[0] === 'bot' && path[1] === 'growth' ? GROWTH_FIELD_LABELS[path[2]] || path[path.length-1] : path[path.length-1]; }
 var PLAT_CATS = [
   ['消息互动', ['recall','react','emojiLikes','reply','forwardMsgs','poke']],
   ['好友与资料', ['handleRequests','listFriends','userInfo','sendLike','profile','modelShow','deleteFriend']],
@@ -773,7 +774,7 @@ function renderField(node, path, value){
   var t = node.type;
   if(t === 'object'){
     var sec = el('div', {cls:'section', 'data-config-group':path.join('.')});
-    sec.appendChild(el('h3', {html: esc(node.description || path.join('.')) + (node.default !== undefined ? ' <span class="hint">默认 ' + esc(String(node.default)) + '</span>' : '')}));
+    sec.appendChild(el('h3', {text: node.description || path.join('.')}));
     var body = el('div', {cls:'body'});
     if(node.children) node.children.forEach(function(c){ body.appendChild(renderField(c, path.concat(c.key), getPath(cfgCache, path.concat(c.key)))); });
     sec.appendChild(body);

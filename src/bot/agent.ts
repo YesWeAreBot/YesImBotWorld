@@ -20,6 +20,7 @@ import { describeToolCall, Scheduler, type ScheduleOptions } from "./scheduler.j
 import { deviceKind, type DeviceKind } from "../apps/deviceTools.js";
 import { GrowthLedger, type GrowthKind, type ReflectionOpportunity, type ReflectionRelation } from "./growth.js";
 import { GrowthRuntime } from "./growth-runtime.js";
+import { RegulationRuntime, StaleRegulationDecision, type RegulationChoice } from "./regulation-runtime.js";
 import { ReceiptInbox } from "./receipts.js";
 import type { WorldObservation } from "../world/state.js";
 import { typingSlackTU } from "./typing.js";
@@ -172,6 +173,7 @@ export class BotAgent {
   private backend: BotBackend;
   readonly scheduler: Scheduler;
   readonly growth: GrowthLedger;
+  readonly regulation: RegulationRuntime;
   private readonly growthRuntime: GrowthRuntime;
   private operationCalls = new Map<string, ToolCallRecord>();
   private readonly receipts: ReceiptInbox;
@@ -310,6 +312,7 @@ export class BotAgent {
     this.toolDefs = tools ?? BOT_TOOLS;
     this.growth = new GrowthLedger(files.base);
     this.growthRuntime = new GrowthRuntime(this.growth, config.bot, clock, context, logger);
+    this.regulation = new RegulationRuntime(files.base, config.bot, clock, context, logger);
     this.receipts = new ReceiptInbox(files.base);
     this.repeatGuard = new RepeatGuard({
       thresholds: config.bot.repeatThresholds ?? [3, 5, 8],
@@ -539,13 +542,14 @@ export class BotAgent {
 
   async stop(): Promise<void> {
     this.growthRuntime.stop();
+    this.regulation.stop();
     this.retired = true;
     this.perceptionListeners.clear();
     this.receipts.deactivate();
     if (!this.running && !this.loopPromise) {
       this.scheduler.stopAll();
       for (const id of this.operationCalls.keys()) if (!this.scheduler.isPending(id)) this.operationCalls.delete(id);
-      await this.receipts.settled(); return;
+      await this.receipts.settled(); await this.regulation.settled(); return;
     }
     this.running = false;
     this.abort?.abort();
@@ -558,6 +562,7 @@ export class BotAgent {
     await this.drainMailbox();
     await this.context.settled();
     await this.receipts.settled();
+    await this.regulation.settled();
     this.loopPromise = null;
     for (const [id, pending] of this.externalToolResults) {
       if (this.scheduler.isPending(id)) continue;
@@ -1101,14 +1106,27 @@ export class BotAgent {
         if (!this.running || this.manualPaused || this.waiting || this.compressionRequested) continue;
 
         let parsed: ParsedToolCall;
+        let regulated: RegulationChoice;
+        let decisionCurrent = () => this.running && !this.manualPaused && !this.generationAbort?.signal.aborted;
         try {
           this.generationAbort = new AbortController();
           const signal = AbortSignal.any([this.abort!.signal, this.generationAbort.signal]);
           parsed = await this.backend.generate(this.context, this.wakeTimeLine, signal);
+          const available = [...this.toolDefs, ...this.perceivedAppDefs].filter(def => this.announcedToolDefs?.has(def.name));
+          const gate = JSON.stringify([...this.announcedToolDefs ?? []]);
+          const control = JSON.stringify(this.residentControl);
+          if (this.config.bot.regulation?.enabled) decisionCurrent = () => {
+            this.refreshToolGate();
+            return this.running && !this.manualPaused && !signal.aborted && !this.compressionRequested &&
+              gate === JSON.stringify([...this.announcedToolDefs ?? []]) && control === JSON.stringify(this.residentControl);
+          };
+          regulated = await this.regulation.choose(parsed, available, call => this.regulationScope(call), signal, decisionCurrent);
+          parsed = regulated.call;
           this.parseFailures = 0;
         } catch (err) {
           if (!this.running) break;
           if (this.manualPaused) continue;
+          if (err instanceof StaleRegulationDecision || this.generationAbort?.signal.aborted) continue;
           if (err instanceof ToolCallParseError) {
             this.parseFailures++;
             this.logger.warn(
@@ -1188,8 +1206,12 @@ export class BotAgent {
           continue;
         }
 
-        if (!this.running || this.manualPaused) continue;
+        if (!decisionCurrent()) continue;
         const call = this.finalize(parsed);
+        await this.regulation.bind(regulated!, call);
+        if (!decisionCurrent()) { await this.regulation.abandon(call.id); continue; }
+        for (const event of await this.regulation.drain()) this.publishPerception(event);
+        if (!decisionCurrent()) { await this.regulation.abandon(call.id); continue; }
         await this.context.appendToolCall(call);
         debug.emit("bot.tool", `${call.id} ${call.name}`, {
           id: call.id,
@@ -1206,7 +1228,11 @@ export class BotAgent {
           truncate(JSON.stringify(call.arguments), 100),
           call.duration ? ` +${call.duration}TU` : "",
         );
-        if (!this.running || this.manualPaused) continue;
+        if (!decisionCurrent()) {
+          await this.regulation.abandon(call.id);
+          this.pushEvent("system", "（这次调用已记录，但执行前控制权或可用能力发生变化，没有执行。）", { ref: call.id });
+          continue;
+        }
         const dispatch = this.dispatch(call);
         this.autonomousDispatch = dispatch;
         try { await dispatch; } finally { if (this.autonomousDispatch === dispatch) this.autonomousDispatch = null; }
@@ -1226,6 +1252,7 @@ export class BotAgent {
   }
 
   private async drainMailboxUnlocked(): Promise<void> {
+    await this.regulation.restore();
     if (!this.growthRestored) {
       await this.growth.restorePerceptions(this.context.stream);
       this.growthRestored = true;
@@ -1237,6 +1264,7 @@ export class BotAgent {
       await this.context.appendEvent(event);
       this.publishPerception(event);
       await this.growth.perceive(event, event.originEventIds ?? [event.id]);
+      await this.regulation.perceive(event);
       debug.emit("bot.event", `[tool receipt] ${event.id}`, { ...event, recovered: true });
     });
     if (!this.mailbox.length) { await this.offerReflection(); return; }
@@ -1288,6 +1316,7 @@ export class BotAgent {
         this.logger.warn("感知证据保存失败，保留当前事件与邮箱，写入恢复前暂停新的推理：%s", err);
         throw err;
       });
+      await this.regulation.perceive(event);
       if (event.source === "koishi" || event.source === "world") {
         this.repeatGuard.reset();
         this.forceRestCount = 0;
@@ -1312,6 +1341,7 @@ export class BotAgent {
     // Maintenance never edits the active request: only this serialized delivery boundary may
     // append its results. Avatar control defers private automatic changes until handback.
     if (this.running && !this.manualPaused) {
+      for (const event of await this.regulation.drain()) this.publishPerception(event);
       for (const event of [...await this.growthRuntime.drain(), ...await this.growthRuntime.remember()]) {
         this.publishPerception(event);
         debug.emit("bot.event", `[growth] ${event.id}`, event);
@@ -1384,6 +1414,22 @@ export class BotAgent {
       issuedAt,
       expectedAt: issuedAt + (duration ?? 0),
     };
+  }
+
+  /** Only perceived routing is used; inspecting hidden device state would disclose stealth actions. */
+  private regulationScope(call: ParsedToolCall): string[] {
+    const scope = [`world:${this.crossing?.location() ?? "home"}`];
+    if (["send", "check_chat", "select_channel", "read_channel"].includes(call.name)) {
+      scope.push(`chat:${String(call.arguments.id ?? this.phoneUi.channelKey ?? "unselected")}`);
+    }
+    for (const key of ["id", "target", "entity_id", "channelId", "reply_to", "app", "path"]) {
+      const value = call.arguments[key];
+      if (typeof value === "string" || typeof value === "number") scope.push(`${call.name}:${key}:${value}`);
+    }
+    if (call.name === "send" && typeof call.arguments.msg === "string") {
+      for (const match of call.arguments.msg.matchAll(/<at\s+id=["']([^"']+)["']/g)) scope.push(`recipient:${match[1]}`);
+    }
+    return scope;
   }
 
   // ---------- 工具派发 ----------
@@ -2243,7 +2289,7 @@ export class BotAgent {
           originEventIds: observationOrigins(text), experience: { agency: "observed", opportunity: false },
         });
         const text = parts[actionIndex]!;
-        return { text, originEventIds: observationOrigins(text) ?? [],
+        return { text, originEventIds: observationOrigins(text) ?? [], experience: { worldPerception: true },
           precedingObservations: parts.slice(0, actionIndex).map(observation),
           followingObservations: parts.slice(actionIndex + 1).map(observation),
         };
@@ -2923,7 +2969,7 @@ export class BotAgent {
     const intent = typeof call.arguments.intent === "string" ? call.arguments.intent : undefined;
     const modality = self ? "self" : typeof call.arguments.modality === "string" ? call.arguments.modality : undefined;
     const observation: WorldObservation = await this.world.observe("bot", { ...(intent ? { intent } : {}), target, modality });
-    return { text: JSON.stringify(observation), originEventIds: observation.sourceEventIds };
+    return { text: JSON.stringify(observation), originEventIds: observation.sourceEventIds, experience: { worldPerception: true, agency: "observed", opportunity: false } };
   }
 
 
@@ -2988,7 +3034,7 @@ export class BotAgent {
     this.refreshToolGate();
     try {
       // The memory writer cannot mutate objective world state.
-      await this.context.applyCompression(result, this.clock.now(), snapshot, await this.growth.summary(this.clock.now()));
+      await this.context.applyCompression(result, this.clock.now(), snapshot, await this.growth.summary(this.clock.now()), await this.regulation.summary());
     } catch (error) {
       for (const name of previousBans) this.tempBannedTools.add(name);
       this.refreshToolGate();

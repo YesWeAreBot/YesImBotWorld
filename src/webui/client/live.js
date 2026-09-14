@@ -12,7 +12,7 @@
     catch (e) {
         console.error('Live calls render', e);
     } }); }
-    function source(call) { return /^bot/i.test(call.source) ? 'Bot' : /^world/i.test(call.source) ? 'World' : /^growth/i.test(call.source) ? 'Growth' : '其他'; }
+    function source(call) { return /^bot/i.test(call.source) ? 'Bot' : /^world/i.test(call.source) ? 'World' : /^growth/i.test(call.source) ? 'Growth' : /^regulation/i.test(call.source) ? 'Regulation' : '其他'; }
     function status(call) { if (call.missing)
         return '已移出缓存'; return { pending: '等待响应', streaming: '正在生成', completed: '已完成', error: '失败', cancelled: '已取消' }[call.status] || call.status; }
     function bytes(n) { return n >= 1048576 ? (n / 1048576).toFixed(1) + ' MB' : n >= 1024 ? (n / 1024).toFixed(1) + ' KB' : (n || 0) + ' B'; }
@@ -164,7 +164,7 @@
             showCallPanel = function () { switchPanel(false); };
             sectionTabs.append(callTab, eventTab);
             root.append(sectionTabs, workspace, insightHost);
-            var toolbar = el('div', { cls: 'live-toolbar' }), filter = el('select', { 'aria-label': '调用来源', cls: 'live-filter' }, [['all', '全部调用'], ['Bot', 'Bot'], ['World', 'World'], ['Growth', 'Growth · 成长整理'], ['其他', '其他']].map(function (pair) { return el('option', { value: pair[0], text: pair[1], selected: selection.source === pair[0] }); }));
+            var toolbar = el('div', { cls: 'live-toolbar' }), filter = el('select', { 'aria-label': '调用来源', cls: 'live-filter' }, [['all', '全部调用'], ['Bot', 'Bot'], ['World', 'World'], ['Growth', 'Growth · 成长整理'], ['Regulation', 'Regulation · 内在调节'], ['其他', '其他']].map(function (pair) { return el('option', { value: pair[0], text: pair[1], selected: selection.source === pair[0] }); }));
             filter.onchange = function () { selection.source = filter.value; render(); };
             var search = el('input', { type: 'search', cls: 'live-search', placeholder: '搜索模型、调用 ID 或状态…', 'aria-label': '搜索调用', value: selection.search });
             search.oninput = function () { selection.search = search.value; render(); };
@@ -226,12 +226,12 @@
         function schedule() { if (!alive || scheduled)
             return; scheduled = setTimeout(function () { scheduled = null; render(); }, 100); }
         function renderLanes(list) {
-            var sources = ['Bot', 'World'].concat(list.some(function (call) { return source(call) === 'Growth'; }) ? ['Growth'] : []);
-            if (!sources.includes('Growth')) lanes.querySelector('[data-live-source=Growth]')?.remove();
+            var sources = ['Bot', 'World'].concat(['Growth', 'Regulation'].filter(function (who) { return list.some(function (call) { return source(call) === who; }); }));
+            ['Growth', 'Regulation'].forEach(function (who) { if (!sources.includes(who)) lanes.querySelector('[data-live-source=' + who + ']')?.remove(); });
             sources.forEach(function (who) {
                 var lane = lanes.querySelector('[data-live-source="' + who + '"]');
                 if (!lane) {
-                    lane = el('article', { cls: 'live-lane', 'data-live-source': who }, [el('div', { cls: 'live-lane-heading' }, [el('span', { cls: 'live-source-mark', text: who === 'Bot' ? 'B' : who === 'World' ? 'W' : 'G' }), el('strong', { text: who === 'Growth' ? '成长整理' : who + ' LLM' }), el('span', { cls: 'live-lane-state', role: 'status' })]), el('div', { cls: 'live-lane-model' }), el('div', { cls: 'live-lane-preview-kind' }), el('pre', { cls: 'live-lane-preview' }), el('div', { cls: 'live-lane-footer' })]);
+                    lane = el('article', { cls: 'live-lane', 'data-live-source': who }, [el('div', { cls: 'live-lane-heading' }, [el('span', { cls: 'live-source-mark', text: who === 'Bot' ? 'B' : who === 'World' ? 'W' : who === 'Growth' ? 'G' : 'R' }), el('strong', { text: who === 'Growth' ? '成长整理' : who === 'Regulation' ? '内在调节' : who + ' LLM' }), el('span', { cls: 'live-lane-state', role: 'status' })]), el('div', { cls: 'live-lane-model' }), el('div', { cls: 'live-lane-preview-kind' }), el('pre', { cls: 'live-lane-preview' }), el('div', { cls: 'live-lane-footer' })]);
                     lanes.appendChild(lane);
                 }
                 var matching = list.filter(function (c) { return source(c) === who; }), call = matching.filter(active).at(-1) || matching.at(-1), pending = matching.filter(active).length;

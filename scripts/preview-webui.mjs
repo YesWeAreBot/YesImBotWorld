@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { createRequire, Module } from 'node:module';
 import { createDeviceFixture } from './webui-preview-devices.mjs';
 import { createLiveFixture } from './webui-preview-live.mjs';
+import { createRegulationFixture } from './webui-preview-regulation.mjs';
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 process.env.NODE_PATH = join(root, 'node_modules');
 Module._initPaths();
@@ -18,6 +19,7 @@ await build({ stdin: { contents: 'export { Config } from "./src/config.ts"; expo
 const { Config, introspect, WebCommandRunner } = require(configModule);
 let config = Config({ autoStart: false });
 const fixture = createDeviceFixture();
+const regulation = createRegulationFixture();
 const debugStreams = new Set();
 const liveFixture = createLiveFixture(entry => {for(const res of debugStreams)res.write('data: '+JSON.stringify({channel:'debug',entry,update:true})+'\n\n');});
 const now = Date.now(), at = 4268;
@@ -138,6 +140,7 @@ const server=http.createServer(async(req,res)=>{
   if(path==='/api/world/state')return json({state:narrativeWorld});
   if(path==='/api/preview/narrative'){narrativeMode=body.enabled!==false;if(player)delete player.observation;return json({ok:true,mode:narrativeMode?'narrative':'structured'});}
   if(path==='/api/bot/growth')return json({growth});
+  if(path==='/api/regulation')return json(regulation);
   if(path==='/api/debug')return json({entries:debugEntries,snapshot:45});
   if(path==='/api/calls')return json(liveFixture.list());
   if(path.startsWith('/api/calls/')){const detail=liveFixture.detail(path.slice('/api/calls/'.length),Number(url.searchParams.get('after') || 0),url.searchParams.get('request')!=='0');return detail?json(detail):json({error:'调用已不可用'},404);}

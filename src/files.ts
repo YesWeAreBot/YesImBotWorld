@@ -50,6 +50,8 @@ const WORLD_DEF_TEMPLATE = `# 世界定义
  * ├── World_Status.md      # 全知世界当前状态的可重建自然语言镜像
  * ├── News.jsonl           # World-LLM 维护：世界重大事件列表（JSONL 格式，世界中心）
  * ├── facts.jsonl          # World-LLM 维护：Bot 的小事记（JSONL 格式，Bot 中心）
+ * ├── growth.jsonl        # 已感知经历与长期成长记录
+ * ├── regulation.jsonl    # 内在调节状态、行动预测与学习审计
  * ├── clock.json           # World Clock 状态
  * ├── meta.json            # 世界元数据（创世时判定：是否现实世界等）
  * ├── focus.json           # Bot 正在关注的频道
@@ -70,6 +72,7 @@ export class WorldFiles {
   /** 自然语言世界的权威日志；Markdown 状态只是可重建镜像。 */
   readonly narrativeJournal: string;
   readonly growthJournal: string;
+  readonly regulationJournal: string;
   readonly contextCommit: string;
   readonly botDef: string;
   readonly worldDef: string;
@@ -96,6 +99,7 @@ export class WorldFiles {
     this.worldJournal = path.join(base, "world-transactions.jsonl");
     this.narrativeJournal = path.join(base, "world-narrative.jsonl");
     this.growthJournal = path.join(base, "growth.jsonl");
+    this.regulationJournal = path.join(base, "regulation.jsonl");
     this.contextCommit = path.join(base, "context-commit.json");
     this.botDef = path.join(base, "Bot_Definition.md");
     this.worldDef = path.join(base, "World_Definition.md");
@@ -357,6 +361,7 @@ export class WorldFiles {
       this.narrativeJournal,
       this.worldJournal,
       this.growthJournal,
+      this.regulationJournal,
       this.contextCommit,
       this.botStatus,
       this.worldStatus,
@@ -377,7 +382,9 @@ export class WorldFiles {
         continue;
       }
       if (await this.exists(file)) {
-        await fs.copyFile(file, path.join(dir, path.basename(file)));
+        const target = path.join(dir, path.basename(file));
+        if (file === this.regulationJournal) await this.snapshotRegulationJournal(target);
+        else await fs.copyFile(file, target);
         saved.push(path.basename(file));
       }
     }
@@ -389,6 +396,30 @@ export class WorldFiles {
     return path.basename(dir);
   }
 
+  /** The append-only journal commits at a newline; a concurrent write may leave a partial copied tail. */
+  private async snapshotRegulationJournal(target: string): Promise<void> {
+    await fs.copyFile(this.regulationJournal, target);
+    const file = await fs.open(target, "r+");
+    try {
+      let end = (await file.stat()).size;
+      const buffer = Buffer.allocUnsafe(64 * 1024);
+      // Scan only the private copy, with bounded memory even when the audit is large.
+      while (end > 0) {
+        const start = Math.max(0, end - buffer.length), length = end - start;
+        let offset = 0;
+        while (offset < length) {
+          const { bytesRead } = await file.read(buffer, offset, length - offset, start + offset);
+          if (!bytesRead) throw new Error("内在调节存档副本读取不完整");
+          offset += bytesRead;
+        }
+        const newline = buffer.subarray(0, length).lastIndexOf(0x0a);
+        if (newline >= 0) { await file.truncate(start + newline + 1); return; }
+        end = start;
+      }
+      await file.truncate(0);
+    } finally { await file.close(); }
+  }
+
   /** 用一份归档快照覆盖当前运行时状态（调用方负责先自动存档/停世界） */
   async restoreFrom(snapDir: string): Promise<void> {
     await this.atomicWrite(path.join(this.base, "bot-receipts-epoch"), randomUUID());
@@ -396,6 +427,7 @@ export class WorldFiles {
       this.narrativeJournal,
       this.worldJournal,
       this.growthJournal,
+      this.regulationJournal,
       this.contextCommit,
       this.botStatus,
       this.worldStatus,
@@ -457,6 +489,7 @@ export class WorldFiles {
       this.narrativeJournal,
       this.worldJournal,
       this.growthJournal,
+      this.regulationJournal,
       this.contextCommit,
       this.botStatus,
       this.worldStatus,

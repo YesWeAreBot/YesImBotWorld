@@ -64,12 +64,16 @@ export type RichTextPart =
 
 /** Facts about an already delivered experience, never access to hidden controller intent. */
 export interface ExperienceMetadata {
+  /** Set by the world-tool dispatcher; model text and platform messages cannot assert this provenance. */
+  worldPerception?: boolean;
   episodeId?: string;
   agency?: "self" | "imposed" | "observed" | "unknown";
   action?: string;
   outcome?: "completed" | "failed" | "unknown";
   situation?: string;
   subjectIds?: string[];
+  /** Roots of messages explicitly quoted by this delivered message; never inferred from proximity. */
+  responseToRoots?: string[];
   /** Only an observed opportunity can support a decision not to repeat a habit. */
   opportunity?: boolean;
 }
@@ -146,6 +150,8 @@ export type StreamEntry =
  * 对应 Prompt 结构中的：角色设定 / 历史压缩 / 工具列表 / 记忆摘要。
  */
 export interface PinnedContext {
+  /** Only refreshed at a normal context compression boundary. */
+  regulationSummary?: string;
   /**
    * 最初设定（Bot 的最初样子）：Bot_Definition.md 的原文。
    * 永远不变——只在创世时与上下文压缩时从定义文件刷新，

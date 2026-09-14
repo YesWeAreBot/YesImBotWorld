@@ -8,6 +8,7 @@ export interface ModalitySupport {
 
 export interface BotModelConfig {
   growth: GrowthConfig;
+  regulation: RegulationConfig;
   baseURL: string;
   apiKey: string;
   model: string;
@@ -41,6 +42,17 @@ export interface BotModelConfig {
   /** 移除工具后仍在重复，达到多少次就强制执行带压缩的 rest（需 breakLoop 开启） */
   breakLoopForceRestAt: number;
   modalities: ModalitySupport;
+}
+
+export interface RegulationConfig {
+  enabled: boolean;
+  decisionEnabled: boolean;
+  timeoutMs: number;
+  maxInputChars: number;
+  candidateCount: number;
+  learningRate: number;
+  driftRate: number;
+  sexualResponseEnabled: boolean;
 }
 
 export interface GrowthConfig {
@@ -342,6 +354,16 @@ export const Config: Schema<Config> = Schema.intersect([
 
   Schema.object({
     bot: Schema.object({
+      regulation: Schema.object({
+        enabled: Schema.boolean().default(false).description("实验性内在调节：依据已交付经历维护需要、递质样信号与行动期待。每次自主决策增加一次 Bot 模型请求；失败保留原候选，历史与原始证据持久保存"),
+        decisionEnabled: Schema.boolean().default(true).description("让需要、风险、成本与已学期待的评分参与实际行动选择；关闭后只评价原候选并学习实际结果"),
+        timeoutMs: Schema.natural().min(1000).max(300000).default(20000).description("单次评价超时（现实毫秒），包含共享端点排队；超时不虚构奖励或学习结果"),
+        maxInputChars: Schema.natural().min(4000).max(200000).default(64000).description("评价请求字符预算，完整作者边界和可用工具不可截断；预算不足时沿用原候选"),
+        candidateCount: Schema.natural().min(1).max(3).default(3).description("最多比较几个候选（含原候选）；只有最终选中的一个会执行"),
+        learningRate: Schema.number().min(0).max(1).default(0.3).description("新结果修正同一身份、情境和策略期待的基础速率；0 暂停期待更新"),
+        driftRate: Schema.number().min(0).max(0.5).default(0).description("每世界小时连接与探索需要的自然增长率；0 仅随真实经历变化，不凭时间创造饥饿或身体疲劳"),
+        sexualResponseEnabled: Schema.boolean().default(false).description("启用独立的性生理反射模拟：积累明确身体感知中的刺激与抑制，模拟峰值及恢复期。内部阶段不等于世界已发生的生理事件，也不代表自愿、愉悦或关系认同"),
+      }).description("内在调节与经验学习（实验）"),
       growth: Schema.object({
         enabled: Schema.boolean().default(true).description("自动整理已感知经历，形成可修订的关系、习惯和性格倾向，并在相关情境中唤起记忆；使用 Bot 的模型配置，独立请求，不改写当前上下文前缀"),
         minEpisodes: Schema.natural().min(1).max(24).default(4).description("积累多少段不同经历后尝试整理；这是调用节流条件，不是习惯或性格升级阈值"),
