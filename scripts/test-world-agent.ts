@@ -10,6 +10,7 @@ import { Prompts } from "../src/prompts.js";
 import { BOT_TOOLS } from "../src/bot/tools.js";
 import type { ChatMessage, ChatResult } from "../src/llm/chat.js";
 import type { NarrativeActor } from "../src/world/narrative-types.js";
+import { parseCompression } from "../src/world/compression.js";
 
 const logger = { info() {}, warn() {}, error() {} } as any;
 const dirs: string[] = [];
@@ -34,13 +35,45 @@ async function definitionAndCompression() {
   assert.equal(context.pinned.persona, f.definition);
   await context.appendEvent({ id: context.nextEventId(), source: "world", content: "一次普通经历", worldTime: 10 });
   const snapshot = await context.compressionSnapshot(); const before = f.store.snapshot();
-  f.setHandler(async () => plain("<HISTORY_SUMMARY>经历摘要</HISTORY_SUMMARY><MEMORY_DIGEST>暂定记忆</MEMORY_DIGEST><BOT_STATUS>性格已永久改变，身处月球</BOT_STATUS>"));
+  let repairs = 0;
+  f.setHandler(async messages => {
+    if (++repairs === 1) return plain("<HISTORY_SUMMARY>经历摘要</HISTORY_SUMMARY><MEMORY_DIGEST>暂定记忆</MEMORY_DIGEST><BOT_STATUS>性格已永久改变，身处月球</BOT_STATUS>");
+    assert.equal(messages.length, 4);
+    assert.match(String(messages.at(-1)?.content), /完整的两个标签/);
+    return plain("<HISTORY_SUMMARY>经历摘要</HISTORY_SUMMARY><MEMORY_DIGEST>暂定记忆</MEMORY_DIGEST>");
+  });
   const result = await f.world.compress({ persona: f.definition, historySummary: "", memoryDigest: "", streamText: snapshot.text, timeLine: "T10" });
   await context.applyCompression(result, 10, snapshot);
+  assert.equal(repairs, 2, "unexpected physical state output is rejected before one bounded repair");
   assert.equal(await f.files.readText(f.files.botDef), f.definition);
   assert.equal(context.pinned.persona, f.definition, "memory cannot replace the author definition");
   assert.deepEqual(f.store.snapshot(), before, "memory summarization cannot mutate physical state");
   const reloaded = new BotContext(f.files, ""); await reloaded.load(); assert.equal(reloaded.pinned.persona, f.definition);
+
+  await context.appendEvent({ id: context.nextEventId(), source: "koishi", content: "尚未整理的真实消息", worldTime: 11 });
+  const pending = await context.compressionSnapshot();
+  const beforePinned = await f.files.readText(f.files.pinned);
+  const beforeStream = await f.files.readText(f.files.stream);
+  let failedCalls = 0;
+  f.setHandler(async () => { failedCalls++; return plain("<HISTORY_SUMMARY>缺少闭合" + "很长的经历".repeat(1000) + "</MEMORY_DIGEST><MEMORY_DIGEST>错误</MEMORY_DIGEST>"); });
+  await assert.rejects(f.world.compress({ persona: f.definition, historySummary: context.pinned.historySummary, memoryDigest: context.pinned.memoryDigest, streamText: pending.text, timeLine: "T11" }), /原始经历未被替换/);
+  assert.equal(failedCalls, 2);
+  assert.equal(await f.files.readText(f.files.pinned), beforePinned);
+  assert.equal(await f.files.readText(f.files.stream), beforeStream, "invalid output cannot truncate or acknowledge the source window");
+  for (const invalid of ["plain text", "<HISTORY_SUMMARY>only</HISTORY_SUMMARY>", "<HISTORY_SUMMARY></HISTORY_SUMMARY><MEMORY_DIGEST>x</MEMORY_DIGEST>", "<HISTORY_SUMMARY>a<HISTORY_SUMMARY>b</HISTORY_SUMMARY></HISTORY_SUMMARY><MEMORY_DIGEST>x</MEMORY_DIGEST>"]) assert.throws(() => parseCompression(invalid));
+  assert.deepEqual(parseCompression("```xml\n<HISTORY_SUMMARY>（无）</HISTORY_SUMMARY><MEMORY_DIGEST>（无）</MEMORY_DIGEST>\n```"), { historySummary: "（无）", memoryDigest: "（无）" });
+
+  const legacy = [
+    { kind: "tool_call" as const, call: { id: "legacy-rest", name: "rest", arguments: {}, issuedAt: 12, expectedAt: 312 } },
+    { kind: "event" as const, event: { id: "legacy-wake", source: "system" as const, content: "一点动静把你从浅睡里惊醒了。", worldTime: 15, refToolCallId: "legacy-rest" } },
+    { kind: "event" as const, event: { id: "actual-speech", source: "koishi" as const, content: "一点动静把你从浅睡里惊醒了。", worldTime: 16 } },
+  ];
+  const original = structuredClone(legacy);
+  const projection = context.serializeForCompression(legacy);
+  assert.match(projection, /经过 3.0 TU/);
+  assert.match(projection, /不是身体观测/);
+  assert.equal(projection.match(/一点动静把你从浅睡里惊醒了。/g)?.length, 1, "only the program receipt is quarantined, not real speech");
+  assert.deepEqual(legacy, original, "compression projection cannot mutate the cached event prefix");
 
   const g = await fixture(110); const raw = "最早经历".repeat(20) + "\n" + "中间经历".repeat(20) + "\n" + "最后经历".repeat(20);
   await g.files.atomicWrite(g.files.stream, raw); let passes = 0;
@@ -128,6 +161,18 @@ async function activeAttentionKeepsPendingEvents() {
   assert.match(BOT_TOOLS.find(tool => tool.name === "observe")!.description, /不会替你打开抽屉/);
   await f.world.runtime.shutdown();
 }
+async function physicalClockUsesWorldBoundary() {
+  const f = await fixture(); let calls = 0;
+  f.setHandler(async messages => {
+    calls++;
+    assert.match(messages.at(-1)!.content as string, /物理钟表/);
+    return { content: "", toolCalls: [{ id: "clock", type: "function", function: { name: "resolve_world", arguments: JSON.stringify({ perceptions: [{ actorId: "bot", text: "墙上的挂钟指向十点。" }] }) } }] };
+  });
+  const receipts: string[] = [];
+  assert.equal(await f.world.resolveCheckTime(text => receipts.push(text)), true);
+  assert.equal(calls, 1); assert.match(receipts.at(-1)!, /挂钟指向十点/);
+  await f.world.runtime.shutdown();
+}
 async function restartRestoresOnlyUndeliveredSuffix() {
   const f = await fixture();
   await f.store.commit({ idempotencyKey: "known", source: "fixture", perceptions: [{ actorId: "bot", text: "你已经到达餐厅，店员刚问你想吃什么。" }] });
@@ -166,7 +211,7 @@ async function heartbeatCannotBypassControlledActionReceipt() {
   await f.world.runtime.shutdown();
 }
 async function main() {
-  try { await definitionAndCompression(); await presentationAndPassiveDelivery(); await actionAndVisitorRouting(); await activeAttentionKeepsPendingEvents(); await restartRestoresOnlyUndeliveredSuffix(); await heartbeatCannotBypassControlledActionReceipt(); console.log("PASS narrative WorldAgent: author/memory isolation, read-only query, passive delivery without inference, concurrent deduplication, action/visitor routing, natural attention and bounded restart recovery"); }
+  try { await definitionAndCompression(); await presentationAndPassiveDelivery(); await actionAndVisitorRouting(); await activeAttentionKeepsPendingEvents(); await physicalClockUsesWorldBoundary(); await restartRestoresOnlyUndeliveredSuffix(); await heartbeatCannotBypassControlledActionReceipt(); console.log("PASS narrative WorldAgent: author/memory isolation, read-only query, passive delivery without inference, concurrent deduplication, action/visitor routing, physical clock attention and bounded restart recovery"); }
   finally { await Promise.all(dirs.map(dir => fs.rm(dir, { recursive: true, force: true }))); }
 }
 main().catch(error => { console.error(error); process.exitCode = 1; });

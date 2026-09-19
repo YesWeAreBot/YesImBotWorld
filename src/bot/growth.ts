@@ -4,6 +4,8 @@ import { createHash, randomUUID } from "node:crypto";
 import type { BotEvent, ExperienceMetadata, StreamEntry } from "../types.js";
 import { richPartsText } from "../media/presentation.js";
 import { appendJsonLine } from "../jsonl.js";
+import { projectObservedMessages } from "./perception-fragments.js";
+import { actionContains, chatEvidence, deriveGrowthScope, growthMatchesScope, growthNeedsReview, matchingBehavior, stateBasis, type GrowthMessageEvidence, type GrowthScope } from "./growth-grounding.js";
 
 export type GrowthKind = "relationship" | "commitment" | "preference" | "state" | "habit" | "trait";
 export type ReflectionRelation = "support" | "counter" | "revise" | "retire";
@@ -18,6 +20,8 @@ export interface PerceivedEvidence {
   /** Stable original causes; rereading or summarizing them is not new evidence. */
   rootEventIds: string[];
   experience?: ExperienceMetadata;
+  /** Renderer-owned message boundaries; no splitting a user's message by textual delimiters. */
+  messages?: GrowthMessageEvidence[];
 }
 
 export interface GrowthRecord {
@@ -37,6 +41,11 @@ export interface GrowthRecord {
   cues?: string[];
   subjectId?: string;
   expiresAt?: number;
+  /** Program-derived timing, never supplied by a reflection proposal. */
+  stateTiming?: { evidenceAt: number; secondsPerTU: number; requestedExpiresAt?: number };
+  scope?: GrowthScope;
+  groundingVersion?: 1;
+  behavior?: string;
 }
 
 export interface GrowthView {
@@ -47,11 +56,16 @@ export interface GrowthView {
   /** No automatic promotion from evidence count to a permanent personality trait. */
   status: "tentative" | "contested";
   active: boolean;
-  inactiveReason?: "expired" | "retired";
+  inactiveReason?: "expired" | "retired" | "corrected";
   situation?: string;
   cues?: string[];
   subjectId?: string;
   expiresAt?: number;
+  stateTimingCorrection?: StateTimingCorrection;
+  correction?: GrowthCorrection;
+  needsReview?: boolean;
+  scope?: GrowthScope;
+  behavior?: string;
   records: GrowthRecord[];
   evidence: PerceivedEvidence[];
 }
@@ -67,6 +81,7 @@ export interface ReflectionInput {
   cues?: string[];
   subjectId?: string;
   expiresAt?: number;
+  behavior?: string;
 }
 
 export interface GrowthReviewSnapshot {
@@ -83,14 +98,19 @@ export interface GrowthReviewSnapshot {
   omittedEvidenceCount: number;
   evidence: PerceivedEvidence[];
   claims: GrowthView[];
+  /** A deferred interval has its own cursor; it must never move the current-experience cursor. */
+  backlogId?: string;
+  reviewEventIds?: string[];
 }
 
+export interface GrowthReviewRejection { index: number; reason: string }
 export interface GrowthReviewResult {
   id: string;
   at: number;
   records: GrowthRecord[];
   views: GrowthView[];
   duplicate: boolean;
+  rejected?: GrowthReviewRejection[];
 }
 
 interface ReviewCommit {
@@ -101,7 +121,70 @@ interface ReviewCommit {
   throughCursor: number;
   at: number;
   records: GrowthRecord[];
+  backlogId?: string;
+  rejected?: GrowthReviewRejection[];
+  sampledEventIds?: string[];
+  relatedEventIds?: string[];
+  omittedEvidenceCount?: number;
 }
+
+interface ReviewDeferred {
+  type: "review_deferred";
+  actorId: string;
+  id: string;
+  afterCursor: number;
+  throughCursor: number;
+  at: number;
+  firstEventId: string;
+  lastEventId: string;
+  reason: string;
+}
+interface ReviewFailure {
+  type: "review_failed";
+  actorId: string;
+  at: number;
+  realAt: number;
+  reason: string;
+  reviewId?: string;
+}
+export interface StateTimingCorrection {
+  type: "state_timing_corrected";
+  id: string;
+  actorId: string;
+  claimId: string;
+  recordId: string;
+  subject: string;
+  at: number;
+  recordedAt: number;
+  evidenceAt: number;
+  evidenceIds: string[];
+  secondsPerTU: number;
+  previousExpiresAt: number;
+  expiresAt: number;
+  reason: string;
+}
+/** Audited withdrawal of a demonstrably unsupported inference; never a fictional new experience. */
+export interface GrowthCorrection {
+  type: "growth_corrected";
+  id: string;
+  actorId: string;
+  claimId: string;
+  recordId: string;
+  subject: string;
+  statement: string;
+  at: number;
+  evidenceIds: string[];
+  reason: string;
+}
+export interface GrowthIsolation {
+  type: "growth_isolated";
+  id: string;
+  actorId: string;
+  at: number;
+  claims: { claimId: string; recordId: string; subject: string; statement: string; reason: string }[];
+}
+interface ReviewBacklog extends ReviewDeferred { cursor: number }
+interface ReviewOptions { at: number; minimumEpisodes?: number; maxEpisodes?: number; maxEvidence?: number }
 
 interface ReviewRun {
   start: number;
@@ -120,7 +203,8 @@ export interface ReflectionOpportunity {
 
 type LedgerLine = { type: "perceived"; evidence: PerceivedEvidence } | { type: "reflection"; record: GrowthRecord }
   | { type: "review_offered"; actorId: string; rootCount: number }
-  | ReviewCommit | { type: "review_acknowledged"; actorId: string; id: string };
+  | ReviewCommit | ReviewDeferred | ReviewFailure | StateTimingCorrection | GrowthCorrection | GrowthIsolation
+  | { type: "review_acknowledged" | "state_timing_acknowledged" | "growth_correction_acknowledged" | "growth_isolation_acknowledged"; actorId: string; id: string };
 
 /** Append-only subjective growth. This class deliberately has no access to the world event store. */
 export class GrowthLedger {
@@ -134,6 +218,13 @@ export class GrowthLedger {
   private reviewRuns: ReviewRun[] = [];
   private reviewIndex = new Map<string, number>();
   private reviews = new Map<string, ReviewCommit>();
+  private reviewBacklogs = new Map<string, ReviewBacklog>();
+  private reviewFailures: ReviewFailure[] = [];
+  private reviewFailureCount = 0;
+  private lastReviewOutcome?: "completed" | "failed";
+  private stateTimingCorrections = new Map<string, StateTimingCorrection>();
+  private claimCorrections = new Map<string, GrowthCorrection>();
+  private isolations = new Map<string, GrowthIsolation>();
   private acknowledged = new Set<string>();
   private loaded: Promise<void> | null = null;
   private tail: Promise<void> = Promise.resolve();
@@ -161,8 +252,23 @@ export class GrowthLedger {
           } else if (item.type === "review_committed" && item.actorId === this.actorId && !this.reviews.has(item.id)) {
             this.records.push(...item.records);
             this.reviews.set(item.id, item);
+            this.lastReviewOutcome = "completed";
+            if (item.backlogId) {
+              const backlog = this.reviewBacklogs.get(item.backlogId);
+              if (backlog) backlog.cursor = Math.max(backlog.cursor, item.throughCursor);
+            } else this.reviewCursor = Math.max(this.reviewCursor, item.throughCursor);
+          } else if (item.type === "review_deferred" && item.actorId === this.actorId && !this.reviewBacklogs.has(item.id)) {
+            this.reviewBacklogs.set(item.id, { ...item, cursor: item.afterCursor });
             this.reviewCursor = Math.max(this.reviewCursor, item.throughCursor);
-          } else if (item.type === "review_acknowledged" && item.actorId === this.actorId) {
+          } else if (item.type === "review_failed" && item.actorId === this.actorId) {
+            this.acceptReviewFailure(item);
+          } else if (item.type === "state_timing_corrected" && item.actorId === this.actorId) {
+            this.stateTimingCorrections.set(item.recordId, item);
+          } else if (item.type === "growth_corrected" && item.actorId === this.actorId) {
+            this.claimCorrections.set(item.recordId, item);
+          } else if (item.type === "growth_isolated" && item.actorId === this.actorId) {
+            this.isolations.set(item.id, item);
+          } else if ((item.type === "review_acknowledged" || item.type === "state_timing_acknowledged" || item.type === "growth_correction_acknowledged" || item.type === "growth_isolation_acknowledged") && item.actorId === this.actorId) {
             this.acknowledged.add(item.id);
           }
         }
@@ -216,10 +322,16 @@ export class GrowthLedger {
     if (event.source === "system" || this.evidence.has(event.id)) return;
     const roots = [...new Set(rootEventIds.filter((id) => typeof id === "string" && id.trim()))];
     if (!roots.length) return; // derived memory/tool output cannot manufacture a fresh experience
+    // `event` is the delivered receipt passed by the append boundary; projection validates
+    // renderer-owned part indexes and their parent roots, never parses body delimiters.
+    const projected = event.parts?.some(part => part.observedMessage) ? projectObservedMessages(event.id, [{ kind: "event", event }]) : null;
+    const messages = projected?.flatMap(part => part.experience?.chat?.kind === "message"
+      ? [{ text: part.content, rootEventIds: part.originEventIds!, chat: part.experience.chat }] : []);
     const evidence: PerceivedEvidence = {
       eventId: event.id, actorId: this.actorId, source: event.source,
       observedAt: event.worldTime, text: event.parts?.length ? richPartsText(event.parts) : event.content, rootEventIds: roots,
       ...(metadata ? { experience: normalizeMetadata(metadata) } : {}),
+      ...(messages?.length ? { messages } : {}),
     };
     await this.append({ type: "perceived", evidence });
     this.acceptEvidence(evidence);
@@ -259,6 +371,179 @@ export class GrowthLedger {
     }));
   }
 
+  /** Move a large old prefix to an explicit, durable background queue, never pretend it was read. */
+  async prioritizeRecent(options: { at: number; since: number; minimumBacklog?: number }): Promise<void> {
+    return this.serial(async () => {
+      finiteTime(options.at, "at"); finiteTime(options.since, "since");
+      let throughCursor = this.reviewCursor;
+      while (throughCursor < this.reviewItems.length) {
+        const evidence = this.evidence.get(this.reviewItems[throughCursor]!.eventId)!;
+        if (evidence.observedAt >= options.since) break;
+        throughCursor++;
+      }
+      if (throughCursor - this.reviewCursor < boundedInteger(options.minimumBacklog, 128, 24, 100_000) || throughCursor === this.reviewItems.length) return;
+      const deferred: ReviewDeferred = { type: "review_deferred", actorId: this.actorId, id: `growth_backlog_${randomUUID()}`,
+        afterCursor: this.reviewCursor, throughCursor, at: options.at,
+        firstEventId: this.reviewItems[this.reviewCursor]!.eventId, lastEventId: this.reviewItems[throughCursor - 1]!.eventId,
+        reason: "较早积压转入历史补审队列，尚未逐条审阅；优先整理近期经历，原始证据保留并可检索。" };
+      await this.append(deferred);
+      this.reviewBacklogs.set(deferred.id, { ...deferred, cursor: deferred.afterCursor });
+      this.reviewCursor = throughCursor;
+    });
+  }
+
+  async reviewStatus(): Promise<{ pending: number; deferred: number; reviews: number; rejected: number; recent: ReviewCommit[]; backlogs: ReviewBacklog[];
+    failures: number; lastOutcome?: "completed" | "failed"; lastFailure?: ReviewFailure; recentFailures: ReviewFailure[];
+    timingCorrections: number; recentTimingCorrections: StateTimingCorrection[];
+    corrections: number; recentCorrections: GrowthCorrection[]; isolations: number; recentIsolations: GrowthIsolation[] }> {
+    return this.serial(async () => structuredClone({ pending: this.reviewItems.length - this.reviewCursor,
+      deferred: [...this.reviewBacklogs.values()].reduce((sum, item) => sum + item.throughCursor - item.cursor, 0),
+      reviews: this.reviews.size, rejected: [...this.reviews.values()].reduce((sum, item) => sum + (item.rejected?.length ?? 0), 0),
+      recent: [...this.reviews.values()].slice(-8).reverse(), backlogs: [...this.reviewBacklogs.values()],
+      failures: this.reviewFailureCount, lastOutcome: this.lastReviewOutcome,
+      lastFailure: this.reviewFailures[0], recentFailures: this.reviewFailures,
+      timingCorrections: this.stateTimingCorrections.size, recentTimingCorrections: [...this.stateTimingCorrections.values()].slice(-8).reverse(),
+      corrections: this.claimCorrections.size, recentCorrections: [...this.claimCorrections.values()].slice(-8).reverse(),
+      isolations: this.isolations.size, recentIsolations: [...this.isolations.values()].slice(-8).reverse() }));
+  }
+
+  /** Repair only a demonstrably stale legacy automatic state; retain the original record and its evidence. */
+  async correctStaleAutomaticStates(options: { at: number; secondsPerTU: number }): Promise<StateTimingCorrection[]> {
+    return this.serial(async () => {
+      const at = finiteTime(options.at, "at");
+      const unit = Number.isFinite(options.secondsPerTU) && options.secondsPerTU > 0 ? options.secondsPerTU : 1;
+      const latest = new Map<string, GrowthRecord>();
+      for (const record of this.records) if (record.relation !== "counter") latest.set(record.claimId, record);
+      const corrected: StateTimingCorrection[] = [];
+      for (const record of latest.values()) {
+        if (record.kind !== "state" || record.origin !== "automatic" || record.relation === "retire" || record.stateTiming ||
+          this.stateTimingCorrections.has(record.id) || record.recordedAt > at || record.expiresAt === undefined || record.expiresAt <= record.recordedAt) continue;
+        const evidence = record.evidenceIds.map(id => this.evidence.get(id));
+        if (!evidence.length || evidence.some(item => !item || !Number.isFinite(item.observedAt) || item.observedAt > record.recordedAt)) continue;
+        const evidenceAt = Math.max(...evidence.map(item => item!.observedAt));
+        const expiresAt = evidenceAt + 7200 / unit;
+        if (expiresAt > record.recordedAt) continue;
+        const correction: StateTimingCorrection = { type: "state_timing_corrected", id: `growth_state_timing_${record.id}`,
+          actorId: this.actorId, claimId: record.claimId, recordId: record.id, subject: record.subject, at,
+          recordedAt: record.recordedAt, evidenceAt, evidenceIds: [...record.evidenceIds], secondsPerTU: unit,
+          previousExpiresAt: record.expiresAt, expiresAt,
+          reason: "旧版自动回顾把两世界小时以前的经历记成了当前临时状态；有效期更正为支持证据时刻加两小时。原记录保留，此为程序时间校正，不是新经历或新的成长。" };
+        await this.append(correction);
+        this.stateTimingCorrections.set(record.id, correction);
+        corrected.push(correction);
+      }
+      return structuredClone(corrected);
+    });
+  }
+
+  async pendingStateTimingCorrections(n = 50): Promise<StateTimingCorrection[]> {
+    return this.serial(async () => structuredClone([...this.stateTimingCorrections.values()]
+      .filter(item => !this.acknowledged.has(item.id)).slice(0, boundedInteger(n, 50, 1, 50))));
+  }
+
+  async ackStateTimingCorrection(id: string): Promise<void> {
+    return this.serial(async () => {
+      if (this.acknowledged.has(id)) return;
+      if (![...this.stateTimingCorrections.values()].some(item => item.id === id)) throw new Error(`找不到状态时间校正 ${id}`);
+      await this.append({ type: "state_timing_acknowledged", actorId: this.actorId, id });
+      this.acknowledged.add(id);
+    });
+  }
+
+  /** Explicit evidence audit: withdraw this exact current inference without changing its history. */
+  async correctClaim(input: { claimId: string; expectedRecordId: string; evidenceIds: string[]; reason: string; at: number }): Promise<GrowthCorrection> {
+    return this.serial(async () => {
+      const at = finiteTime(input.at, "at"), reason = requiredText(input.reason, "reason", 1200);
+      const previous = this.claimCorrections.get(input.expectedRecordId);
+      if (previous) {
+        if (previous.claimId !== input.claimId) throw new Error("更正记录与认识不对应");
+        return structuredClone(previous);
+      }
+      const view = this.view(input.claimId, at);
+      const current = view && [...view.records].reverse().find(record => record.relation !== "counter");
+      if (!current || current.id !== input.expectedRecordId) throw new Error("待更正认识已变化；请重新核对当前记录，不能撤回未审阅的新判断");
+      if (current.relation === "retire") throw new Error("此认识已停止适用，无需重复撤回");
+      if (at < current.recordedAt) throw new Error("更正时刻不能早于被更正记录");
+      const evidenceIds = stringList(input.evidenceIds, "evidenceIds", 20, 300);
+      if (!evidenceIds.length || evidenceIds.some(id => !this.evidence.has(id) || this.evidence.get(id)!.observedAt > at)) throw new Error("更正须引用实际已交付、可审计的原始证据");
+      const supportingIds = new Set(view!.records.flatMap(record => record.evidenceIds));
+      if (!evidenceIds.some(id => supportingIds.has(id))) throw new Error("更正须核对至少一条该认识曾引用的证据，不能凭无关材料撤回认识");
+      const correction: GrowthCorrection = { type: "growth_corrected", id: `growth_correction_${current.id}`, actorId: this.actorId,
+        claimId: current.claimId, recordId: current.id, subject: current.subject, statement: current.statement, at, evidenceIds, reason };
+      await this.append(correction); this.claimCorrections.set(current.id, correction);
+      return structuredClone(correction);
+    });
+  }
+
+  async pendingCorrections(n = 50): Promise<GrowthCorrection[]> {
+    return this.serial(async () => structuredClone([...this.claimCorrections.values()].filter(item => !this.acknowledged.has(item.id))
+      .slice(0, boundedInteger(n, 50, 1, 50))));
+  }
+
+  async ackCorrection(id: string): Promise<void> {
+    return this.serial(async () => {
+      if (this.acknowledged.has(id)) return;
+      if (![...this.claimCorrections.values()].some(item => item.id === id)) throw new Error(`找不到认识更正 ${id}`);
+      await this.append({ type: "growth_correction_acknowledged", actorId: this.actorId, id }); this.acknowledged.add(id);
+    });
+  }
+
+  /** Old ungrounded inferences are uncertain, not automatically false. Explain their quarantine once. */
+  async isolateUnverifiedClaims(at: number): Promise<void> {
+    return this.serial(async () => {
+      finiteTime(at, "at");
+      const seen = new Set([...this.isolations.values()].flatMap(item => item.claims.map(claim => claim.recordId)));
+      const claims = [...new Set(this.records.map(record => record.claimId))].map(id => this.view(id, at)!)
+        .filter(view => view.needsReview && view.inactiveReason !== "retired" && view.inactiveReason !== "corrected")
+        .flatMap(view => {
+          const record = [...view.records].reverse().find(item => item.relation !== "counter")!;
+          return seen.has(record.id) ? [] : [{ claimId: view.claimId, recordId: record.id, subject: view.subject, statement: view.statement,
+            reason: view.kind === "habit" || view.kind === "trait" ? "旧倾向缺少可核验的共同自主动作与跨日依据；重复次数本身不证明稳定人格"
+              : "旧聊天认识缺少可核验的发送者或频道范围；不能按名字、当前界面或通知补猜归属" }];
+        });
+      // Bounded batches keep both durable audit and appended clarification readable.
+      for (let offset = 0; offset < claims.length; offset += 8) {
+        const batch = claims.slice(offset, offset + 8);
+        const id = "growth_isolation_" + createHash("sha256").update(JSON.stringify(batch.map(item => item.recordId))).digest("hex").slice(0, 24);
+        const isolation: GrowthIsolation = { type: "growth_isolated", id, actorId: this.actorId, at, claims: batch };
+        await this.append(isolation); this.isolations.set(id, isolation);
+      }
+    });
+  }
+
+  async pendingIsolations(n = 1): Promise<GrowthIsolation[]> {
+    return this.serial(async () => structuredClone([...this.isolations.values()].filter(item => !this.acknowledged.has(item.id))
+      .slice(0, boundedInteger(n, 1, 1, 8))));
+  }
+
+  async ackIsolation(id: string): Promise<void> {
+    return this.serial(async () => {
+      if (this.acknowledged.has(id)) return;
+      if (!this.isolations.has(id)) throw new Error(`找不到认识隔离记录 ${id}`);
+      await this.append({ type: "growth_isolation_acknowledged", actorId: this.actorId, id }); this.acknowledged.add(id);
+    });
+  }
+
+  /** Transport/format failure is an audit event, never a consumed review or a new experience. */
+  async recordReviewFailure(input: { at: number; realAt: number; reason: string; reviewId?: string }, current: () => boolean = () => true): Promise<void> {
+    return this.serial(async () => {
+      if (!current()) return;
+      finiteTime(input.at, "at"); finiteTime(input.realAt, "realAt");
+      const reason = [...input.reason].slice(0, 500).join("");
+      const last = this.reviewFailures[0];
+      // Aggressive test/user intervals must not generate a new identical journal line every tick.
+      if (this.lastReviewOutcome === "failed" && last?.reason === reason && input.realAt >= last.realAt && input.realAt - last.realAt < 60_000) return;
+      const failed: ReviewFailure = { type: "review_failed", actorId: this.actorId, at: input.at, realAt: input.realAt, reason,
+        ...(input.reviewId ? { reviewId: input.reviewId } : {}) };
+      await this.append(failed); this.acceptReviewFailure(failed);
+    });
+  }
+
+  private acceptReviewFailure(failed: ReviewFailure): void {
+    this.reviewFailures.unshift(failed); this.reviewFailures.splice(8); this.reviewFailureCount++;
+    this.lastReviewOutcome = "failed";
+  }
+
   /** A bounded invitation to deliberate; accumulating observations never manufactures a claim. */
   async reflectionOpportunity(minimumFreshRoots = 24): Promise<ReflectionOpportunity | null> {
     return this.serial(async () => {
@@ -288,122 +573,149 @@ export class GrowthLedger {
   }
 
   /** Read only delivered evidence. The cursor advances exclusively with a complete committed review. */
-  async snapshotReview(options: { at: number; minimumEpisodes?: number; maxEpisodes?: number; maxEvidence?: number } ): Promise<GrowthReviewSnapshot | null> {
+  async snapshotReview(options: ReviewOptions): Promise<GrowthReviewSnapshot | null> {
     return this.serial(async () => {
-      const at = finiteTime(options.at, "at");
-      const minimum = boundedInteger(options.minimumEpisodes, 4, 1, 100);
-      const maxEpisodes = boundedInteger(options.maxEpisodes, 12, minimum, 100);
-      const maxEvidence = boundedInteger(options.maxEvidence, 24, 1, 100);
-      const episodeIds = new Set<string>();
-      const selectedRuns: ReviewRun[] = [];
-      let throughCursor = this.reviewCursor;
-      // Runs skip arbitrarily busy stretches of one conversation in constant time. Bound highly
-      // interleaved runs too; an oversized batch may be reviewed with fewer than the usual minimum.
-      const runBudget = 256;
-      let low = 0, high = this.reviewRuns.length;
-      while (low < high) {
-        const middle = (low + high) >>> 1;
-        if (this.reviewRuns[middle]!.end <= this.reviewCursor) low = middle + 1;
-        else high = middle;
+      const current = this.snapshotReviewUnlocked(options, this.reviewCursor, this.reviewItems.length);
+      if (current) return current;
+      for (const backlog of this.reviewBacklogs.values()) {
+        if (backlog.cursor >= backlog.throughCursor) continue;
+        const snapshot = this.snapshotReviewUnlocked({ ...options, minimumEpisodes: 1 }, backlog.cursor, backlog.throughCursor, backlog.id);
+        if (snapshot) return snapshot;
       }
-      for (let index = low; index < this.reviewRuns.length && selectedRuns.length < runBudget; index++) {
-        const run = this.reviewRuns[index]!;
-        if (run.maxObservedAt > at) break;
-        const additions = run.episodeIds.filter(id => !episodeIds.has(id));
-        if (episodeIds.size && episodeIds.size + additions.length > maxEpisodes) break;
-        run.episodeIds.forEach(id => episodeIds.add(id));
-        selectedRuns.push(run);
-        throughCursor = run.end;
-        if (episodeIds.size >= maxEpisodes) break;
-      }
-      const boundedOverflow = selectedRuns.length === runBudget;
-      if (!selectedRuns.length || (episodeIds.size < minimum && !boundedOverflow)) return null;
-      const candidates = new Map<number, number>();
-      for (const run of selectedRuns) {
-        const start = Math.max(run.start, this.reviewCursor);
-        const samples = Math.min(maxEvidence, run.end - start);
-        for (let step = 0; step < samples; step++) {
-          const index = samples === 1 ? start : start + Math.floor(step * (run.end - start - 1) / (samples - 1));
-          candidates.set(index, Math.max(candidates.get(index) ?? 0, 1));
-        }
-        const roles = [[run.samples.last, 4], [run.samples.failed, 7], [run.samples.imposed, 7],
-          [run.samples.choice, 6], [run.samples.first, 3], [Math.max(run.start, this.reviewCursor), 3]] as const;
-        for (const [index, priority] of roles) if (index !== undefined && index >= this.reviewCursor && index < throughCursor) {
-          candidates.set(index, Math.max(candidates.get(index) ?? 0, priority));
-        }
-      }
-      const ranked = [...candidates].sort((a, b) => b[1] - a[1] || b[0] - a[0]);
-      const selected = new Set<number>();
-      // First cover every episode; then spend the remaining slots on different outcomes and boundaries.
-      for (const episode of episodeIds) {
-        const representative = ranked.find(([index]) => this.reviewItems[index]!.episodeIds.includes(episode));
-        if (representative) selected.add(representative[0]);
-        if (selected.size >= maxEvidence) break;
-      }
-      const representatives = new Set(selected);
-      for (const [index] of ranked) { if (selected.size >= maxEvidence) break; selected.add(index); }
-      const fresh = [...selected].sort((a, b) => a - b).map(index => this.evidence.get(this.reviewItems[index]!.eventId)!);
-      const freshIds = new Set(fresh.map(item => item.eventId));
-      const subjectIds = [...new Set(fresh.flatMap(e => e.experience?.subjectIds ?? []))];
-      const text = fresh.map(e => `${e.experience?.situation ?? ""} ${e.text}`).join("\n");
-      const queryText = normalize(text);
-      const contextEvidence = [...this.evidence.values()].filter(e => {
-        const index = this.reviewIndex.get(e.eventId);
-        return !freshIds.has(e.eventId) && e.observedAt <= at &&
-          (index === undefined || index < this.reviewCursor || index >= throughCursor);
-      })
-        .map(e => ({ evidence: e, score:
-          (e.experience?.episodeId && episodeIds.has(e.experience.episodeId) ? 30 : 0) +
-          (e.experience?.subjectIds?.some(id => subjectIds.includes(id)) ? 15 : 0) +
-          overlapScore(`${e.experience?.situation ?? ""} ${e.experience?.action ?? ""} ${e.text}`, queryText) }))
-        .filter(item => item.score >= 3)
-        .sort((a, b) => b.score - a.score || b.evidence.observedAt - a.evidence.observedAt);
-      // Repeated readings of a snapshot must not crowd original independent choices out of the review.
-      const contextEpisodes = new Set<string>();
-      const relatedHistory = contextEvidence.filter(item => {
-        const key = item.evidence.experience?.episodeId ?? item.evidence.rootEventIds.join("\0");
-        if (contextEpisodes.has(key)) return false;
-        contextEpisodes.add(key); return true;
-      });
-      // Reserve a third of the request for related independent older experiences. Otherwise a
-      // dense new batch can perpetually crowd out earlier no-change batches and prevent a sparse
-      // habit from ever being recognized. Keep at least one representative of every fresh episode.
-      const historicalBudget = Math.min(relatedHistory.length, Math.floor(maxEvidence / 3), maxEvidence - representatives.size);
-      const freshBudget = maxEvidence - historicalBudget;
-      const finalSelected = new Set(representatives);
-      for (const [index] of ranked) { if (finalSelected.size >= freshBudget) break; finalSelected.add(index); }
-      const finalFresh = [...finalSelected].sort((a, b) => a - b).map(index => this.evidence.get(this.reviewItems[index]!.eventId)!);
-      const context = relatedHistory.slice(0, maxEvidence - finalFresh.length).map(item => item.evidence);
-      const evidence = [...context, ...finalFresh];
-      // Inactive claims remain available to a review so an expired state is not silently re-created.
-      const visibleEvidence = new Set(evidence.map(item => item.eventId));
-      const claims = this.retrieveUnlocked({ text, subjectIds, at, n: 8 }, true).map(claim => {
-        const counter = claim.status === "contested" ? [...claim.records].reverse().find(record => record.relation === "counter") : undefined;
-        return { ...claim,
-          // Later supporting records do not resolve a counterexample; keep its actual content
-          // available to the next reviewer even when the recent revision list is abbreviated.
-          records: claim.records.filter((record, index) => index >= claim.records.length - 4 || record === counter),
-          evidence: claim.evidence.filter(item => visibleEvidence.has(item.eventId)) };
-      });
-      const snapshot = { actorId: this.actorId, afterCursor: this.reviewCursor, throughCursor,
-        revision: this.records.length, createdAt: at, episodeIds: [...episodeIds],
-        coveredEventCount: throughCursor - this.reviewCursor,
-        omittedEvidenceCount: throughCursor - this.reviewCursor - finalFresh.length, evidence, claims };
-      return structuredClone({ id: snapshotId(snapshot), ...snapshot });
+      return null;
     });
   }
 
+  private snapshotReviewUnlocked(options: ReviewOptions, cursor: number, limit: number, backlogId?: string): GrowthReviewSnapshot | null {
+    const at = finiteTime(options.at, "at");
+    const minimum = boundedInteger(options.minimumEpisodes, 4, 1, 100);
+    const maxEpisodes = boundedInteger(options.maxEpisodes, 12, minimum, 100);
+    const maxEvidence = boundedInteger(options.maxEvidence, 24, 1, 100);
+    const episodeIds = new Set<string>();
+    const selectedRuns: ReviewRun[] = [];
+    let throughCursor = cursor;
+    // Runs skip arbitrarily busy stretches of one conversation in constant time. Bound highly
+    // interleaved runs too; an oversized batch may be reviewed with fewer than the usual minimum.
+    const runBudget = 256;
+    let low = 0, high = this.reviewRuns.length;
+    while (low < high) {
+      const middle = (low + high) >>> 1;
+      if (this.reviewRuns[middle]!.end <= cursor) low = middle + 1;
+      else high = middle;
+    }
+    for (let index = low; index < this.reviewRuns.length && selectedRuns.length < runBudget; index++) {
+      const original = this.reviewRuns[index]!;
+      if (original.start >= limit) break;
+      const run = original.end > limit ? { ...original, end: limit, maxObservedAt: this.evidence.get(this.reviewItems[limit - 1]!.eventId)!.observedAt } : original;
+      if (run.maxObservedAt > at) break;
+      const additions = run.episodeIds.filter(id => !episodeIds.has(id));
+      if (episodeIds.size && episodeIds.size + additions.length > maxEpisodes) break;
+      run.episodeIds.forEach(id => episodeIds.add(id));
+      selectedRuns.push(run);
+      throughCursor = run.end;
+      if (episodeIds.size >= maxEpisodes) break;
+    }
+    const boundedOverflow = selectedRuns.length === runBudget;
+    if (!selectedRuns.length || (episodeIds.size < minimum && !boundedOverflow)) return null;
+    const candidates = new Map<number, number>();
+    for (const run of selectedRuns) {
+      const start = Math.max(run.start, cursor);
+      const samples = Math.min(maxEvidence, run.end - start);
+      for (let step = 0; step < samples; step++) {
+        const index = samples === 1 ? start : start + Math.floor(step * (run.end - start - 1) / (samples - 1));
+        candidates.set(index, Math.max(candidates.get(index) ?? 0, 1));
+      }
+      const roles = [[run.samples.last, 4], [run.samples.failed, 7], [run.samples.imposed, 7],
+        [run.samples.choice, 6], [run.samples.first, 3], [Math.max(run.start, cursor), 3]] as const;
+      for (const [index, priority] of roles) if (index !== undefined && index >= cursor && index < throughCursor) {
+        candidates.set(index, Math.max(candidates.get(index) ?? 0, priority));
+      }
+    }
+    const ranked = [...candidates].sort((a, b) => b[1] - a[1] || b[0] - a[0]);
+    const selected = new Set<number>();
+    // First cover every episode; then spend the remaining slots on different outcomes and boundaries.
+    for (const episode of episodeIds) {
+      const representative = ranked.find(([index]) => this.reviewItems[index]!.episodeIds.includes(episode));
+      if (representative) selected.add(representative[0]);
+      if (selected.size >= maxEvidence) break;
+    }
+    const representatives = new Set(selected);
+    for (const [index] of ranked) { if (selected.size >= maxEvidence) break; selected.add(index); }
+    const fresh = [...selected].sort((a, b) => a - b).map(index => this.evidence.get(this.reviewItems[index]!.eventId)!);
+    const freshIds = new Set(fresh.map(item => item.eventId));
+    const subjectIds = [...new Set(fresh.flatMap(e => e.experience?.subjectIds ?? []))];
+    const text = fresh.map(e => `${e.experience?.situation ?? ""} ${e.text}`).join("\n");
+    const queryText = normalize(text);
+    const contextEvidence = [...this.evidence.values()].filter(e => {
+      const index = this.reviewIndex.get(e.eventId);
+      return !freshIds.has(e.eventId) && e.observedAt <= at &&
+        (index === undefined || index < cursor || index >= throughCursor);
+    })
+      .map(e => ({ evidence: e, score:
+        (e.experience?.episodeId && episodeIds.has(e.experience.episodeId) ? 30 : 0) +
+        (e.experience?.subjectIds?.some(id => subjectIds.includes(id)) ? 15 : 0) +
+        overlapScore(`${e.experience?.situation ?? ""} ${e.experience?.action ?? ""} ${e.text}`, queryText) }))
+      .filter(item => item.score >= 3)
+      .sort((a, b) => b.score - a.score || b.evidence.observedAt - a.evidence.observedAt);
+    // Repeated readings of a snapshot must not crowd original independent choices out of the review.
+    const contextEpisodes = new Set<string>();
+    const relatedHistory = contextEvidence.filter(item => {
+      const key = item.evidence.experience?.episodeId ?? item.evidence.rootEventIds.join("\0");
+      if (contextEpisodes.has(key)) return false;
+      contextEpisodes.add(key); return true;
+    });
+    // Reserve a third of the request for related independent older experiences. Otherwise a
+    // dense new batch can perpetually crowd out earlier no-change batches and prevent a sparse
+    // habit from ever being recognized. Keep at least one representative of every fresh episode.
+    const historicalBudget = Math.min(relatedHistory.length, Math.floor(maxEvidence / 3), maxEvidence - representatives.size);
+    const freshBudget = maxEvidence - historicalBudget;
+    const finalSelected = new Set(representatives);
+    for (const [index] of ranked) { if (finalSelected.size >= freshBudget) break; finalSelected.add(index); }
+    const finalFresh = [...finalSelected].sort((a, b) => a - b).map(index => this.evidence.get(this.reviewItems[index]!.eventId)!);
+    const context = relatedHistory.slice(0, maxEvidence - finalFresh.length).map(item => item.evidence);
+    const evidence = [...context, ...finalFresh];
+    // Inactive claims remain available to a review so an expired state is not silently re-created.
+    const visibleEvidence = new Set(evidence.map(item => item.eventId));
+    const claims = this.retrieveUnlocked({ text, subjectIds, at, n: 8 }, true).map(claim => {
+      const counter = claim.status === "contested" ? [...claim.records].reverse().find(record => record.relation === "counter") : undefined;
+      return { ...claim,
+        // Later supporting records do not resolve a counterexample; keep its actual content
+        // available to the next reviewer even when the recent revision list is abbreviated.
+        records: claim.records.filter((record, index) => index >= claim.records.length - 4 || record === counter),
+        evidence: claim.evidence.filter(item => visibleEvidence.has(item.eventId)) };
+    });
+    const snapshot = { actorId: this.actorId, afterCursor: cursor, throughCursor,
+      revision: this.records.length + this.stateTimingCorrections.size + this.claimCorrections.size, createdAt: at, episodeIds: [...episodeIds],
+      coveredEventCount: throughCursor - cursor,
+      omittedEvidenceCount: throughCursor - cursor - finalFresh.length, evidence, claims,
+      reviewEventIds: finalFresh.map(item => item.eventId), ...(backlogId ? { backlogId } : {}) };
+    return structuredClone({ id: snapshotId(snapshot), ...snapshot });
+  }
+
   /** One JSONL line is the transaction: every reflection and the consumed cursor succeed or fail together. */
-  async commitReview(snapshot: GrowthReviewSnapshot, proposals: ReflectionInput[], at: number, signal?: AbortSignal): Promise<GrowthReviewResult> {
+  async commitReview(snapshot: GrowthReviewSnapshot, proposals: ReflectionInput[], at: number, signal?: AbortSignal, secondsPerTU = 1): Promise<GrowthReviewResult> {
+    return this.commitReviewItems(snapshot, proposals, at, signal, undefined, undefined, secondsPerTU);
+  }
+
+  /** Automatic proposals are independent: retain strict evidence guards without poisoning other valid items. */
+  async commitAutomaticReview(snapshot: GrowthReviewSnapshot, proposals: unknown[], at: number,
+    prepare: (input: unknown) => ReflectionInput, signal?: AbortSignal, shownEvidenceIds?: string[], secondsPerTU = 1): Promise<GrowthReviewResult> {
+    return this.commitReviewItems(snapshot, proposals, at, signal, prepare, shownEvidenceIds, secondsPerTU);
+  }
+
+  private async commitReviewItems(snapshot: GrowthReviewSnapshot, proposals: unknown[], at: number, signal?: AbortSignal,
+    prepare?: (input: unknown) => ReflectionInput, shownEvidenceIds?: string[], secondsPerTU = 1): Promise<GrowthReviewResult> {
     return this.serial(async () => {
       signal?.throwIfAborted();
       const previous = this.reviews.get(snapshot.id);
       if (previous) return this.reviewResult(previous, true);
       finiteTime(at, "at");
       const { id, ...unsigned } = snapshot;
-      if (snapshot.actorId !== this.actorId || id !== snapshotId(unsigned) || snapshot.afterCursor !== this.reviewCursor ||
-        snapshot.throughCursor <= snapshot.afterCursor || snapshot.throughCursor > this.reviewItems.length ||
-        snapshot.revision !== this.records.length || at < snapshot.createdAt) {
+      const backlog = snapshot.backlogId ? this.reviewBacklogs.get(snapshot.backlogId) : undefined;
+      if (snapshot.actorId !== this.actorId || id !== snapshotId(unsigned) || (snapshot.backlogId && !backlog) ||
+        snapshot.afterCursor !== (backlog?.cursor ?? this.reviewCursor) ||
+        snapshot.throughCursor <= snapshot.afterCursor || snapshot.throughCursor > (backlog?.throughCursor ?? this.reviewItems.length) ||
+        snapshot.revision !== this.records.length + this.stateTimingCorrections.size + this.claimCorrections.size || at < snapshot.createdAt) {
         throw new Error("成长整理快照已失效；请重新读取经历与当前认识，游标未前移");
       }
       if (!Array.isArray(proposals) || proposals.length > 8) throw new Error("每次成长整理须为 0 至 8 条认识；没有变化请返回空数组");
@@ -412,21 +724,37 @@ export class GrowthLedger {
         if (JSON.stringify(this.evidence.get(evidence.eventId)) !== JSON.stringify(evidence)) throw new Error("成长整理证据已失效；请重新读取快照");
       }
       const allowed = new Set(included.map(e => e.eventId));
+      const shown = new Set(shownEvidenceIds ?? snapshot.evidence.map(item => item.eventId));
+      if ([...shown].some(id => !allowed.has(id))) throw new Error("成长整理请求样本不属于已交付快照，游标未前移");
+      const batchIds = new Set(snapshot.reviewEventIds ?? snapshot.evidence.map(item => item.eventId));
+      const sampledEventIds = [...shown].filter(id => batchIds.has(id));
       const allowedClaims = new Set(snapshot.claims.map(claim => claim.claimId));
       const staged = [...this.records];
       const changes: GrowthRecord[] = [];
-      for (const input of proposals) {
-        if (input.claimId && !allowedClaims.has(input.claimId)) throw new Error(`认识 ${input.claimId} 未包含在本次整理快照中`);
-        const proposed = this.propose(input, at, staged, allowed);
-        if (proposed.record) { proposed.record.origin = "automatic"; staged.push(proposed.record); changes.push(proposed.record); }
+      const rejected: GrowthReviewRejection[] = [];
+      for (const [index, raw] of proposals.entries()) {
+        try {
+          const input = prepare ? prepare(raw) : raw as ReflectionInput;
+          if (input.claimId && !allowedClaims.has(input.claimId)) throw new Error(`认识 ${input.claimId} 未包含在本次整理快照中`);
+          const proposed = this.propose(input, at, staged, shownEvidenceIds ? shown : allowed, secondsPerTU);
+          if (proposed.record) { proposed.record.origin = "automatic"; staged.push(proposed.record); changes.push(proposed.record); }
+        } catch (error) {
+          if (!prepare) throw error;
+          rejected.push({ index, reason: error instanceof Error ? error.message : String(error) });
+        }
       }
       const commit: ReviewCommit = { type: "review_committed", actorId: this.actorId, id,
-        afterCursor: snapshot.afterCursor, throughCursor: snapshot.throughCursor, at, records: changes };
+        afterCursor: snapshot.afterCursor, throughCursor: snapshot.throughCursor, at, records: changes,
+        ...(snapshot.backlogId ? { backlogId: snapshot.backlogId } : {}), ...(rejected.length ? { rejected } : {}),
+        sampledEventIds, relatedEventIds: [...shown].filter(id => !batchIds.has(id)),
+        omittedEvidenceCount: snapshot.coveredEventCount - sampledEventIds.length };
       signal?.throwIfAborted();
       await this.append(commit);
       this.records.push(...changes);
       this.reviews.set(id, commit);
-      this.reviewCursor = snapshot.throughCursor;
+      this.lastReviewOutcome = "completed";
+      if (backlog) backlog.cursor = snapshot.throughCursor;
+      else this.reviewCursor = snapshot.throughCursor;
       return this.reviewResult(commit, false);
     });
   }
@@ -435,7 +763,7 @@ export class GrowthLedger {
     const last = commit.records.at(-1);
     const end = last ? this.records.findIndex(record => record.id === last.id) + 1 : 0;
     const committedRecords = this.records.slice(0, end);
-    return structuredClone({ id: commit.id, at: commit.at, records: commit.records, duplicate,
+    return structuredClone({ id: commit.id, at: commit.at, records: commit.records, duplicate, ...(commit.rejected?.length ? { rejected: commit.rejected } : {}),
       views: [...new Set(commit.records.map(record => record.claimId))].map(id => this.view(id, commit.at, committedRecords)!) });
   }
 
@@ -454,19 +782,20 @@ export class GrowthLedger {
     });
   }
 
-  private retrieveUnlocked(query: { text: string; subjectIds?: string[]; at: number; n?: number }, includeInactive = false): GrowthView[] {
+  private retrieveUnlocked(query: { text: string; subjectIds?: string[]; channelKeys?: string[]; at: number; n?: number }, includeInactive = false): GrowthView[] {
     const text = normalize(query.text);
     const subjects = new Set(query.subjectIds ?? []);
     return [...new Set(this.records.map(record => record.claimId))].map(id => this.view(id, query.at)!)
       .filter(view => includeInactive || view.active)
+      .filter(view => includeInactive || growthMatchesScope(view, query.channelKeys ?? [], subjects))
       .map(view => ({ view, score: relevance(view, text, subjects) }))
       .filter(item => item.score >= 3)
-      .sort((a, b) => b.score - a.score || b.view.records.at(-1)!.recordedAt - a.view.records.at(-1)!.recordedAt || a.view.claimId.localeCompare(b.view.claimId))
+      .sort((a, b) => b.score - a.score || semanticRecord(b.view).recordedAt - semanticRecord(a.view).recordedAt || a.view.claimId.localeCompare(b.view.claimId))
       .slice(0, boundedInteger(query.n, 4, 1, 12)).map(item => item.view);
   }
 
   /** Deterministic phrase/Chinese-word matching; no extra model and no unrelated memory injected. */
-  async retrieve(query: { text: string; subjectIds?: string[]; at: number; n?: number }): Promise<GrowthView[]> {
+  async retrieve(query: { text: string; subjectIds?: string[]; channelKeys?: string[]; at: number; n?: number }): Promise<GrowthView[]> {
     return this.serial(async () => this.retrieveUnlocked({ ...query, at: finiteTime(query.at, "at") }));
   }
 
@@ -476,7 +805,7 @@ export class GrowthLedger {
       finiteTime(at, "at");
       const limit = boundedInteger(maxChars, 2400, 100, 12_000);
       const views = [...new Set(this.records.map(record => record.claimId))].map(id => this.view(id, at)!)
-        .filter(view => view.active).sort((a, b) => b.records.at(-1)!.recordedAt - a.records.at(-1)!.recordedAt);
+        .filter(view => view.active && !view.needsReview).sort((a, b) => semanticRecord(b).recordedAt - semanticRecord(a).recordedAt);
       const lines: string[] = [];
       let size = 0;
       for (const view of views) {
@@ -488,9 +817,9 @@ export class GrowthLedger {
     });
   }
 
-  async reflect(input: ReflectionInput, at: number): Promise<{ duplicate: boolean; view: GrowthView }> {
+  async reflect(input: ReflectionInput, at: number, secondsPerTU = 1): Promise<{ duplicate: boolean; view: GrowthView }> {
     return this.serial(async () => {
-      const proposed = this.propose(input, at, this.records);
+      const proposed = this.propose(input, at, this.records, undefined, secondsPerTU);
       if (!proposed.record) return { duplicate: true, view: this.view(proposed.claimId, at)! };
       await this.append({ type: "reflection", record: proposed.record });
       this.records.push(proposed.record);
@@ -499,7 +828,7 @@ export class GrowthLedger {
   }
 
   /** Validation and construction are pure; an entire review is checked before its single append. */
-  private propose(input: ReflectionInput, at: number, records: GrowthRecord[], allowedEvidence?: Set<string>): { claimId: string; record?: GrowthRecord } {
+  private propose(input: ReflectionInput, at: number, records: GrowthRecord[], allowedEvidence?: Set<string>, secondsPerTU = 1): { claimId: string; record?: GrowthRecord } {
     if (!["relationship", "commitment", "preference", "state", "habit", "trait"].includes(input.kind)) {
       throw new Error("成长类型须为 relationship、commitment、preference、state、habit 或 trait");
     }
@@ -531,6 +860,9 @@ export class GrowthLedger {
       throw new Error("改变原判断请使用 relation=revise，旧判断及其证据会保留");
     }
     if (latest?.relation === "retire" && relation === "support") throw new Error("此认识已停止适用；如有新的改变，请引用新经历并使用 revise");
+    if (latest && this.claimCorrections.has(latest.id) && (relation === "support" || relation === "revise" && statement === latest.statement)) {
+      throw new Error("此认识已因证据归属或支持不足而撤回；不能沿用原判断，须依据新的实际经历作明确修订");
+    }
     const subjectId = input.subjectId === undefined ? latest?.subjectId : requiredText(input.subjectId, "subjectId", 300);
     if (latest?.subjectId && subjectId !== latest.subjectId) throw new Error("修订不能改变认识所关联的身份");
     if (subjectId && !latest?.subjectId && !evidence.some(item => item.experience?.subjectIds?.includes(subjectId))) {
@@ -538,9 +870,20 @@ export class GrowthLedger {
     }
     const situation = input.situation === undefined ? latest?.situation : requiredText(input.situation, "situation", 500);
     const cues = input.cues === undefined ? latest?.cues : stringList(input.cues, "cues", 12, 100);
-    const expiresAt = input.expiresAt === undefined ? latest?.expiresAt : finiteTime(input.expiresAt, "expiresAt");
-    if (input.kind === "state" && relation !== "retire" && relation !== "counter" && (expiresAt === undefined || expiresAt <= at)) {
-      throw new Error("临时状态须指定晚于当前世界时刻的 expiresAt；过期状态不能继续作为当前状态");
+    const behavior = input.behavior === undefined ? latest?.behavior : requiredText(input.behavior, "behavior", 200);
+    if (input.behavior !== undefined && input.kind !== "habit" && input.kind !== "trait") throw new Error("behavior 仅用于习惯或性格倾向的实际动作依据");
+    const scope = relation === "retire" || relation === "counter" ? latest?.scope : deriveGrowthScope(input.kind, evidence, subjectId);
+    if (latest?.scope?.domain === "chat" && scope?.domain === "chat" && input.kind === "state" && latest.scope.channelKey !== scope.channelKey) throw new Error("不能把一个频道的注意状态续接到另一个频道");
+    let expiresAt = input.expiresAt === undefined ? latest?.expiresAt : finiteTime(input.expiresAt, "expiresAt（expires_at）");
+    let stateTiming: GrowthRecord["stateTiming"];
+    if (input.kind === "state" && relation !== "retire" && relation !== "counter") {
+      const unit = Number.isFinite(secondsPerTU) && secondsPerTU > 0 ? secondsPerTU : 1;
+      const evidenceAt = Math.max(...evidence.filter(stateBasis).map(item => item.observedAt));
+      // A delayed review describes the past; reviewing it now cannot renew a bodily or situational state.
+      if (evidenceAt + 7200 / unit <= at) throw new Error("临时状态缺少最近两世界小时内实际支持它的经历；旧经历不能恢复成当前 state，未来 expiresAt 也不能代替新证据");
+      if (input.expiresAt !== undefined && input.expiresAt <= at) throw new Error("临时状态 expiresAt（expires_at）必须晚于当前世界时刻");
+      expiresAt = Math.min(input.expiresAt ?? evidenceAt + 7200 / unit, evidenceAt + 86400 / unit);
+      stateTiming = { evidenceAt, secondsPerTU: unit, ...(input.expiresAt !== undefined ? { requestedExpiresAt: input.expiresAt } : {}) };
     }
     if (input.kind !== "state" && input.expiresAt !== undefined) throw new Error("expiresAt 仅用于临时状态 state");
     if ((input.kind === "habit" || input.kind === "trait" || input.kind === "state") && !situation) throw new Error("临时状态、习惯或性格倾向须说明适用的 situation，不能直接泛化到所有情境");
@@ -551,6 +894,10 @@ export class GrowthLedger {
     if (!input.claimId) {
       const existing = records.find((r) => r.kind === input.kind && r.subject === subject && r.statement === statement && r.subjectId === subjectId);
       if (existing) throw new Error(`已有相同认识 ${existing.claimId}，请引用 claim_id 更新证据`);
+      if (behavior && (input.kind === "habit" || input.kind === "trait")) {
+        const sameBehavior = matchingBehavior(records, input.kind, behavior, subjectId);
+        if (sameBehavior) throw new Error(`已有同一行为的认识 ${sameBehavior.claimId}，不能换个近义标题再次强化；请核对原有情境、例外并修订`);
+      }
     }
     if ((input.kind === "habit" || input.kind === "trait") && (relation === "support" || relation === "revise")) {
       // A revision cannot convert counterevidence or one forced act into a positive behavioral pattern.
@@ -562,10 +909,17 @@ export class GrowthLedger {
       const choices = independentChoices(voluntary);
       const minimum = input.kind === "habit" ? 3 : 6;
       if (choices.length < minimum) throw new Error(`${input.kind} 至少须有 ${minimum} 次不同经历中的自主完成选择；未知、被迫、失败与重复读取不计入`);
+      if (!behavior || behavior.trim().length < 2) throw new Error("习惯与性格须给出 behavior：实际自主 action 里共同出现的明确动作短语，不能仅凭重复次数归纳");
+      const relevantChoices = independentChoices(voluntary.filter(item => actionContains(item, behavior)));
+      if (relevantChoices.length < minimum) throw new Error(`${input.kind} 的 behavior 必须由至少 ${minimum} 次实际自主动作逐字支持；不能把无关动作凑成习惯`);
+      const unit = Number.isFinite(secondsPerTU) && secondsPerTU > 0 ? secondsPerTU : 1;
+      const elapsed = (Math.max(...relevantChoices.map(item => item.observedAt)) - Math.min(...relevantChoices.map(item => item.observedAt))) * unit;
+      if (elapsed < (input.kind === "trait" ? 7 : 1) * 86400) throw new Error(`${input.kind} 的支持经历尚未跨越${input.kind === "trait" ? "七个" : "一个"}世界日；连续循环只能说明当时行为，不能靠多次调用立刻固化人格`);
       if (!evidence.some(e => voluntary.includes(e) && e.rootEventIds.some(id => fresh.includes(id)))) {
         throw new Error("支持或修订行为倾向须有本次新增的自主完成选择；未知、被迫或失败经历可作为反证，但不能证明新的自愿习惯");
       }
-      if (input.kind === "trait" && new Set(choices.map(e => normalize(e.experience!.situation ?? "")).filter(Boolean)).size < 3) {
+      if (!evidence.some(e => voluntary.includes(e) && actionContains(e, behavior) && e.rootEventIds.some(id => fresh.includes(id)))) throw new Error("补充行为依据必须含新增的同一 behavior 实践；无关的新经历不能重复强化原有习惯");
+      if (input.kind === "trait" && new Set(relevantChoices.map(e => normalize(e.experience!.situation ?? "")).filter(Boolean)).size < 3) {
         throw new Error("性格倾向至少须有 3 种不同情境的自主经历；单一关系或场景应保留为局部认识");
       }
     }
@@ -577,6 +931,8 @@ export class GrowthLedger {
       origin: "manual",
       ...(subjectId ? { subjectId } : {}), ...(situation ? { situation } : {}),
       ...(cues ? { cues } : {}), ...(expiresAt !== undefined ? { expiresAt } : {}),
+      ...(stateTiming ? { stateTiming } : {}),
+      ...(scope ? { scope } : {}), ...(behavior ? { behavior } : {}), groundingVersion: 1,
     };
     return { claimId: record.claimId, record };
   }
@@ -594,19 +950,26 @@ export class GrowthLedger {
     for (let i = 0; i < records.length; i++) if (records[i]!.relation === "revise") lastRevision = i;
     const contested = records.slice(Math.max(0, lastRevision)).some((r) => r.relation === "counter");
     const ids = new Set(records.flatMap((r) => r.evidenceIds));
-    const inactiveReason = latest.relation === "retire" ? "retired" as const
-      : first.kind === "state" && (latest.expiresAt === undefined || latest.expiresAt <= at) ? "expired" as const : undefined;
-    return structuredClone({
+    const stateTimingCorrection = this.stateTimingCorrections.get(latest.id);
+    const correction = this.claimCorrections.get(latest.id);
+    const expiresAt = stateTimingCorrection?.expiresAt ?? latest.expiresAt;
+    const inactiveReason = latest.relation === "retire" ? "retired" as const : correction ? "corrected" as const
+      : first.kind === "state" && (expiresAt === undefined || expiresAt <= at) ? "expired" as const : undefined;
+    const view: GrowthView = {
       claimId, kind: first.kind, subject: first.subject, statement: latest.statement,
       status: contested ? "contested" : "tentative", active: !inactiveReason,
       ...(inactiveReason ? { inactiveReason } : {}),
       ...(latest.subjectId ? { subjectId: latest.subjectId } : {}),
       ...(latest.situation ? { situation: latest.situation } : {}),
       ...(latest.cues ? { cues: latest.cues } : {}),
-      ...(latest.expiresAt !== undefined ? { expiresAt: latest.expiresAt } : {}),
+      ...(expiresAt !== undefined ? { expiresAt } : {}), ...(stateTimingCorrection ? { stateTimingCorrection } : {}),
+      ...(correction ? { correction } : {}),
+      ...(latest.scope ? { scope: latest.scope } : {}), ...(latest.behavior ? { behavior: latest.behavior } : {}),
       records,
       evidence: [...ids].flatMap((id) => this.evidence.get(id) ? [this.evidence.get(id)!] : []),
-    });
+    };
+    if (growthNeedsReview(view)) view.needsReview = true;
+    return structuredClone(view);
   }
 
   async recall(query: { kind?: GrowthKind; subject?: string; keyword?: string; claimId?: string; n?: number; at?: number; active?: boolean } = {}): Promise<GrowthView[]> {
@@ -663,11 +1026,30 @@ function normalizeMetadata(value: ExperienceMetadata): ExperienceMetadata {
     ...(typeof value.opportunity === "boolean" ? { opportunity: value.opportunity } : {}),
     ...(value.worldPerception === true ? { worldPerception: true } : {}),
     ...(Array.isArray(value.responseToRoots) ? { responseToRoots: [...new Set(value.responseToRoots.filter((id): id is string => typeof id === "string" && !!id))] } : {}),
+    ...(value.chat ? { chat: normalizeChat(value.chat) } : {}),
   };
+}
+
+function normalizeChat(chat: NonNullable<ExperienceMetadata["chat"]>): NonNullable<ExperienceMetadata["chat"]> {
+  if (!["message", "notice", "attention", "send"].includes(chat.kind)) throw new Error("聊天证据类别无效");
+  return { kind: chat.kind, channelKey: requiredText(chat.channelKey, "chat.channelKey", 500),
+    ...(chat.senderId ? { senderId: requiredText(chat.senderId, "chat.senderId", 300) } : {}),
+    ...(typeof chat.senderOwn === "boolean" ? { senderOwn: chat.senderOwn } : {}) };
+}
+
+/** Additional support is audit history, not a stronger personality instruction or a fresh recollection. */
+export function semanticRecord(view: GrowthView): GrowthRecord {
+  return [...view.records].reverse().find(record => record.relation !== "support") ?? view.records[0]!;
 }
 
 function snapshotId(snapshot: Omit<GrowthReviewSnapshot, "id">): string {
   return `growth_review_${createHash("sha256").update(JSON.stringify(snapshot)).digest("hex").slice(0, 24)}`;
+}
+
+/** The same program-verified admission rule used by habit/trait validation, for model evidence hints. */
+export function independentGrowthChoices(evidence: PerceivedEvidence[]): PerceivedEvidence[] {
+  return independentChoices(evidence.filter(item => item.experience?.agency === "self" && item.experience.outcome === "completed" &&
+    item.experience.opportunity === true && !!item.experience.episodeId));
 }
 
 /** Multiple tools in one episode, and projections sharing an original cause, are one choice. */
@@ -724,10 +1106,14 @@ function relevance(view: GrowthView, normalizedQuery: string, subjectIds: Set<st
 export function growthViewText(view: GrowthView): string {
   const labels: Record<GrowthKind, string> = { relationship: "关系认识", commitment: "承诺", preference: "偏好", state: "临时状态", habit: "情境习惯", trait: "性格倾向" };
   const counter = view.status === "contested" ? [...view.records].reverse().find(record => record.relation === "counter") : undefined;
-  return `${labels[view.kind]}：${view.subject}${view.subjectId ? `〔${growthIdentityText(view.subjectId)}〕` : ""}${view.situation ? `（${view.situation}）` : ""}。${view.statement}` +
-    (view.kind === "state" && view.expiresAt !== undefined ? `（仅适用于世界时刻 ${view.expiresAt} 之前。）` : "") +
+  const withdrawn = view.inactiveReason === "corrected" || !!view.correction;
+  const status = withdrawn ? "【已撤回，不作为当前事实或行动依据】" : view.needsReview ? "【待复核，已隔离，不作为当前事实或行动依据】" : "";
+  return status + `${labels[view.kind]}：${view.subject}${view.subjectId ? `〔${growthIdentityText(view.subjectId)}〕` : ""}${view.situation ? `（${view.situation}）` : ""}。${view.statement}` +
+    (view.kind === "state" && view.expiresAt !== undefined ? `（${withdrawn || view.needsReview ? "原记录期限为世界时刻" : "仅适用于世界时刻"} ${view.expiresAt} 之前。）` : "") +
     (counter ? ` 存在反例，尚不能一概而论：${counter.statement}` : "") +
-    (!view.active ? `（${view.inactiveReason === "retired" ? "已停止适用" : "已过期"}。）` : "");
+    (withdrawn ? `（撤回原因：${view.correction?.reason ?? "原判断缺少依据"}。）` :
+      view.needsReview ? "（原始记录与证据保留供复核，隔离不代表结论真伪已经确定。）" :
+        !view.active ? `（${view.inactiveReason === "retired" ? "已停止适用" : "已过期"}。）` : "");
 }
 
 function growthIdentityText(subjectId: string): string {

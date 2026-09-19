@@ -105,6 +105,7 @@ export interface WebUIHost {
   getStructuredWorld?(): Promise<unknown>;
   /** 独立的成长记录，不包含置顶人设或内部上下文。 */
   getGrowth?(): Promise<unknown>;
+  getGrowthStatus?(): Promise<unknown>;
   /** Internal simulation and decision audit, administrator-only. */
   getRegulation?(): Promise<unknown>;
   prompts(): Prompts;
@@ -864,6 +865,12 @@ export class WebUIServer {
       if (!host.getGrowth) return void sendJSON(res, 503, { error: "成长记录尚未就绪" });
       return void sendJSON(res, 200, { growth: await host.getGrowth() });
     }
+    if (pathname === "/api/bot/growth/status") {
+      if (access.kind !== "admin") return void sendJSON(res, 403, { error: "仅管理员可读取成长审阅与拒绝原因" });
+      if (method !== "GET") return void sendJSON(res, 405, { error: "成长审阅状态只提供读取" });
+      if (!host.getGrowthStatus) return void sendJSON(res, 503, { error: "成长审阅状态尚未就绪" });
+      return void sendJSON(res, 200, await host.getGrowthStatus());
+    }
     if (pathname === "/api/overview" && method === "GET") {
       const clock = host.getClock();
       const bot = host.botStatus();
@@ -1139,7 +1146,11 @@ export class WebUIServer {
       let apiKey = String(body.apiKey ?? "");
       // apiKey 被脱敏回传时（仍是掩码），按 group 路径从当前配置回填真实密钥
       if (apiKey === SECRET_MASK) {
-        apiKey = getSecretByPath(host.config, String(body.group ?? ""));
+        const keyPath = String(body.group ?? "") + ".apiKey";
+        if (!pathIsSecret(keyPath.split("."), collectSecretPaths(introspect(host.configSchema)))) {
+          return void sendJSON(res, 400, { error: "模型配置组不存在或未声明独立密钥" });
+        }
+        apiKey = getSecretByPath(host.config, keyPath);
       }
       if (!baseURL) return void sendJSON(res, 400, { error: "缺少 baseURL" });
       try {
@@ -1576,7 +1587,7 @@ function getSecretByPath(config: unknown, pathStr: string): string {
   const parts = pathStr.split(".").filter(Boolean);
   let cur: unknown = config;
   for (const p of parts) {
-    if (cur && typeof cur === "object") cur = (cur as Record<string, unknown>)[p];
+    if (cur && typeof cur === "object" && Object.prototype.hasOwnProperty.call(cur, p)) cur = (cur as Record<string, unknown>)[p];
     else return "";
   }
   return typeof cur === "string" ? cur : "";
@@ -1613,6 +1624,7 @@ async function fetchLlmModels(baseURL: string, apiKey: string): Promise<string[]
   const url = root + "/models";
   const res = await llmFetch(url, {
     headers: apiKey ? { authorization: `Bearer ${apiKey}` } : {},
+    signal: AbortSignal.timeout(15_000),
   });
   if (!res.ok) {
     const text = await res.text().catch(() => "");

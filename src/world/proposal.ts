@@ -4,11 +4,11 @@ import type { ChatToolDef } from "../llm/chat.js";
 export function worldResolutionTool(initializing = false): ChatToolDef {
   const prose = { type: "string", minLength: 1, maxLength: 200_000 };
   return { type: "function", function: { name: "resolve_world",
-    description: "返回自然语言世界裁定。普通任务将角色感知与状态全文一起保存后交付；app_observe只读返回私有应用输出，app_action保存设备变化及私有回执，由设备流程决定感知。不需要实体或操作数组。",
+    description: "返回自然语言世界裁定。所有字段禁止新增平台消息、通知、收发回执或软件状态；普通任务只保存物理世界事实与感知。app_observe只读返回既有虚构应用输出，app_action保存虚构设备变化及私有回执，由设备流程决定感知；两者均不能模拟真实聊天平台。不需要实体或操作数组。",
     parameters: { type: "object", additionalProperties: false, required: initializing ? ["perceptions", "worldState", "actorStates", "botName"] : ["perceptions"], properties: {
       perceptions: { type: "array", maxItems: 100, description: "普通任务只向在场角色投递其实际感知，没有动静可省略。app_observe/app_action仅放请求actorId的一份私有应用输出，不代表角色已知。不能投递全知状态。", items: {
-        type: "object", additionalProperties: false, required: ["actorId", "text"], properties: { actorId: { type: "string" }, text: { ...prose, description: "普通任务写实际经过、环境细节与NPC回应，不代替角色作决定；应用任务仅写应用输出。" } } } },
-      worldState: { ...prose, description: "更新后的完整自然语言世界状态，保留仍有效的事实、秘密、对话进度、NPC目标和未完成过程。普通任务无变化省略；app_action必须填写，无变化原文返回；app_observe不能填写。不是变更摘要或JSON。" },
+        type: "object", additionalProperties: false, required: ["actorId", "text"], properties: { actorId: { type: "string" }, text: { ...prose, description: "普通任务写物理经过、环境细节与在场NPC回应，不代替角色作决定，不呈现平台消息/通知、软件界面或读写成功。应用任务仅写授权虚构应用输出。" } } } },
+      worldState: { ...prose, description: "更新后的完整自然语言物理世界状态，保留仍有效的事实、秘密、在场NPC交谈进度、目标和未完成过程。不能新建或沿用外部聊天断言。已有虚构软件/文件原文普通任务只可逐字保留。普通任务无变化省略；app_action必须填写，无变化原文返回；app_observe不能填写。不是变更摘要或JSON。" },
       actorStates: { type: "array", maxItems: 100, description: "需要更新的受控角色身体、处境、随身物品和活动状态全文；不代写主观认识与意图。NPC记在worldState。", items: {
         type: "object", additionalProperties: false, required: ["actorId", "state"], properties: { actorId: { type: "string" }, state: prose } } },
       ...(initializing ? { botName: { type: "string", minLength: 1, maxLength: 64 } } : {}),

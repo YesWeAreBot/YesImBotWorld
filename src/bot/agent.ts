@@ -7,7 +7,7 @@ import type { AppManager } from "../apps/manager.js";
 import type { WorldClock } from "../clock.js";
 import { needsMsgIds, type Config } from "../config.js";
 import type { WorldFiles } from "../files.js";
-import { RepeatGuard, type ObserveResult } from "./repeatGuard.js";
+import { canonicalizeArgs, RepeatGuard, type ObserveResult } from "./repeatGuard.js";
 import { ToolCallParseError } from "../llm/parse.js";
 import type { BotEvent, CompressionResult, EventSource, ExperienceMetadata, MediaRef, ParsedToolCall, PhoneStatus, PickFailure, PickResult, RichText, RichTextPart, ToolCallRecord } from "../types.js";
 import type { WorldAgent } from "../world/agent.js";
@@ -28,6 +28,7 @@ import { BOT_TOOLS, renderToolsText, toolLayer, type BotToolDef } from "./tools.
 import type { AppToolDef } from "../apps/app.js";
 import { signatureParams } from "./nativeTools.js";
 import { sliceText } from "../text.js";
+import { detectDeviceRequest, DEVICE_TOOL_GUIDANCE } from "../world/device-boundary.js";
 
 /** 代理执行单个工具调用的回传结果（管理员「手动驾驶」Bot） */
 export interface ManualToolResult {
@@ -189,7 +190,7 @@ export class BotAgent {
   private running = false;
   private loopPromise: Promise<void> | null = null;
   private abort: AbortController | null = null;
-  private waiting: { callId: string; kind?: "wait" | "nap"; startedTU?: number } | null = null;
+  private waiting: { callId: string; kind?: "wait" | "rest"; startedTU?: number } | null = null;
   private wakeFn: (() => void) | null = null;
   private lastGenAt = 0;
   /**
@@ -213,6 +214,9 @@ export class BotAgent {
    * 按 (工具名, 规范化参数) 链式计数，连续重复达到阈值时注入递进式提醒（纯 advisory，不拦截）。
    */
   private repeatGuard: RepeatGuard;
+  /** Root IDs survive context compaction; rereading a result is not new progress. */
+  private progressRoots = new Set<string>();
+  private observedWorldShape: string | null = null;
   /**
    * 打破死循环的强制手段（breakLoop）：
    * - tempBannedTools：被暂时移除的工具（下次压缩后自动恢复）；
@@ -221,16 +225,16 @@ export class BotAgent {
   private tempBannedTools = new Set<string>();
   private forceRestCount = 0;
   /**
-   * 已完成的等待区间（世界 TU，被打断的按实际时长计），用于"等待时长占比过高"的拦截。
-   * 少量多次的短等是正常的；要治的是「几乎全部时间都在干等」——所以按时长不按次数。
+   * Actual autonomous wait/rest intervals. Notifications and compaction do not renew this budget.
    */
   private waitLog: { from: number; to: number }[] = [];
+  private pauseStarts = new Map<string, { from: number; autonomous: boolean }>();
   /**
-   * wait 确认通行证：只有刚被拦下过，confirm: true 才有效（单次，用后失效）。
+   * Pause confirmation applies only to the same tool immediately after a refusal.
    * 静态的绕过参数会被模型货物崇拜——每次都习惯性带上 confirm，拦截就形同虚设；
    * 单次通行证保证每一次高占比等待都要经过一轮显式的"拦下 → 确认"。
    */
-  private waitConfirmArmed = false;
+  private pauseConfirmArmed: "wait" | "rest" | null = null;
   /** 连续几次模型输出不是合法工具调用，用于在反馈里提示模型直接输出 JSON */
   private parseFailures = 0;
   /**
@@ -266,7 +270,7 @@ export class BotAgent {
    */
   private externalToolResults = new Map<string, { resolve: (r: ManualToolResult) => void; systemText: string | null }>();
   /**
-   * 注入 system 段的"醒来时刻"：仅在 start() 与 rest 结束时更新。
+   * 固定上下文窗口的记录时刻：仅在 start() 与记忆整理后更新，不代表角色醒来。
    * 决不能用实时时间——那会让 system 段随时间不断变化，
    * 前缀在 system 处断裂，整个 Tool Call 流每次请求都重新 prompt eval（缓存全灭）。
    * 当前时间由事件的 t 属性承载。
@@ -317,13 +321,14 @@ export class BotAgent {
     this.repeatGuard = new RepeatGuard({
       thresholds: config.bot.repeatThresholds ?? [3, 5, 8],
       include: [],
-      exclude: config.bot.repeatExclude ?? ["rest", "wait"],
+      exclude: config.bot.repeatExclude ?? [],
       argumentsPreviewChars: 500,
     });
+    for (const entry of context.stream) if (entry.kind === "event") this.noteProgress(entry.event, false);
     this.logger.info(
       "[repeatGuard] thresholds=%s exclude=%s",
       JSON.stringify(config.bot.repeatThresholds ?? [3, 5, 8]),
-      JSON.stringify(config.bot.repeatExclude ?? ["rest", "wait"]),
+      JSON.stringify(config.bot.repeatExclude ?? []),
     );
     // 原生声明在第一次生成时冻结；实时允许集通过追加的能力事件更新。
     this.backend = createBackend(config.bot, this.layerNames("core"), this.toolDefs);
@@ -463,7 +468,7 @@ export class BotAgent {
         if (removed.length) lines.push(`现在不可用：${removed.join("、")}。调用这些工具不会执行操作。`);
         if (added.length) lines.push(`现在新增可用：\n${renderToolsText(added)}`);
         if (changed.length) lines.push(`以下工具的参数或语义已更新：\n${renderToolsText(changed)}`);
-        if (this.config.bot.nativeToolCalls && (added.length || changed.length)) lines.push('原生 function 声明会在整理记忆后更新；新能力或新参数尚未出现在声明中时，可在正文输出单个 {"name":"工具名","arguments":{},"duration":0} 调用。');
+        if (this.config.bot.nativeToolCalls && (added.length || changed.length)) lines.push('原生 function 声明会在整理记忆后更新；新能力或新参数尚未出现在声明中时，可在正文输出单个 {"name":"工具名","arguments":{},"duration":0} 调用。缺少原生声明不表示要用 act 代替设备工具。');
         this.pushEvent("system", lines.join("\n") + "）");
       }
     }
@@ -546,6 +551,7 @@ export class BotAgent {
     this.retired = true;
     this.perceptionListeners.clear();
     this.receipts.deactivate();
+    for (const id of this.pauseStarts.keys()) this.finishPause(id);
     if (!this.running && !this.loopPromise) {
       this.scheduler.stopAll();
       for (const id of this.operationCalls.keys()) if (!this.scheduler.isPending(id)) this.operationCalls.delete(id);
@@ -651,50 +657,38 @@ export class BotAgent {
     const shouldWake = this.waiting !== null && (isWaitResult || opts.wake === true || puppetResult);
 
     if (shouldWake && !isWaitResult) {
-      // 提前唤醒 wait/小憩：取消到期任务，并在事件前插入打断说明
+      // Interrupt the timer, without turning a scheduling transition into bodily sleep.
       const { callId, kind, startedTU } = this.waiting!;
       const timer = this.scheduler.pending().find(task => task.id === callId);
       const cancellation = this.scheduler.cancel(callId);
       if (cancellation === "cancelled") this.operationCalls.delete(callId);
+      const elapsed = Math.max(0, this.clock.now() - (startedTU ?? timer?.issuedAt ?? this.clock.now()));
+      const roots = opts.originEventIds ?? rich.originEventIds;
+      const chat = rich.experience?.chat;
+      const anonymousNotice = !chat && !!roots?.some(root => root.startsWith("chat-notice:"));
+      const cause = chat?.kind === "notice"
+        ? `收到频道 ${chat.channelKey} 的新通知；发送者和消息正文尚未读取`
+        : chat?.kind === "message"
+        ? `频道 ${chat.channelKey} 的新消息已交付，具体内容以随后事件为准`
+        : anonymousNotice
+        ? "收到新的手机通知信号；通知来源的频道、发送者和内容尚未确认"
+        : puppetResult ? "外部操纵的结果到达"
+        : source === "tool" ? "已有操作的结果到达"
+        : source === "world" ? "新的世界感知到达"
+        : source === "koishi" ? "新的聊天事件到达"
+        : "新的事件到达";
+      const interruption = `（${kind === "rest" ? "休息" : "等待"}计时被中断：${cause}。实际经过 ${elapsed.toFixed(1)} TU；未继续计时到原定时刻。）`;
       if (cancellation === "cancelled") {
-        const elapsed = Math.max(0, this.clock.now() - (startedTU ?? timer?.issuedAt ?? this.clock.now()));
-        this.externalToolResults.get(callId)?.resolve({ ok: false, callId, text: `（${kind === "nap" ? "休息" : "等待"}被新动静打断，实际经过 ${elapsed.toFixed(1)} TU；未继续等待到原定时刻。）` });
+        this.externalToolResults.get(callId)?.resolve({ ok: false, callId, text: interruption });
         this.externalToolResults.delete(callId);
         this.puppetCalls.delete(callId);
         this.stealthCalls.delete(callId);
       }
-      // 被打断的等待按实际时长计入等待占比（小憩不算 wait）
-      if (kind !== "nap" && startedTU !== undefined) this.recordWait(startedTU);
-      this.mailbox.push({
+      if (cancellation === "cancelled") this.finishPause(callId);
+      if (cancellation === "cancelled") this.mailbox.push({
         source: "system",
-        content:
-          this.residentControl?.mode === "puppet"
-            ? "外部动静打断了你的安静等待；你可以继续感知，身体动作仍由外部操纵。"
-            : kind === "nap"
-            ? pickMeta([
-                "动静把你从小憩中弄醒了。",
-                "一点动静把你从浅睡里惊醒了。",
-                "你被一阵动静叫醒，睁开了眼。",
-                "外面有了响动，你迷迷糊糊醒了过来。",
-                "你被某个动静从打盹里拽了出来。",
-                "睡意被打断，你重新清醒过来。",
-                "什么东西响了一下，你从浅睡中转醒。",
-                "你迷迷糊糊睁眼，原来是旁边有动静。",
-                "一阵声响惊动了你，小憩到此为止。",
-                "你从半睡半醒中被拉回现实。",
-              ])
-            : pickMeta([
-                "你的等待被打断了。",
-                "你等的空当被打断了。",
-                "没等到头，你被别的事打断了。",
-                "你正等着，却被别的事岔开了。",
-                "等待没能继续，有情况插了进来。",
-                "你还没等到结果，就被打断了。",
-                "正要往下等，事情起了变化。",
-                "等待被搅了，不得不先处理别的。",
-                "你没等完，就被别的动静打断了。",
-                "等待中途出了岔子，停下吧。",
-              ]),
+        content: interruption,
+        originEventIds: [],
         refToolCallId: callId,
         worldTime: this.clock.now(),
       });
@@ -800,13 +794,13 @@ export class BotAgent {
    * 注入同样遵守阻塞规则：在下一次生成前统一追加。
    * msgId：平台消息 id，与真实 send 工具的结果格式一致（开启引用类操作时展示）。
    */
-  simulateExternalSend(channelKey: string, content: string | RichText, msgId?: string, sendArgs?: { msg: string } | null): void {
+  simulateExternalSend(channelKey: string, content: string | RichText, msgId?: string, sendArgs?: { msg: string } | null, identityText = ""): void {
     const rich = typeof content === "string" ? { text: content } : content;
     // Callers with unsupported message kinds retain the actual perceived action,
     // without inventing a send tool invocation that could never send that content.
     const args = sendArgs === undefined ? (typeof content === "string" ? { msg: content } : null) : sendArgs;
     const msgTag = msgId && needsMsgIds(this.config.platformOps) ? `（msg:${msgId}）` : "";
-    const prefix = `${args ? "消息已发送到" : "你刚才在"} ${channelKey}${msgTag}${args ? "。" : "发出了一条消息。"}已发送的消息正文：\n`;
+    const prefix = `${identityText ? `${identityText}\n` : ""}${args ? "消息已发送到" : "你刚才在"} ${channelKey}${msgTag}${args ? "。" : "发出了一条消息。"}已发送的消息正文：\n`;
     const suffix = "\n〔已发送消息结束〕";
     this.mailbox.push({
       source: args ? "tool" : "koishi",
@@ -850,6 +844,7 @@ export class BotAgent {
     await this.autonomousDispatch;
     this.interruptAllDeferred("管理员接管了设备");
     const cancelled = this.scheduler.cancelUncommitted();
+    for (const id of cancelled) this.finishPause(id);
     if (this.waiting && cancelled.includes(this.waiting.callId)) { this.waiting = null; this.wakeFn?.(); }
     for (const id of cancelled) {
       this.operationCalls.delete(id);
@@ -926,6 +921,7 @@ export class BotAgent {
     const status = this.scheduler.cancel(id);
     const text = status === "cancelled" ? "尚未提交的调用已取消。" : "调用已开始提交，无法撤销；请等待真实回执。";
     if (status === "cancelled") {
+      this.finishPause(id);
       this.operationCalls.delete(id);
       this.externalToolResults.get(id)?.resolve({ ok: false, text, callId: id });
       this.externalToolResults.delete(id);
@@ -1074,6 +1070,9 @@ export class BotAgent {
       try {
         this.refreshToolGate();
         await this.drainMailbox();
+
+        const identityUpdate = await this.context.refreshChatAccounts(this.clock.now());
+        if (identityUpdate) this.publishPerception(identityUpdate);
 
         // 手动驾驶（管理员扮演接管）：暂停自主生成，仅负责排空邮箱 + 处理外部注入的工具/事件。
         // 短睡后回到循环顶部重排邮箱，保证注入的事件及时进入上下文。
@@ -1317,10 +1316,7 @@ export class BotAgent {
         throw err;
       });
       await this.regulation.perceive(event);
-      if (event.source === "koishi" || event.source === "world") {
-        this.repeatGuard.reset();
-        this.forceRestCount = 0;
-      }
+      this.noteProgress(event);
       const resultLabel = event.refToolCallId
         ? `[${event.source} ← ${event.refToolCallId}] ${event.id}`
         : `[${event.source}] ${event.id}`;
@@ -1435,6 +1431,7 @@ export class BotAgent {
   // ---------- 工具派发 ----------
 
   private async dispatch(call: ToolCallRecord): Promise<void> {
+    if (call.role === "agent" && !call.control && call.name !== this.pauseConfirmArmed) this.pauseConfirmArmed = null;
     if (call.control && (this.residentClosing || this.residentControl?.sessionId !== call.control.sessionId || this.residentControl.mode !== call.control.mode)) {
       this.pushEvent("system", "（角色接管会话已结束，此调用没有执行。）", { ref: call.id });
       return;
@@ -1498,20 +1495,16 @@ export class BotAgent {
         return this.dispatchLocal(call, async () => {
           const a = call.arguments;
           const now = this.clock.now(), unit = this.clock.unitWorldSeconds > 0 ? this.clock.unitWorldSeconds : 1;
-          let expiresAt = a.expires_at as number | undefined;
-          if (a.kind === "state" && a.relation !== "counter" && a.relation !== "retire") {
-            if (expiresAt !== undefined && (typeof expiresAt !== "number" || !Number.isFinite(expiresAt) || expiresAt <= now)) throw new Error("临时状态 expires_at 必须是未来的世界 TU 时刻");
-            expiresAt = Math.min(expiresAt ?? now + 7200 / unit, now + 86400 / unit);
-          }
           const result = await this.growth.reflect({
             kind: a.kind as GrowthKind, subject: a.subject as string, statement: a.statement as string,
             evidenceIds: Array.isArray(a.event_ids) ? a.event_ids as string[] : [],
             relation: a.relation as ReflectionRelation | undefined,
             claimId: typeof a.claim_id === "string" ? a.claim_id : undefined,
             situation: a.situation as string | undefined, cues: a.cues as string[] | undefined,
+            behavior: a.behavior as string | undefined,
             subjectId: a.subject_id as string | undefined,
-            expiresAt,
-          }, now);
+            expiresAt: a.expires_at as number | undefined,
+          }, now, unit);
           return { text: JSON.stringify(result), originEventIds: [], growthReferences: [{ claimId: result.view.claimId, recordId: result.view.records.at(-1)!.id }] };
         });
       case "recall_growth":
@@ -1716,10 +1709,9 @@ export class BotAgent {
         return this.dispatchLocal(call, async () => {
           const resolved = await this.messenger.resolveKey(id);
           if ("error" in resolved) return resolved.error;
-          await this.notifyList?.set(resolved.key, allow);
-          return allow
-            ? `你打开了 ${resolved.key} 的消息通知。`
-            : `你把 ${resolved.key} 设为了免打扰，之后它的新消息不会再提醒你（消息记录里仍能翻到）。`;
+          if (!this.notifyList) return "（当前无法修改频道通知设置。）";
+          await this.notifyList.set(resolved.key, allow);
+          return `${resolved.key} 的通知设置已更新。${this.notifyList.channelStatusText(resolved.key)}`;
         });
       }
       case "open_app": {
@@ -2163,49 +2155,9 @@ export class BotAgent {
       this.pushEvent("system", "（等待时长必须大于 0。）", { ref: call.id });
       return;
     }
-    // 干等占比拦截：最近一个窗口内实际处于等待中的世界时间占比过高时，新的 wait 直接拦下。
-    // confirm: true 只在"刚被拦下"后的下一次生效（单次通行证）——习惯性地每次都带上没有任何作用，
-    // 每一次高占比等待都必须经过一轮显式的"拦下 → 确认"。
-    // 按时长不按次数：少量多次的短等是正常的，要治的是「几乎全部时间都在干等」
-    const threshold = this.config.bot.waitRateThreshold;
-    const windowTU = this.config.bot.waitRateWindow;
-    if (threshold > 0 && windowTU > 0 && this.residentControl?.mode !== "puppet") {
-      const nowTU = this.clock.now();
-      const waited = this.waitedWithin(nowTU - windowTU, nowTU);
-      const rate = Math.round((waited / windowTU) * 100);
-      if (rate >= threshold) {
-        if (isTruthy(call.arguments.confirm) && this.waitConfirmArmed) {
-          this.waitConfirmArmed = false; // 通行证单次有效
-        } else {
-          this.waitConfirmArmed = true;
-          const confirmNote = isTruthy(call.arguments.confirm)
-            ? "你带了 confirm: true，但它只在被拦下之后的下一次等待里才生效——每次都习惯性地带上是没有意义的，不要那样做。"
-            : "";
-          // 引导语做 10 套字面差异大的变体随机；事实（窗口时长/等待占比）与 confirm 指引保持稳定
-          const idleGuidance = pickMeta([
-            "你最近大部分时间都在空等，这样不会有任何进展。去看点新东西、找点真正想做的事，或暂时放下手机做点别的实际的事。",
-            "空等占了你太多时间，再等下去只会原地踏步。主动去找点事情做，或者干脆离开手机去干点实在的。",
-            "你几乎一直在等，但这等待换不来任何变化。给自己找件新鲜事，或起身做点实际的，别干耗着。",
-            "这么久的空等没有意义，生活不会自己找上门。要么去找感兴趣的事，要么放下手机，做点看得见摸得着的事。",
-            "你花在干等上的时间太多了，这只是在虚度。换个方向，主动做点什么，哪怕是件很小的事。",
-            "等待解决不了任何问题，你只是在消耗自己。别傻等了，去找事做，或暂时离开聊天专心做点别的。",
-            "你最近几乎都在发呆等待，这样日子会一事无成。请动起来，找点新目标，或做点实际的事。",
-            "空等已经成了你的常态，这很危险。你需要主动出击——看新东西、找想做的事、或放下手机做实事。",
-            "别再等了，等待不会带来哪怕一点点进展。去探索、去行动，或者干脆离开屏幕歇一歇脑子。",
-            "你把大半时间耗在了无谓的等待上。真正的进展来自做事，不是等。去找点新鲜事，或起身做点实际的。",
-          ]);
-          this.pushEvent(
-            "system",
-            `（最近 ${windowTU} TU 里，你有 ${Math.round(waited)} TU（${rate}%）都在干等——这次等待没有开始。${confirmNote}` +
-              `${idleGuidance}` +
-              `想清楚确实无事可做的话，紧接着再调用一次 wait 并带上 confirm: true。）`,
-            { ref: call.id },
-          );
-          return;
-        }
-      }
-    }
-    this.waiting = { callId: call.id, startedTU: this.clock.now() };
+    if (this.gatePause(call)) return;
+    const startedTU = this.startPause(call);
+    this.waiting = { callId: call.id, kind: "wait", startedTU };
 
     // Drain already committed passive perceptions only after the wait actually ends.
     // Interrupted waits must not trigger active observation or invent an elapsed interval.
@@ -2214,13 +2166,14 @@ export class BotAgent {
     this.schedule(call, {
       executeAt: "expected",
       run: async () => {
-        this.recordWait(call.issuedAt);
+        this.finishPause(call.id);
         if (shouldObserve) {
           void this.world.resolveWait(call, (content) => this.pushEvent("world", content)).catch((err) => {
             this.logger.warn("等待后的感知交付失败：%s", err);
           });
         }
-        return { text: "等待结束了。", originEventIds: [] };
+        const elapsed = Math.max(0, this.clock.now() - startedTU);
+        return { text: `（等待计时到期，实际经过 ${elapsed.toFixed(1)} TU，原定 ${n} TU。）`, originEventIds: [] };
       },
     });
   }
@@ -2229,6 +2182,11 @@ export class BotAgent {
     const desc = typeof call.arguments.description === "string" ? call.arguments.description.trim() : "";
     if (!desc) {
       this.pushEvent("system", "（动作未提交：act.description 必须是非空的具体行动；target 和 speech 是可选补充，不能代替行动描述。）", { ref: call.id });
+      return;
+    }
+    const boundary = detectDeviceRequest([desc, typeof call.arguments.target === "string" ? call.arguments.target : ""].join("\n"));
+    if (boundary) {
+      this.pushEvent("system", `（动作未提交：${describeToolCall(call)}。${DEVICE_TOOL_GUIDANCE}）`, { ref: call.id, originEventIds: [] });
       return;
     }
     // blockingAct：一个人同时只能专注做一件事。上一个动作还没完成时，新的 act 直接拒绝并提示，
@@ -2453,6 +2411,14 @@ export class BotAgent {
       text: heading + (visible?.text ? (visible.parts?.length ? visible.text : truncate(visible.text, 3000)) : ""),
       attachments: visible?.attachments,
       parts: visible?.parts?.length ? [{ kind: "text", text: heading }, ...visible.parts] : undefined,
+      // Preserve the original visible message roots and scope; a screen reread is
+      // observed evidence, even if an application's cached result described a past execution.
+      originEventIds: visible?.originEventIds ?? [],
+      growthReferences: visible?.growthReferences,
+      experience: { ...visible?.experience, agency: "observed", outcome: "unknown", opportunity: false, worldPerception: false,
+        action: undefined,
+        ...(visible?.experience?.chat?.kind === "send" ? { chat: { ...visible.experience.chat, kind: "attention" } } : {}),
+      },
     };
   }
 
@@ -2528,6 +2494,39 @@ export class BotAgent {
     return false;
   }
 
+  /** Interruptions alone are not progress: require a new delivered fact or completed choice. */
+  private noteProgress(event: BotEvent, reset = true): void {
+    if (event.source === "system") return;
+    const roots = event.originEventIds ?? [];
+    const fresh = roots.filter(root => !this.progressRoots.has(root));
+    for (const root of roots) this.progressRoots.add(root);
+    while (this.progressRoots.size > 4096) this.progressRoots.delete(this.progressRoots.values().next().value!);
+    // An unread notification confirms only a notification, irrespective of which channel is open.
+    if (!fresh.length || fresh.every(root => root.startsWith("chat-notice:"))) return;
+    let progress = fresh.some(root => root.startsWith("chat-message:")) ||
+      (event.experience?.agency === "self" && event.experience.outcome === "completed" && event.experience.opportunity === true);
+    if (event.source === "world" || event.experience?.worldPerception) {
+      try {
+        const parsed = JSON.parse(event.content);
+        const observation = parsed.observation ?? parsed;
+        if (Array.isArray(observation.entities)) {
+          const names = new Map(observation.entities.map((entity: any) => [entity.observedId, `${entity.kind}:${entity.name}`]));
+          const shape = JSON.stringify(observation.entities.map((entity: any) => canonicalizeArgs({
+            kind: entity.kind, name: entity.name, self: entity.self, attributes: entity.attributes,
+            location: names.get(entity.locationObservedId), owner: names.get(entity.ownerObservedId),
+          })).sort());
+          progress ||= shape !== this.observedWorldShape;
+          this.observedWorldShape = shape;
+        }
+        progress ||= Array.isArray(observation.utterances) && observation.utterances.some((utterance: any) => fresh.includes(utterance.eventId));
+      } catch { /* Free-form world prose cannot prove a new structured state transition. */ }
+    }
+    if (reset && progress) {
+      this.repeatGuard.reset();
+      this.forceRestCount = 0;
+    }
+  }
+
   /**
    * 工具结果溢出治理（spill/prune，对应 dsh 的 tool-result-pruner + spill-policy）：
    * 纯文本结果超过 spillMinChars 时，裁成「头部 + 省略标记 + 尾部」，全文 fire-and-forget 落盘到
@@ -2558,22 +2557,66 @@ export class BotAgent {
     return typeof content === "string" ? preview : { ...content, text: preview };
   }
 
-  /** 记录一段实际发生的等待（从 fromTU 到现在），并顺手清理窗口外的旧区间 */
+  /** A shared idle budget prevents rest from being a second unrestricted wait. */
+  private gatePause(call: ToolCallRecord): boolean {
+    const threshold = this.config.bot.waitRateThreshold;
+    const windowTU = this.config.bot.waitRateWindow;
+    if (call.role !== "agent" || call.control || this.residentControl?.mode === "puppet" || !(threshold > 0 && windowTU > 0)) return false;
+    const now = this.clock.now();
+    const paused = this.waitedWithin(now - windowTU, now);
+    const rate = Math.round(paused / windowTU * 100);
+    if (rate < threshold) { this.pauseConfirmArmed = null; return false; }
+    if (this.pauseConfirmArmed === call.name && isTruthy(call.arguments.confirm)) {
+      this.pauseConfirmArmed = null;
+      return false;
+    }
+    this.pauseConfirmArmed = call.name === "rest" ? "rest" : "wait";
+    const pending = this.scheduler.pending().filter(task => task.name !== "wait" && task.name !== "rest" &&
+      !task.control && !this.stealthCalls.has(task.id) && this.operationCalls.get(task.id)?.role === "agent");
+    const opportunity = pending.length
+      ? `已经发起、尚未返回的操作：${pending.map(task => `${task.id}（${task.name}）`).join("、")}；它们的结果会实际交付，不必重做。`
+      : "当前没有尚未返回的自主操作；可以依据已知处境做一件具体的事，用 act 提交真实身体动作，或在实际需要时读取设备内容。";
+    const guidance = this.config.bot.disableWait
+      ? "wait 当前关闭；不要用 rest 反复空等消息。"
+      : "wait 与 rest 共用此暂停占比；换一个计时工具不会重新获得预算。";
+    this.pushEvent("system", `（最近 ${windowTU} TU 内，自主 wait/rest 实际暂停共 ${paused.toFixed(1)} TU（${rate}%），已达 ${threshold}% 提醒阈值；这次 ${call.name} 没有开始。${guidance}${opportunity}` +
+      `如确实需要继续休息或等已有操作，请结合实际身体感知与当前任务判断，紧接着再调用 ${call.name} 并带 confirm: true；这只确认本次计时，仍计入暂停时长，不证明已经睡眠或恢复体力。）`, { ref: call.id, originEventIds: [] });
+    return true;
+  }
+
+  private startPause(call: ToolCallRecord): number {
+    const from = this.clock.now();
+    this.pauseStarts.set(call.id, { from, autonomous: call.role === "agent" && !call.control && this.residentControl?.mode !== "puppet" });
+    return from;
+  }
+
+  private finishPause(callId: string): void {
+    const pause = this.pauseStarts.get(callId);
+    if (!pause) return;
+    this.pauseStarts.delete(callId);
+    if (pause.autonomous) this.recordWait(pause.from);
+  }
+
+  /** Record actual autonomous paused time; an interruption cannot erase its elapsed portion. */
   private recordWait(fromTU: number): void {
     const to = this.clock.now();
     if (to <= fromTU) return;
     this.waitLog.push({ from: fromTU, to });
-    const keepAfter = to - this.config.bot.waitRateWindow * 2;
+    const keepAfter = to - (this.config.bot.waitRateWindow || 3600) * 2;
     if (this.waitLog[0] && this.waitLog[0].to < keepAfter) {
       this.waitLog = this.waitLog.filter((iv) => iv.to >= keepAfter);
     }
   }
 
-  /** 窗口 [fromTU, toTU] 内实际处于等待中的世界时长（区间重叠部分求和） */
+  /** Union intervals so overlapping controller transitions cannot double-count elapsed time. */
   private waitedWithin(fromTU: number, toTU: number): number {
-    let sum = 0;
-    for (const iv of this.waitLog) {
-      sum += Math.max(0, Math.min(iv.to, toTU) - Math.max(iv.from, fromTU));
+    const intervals = [...this.waitLog, ...[...this.pauseStarts.values()].filter(item => item.autonomous).map(item => ({ from: item.from, to: toTU }))]
+      .map(iv => ({ from: Math.max(fromTU, iv.from), to: Math.min(toTU, iv.to) }))
+      .filter(iv => iv.to > iv.from).sort((a, b) => a.from - b.from);
+    let sum = 0, through = fromTU;
+    for (const iv of intervals) {
+      sum += Math.max(0, iv.to - Math.max(through, iv.from));
+      through = Math.max(through, iv.to);
     }
     return sum;
   }
@@ -2943,6 +2986,7 @@ export class BotAgent {
     const target = String(call.arguments.id ?? call.arguments.toolcall_id ?? "");
     const result = this.scheduler.cancel(target);
     if (result === "cancelled") {
+      this.finishPause(target);
       this.operationCalls.delete(target);
       this.externalToolResults.get(target)?.resolve({ ok: false, callId: target, text: "（尚未提交的调用已取消，没有继续执行。）" });
       this.externalToolResults.delete(target);
@@ -2967,6 +3011,7 @@ export class BotAgent {
     const self = call.arguments.target === "self";
     const target = !self && typeof call.arguments.target === "string" ? call.arguments.target : undefined;
     const intent = typeof call.arguments.intent === "string" ? call.arguments.intent : undefined;
+    if (detectDeviceRequest([intent?.trim() || "查看", target].filter(Boolean).join(" "))) throw new Error(`观察未执行。${DEVICE_TOOL_GUIDANCE}`);
     const modality = self ? "self" : typeof call.arguments.modality === "string" ? call.arguments.modality : undefined;
     const observation: WorldObservation = await this.world.observe("bot", { ...(intent ? { intent } : {}), target, modality });
     return { text: JSON.stringify(observation), originEventIds: observation.sourceEventIds, experience: { worldPerception: true, agency: "observed", opportunity: false } };
@@ -2975,24 +3020,27 @@ export class BotAgent {
 
   /** 角色休息与记忆维护分别调度；通知始终可以打断角色休息。 */
   private dispatchRest(call: ToolCallRecord): void {
+    if (this.gatePause(call)) return;
     const threshold = this.config.bot.restCompressMinChars;
     if (threshold <= 0 || this.context.approxChars() >= threshold) this.compressionRequested = "rest";
     // Actual rest is always an interruptible timer; context maintenance never imposes sleep.
     this.dispatchLightRest(call);
   }
 
-  /** 小憩：纯计时暂停（语义同 wait），到点或被动静唤醒 */
+  /** Pause generation until the timer ends or an actual delivered event interrupts it. */
   private dispatchLightRest(call: ToolCallRecord): void {
     const raw = Number(call.arguments.duration ?? call.duration ?? 0);
-    const n = Number.isFinite(raw) && raw > 0 ? raw : 300; // 未指定时长：默认打个盹
+    const n = Number.isFinite(raw) && raw > 0 ? raw : 300;
     // expectedAt 只影响调度不进入上下文渲染，可安全修正（duration 可能写在 arguments 里）
     call.expectedAt = call.issuedAt + n;
-    this.waiting = { callId: call.id, kind: "nap" };
+    const startedTU = this.startPause(call);
+    this.waiting = { callId: call.id, kind: "rest", startedTU };
     this.schedule(call, {
       executeAt: "expected",
       run: async () => {
-        const napWake = `（休息计时结束，经过 ${n} TU。可继续观察或行动；身体状态以实际观测为准。）`;
-        return { text: napWake, originEventIds: [] };
+        this.finishPause(call.id);
+        const elapsed = Math.max(0, this.clock.now() - startedTU);
+        return { text: `（休息计时到期，实际经过 ${elapsed.toFixed(1)} TU，原定 ${n} TU。可继续观察或行动；此回执只说明计时，身体状态以实际观测为准。）`, originEventIds: [] };
       },
     });
   }
@@ -3019,6 +3067,7 @@ export class BotAgent {
         memoryDigest: this.context.pinned.memoryDigest,
         streamText: snapshot.text,
         timeLine: this.clock.timeLine(),
+        chatAccounts: this.context.accountsProvider?.() ?? "",
       }), this.abort?.signal);
     } catch (err) {
       if (!this.running) return;
@@ -3041,8 +3090,12 @@ export class BotAgent {
       throw error;
     }
     this.backend.resetToolSnapshot?.();
-    this.repeatGuard.reset();
-    this.forceRestCount = 0;
+    // Ordinary maintenance is not new progress. Only the explicit loop intervention
+    // starts a new repeat-detection attempt; neither path renews the pause budget.
+    if (reason === "breakLoop") {
+      this.repeatGuard.reset();
+      this.forceRestCount = 0;
+    }
     this.refreshToolGate();
     this.wakeTimeLine = this.clock.timeLine();
   }

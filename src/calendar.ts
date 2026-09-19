@@ -45,6 +45,19 @@ export function gregorian(epoch: string): GregorianCalendar {
   return { kind: "gregorian", epoch };
 }
 
+/** Parse explicit Gregorian input without Date.parse's rollover/ambiguous-date guesses. */
+export function parseGregorianEpoch(input: string): number | null {
+  const match = /^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?(Z|[+-]\d{2}:?\d{2})?)?$/.exec(input.trim());
+  if (!match) return null;
+  const year = Number(match[1]), month = Number(match[2]), day = Number(match[3]);
+  const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const days = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1];
+  if (!days || day < 1 || day > days || Number(match[4] ?? 0) > 23 || Number(match[5] ?? 0) > 59 || Number(match[6] ?? 0) > 59) return null;
+  const value = input.trim().replace(" ", "T") + (match[4] === undefined ? "T00:00:00" : "");
+  const ms = Date.parse(value);
+  return Number.isFinite(ms) ? ms : null;
+}
+
 /** 把世界时间（自 epoch 起经过的世界秒数）格式化为可读字符串 */
 export function formatWorldTime(cal: CalendarSpec, worldSeconds: number): string {
   return cal.kind === "gregorian" ? formatGregorian(cal, worldSeconds) : formatCustom(cal, worldSeconds);
@@ -65,9 +78,8 @@ export function formatDateMs(ms: number): string {
 }
 
 function formatGregorian(cal: GregorianCalendar, worldSeconds: number): string {
-  const epochMs = Date.parse(cal.epoch.replace(" ", "T"));
-  const base = Number.isNaN(epochMs) ? Date.parse(DEFAULT_EPOCH.replace(" ", "T")) : epochMs;
-  return formatDateMs(base + worldSeconds * 1000);
+  const base = parseGregorianEpoch(cal.epoch);
+  return base === null ? "历法未就绪（初始时刻不是有效公历日期）" : formatDateMs(base + worldSeconds * 1000);
 }
 
 function formatCustom(cal: CustomCalendar, worldSeconds: number): string {
@@ -110,7 +122,7 @@ export function parseCalendarSpec(raw: unknown): CalendarSpec | null {
   if (typeof raw !== "object" || raw === null) return null;
   const o = raw as Record<string, unknown>;
   if (o.kind === "gregorian") {
-    if (typeof o.epoch !== "string" || Number.isNaN(Date.parse(o.epoch.replace(" ", "T")))) return null;
+    if (typeof o.epoch !== "string" || parseGregorianEpoch(o.epoch) === null) return null;
     return { kind: "gregorian", epoch: o.epoch };
   }
   if (o.kind === "custom") {

@@ -38,40 +38,41 @@ async function fixture(baseURL: string, extra: Record<string, unknown> = {}) {
   const files = new WorldFiles(base); await files.ensure(); await fs.writeFile(files.botDef, "小澈喜欢安静的生活；作者明确要求保留对家人的牵挂。", "utf8");
   const context = new BotContext(files); await context.load();
   const ledger = new GrowthLedger(base), cfg = config(baseURL, extra);
-  let at = 100, real = 1000;
+  const reflect = ledger.reflect.bind(ledger); ledger.reflect = (input, at, unit = 120) => reflect(input, at, unit);
+  let at = 100000, real = 1000;
   const clock = { now: () => at, unitWorldSeconds: 120 };
   const runtime = new GrowthRuntime(ledger, cfg, clock, context, logger, { realNow: () => real }); runtimes.push(runtime);
-  async function event(id: string, text = "晚饭后沿河散步，让一天的忙碌慢慢平复。", metadata: any = {}) {
-    const event: BotEvent = { id, source: "world", worldTime: at - 1, content: text, originEventIds: ["root:" + id],
+  async function event(id: string, text = "晚饭后沿河散步，让一天的忙碌慢慢平复。", metadata: any = {}, observedAt = at - 1) {
+    const event: BotEvent = { id, source: "world", worldTime: observedAt, content: text, originEventIds: ["root:" + id],
       experience: { agency: "self", outcome: "completed", episodeId: "episode:" + id, situation: "晚饭后河边", action: "散步", opportunity: true, ...metadata } };
     await context.appendEvent(event); await ledger.perceive(event); return event;
   }
-  async function events(prefix = "walk", count = 4) { for (let i = 1; i <= count; i++) await event(prefix + i); }
+  async function events(prefix = "walk", count = 4) { for (let i = 1; i <= count; i++) await event(prefix + i, undefined, {}, at - 1 - (count - i) * 86400 / clock.unitWorldSeconds); }
   return { files, context, ledger, cfg, clock, runtime, event, events, advance: () => { at += 10; real += 1100; }, setTime: (value: number) => { at = value; } };
 }
-const habit = (ids = ["walk1", "walk2", "walk3"]): ReflectionInput => ({ kind: "habit", subject: "饭后散步", statement: "天气合适且没有别的约定时，晚饭后我喜欢沿河走一会儿。", situation: "晚饭后，天气适合出门且没有其他约定。", cues: ["晚饭后", "河边"], evidenceIds: ids });
-const authorUpdate = (id: string, definition: string): BotEvent => ({ id, source: "system", worldTime: 100,
+const habit = (ids = ["walk1", "walk2", "walk3"]): ReflectionInput => ({ kind: "habit", subject: "饭后散步", behavior: "散步", statement: "天气合适且没有别的约定时，晚饭后我喜欢沿河走一会儿。", situation: "晚饭后，天气适合出门且没有其他约定。", cues: ["晚饭后", "河边"], evidenceIds: ids });
+const authorUpdate = (id: string, definition: string): BotEvent => ({ id, source: "system", worldTime: 100000,
   content: "（角色定义已由世界管理者更新。以下是新的作者定义，从现在起据此行动；固定定义会在下次记忆整理时同步。）\n" + definition });
 
 async function currentCounterAndInactiveReasons(baseURL: string) {
   const f = await fixture(baseURL); await f.events();
-  const original = await f.ledger.reflect(habit(), 100);
+  const original = await f.ledger.reflect(habit(), 100000);
   const counter = "但晚饭后有朋友来访时，我会留下陪他们，不能说每个晚上都要出门。";
   await f.event("stay-with-friends", "晚饭后朋友来访，我选择留在家里陪他们聊天。", { action: "留下陪朋友聊天", situation: "晚饭后朋友来访" });
-  await f.ledger.reflect({ ...habit(["stay-with-friends"]), claimId: original.view.claimId, relation: "counter", statement: counter }, 100);
+  await f.ledger.reflect({ ...habit(["stay-with-friends"]), claimId: original.view.claimId, relation: "counter", statement: counter }, 100000);
   for (let i = 0; i < 4; i++) {
     await f.event("later-walk-" + i);
-    await f.ledger.reflect({ ...habit(["later-walk-" + i]), claimId: original.view.claimId, relation: "support" }, 100);
+    await f.ledger.reflect({ ...habit(["later-walk-" + i]), claimId: original.view.claimId, relation: "support" }, 100000);
   }
   const fullHabit = (await f.ledger.recall({ claimId: original.view.claimId }))[0]!;
   assert.equal(fullHabit.records.slice(-4).some(record => record.relation === "counter"), false, "the unresolved counter must lie outside the recent-four shortcut");
   const temporary = await f.ledger.reflect({ kind: "state", subject: "散步后短暂疲倦", statement: "今天晚饭后散步回来暂时想歇一会儿。",
-    situation: "晚饭后在河边散步归来，休息恢复以前。", expiresAt: 101, evidenceIds: ["walk1"] }, 100);
-  const preference = await f.ledger.reflect({ kind: "preference", subject: "晚饭后河边喝浓茶", statement: "曾经喜欢晚饭后在河边喝一杯浓茶。", evidenceIds: ["walk2"] }, 100);
+    situation: "晚饭后在河边散步归来，休息恢复以前。", expiresAt: 100001, evidenceIds: ["walk4"] }, 100000);
+  const preference = await f.ledger.reflect({ kind: "preference", subject: "晚饭后河边喝浓茶", statement: "曾经喜欢晚饭后在河边喝一杯浓茶。", evidenceIds: ["walk2"] }, 100000);
   await f.event("stop-night-tea", "连续几次晚饭后喝浓茶影响睡觉，我决定以后散步时喝清水。", { action: "晚饭后散步改喝清水" });
   await f.ledger.reflect({ kind: "preference", subject: preference.view.subject, claimId: preference.view.claimId, relation: "retire",
-    statement: "晚饭后喝浓茶影响睡眠，这个安排已经停止，散步时改喝清水。", evidenceIds: ["stop-night-tea"] }, 100);
-  f.setTime(110);
+    statement: "晚饭后喝浓茶影响睡眠，这个安排已经停止，散步时改喝清水。", evidenceIds: ["stop-night-tea"] }, 100000);
+  f.setTime(100010);
   await f.event("revisit-inactive", "饭后散步回来，散步后短暂疲倦已经消退，也想起晚饭后河边喝浓茶这个安排已经停止。");
   response = () => ({ changes: [] });
   f.runtime.tick(); await f.runtime.settled();
@@ -81,7 +82,7 @@ async function currentCounterAndInactiveReasons(baseURL: string) {
   assert.equal(current.status, "contested");
   assert.equal(current.currentCounter, counter, "the next real maintenance request includes the unresolved objection, even after four later supports");
   const expired = payload.existing.find((claim: any) => claim.claimId === temporary.view.claimId);
-  assert.equal(expired.active, false); assert.equal(expired.inactiveReason, "expired"); assert.equal(expired.expiresAt, 101);
+  assert.equal(expired.active, false); assert.equal(expired.inactiveReason, "expired"); assert.equal(expired.expiresAt, 100001);
   const retired = payload.existing.find((claim: any) => claim.claimId === preference.view.claimId);
   assert.equal(retired.active, false); assert.equal(retired.inactiveReason, "retired");
   assert.match(retired.statement, /影响睡眠.*已经停止/);
@@ -106,7 +107,7 @@ async function authorDefinitionsAndMetadataBudget(baseURL: string) {
   const beforeOversize = requests.length;
   tooLarge.runtime.tick(); await tooLarge.runtime.settled();
   assert.equal(requests.length, beforeOversize, "an oversized author definition is rejected before model submission, never silently shortened");
-  assert.ok(await tooLarge.ledger.snapshotReview({ at: 100, minimumEpisodes: 1 }));
+  assert.ok(await tooLarge.ledger.snapshotReview({ at: 100000, minimumEpisodes: 1 }));
   assert.ok(warnings.some(warning => warning.includes("作者边界不能截断") && warning.includes("原经历未被消费")));
 
   const queued = await fixture(baseURL); await queued.events();
@@ -125,7 +126,7 @@ async function authorDefinitionsAndMetadataBudget(baseURL: string) {
   inFlightRuntime.tick(); await until(() => started);
   await inflight.context.appendEvent(authorUpdate("in-flight-definition", "生成期间交付的更新：保留家庭牵挂。"));
   resolveInference({ content: JSON.stringify({ changes: [] }), toolCalls: [] }); await inFlightRuntime.settled();
-  assert.ok(await inflight.ledger.snapshotReview({ at: 100, minimumEpisodes: 1 }), "a result based on an obsolete author definition cannot consume its evidence cursor");
+  assert.ok(await inflight.ledger.snapshotReview({ at: 100000, minimumEpisodes: 1 }), "a result based on an obsolete author definition cannot consume its evidence cursor");
   assert.ok(warnings.some(warning => warning.includes("作者定义在本次整理期间已更新")));
 
   const dense = await fixture(baseURL, { maxInputChars: 7000 });
@@ -136,8 +137,8 @@ async function authorDefinitionsAndMetadataBudget(baseURL: string) {
   for (let i = 0; i < 8; i++) await dense.ledger.reflect({ kind: "relationship", subject: "朋友的完整称呼".repeat(20) + i,
     subjectId: subjects[i], statement: "河边喝茶时这位朋友愿意耐心倾听，但遇到争执仍需要沟通。".repeat(35),
     situation: "河边喝茶时与这位朋友相处。".repeat(20), cues: Array.from({ length: 12 }, (_, j) => "河边喝茶".repeat(18) + j),
-    evidenceIds: ["dense" + i] }, 100);
-  const originalSnapshot = (await dense.ledger.snapshotReview({ at: 100 }))!;
+    evidenceIds: ["dense" + i] }, 100000);
+  const originalSnapshot = (await dense.ledger.snapshotReview({ at: 100000 }))!;
   let densePayload: any, hiddenEvidence: string | undefined;
   response = request => {
     densePayload = JSON.parse(request.messages[1].content);
@@ -152,7 +153,12 @@ async function authorDefinitionsAndMetadataBudget(baseURL: string) {
   assert.ok(densePayload.sampling.omittedEvidence > originalSnapshot.omittedEvidenceCount);
   assert.ok(densePayload.sampling.metadataCompactLevel > 0);
   assert.ok(densePayload.evidence.every((item: any) => item.text.length >= 80 && item.text.includes("截断")));
-  assert.ok(await dense.ledger.snapshotReview({ at: 100, minimumEpisodes: 1 }), "guessing an omitted evidence ID is rejected even if it exists in the original snapshot");
+  assert.ok((await dense.ledger.reviewStatus()).recent[0]!.rejected?.some(item => item.reason.includes("本次请求未展示的证据")),
+    "guessing an omitted evidence ID is rejected and audited even if it exists in the original snapshot");
+  const sampledAudit = (await dense.ledger.reviewStatus()).recent[0]!;
+  assert.ok(sampledAudit.sampledEventIds!.every(id => densePayload.evidence.some((item: any) => item.id === id && item.reviewRole === "batch")),
+    "audit records the budget-reduced request, never claims that omitted IDs were read");
+  assert.equal(sampledAudit.omittedEvidenceCount, sampledAudit.throughCursor - sampledAudit.afterCursor - sampledAudit.sampledEventIds!.length);
   dense.advance();
   response = request => {
     const payload = JSON.parse(request.messages[1].content), omitted = payload.existing.find((claim: any) => claim.detailsOmitted);
@@ -162,13 +168,15 @@ async function authorDefinitionsAndMetadataBudget(baseURL: string) {
       claimId: original.claimId, relation: "support", evidenceIds: [payload.evidence[0].id] }] };
   };
   dense.runtime.tick(); await dense.runtime.settled();
-  assert.ok(await dense.ledger.snapshotReview({ at: dense.clock.now(), minimumEpisodes: 1 }), "an omitted claim index does not authorize revising its unseen full judgment");
+  assert.ok((await dense.ledger.reviewStatus()).recent[0]!.rejected?.some(item => item.reason.includes("未完整展开的认识")),
+    "an omitted claim index does not authorize revising its unseen full judgment");
   dense.advance(); response = () => ({ changes: [] });
   dense.runtime.tick(); await dense.runtime.settled();
   assert.equal((await dense.ledger.stats()).records, 8, "budget adaptation never edits the archived evidence or existing claims");
   assert.equal((await dense.ledger.recallEvidence({ eventIds: ["dense0"] }))[0]!.text, "一起在河边喝茶，谈论近日的心情。".repeat(400));
   assert.ok(warnings.some(warning => warning.includes("本次请求未展示的证据")));
   dense.advance(); dense.cfg.growth.maxInputChars = 4000;
+  for (let i = 0; i < 4; i++) await dense.event("minimal" + i, "一起在河边喝茶，谈论近日的心情。", { subjectIds: subjects });
   const beforeMinimal = requests.length;
   dense.runtime.tick(); await dense.runtime.settled();
   assert.equal(requests.length, beforeMinimal + 1, "oversized optional claim indexes cannot permanently block an otherwise affordable minimal review");
@@ -179,7 +187,7 @@ async function authorDefinitionsAndMetadataBudget(baseURL: string) {
 
 async function maintenanceAndCache(baseURL: string) {
   const f = await fixture(baseURL); await f.events();
-  await f.context.appendEvent({ id: "private_system", source: "system", content: "不应交给成长整理的系统审计：hidden-controller-diagnostic", worldTime: 100 });
+  await f.context.appendEvent({ id: "private_system", source: "system", content: "不应交给成长整理的系统审计：hidden-controller-diagnostic", worldTime: 100000 });
   const prefix = await f.context.toChatMessages("T100");
   const before = requests.length;
   response = () => ({ changes: [habit()] });
@@ -236,8 +244,8 @@ async function durableDeliveryAndRecall(baseURL: string) {
   assert.equal((await ledgerAgain.pendingReviews()).length, 0);
   assert.deepEqual(await again.remember(), [], "reference metadata survives restart");
   const compression = await contextAgain.compressionSnapshot();
-  await contextAgain.applyCompression({ historySummary: "以前饭后会散步", memoryDigest: "有适用情境的习惯" }, 110, compression);
-  const next: BotEvent = { id: "after_compaction", source: "world", content: "晚饭后站在门口，河边吹来凉风。", worldTime: 111, originEventIds: ["new-cause"] };
+  await contextAgain.applyCompression({ historySummary: "以前饭后会散步", memoryDigest: "有适用情境的习惯" }, 100010, compression);
+  const next: BotEvent = { id: "after_compaction", source: "world", content: "晚饭后站在门口，河边吹来凉风。", worldTime: 100011, originEventIds: ["new-cause"] };
   await contextAgain.appendEvent(next); await ledgerAgain.perceive(next);
   const prefix = await contextAgain.toChatMessages("T111");
   const recall = await again.remember([next]);
@@ -259,17 +267,21 @@ async function strictStateAndBoundedInput(baseURL: string) {
   assert.ok(payload.evidence.every((evidence: any) => evidence.text.includes("截断") && evidence.text.length > 100));
   assert.ok(Math.max(...payload.evidence.map((evidence: any) => evidence.text.length)) - Math.min(...payload.evidence.map((evidence: any) => evidence.text.length)) <= 2, "long evidence receives an even budget without dropping later positions");
   const state = (await f.ledger.recall())[0]!;
-  assert.equal(state.expiresAt, 160, "default temporary state lasts two world hours in TU");
+  assert.equal(state.expiresAt, 100059, "default temporary state lasts two world hours from the supporting observation, not its later review");
   assert.equal((await f.ledger.recallEvidence({ eventIds: ["long1"] }))[0]!.text.length, "晚饭后河边散步😀\\\"".repeat(2500).length, "request truncation never changes ledger evidence");
   const cap = await fixture(baseURL); await cap.events();
-  response = () => ({ changes: [{ kind: "state", subject: "今天的心情", statement: "今天想先缓一缓。", situation: "忙碌之后", evidenceIds: ["walk1"], expiresAt: 99999999 }] });
+  response = () => ({ changes: [{ kind: "state", subject: "今天的心情", statement: "今天想先缓一缓。", situation: "忙碌之后", evidenceIds: ["walk4"], expiresAt: 99999999 }] });
   cap.runtime.tick(); await cap.runtime.settled();
-  assert.equal((await cap.ledger.recall())[0]!.expiresAt, 820, "state expiry cannot exceed one world day");
+  assert.equal((await cap.ledger.recall())[0]!.expiresAt, 100719, "state expiry cannot exceed one world day from its supporting observation");
   for (const bad of [{ changes: [], execute: "act" }, { changes: [{ ...habit(), privateThoughts: "unknown" }] }, { content: "{}", tool_calls: [{ id: "forbidden", type: "function", function: { name: "act", arguments: "{}" } }] }]) {
     const reject = await fixture(baseURL); await reject.events(); response = () => bad;
     reject.runtime.tick(); await reject.runtime.settled();
     assert.equal((await reject.ledger.stats()).records, 0);
-    assert.ok(await reject.ledger.snapshotReview({ at: 100, minimumEpisodes: 1 }), "invalid output leaves experiences available for a later review");
+    if ("changes" in bad && bad.changes?.length) {
+      assert.equal(await reject.ledger.snapshotReview({ at: 100000, minimumEpisodes: 1 }), null, "an invalid individual proposal is audited without blocking later batches");
+      assert.match((await reject.ledger.reviewStatus()).recent[0]!.rejected![0]!.reason, /未定义字段/);
+      assert.equal((await reject.ledger.recallEvidence({ n: 10 })).length, 4, "rejected proposals never erase the original experiences");
+    } else assert.ok(await reject.ledger.snapshotReview({ at: 100000, minimumEpisodes: 1 }), "invalid response envelopes retain the unreviewed cursor");
   }
   const forced = await fixture(baseURL);
   for (let i = 1; i <= 4; i++) await forced.event("walk" + i, undefined, { agency: "imposed" });
@@ -280,7 +292,7 @@ async function strictStateAndBoundedInput(baseURL: string) {
 async function relevantRecallAndCheckpoint(baseURL: string) {
   const f = await fixture(baseURL);
   await f.event("friend_a", "阿青把茶递过来，关心我今天的心情。", { agency: "observed", subjectIds: ["person:a"], situation: "和阿青交谈" });
-  await f.ledger.reflect({ kind: "relationship", subject: "阿青", subjectId: "person:a", statement: "阿青愿意照顾我的感受。", evidenceIds: ["friend_a"] }, 100);
+  await f.ledger.reflect({ kind: "relationship", subject: "阿青", subjectId: "person:a", statement: "阿青愿意照顾我的感受。", evidenceIds: ["friend_a"] }, 100000);
   await f.event("friend_b", "阿南正在另一个频道讨论电影的配乐。", { agency: "observed", subjectIds: ["person:b"], situation: "和阿南交谈" });
   assert.deepEqual(await f.runtime.remember(), [], "the previous channel's identities cannot leak into the newest situation");
   await f.event("rain", "窗外下起了小雨。", { agency: "observed", subjectIds: [], situation: "听见窗外天气变化" });
@@ -299,7 +311,74 @@ async function relevantRecallAndCheckpoint(baseURL: string) {
   assert.equal(restored.stream.filter(entry => entry.kind === "event" && entry.event.id.startsWith("ev_growth_recall_")).length, 1);
 }
 
+async function partialAutomaticReview(baseURL: string) {
+  const f = await fixture(baseURL);
+  await f.event("friend1", "朋友递来一杯热茶，陪我聊了一会儿。", { agency: "observed", outcome: "unknown", opportunity: false, subjectIds: ["person:friend"] });
+  await f.event("friend2", "朋友说愿意下次一起去河边。", { agency: "observed", outcome: "unknown", opportunity: false, subjectIds: ["person:friend"] });
+  await f.event("walk3"); await f.event("walk4");
+  const before = await f.context.toChatMessages("T100");
+  let payload: any;
+  response = request => {
+    payload = JSON.parse(request.messages[1].content);
+    return { changes: [habit(["friend1", "friend2", "walk3"]),
+      { kind: "relationship", subject: "朋友", subjectId: "person:friend", statement: "这次相处时，朋友愿意陪我聊聊。", evidenceIds: ["friend1"] },
+      { kind: "state", subject: "当时的疲倦", statement: "当时暂时想歇歇。", situation: "散步回来", evidenceIds: ["walk3"], expiresAt: payload.time.nowTU },
+      { kind: "relationship", subject: "下次散步的约定", statement: "朋友提过下次一起散步，还需到时确认。", evidenceIds: ["friend2"] }] };
+  };
+  f.runtime.tick(); await f.runtime.settled();
+  assert.equal((await f.ledger.stats()).records, 2, "one unsupported habit and one expired state do not discard valid relationships");
+  const audit = await f.ledger.reviewStatus();
+  assert.deepEqual(audit.recent[0]!.rejected?.map(item => item.index), [0, 2]);
+  assert.equal(audit.pending, 0);
+  assert.deepEqual(payload.behavioralEvidence.independentChoiceEventIds.sort(), ["walk3", "walk4"]);
+  assert.ok(payload.evidence.every((item: any) => item.reviewRole === "batch" && item.ageWorldSeconds === 120));
+  assert.deepEqual(await f.context.toChatMessages("T101"), before, "background partial commit still waits for a context boundary");
+  const restart = new GrowthLedger(f.files.base);
+  assert.equal((await restart.stats()).records, 2);
+  assert.deepEqual((await restart.reviewStatus()).recent[0]!.rejected, audit.recent[0]!.rejected, "rejected reasons survive restart");
+  await f.runtime.drain();
+  assert.match(f.context.stream.at(-1)?.kind === "event" ? (f.context.stream.at(-1) as any).event.content : "", /朋友愿意陪我聊聊/);
+  assert.equal((await f.ledger.recallEvidence({ n: 10 })).length, 4);
+}
+
+async function durableValidationFeedback(baseURL: string) {
+  const f = await fixture(baseURL); await f.events();
+  response = request => {
+    const payload = JSON.parse(request.messages[1].content);
+    return { changes: [{ kind: "state", subject: "散步后的片刻疲倦", statement: "散步回来暂时想歇歇。", situation: "散步后，休息恢复以前",
+      evidenceIds: ["walk1"], expiresAt: payload.time.nowTU }] };
+  };
+  f.runtime.tick(); await f.runtime.settled(); f.runtime.stop();
+  const rejected = await f.ledger.reviewStatus();
+  assert.equal((await f.ledger.stats()).records, 0); assert.match(rejected.recent[0]!.rejected![0]!.reason, /expiresAt/);
+  f.advance();
+  for (let i = 0; i < 4; i++) await f.event("correct" + i, "散步后暂时想休息，来访的朋友愿意坐下来陪我说说话。");
+  const context = new BotContext(f.files); await context.load();
+  const ledger = new GrowthLedger(f.files.base), prefix = await context.toChatMessages("T110");
+  const runtime = new GrowthRuntime(ledger, f.cfg, f.clock, context, logger); runtimes.push(runtime);
+  response = request => {
+    const payload = JSON.parse(request.messages[1].content);
+    assert.ok(payload.validationFeedback.some((item: string) => item.includes("expiresAt")), "the restarted reviewer sees the exact previous time-validation correction");
+    assert.ok(payload.validationFeedback.length <= 8 && payload.validationFeedback.every((item: string) => item.length <= 220));
+    assert.match(request.messages[0].content, /validationFeedback.*不是新经历/);
+    assert.match(request.messages[0].content, /state 示例故意省略 expiresAt/);
+    assert.match(request.messages[0].content, /新建认识(?:故意)?省略 claimId/);
+    return { changes: [
+      { kind: "state", subject: "这次散步后想休息", statement: "这次散步后暂时想歇一会儿。", situation: "散步后，休息恢复以前", evidenceIds: ["correct1"] },
+      { kind: "relationship", subject: "来访的朋友", statement: "这次相处时对方愿意陪我说话。", evidenceIds: ["correct2"] },
+    ] };
+  };
+  runtime.tick(); await runtime.settled();
+  const records = await ledger.recall(), correction = await ledger.reviewStatus();
+  assert.equal(records.length, 2); assert.equal(records.find(item => item.kind === "state")!.expiresAt, 100069);
+  assert.equal(correction.lastOutcome, "completed"); assert.equal(correction.recent[0]!.rejected, undefined);
+  assert.deepEqual(await context.toChatMessages("T111"), prefix, "program feedback stays outside the actor's append-only consciousness");
+  assert.equal((await ledger.stats()).perceivedEvents, 8, "format diagnostics never become evidence");
+  await runtime.drain(); assert.doesNotMatch(context.stream.filter(entry => entry.kind === "event").at(-1)?.event.content ?? "", /validationFeedback|expiresAt/);
+}
+
 async function cancellationAndFailures(baseURL: string) {
+  response = () => ({ changes: [] });
   const f = await fixture(baseURL, { reviewTimeoutMs: 35 }); await f.events();
   let release!: () => void, entered = false;
   const lock = withEndpointLock(baseURL, async () => { entered = true; await new Promise<void>(resolve => { release = resolve; }); });
@@ -308,16 +387,25 @@ async function cancellationAndFailures(baseURL: string) {
   assert.equal(requests.length, before, "timeout can leave a busy endpoint queue without ever sending");
   release(); await lock; await pause(10);
   assert.equal(requests.length, before, "a cancelled queued request does not start after the endpoint is released");
-  assert.ok(await f.ledger.snapshotReview({ at: 100, minimumEpisodes: 1 }));
+  assert.ok(await f.ledger.snapshotReview({ at: 100000, minimumEpisodes: 1 }));
+  const timedOut = await f.ledger.reviewStatus();
+  assert.equal(timedOut.lastOutcome, "failed"); assert.match(timedOut.lastFailure!.reason, /成长整理等待或生成超时/);
+  assert.equal(timedOut.reviews, 0, "timeout audit must not pretend the unreviewed batch completed");
   const late = await fixture(baseURL); await late.events();
   let resolveLate!: (value: any) => void, started = false;
   const runtime = new GrowthRuntime(late.ledger, late.cfg, late.clock, late.context, logger, { infer: async () => { started = true; return new Promise(resolve => { resolveLate = resolve; }); } }); runtimes.push(runtime);
   runtime.tick(); await until(() => started); runtime.stop(); await runtime.settled();
   resolveLate({ content: JSON.stringify({ changes: [habit()] }), toolCalls: [] }); await pause(10);
   assert.equal((await late.ledger.stats()).records, 0, "a model completing after stop cannot commit");
+  assert.equal((await late.ledger.reviewStatus()).failures, 0, "intentional lifecycle stop is not a transport failure");
   const failed = await fixture(baseURL); await failed.events(); status = 400;
   failed.runtime.tick(); await failed.runtime.settled(); status = 200;
-  assert.ok(await failed.ledger.snapshotReview({ at: 100, minimumEpisodes: 1 }));
+  assert.ok(await failed.ledger.snapshotReview({ at: 100000, minimumEpisodes: 1 }));
+  const failure = await failed.ledger.reviewStatus(), failureReload = await new GrowthLedger(failed.files.base).reviewStatus();
+  assert.equal(failure.lastOutcome, "failed"); assert.match(failure.lastFailure!.reason, /400/);
+  assert.deepEqual(failureReload.lastFailure, failure.lastFailure, "transport failure remains visible after restart");
+  await failed.ledger.recordReviewFailure({ at: 100000, realAt: failure.lastFailure!.realAt + 1000, reason: failure.lastFailure!.reason, reviewId: "another-snapshot" });
+  assert.equal((await failed.ledger.reviewStatus()).failures, 1, "rapid identical errors are coalesced even when the snapshot timestamp changes");
   const old = await fixture(baseURL); await old.events(); delete (old.cfg as any).growth;
   const prior = requests.length; old.runtime.tick(); await old.runtime.settled();
   assert.equal(requests.length, prior, "old partial test/integration configs do not enable a new background model implicitly");
@@ -334,6 +422,8 @@ async function main() {
     await currentCounterAndInactiveReasons(baseURL);
     await authorDefinitionsAndMetadataBudget(baseURL);
     await relevantRecallAndCheckpoint(baseURL);
+    await partialAutomaticReview(baseURL);
+    await durableValidationFeedback(baseURL);
     await cancellationAndFailures(baseURL);
     assert.ok(warnings.length >= 5, "malformed, forced and transport failures are reported without consuming their evidence");
     console.log("PASS growth maintenance: isolated HTTP/usage, one background review, immutable prefixes, bounded evidence, temporary TU expiry, forced-agency guards, durable outbox/restart, relevant recollection, throttle, queue timeout and late-result cancellation");

@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
-import { type CalendarSpec, formatDateMs, formatWorldTime, gregorian } from "./calendar.js";
+import { type CalendarSpec, formatDateMs, formatWorldTime, gregorian, parseCalendarSpec, parseGregorianEpoch } from "./calendar.js";
 import type { ClockConfigData } from "./config.js";
 
 interface ClockPersist {
@@ -26,6 +26,21 @@ const CHECKPOINT_MS = 30_000;
 
 /** 同步模式下固定的换算关系：1 TU = 1 现实秒 = 1 世界秒 */
 const SYNC_SECONDS_PER_UNIT = 1;
+
+export interface ClockAuthority {
+  tu: number;
+  source: "wall_clock" | "world_calendar";
+  formatted: string;
+  timeLine: string;
+  timeZone: string;
+  utcOffset: string | null;
+  calendarKind: "gregorian" | "custom" | "unavailable";
+  /** Present only when code can unambiguously compare Gregorian current-date assertions. */
+  date?: string;
+  weekday?: string;
+  unitRealSeconds: number;
+  unitWorldSeconds: number;
+}
 
 /**
  * World Clock：维护世界时间（以 Time Unit 计）。
@@ -101,7 +116,9 @@ export class WorldClock {
 
   /** 采用新的历法（创世时由 World-LLM 生成后调用） */
   async setCalendar(spec: CalendarSpec): Promise<void> {
-    this.state.calendar = spec;
+    const validated = parseCalendarSpec(spec);
+    if (!validated) throw new Error("无法采用无效历法，现有时钟未改变。");
+    this.state.calendar = validated;
     await this.save();
   }
 
@@ -270,5 +287,28 @@ export class WorldClock {
   /** 例如 `T=12.5（世界时间 2026-01-01 20:30）` */
   timeLine(tu = this.now()): string {
     return `T=${tu.toFixed(1)}（世界时间 ${this.clockString(tu)}）`;
+  }
+
+  /** One deterministic time sample. World type/device mode never chooses this clock's date. */
+  authority(tu = this.now()): ClockAuthority {
+    if (!Number.isFinite(tu)) throw new Error("时间采样必须是有限 TU。");
+    const calendar = this.calendar;
+    const epoch = calendar.kind === "gregorian" ? parseGregorianEpoch(calendar.epoch) : null;
+    const ms = this.syncRealTime ? this.genesisMs + tu * 1000 : epoch === null ? null : epoch + tu * this.unitWorldSeconds * 1000;
+    const formatted = this.clockString(tu);
+    const result: ClockAuthority = {
+      tu, source: this.syncRealTime ? "wall_clock" : "world_calendar", formatted,
+      timeLine: `T=${tu.toFixed(1)}（世界时间 ${formatted}）`,
+      timeZone: ms === null ? calendar.kind === "custom" ? "自定义世界历法（无地球时区映射）" : "历法未就绪" : Intl.DateTimeFormat().resolvedOptions().timeZone,
+      utcOffset: null, calendarKind: this.syncRealTime ? "gregorian" : calendar.kind === "custom" ? "custom" : epoch === null ? "unavailable" : "gregorian",
+      unitRealSeconds: this.unitRealSeconds, unitWorldSeconds: this.unitWorldSeconds,
+    };
+    if (ms !== null) {
+      const date = new Date(ms), offset = -date.getTimezoneOffset(), pad = (n: number) => String(n).padStart(2, "0");
+      result.date = `${String(date.getFullYear()).padStart(4, "0")}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+      result.weekday = ["星期日", "星期一", "星期二", "星期三", "星期四", "星期五", "星期六"][date.getDay()];
+      result.utcOffset = `${offset >= 0 ? "+" : "-"}${pad(Math.floor(Math.abs(offset) / 60))}:${pad(Math.abs(offset) % 60)}`;
+    }
+    return result;
   }
 }

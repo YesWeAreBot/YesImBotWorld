@@ -3,11 +3,12 @@ import { NarrativeWorld } from "./runtime.js";
 import type { NarrativeObservation } from "./narrative-types.js";
 import type { WorldObservation } from "./state.js";
 import type { Logger } from "koishi";
-import { type CalendarSpec, describeCalendar, gregorian, parseCalendarSpec } from "../calendar.js";
+import { type CalendarSpec, describeCalendar, gregorian, parseCalendarSpec, parseGregorianEpoch } from "../calendar.js";
 import type { WorldClock } from "../clock.js";
 import type { WorldModelConfig } from "../config.js";
 import type { WorldFiles } from "../files.js";
-import { ChatClient } from "../llm/chat.js";
+import { ChatClient, type ChatMessage } from "../llm/chat.js";
+import { parseCompression } from "./compression.js";
 import { withEndpointLock } from "../llm/lock.js";
 import { extractHtml } from "../apps/html.js";
 import {
@@ -373,7 +374,7 @@ export class WorldAgent {
   /** 主动查看时间：由世界裁定它此刻能否得知时间（允许失败）。只读任务，走并行队列 */
   async resolveCheckTime(deliver: (content: string) => void): Promise<boolean> {
     if (this.remote) return this.remote.resolveCheckTime(deliver);
-    deliver(JSON.stringify(await this.observe("bot", { target: "看看当前可见的时钟能否读出时间；没有可见钟表就说明无法得知，真实手机或电脑时间需通过设备工具读取。", modality: "sight" }))); return true;
+    deliver(JSON.stringify(await this.observe("bot", { target: "看看当前可见的物理钟表能否读出时间；没有可见钟表就说明无法得知。", modality: "sight" }))); return true;
   }
 
   /** Tingle：世界心跳，推进世界演化。返回 World 为下一次心跳设定的间隔（TU），未设定则返回 null */
@@ -543,9 +544,14 @@ export class WorldAgent {
       this.logger.warn("历法生成调用失败: %s", err);
     }
     if (!spec) {
-      this.logger.warn("World-LLM 未能生成有效的历法规格，回退为现实公历");
+      if (parseGregorianEpoch(this.clock.configuredEpoch) === null) throw new Error("未能建立符合配置初始时刻的历法；创世尚未生成状态，请检查世界定义和初始时刻后重试。不会用默认公历日期替代作者的自定义纪年。");
+      this.logger.warn("World-LLM 未能生成有效的历法规格，使用配置明确给出的公历初始时刻");
       spec = gregorian(this.clock.configuredEpoch);
     }
+    // An explicit Gregorian epoch is a configuration value, not a model decision.
+    // Keep authored custom calendars intact: an ISO-looking input alone cannot disprove
+    // a custom calendar explicitly required by the world definition.
+    if (spec.kind === "gregorian" && parseGregorianEpoch(this.clock.configuredEpoch) !== null) spec = gregorian(this.clock.configuredEpoch);
     await this.clock.setCalendar(spec);
     this.logger.info("世界历法：%s；创世时刻 %s", describeCalendar(spec), this.clock.clockString(0));
   }
@@ -635,7 +641,7 @@ export class WorldAgent {
   }
 
   private async generateCalendar(worldDef: string): Promise<CalendarSpec | null> {
-    const system = this.prompts.world.generateCalendarSystem;
+    const system = this.prompts.world.generateCalendarSystem + "\n配置的初始时刻是T=0锚点，作者定义决定历法规则。不得把作者指定的过去或未来改成现实今天，不得自行改写明确的公历日期；自定义纪年必须按作者与配置解析。世界是否连接现实应用不决定历法或时间同步模式。";
     const user = fill(this.prompts.world.generateCalendarUser, {
       worldDef,
       epoch: this.clock.configuredEpoch,
@@ -673,6 +679,7 @@ export class WorldAgent {
     memoryDigest: string;
     streamText: string;
     timeLine: string;
+    chatAccounts?: string;
   }): Promise<CompressionResult> {
     return this.enqueue(async () => {
       // 输入长度防护：意识流超过单次上限时不再丢弃最早内容，而是按时间序
@@ -716,26 +723,35 @@ export class WorldAgent {
               `这是第 ${i + 1}/${chunks.length} 段${isLast ? "，也是最近的一段" : "，之后还有更近的经历会继续沉淀"}）\n` +
               ""
             : "";
+        const chatAccounts = input.chatAccounts || "未提供账号映射；不能按昵称猜测归属";
         const user = fill(this.prompts.world.compressUser, {
           timeLine: input.timeLine,
+          chatAccounts,
           persona,
           historySummary,
           memoryDigest,
           streamText: partHeader + chunks[i],
-        });
-        try {
-          const result = await this.client.complete([
-            { role: "system", content: system },
-            { role: "user", content: user },
-          ], { signal: this.maintenanceAbort.signal });
-          const parsed = parseCompression(result.content);
-          historySummary = parsed.historySummary;
-          memoryDigest = parsed.memoryDigest;
-
-        } catch (err) {
-          // The caller retires the entire snapshot only on complete success.
-          // Partial summaries cannot acknowledge unprocessed events.
-          throw err;
+        }) + (this.prompts.world.compressUser.includes("{{chatAccounts}}") ? "" : `\n\n<chat_accounts>\n${chatAccounts}\n</chat_accounts>`);
+        const messages: ChatMessage[] = [
+          { role: "system", content: system },
+          { role: "user", content: user },
+        ];
+        for (let attempt = 0; attempt < 2; attempt++) {
+          const result = await this.client.complete(messages, { signal: this.maintenanceAbort.signal });
+          try {
+            const parsed = parseCompression(result.content);
+            historySummary = parsed.historySummary;
+            memoryDigest = parsed.memoryDigest;
+            break;
+          } catch (err) {
+            // Exactly one format repair; transport errors and aborts propagate directly.
+            // No partial result reaches the caller, so its durable snapshot remains intact.
+            if (attempt > 0 || this.maintenanceAbort.signal.aborted) throw err;
+            this.logger.warn("压缩第 %d 段格式校验失败，尝试修正一次：%s", i + 1, String(err));
+            messages.push({ role: "assistant", content: result.content }, {
+              role: "user", content: `${String(err)}\n请依据上面的全部输入重新给出完整的两个标签；只修正输出格式，不添加经历、不丢弃已交付内容。`,
+            });
+          }
         }
       }
       return { historySummary, memoryDigest };
@@ -774,18 +790,4 @@ function extractJson(text: string): unknown {
   } catch {
     return null;
   }
-}
-
-function parseCompression(content: string): CompressionResult {
-  const pick = (tag: string): string | undefined => {
-    const m = content.match(new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`));
-    return m?.[1]?.trim();
-  };
-  const historySummary = pick("HISTORY_SUMMARY");
-  const memoryDigest = pick("MEMORY_DIGEST");
-  if (!historySummary) {
-    // 容错：模型没按格式输出时，把全文当作历史摘要
-    return { historySummary: content.trim().slice(0, 4000), memoryDigest: "（压缩输出格式异常，摘要缺失）" };
-  }
-  return { historySummary, memoryDigest: memoryDigest ?? "（无）" };
 }

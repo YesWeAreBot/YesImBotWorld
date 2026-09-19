@@ -2,12 +2,14 @@ import assert from "node:assert/strict";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { BOT_TOOLS } from "../src/bot/tools.js";
+import { availableTools, BOT_TOOLS } from "../src/bot/tools.js";
 import { BotAgent } from "../src/bot/agent.js";
 import { BotContext } from "../src/bot/context.js";
 import { WorldFiles } from "../src/files.js";
 import { Scheduler } from "../src/bot/scheduler.js";
 import { ReceiptInbox } from "../src/bot/receipts.js";
+import { toNativeToolDefs } from "../src/bot/nativeTools.js";
+import { projectObservedMessages } from "../src/bot/perception-fragments.js";
 import type { BotEvent, ToolCallRecord } from "../src/types.js";
 
 const logger = { info() {}, warn() {}, error() {} } as any;
@@ -41,6 +43,201 @@ async function lifecycle() {
   f2.agent.start(); await until(() => !!f2.agent.compressionPromise);
   await Promise.race([f2.agent.stop(), sleep(200).then(() => { throw new Error("compression must not block stop"); })]);
 }
+async function truthfulRestReceipts() {
+  const f = await fixture({ restCompressMinChars: 1e9 });
+  let now = 100;
+  f.clock.now = () => now;
+  f.clock.realMsUntil = () => 60_000;
+  const rest = { ...call("rest_interrupted", "rest"), issuedAt: now };
+  f.agent.dispatchRest(rest);
+  assert.equal(rest.expectedAt, 400, "an omitted duration defaults to 300 TU");
+  now += 7.5;
+  f.agent.pushEvent("koishi", { text: "手机振动了一下。", originEventIds: ["chat-notice:unseen"],
+    experience: { agency: "observed", situation: "手机通知", subjectIds: [] } }, { wake: true });
+  const interruption = f.agent.mailbox.find((item: any) => item.refToolCallId === rest.id);
+  assert.match(interruption.content, /实际经过 7\.5 TU/);
+  assert.match(interruption.content, /来源的频道、发送者和内容尚未确认/);
+  assert.doesNotMatch(interruption.content, /睡|醒|迷迷糊糊|睁开/);
+  assert.deepEqual(interruption.originEventIds, []);
+  assert.equal(f.agent.waiting, null);
+  assert.equal(f.agent.scheduler.pendingCount, 0);
+  await f.agent.drainMailbox();
+  const evidence = await f.agent.growth.recallEvidence({ n: 10 });
+  assert.equal(evidence.length, 1, "the actual notification is evidence; interrupted rest is not sleep evidence");
+  const completed = await fixture({ restCompressMinChars: 1e9 });
+  completed.agent.dispatchRest(call("rest_completed", "rest", { duration: 0.005 }));
+  await until(() => completed.agent.mailbox.some((item: any) => item.refToolCallId === "rest_completed"));
+  const result = completed.agent.mailbox.find((item: any) => item.refToolCallId === "rest_completed");
+  assert.match(result.content, /休息计时到期，实际经过/);
+  assert.doesNotMatch(result.content, /睡醒|从浅睡|恢复了体力/);
+  assert.deepEqual(result.originEventIds, []);
+  assert.equal(completed.agent.waiting, null);
+  const visible = await fixture({ restCompressMinChars: 1e9 });
+  visible.agent.dispatchRest(call("visible_notice_rest", "rest", { duration: 300 }));
+  visible.agent.pushEvent("koishi", { text: "已知频道有新通知", originEventIds: ["chat-notice:visible"],
+    experience: { agency: "observed", chat: { channelKey: "onebot:group-a:account-a", kind: "notice" } } }, { wake: true });
+  const visibleNotice = visible.agent.mailbox.find((item: any) => item.refToolCallId === "visible_notice_rest");
+  assert.match(visibleNotice.content, /收到频道 onebot:group-a:account-a 的新通知/);
+  assert.match(visibleNotice.content, /发送者和消息正文尚未读取/);
+  assert.doesNotMatch(visibleNotice.content, /来源的频道.*未确认/);
+  visible.agent.dispatchRest(call("message_rest", "rest", { duration: 300 }));
+  visible.agent.pushEvent("koishi", { text: "实际已经交付的消息正文", originEventIds: ["chat-message:visible"],
+    experience: { agency: "observed", chat: { channelKey: "onebot:group-a:account-a", kind: "message" } } }, { wake: true });
+  const messageNotice = visible.agent.mailbox.find((item: any) => item.refToolCallId === "message_rest");
+  assert.match(messageNotice.content, /新消息已交付/);
+  assert.doesNotMatch(messageNotice.content, /正文尚未读取|发送者和内容尚未确认/);
+}
+async function progressDoesNotFollowNoise() {
+  const f = await fixture({ restCompressMinChars: 1e9 });
+  const repeated = call("same_rest", "rest", { duration: 300 });
+  const count = () => f.agent.repeatGuard.observe(repeated).count;
+  assert.equal(count(), 1);
+  f.agent.pushEvent("koishi", { text: "手机振动了一下。", originEventIds: ["chat-notice:a"] });
+  await f.agent.drainMailbox();
+  assert.equal(count(), 2, "an anonymous notification cannot erase a rest loop");
+  f.agent.pushEvent("world", { text: "时刻变化了。", originEventIds: ["world:unstructured"] });
+  await f.agent.drainMailbox();
+  assert.equal(count(), 3, "a new world envelope alone cannot prove changed circumstances");
+  f.agent.pushEvent("koishi", { text: "实际读到一条新消息", originEventIds: ["chat-message:a"] });
+  await f.agent.drainMailbox();
+  assert.equal(count(), 1, "a new delivered message allows reassessment");
+  f.agent.pushEvent("tool", { text: "回读同一条消息", originEventIds: ["chat-message:a"] });
+  await f.agent.drainMailbox();
+  assert.equal(count(), 2, "rereading a message cannot manufacture progress");
+  const observation = (id: string, revision: number, door: string) => JSON.stringify({
+    actorId: "bot", observationId: id, worldSequence: revision, observedAt: revision,
+    sourceEventIds: [`world:${id}`], utterances: [],
+    entities: [{ observedId: `handle-${id}`, kind: "place", name: "房间", self: false, revision, attributes: { door } }],
+  });
+  f.agent.pushEvent("world", observation("first", 1, "closed"));
+  await f.agent.drainMailbox(); assert.equal(count(), 1);
+  f.agent.pushEvent("world", observation("same", 2, "closed"));
+  await f.agent.drainMailbox(); assert.equal(count(), 2, "time, revision and observed handles are not progress");
+  f.agent.pushEvent("world", observation("changed", 3, "open"));
+  await f.agent.drainMailbox(); assert.equal(count(), 1, "a changed perceived physical fact allows reassessment");
+}
+async function sharedPauseBudget() {
+  const f = await fixture({ disableWait: true, waitRateThreshold: 50, waitRateWindow: 100, restCompressMinChars: 1e9 });
+  let now = 0;
+  f.clock.now = () => now;
+  f.clock.realMsUntil = () => 60_000;
+  const pause = (id: string, name = "rest", confirm = false) => ({ ...call(id, name, { duration: 80, ...(confirm ? { confirm: true } : {}) }, 80), issuedAt: now, expectedAt: now + 80 });
+  f.agent.dispatchRest(pause("first"));
+  now = 60;
+  f.agent.pushEvent("koishi", { text: "手机有通知。", originEventIds: ["chat-notice:budget"] }, { wake: true });
+  assert.equal(f.agent.waitedWithin(0, now), 60, "an interrupted rest charges actual time, not its requested duration");
+  const hidden = { ...call("hidden-control", "act", { description: "尚未感知的外部意图" }, 600), role: "system" as const };
+  f.agent.operationCalls.set(hidden.id, hidden);
+  f.agent.stealthCalls.add(hidden.id);
+  f.agent.scheduler.schedule(hidden, { executeAt: "expected", run: async () => null });
+  f.agent.dispatchRest(pause("blocked", "rest", true));
+  assert.equal(f.agent.waiting, null, "habitually adding confirm cannot bypass a first refusal");
+  const refused = f.agent.mailbox.find((item: any) => item.refToolCallId === "blocked");
+  assert.match(refused.content, /60\.0 TU（60%）/);
+  assert.match(refused.content, /不要用 rest 反复空等消息/);
+  assert.doesNotMatch(refused.content, /hidden-control|外部意图/, "budget feedback may list only the character's own submitted tasks");
+  assert.equal(f.agent.compressionRequested, null, "a refused rest cannot erase repetition by requesting compaction");
+  f.agent.dispatchWait(pause("switch_tool", "wait", true));
+  assert.equal(f.agent.waiting, null, "rest confirmation cannot be transferred to wait");
+  f.agent.dispatchRest(pause("back_to_rest", "rest", true));
+  assert.equal(f.agent.waiting, null);
+  f.agent.dispatchRest(pause("confirmed", "rest", true));
+  assert.equal(f.agent.waiting.callId, "confirmed", "a considered next-call confirmation permits real continued rest");
+  now = 75;
+  f.agent.dispatchCancel(call("cancel", "cancel", { id: "confirmed" }));
+  assert.equal(f.agent.waitedWithin(0, now), 75, "cancellation retains the elapsed part exactly once");
+  f.agent.dispatchRest(pause("again", "rest", true));
+  assert.equal(f.agent.waiting, null, "confirmation is consumed, not a standing permission");
+  const manual = { ...pause("human_rest"), role: "system" as const };
+  f.agent.dispatchRest(manual);
+  assert.equal(f.agent.waiting.callId, "human_rest", "a controller's explicit rest is not blocked by the autonomous budget");
+  now = 85;
+  f.agent.dispatchCancel(call("cancel_human", "cancel", { id: "human_rest" }));
+  assert.equal(f.agent.waitedWithin(0, now), 75, "controller time is not attributed to autonomous idling");
+  now = 200;
+  f.agent.dispatchRest(pause("fresh_window"));
+  assert.equal(f.agent.waiting.callId, "fresh_window", "elapsed world time restores budget without requiring an incoming notification");
+  now = 205;
+  await f.agent.stop();
+  assert.equal(f.agent.waitedWithin(100, now), 5, "stopping records the real interval and cancels its timer");
+  const tools = availableTools({ ops: {}, disableWait: true, waitConfirm: true } as any);
+  assert.ok(!tools.some(tool => tool.name === "wait"));
+  assert.match(tools.find(tool => tool.name === "rest")!.signature, /confirm\?: boolean/);
+}
+async function maintenanceIsNotProgress() {
+  const f = await fixture({ waitRateWindow: 100 }, { compress: async () => ({ historySummary: "已整理", memoryDigest: "摘要" }) });
+  const repeated = call("rest_before_maintenance", "rest", { duration: 300 });
+  assert.equal(f.agent.repeatGuard.observe(repeated).count, 1);
+  f.agent.waitLog.push({ from: 0, to: 60 });
+  await f.context.appendEvent({ id: f.context.nextEventId(), source: "system", content: "维护说明", worldTime: 60 });
+  f.agent.running = true;
+  await f.agent.compactContext(null);
+  assert.equal(f.agent.repeatGuard.observe(repeated).count, 2, "routine rest compression cannot erase a repetition streak");
+  assert.equal(f.agent.waitedWithin(0, 100), 60, "compaction cannot restore the spent pause budget");
+  await f.agent.stop();
+}
+async function reflectBehaviorContract() {
+  const def = toNativeToolDefs(BOT_TOOLS).find(tool => tool.function.name === "reflect")!;
+  assert.deepEqual((def.function.parameters.properties as any).behavior, { type: "string" });
+  const f = await fixture();
+  let received: any;
+  f.agent.growth.reflect = async (input: any) => {
+    received = input;
+    return { duplicate: false, view: { claimId: "claim", records: [{ id: "record" }] } };
+  };
+  await f.agent.dispatch(call("reflect_behavior", "reflect", {
+    kind: "habit", subject: "书桌整理", statement: "收工后整理书桌", situation: "收工之后", behavior: "整理书桌", event_ids: ["actual-action"],
+  }));
+  await until(() => !!received);
+  assert.equal(received.behavior, "整理书桌", "manual reflection must forward the exact behavior anchor to the evidence validator");
+  await until(() => f.agent.scheduler.pendingCount === 0);
+}
+async function deviceObservationEvidence() {
+  const f = await fixture();
+  const chat = { channelKey: "onebot:visible:account", kind: "attention" as const };
+  const parts = ["first", "second"].map(id => ({ kind: "text" as const, text: `已读消息 ${id}`,
+    observedMessage: { originEventIds: [`chat-message:${id}`], experience: { agency: "observed" as const,
+      chat: { ...chat, kind: "message" as const }, subjectIds: ["chat-user:[\"onebot\",\"known-user\"]"] } } }));
+  f.agent.peekDevice = async () => ({ text: "两条已读消息", parts, originEventIds: ["chat-message:first", "chat-message:second"],
+    growthReferences: [{ claimId: "existing", recordId: "record" }], experience: { agency: "observed", chat } });
+  const screen = await f.agent.deviceObservation("phone");
+  assert.deepEqual(screen.originEventIds, ["chat-message:first", "chat-message:second"]);
+  assert.deepEqual(screen.experience.chat, chat);
+  assert.deepEqual(screen.growthReferences, [{ claimId: "existing", recordId: "record" }]);
+  f.agent.pushEvent("tool", screen, { ref: "screen_read" });
+  await f.agent.drainMailbox();
+  const parent = f.context.stream.find(entry => entry.kind === "event") as any;
+  assert.equal(projectObservedMessages(parent.event.id, f.context.stream)?.length, 2, "screen wrappers must retain complete parent roots for per-message projection");
+  f.agent.pushEvent("tool", await f.agent.deviceObservation("phone"), { ref: "screen_reread" });
+  await f.agent.drainMailbox();
+  assert.equal((await f.agent.growth.stats()).uniqueRoots, 2, "rereading a screen does not duplicate the original message causes");
+  f.agent.peekDevice = async () => ({ text: "界面保留的旧执行结果", originEventIds: ["prior-action"], experience: {
+    agency: "self", action: "旧动作", outcome: "completed", opportunity: true, worldPerception: true,
+  } });
+  const cached = await f.agent.deviceObservation("phone");
+  assert.equal(cached.experience.agency, "observed");
+  assert.equal(cached.experience.outcome, "unknown");
+  assert.equal(cached.experience.opportunity, false);
+  assert.equal(cached.experience.worldPerception, false);
+  assert.equal(cached.experience.action, undefined, "an old application execution cannot become a new voluntary action by viewing its result");
+}
+async function truthfulChannelNoticeSetting() {
+  const f = await fixture();
+  f.agent.running = true;
+  f.agent.phoneUi.chatOpen = true;
+  f.agent.phoneUi.channelKey = "onebot:visible:account";
+  f.agent.messenger.resolveKey = async (key: string) => ({ key, isPrivate: true });
+  let enabled = true;
+  f.agent.notifyList = { set: async (_key: string, allow: boolean) => { enabled = allow; },
+    channelStatusText: () => enabled ? "频道通知：开启。" : "频道通知：免打扰（不主动震动／唤醒；打开频道仍能看见消息）。" };
+  await f.agent.dispatch({ ...call("notify_setting", "channel_notify", { allow: false }), role: "system" });
+  await until(() => f.agent.mailbox.some((item: any) => item.refToolCallId === "notify_setting" && item.source === "tool"));
+  const receipt = f.agent.mailbox.find((item: any) => item.refToolCallId === "notify_setting" && item.source === "tool");
+  assert.equal(enabled, false);
+  assert.match(receipt.content, /打开频道仍能看见消息/);
+  assert.doesNotMatch(receipt.content, /之后.*不会再提醒/);
+  await f.agent.stop();
+}
 async function breakLoop() {
   const f = await fixture({ breakLoop: true, breakLoopRemoveToolAt: 6, breakLoopForceRestAt: 12 });
   for (let i = 0; i < 12; i++) {
@@ -55,9 +252,9 @@ async function breakLoop() {
     observe: async () => ({ observationId: "obs_1", actorId: "bot", worldSequence: 1, observedAt: 0, entities: [], sourceEventIds: ["origin_1"] }),
     compress: async () => { entered.resolve(); return finish.promise; },
   });
-  f2.agent.backend = { generate: async () => { generations++; return generations <= 2 ? { name: "observe", arguments: {} } : { name: "wait", arguments: { n: 3600 } }; }, setToolNames() {}, setToolDefs() {} };
+  f2.agent.backend = { generate: async () => { generations++; return generations <= 3 ? { name: "observe", arguments: {} } : { name: "wait", arguments: { n: 3600 } }; }, setToolNames() {}, setToolDefs() {} };
   f2.agent.start(); await entered.promise;
-  assert.equal(generations, 2, "generation must pause at compression boundary");
+  assert.equal(generations, 3, "the first new observation is progress; repeating it must pause at the compression boundary");
   const late: BotEvent = { id: "ev_manual_late", source: "koishi", content: "压缩开始后收到的重要承诺", worldTime: 3 };
   await f2.context.appendEvent(late);
   finish.resolve({ historySummary: "prefix only", memoryDigest: "digest" });
@@ -191,7 +388,7 @@ async function lateReceipts() {
   const restoredTimeline = new ReceiptInbox(f.files.base); await restoredTimeline.drain(async () => { leaked++; }); assert.equal(leaked, 1, "restore must rotate the receipt epoch instead of importing abandoned-future results");
 }
 async function main() {
-  try { await lifecycle(); await breakLoop(); await contextWrites(); await recoverInterruptedCompression(); await observationProvenance(); await schedulerAndFailure(); await lateReceipts(); console.log("PASS bot runtime: interruptible rest/stop, bounded compression, serialized context, truthful failure/cancellation, durable late receipts and timeline fences"); }
+  try { await lifecycle(); await truthfulRestReceipts(); await progressDoesNotFollowNoise(); await sharedPauseBudget(); await maintenanceIsNotProgress(); await reflectBehaviorContract(); await deviceObservationEvidence(); await truthfulChannelNoticeSetting(); await breakLoop(); await contextWrites(); await recoverInterruptedCompression(); await observationProvenance(); await schedulerAndFailure(); await lateReceipts(); console.log("PASS bot runtime: truthful rest/interruptions, shared pause budget and real progress, behavior/device evidence and DND receipts, interruptible stop, bounded compression, serialized context, truthful failure/cancellation, durable late receipts and timeline fences"); }
   finally { await Promise.all(dirs.map((dir) => fs.rm(dir, { recursive: true, force: true }))); }
 }
 main().catch((err) => { console.error(err); process.exitCode = 1; });

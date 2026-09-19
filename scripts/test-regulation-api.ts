@@ -52,9 +52,10 @@ async function filesLifecycle(base: string): Promise<{ files: WorldFiles; archiv
 async function httpAndWatch(base: string, files: WorldFiles, archive: string, original: string) {
   const cfg = Config({ autoStart:false });
   cfg.webui = { ...cfg.webui, host:"127.0.0.1",port:0,token:"isolated-regulation-admin" };
-  let reads = 0, enabled = true;
+  let reads = 0, growthStatusReads = 0, enabled = true;
   const view = () => ({enabled,decisionEnabled:true,worldSecondsPerUnit:30,state:{at:120,needs:{recovery:.2}},recent:[{id:"private-choice",type:"decision",at:120,summary:"private evidence"}]});
-  const server: any = new WebUIServer({ config:cfg, files, webuiDir:path.join(base,"webui"),getRegulation:async()=>{reads++;return view();} } as never);
+  const growthStatus = { pending: 9, deferred: 14, reviews: 2, rejected: 1, failures: 1, lastOutcome: "failed", lastFailure: { at: 32, realAt: 1234, reason: "private timeout detail" }, recentFailures: [{ at: 32, realAt: 1234, reason: "private timeout detail" }], recent: [{ at: 30, records: [], rejected: [{ index: 0, reason: "private validation detail" }] }], backlogs: [] };
+  const server: any = new WebUIServer({ config:cfg, files, webuiDir:path.join(base,"webui"),getRegulation:async()=>{reads++;return view();}, getGrowth:async()=>[], getGrowthStatus:async()=>{growthStatusReads++;return growthStatus;} } as never);
   const roles: Record<string,string> = {};
   for (const preset of ["viewer","player","operator"] as const) {
     assert.ok((await server.visitors.create(preset,"isolated-password",preset)).ok);
@@ -69,12 +70,22 @@ async function httpAndWatch(base: string, files: WorldFiles, archive: string, or
       return {status:response.status,body:await response.json() as any};
     }
     assert.equal((await request("/api/regulation","anonymous")).status,401);
+    assert.equal((await request("/api/bot/growth/status","anonymous")).status,401);
     for (const role of Object.keys(roles)) {
       assert.equal((await request("/api/regulation",role)).status,403,role+" cannot read an administrator's internal audit");
       assert.equal((await request("/api/regulation",role,"POST")).status,403);
+      assert.equal((await request("/api/bot/growth/status",role)).status,403,role+" cannot read rejected growth proposals even with notes permission");
+      assert.equal((await request("/api/bot/growth/status",role,"POST")).status,403);
       assert.equal((await request("/api/archive/file?folder="+encodeURIComponent(archive)+"&file=regulation.jsonl",role)).status,403,"Archive grants cannot bypass the internal-audit restriction");
     }
     assert.equal(reads,0,"Unauthorized requests never load private regulation");
+    assert.equal(growthStatusReads,0,"Unauthorized requests never read private growth review data");
+    const status = await request("/api/bot/growth/status");
+    assert.equal(status.status,200); assert.deepEqual(status.body,growthStatus);
+    assert.deepEqual((await request("/api/bot/growth")).body,{growth:[]},"The public growth view keeps its existing array shape");
+    assert.deepEqual((await request("/api/bot/growth","viewer")).body,{growth:[]},"Notes-authorized visitors retain the growth view without its audit");
+    assert.equal((await request("/api/bot/growth/status","admin","POST")).status,405);
+    assert.equal(growthStatusReads,1,"The growth status endpoint is read only");
     const result = await request("/api/regulation");
     assert.equal(result.status,200); assert.deepEqual(result.body,view(),"API exposes the direct documented view shape");
     enabled = false;

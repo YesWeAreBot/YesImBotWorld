@@ -35,7 +35,7 @@ async function main() {
           requests++;
           const payload = JSON.parse(messages[1]!.content as string);
           const eligible = payload.evidence.filter((e: any) => e.experience?.agency === "self" && e.experience?.outcome === "completed");
-          return { content: JSON.stringify({ changes: requests === 1 ? [{ kind: "habit", subject: "饭后散步",
+          return { content: JSON.stringify({ changes: requests === 1 ? [{ kind: "habit", subject: "饭后散步", behavior: "散步",
             statement: "晚饭后天气合适又没有约定时，我倾向沿河散步。", situation: "晚饭后，天气适合出门且没有约定", cues: ["晚饭后", "河边"],
             evidenceIds: eligible.slice(0, 3).map((e: any) => e.id) }] : [] }), toolCalls: [] };
         },
@@ -46,9 +46,9 @@ async function main() {
     const context = new BotContext(files); await context.load();
     const agent = make(context);
     const prefix = await context.toChatMessages("T100");
-    for (let i = 1; i <= 4; i++) agent.pushEvent("world", { text: `第 ${i} 天晚饭后，沿河散步回来，心情放松了。`,
+    for (let i = 1; i <= 4; i++) { time = 100 + (i - 1) * 86400 / clock.unitWorldSeconds; agent.pushEvent("world", { text: `第 ${i} 天晚饭后，沿河散步回来，心情放松了。`,
       originEventIds: [`walk-cause:${i}`], experience: { episodeId: `walk:${i}`, agency: "self", outcome: "completed", opportunity: true,
-        action: "沿河散步", situation: "晚饭后河边" } });
+        action: "沿河散步", situation: "晚饭后河边" } }); }
     await agent.drainMailbox(); await agent.growthRuntime.settled();
     assert.equal(requests, 1, "Agent starts automatic maintenance without reflect or a manual invitation");
     assert.equal((await agent.growth.pendingReviews()).length, 1);
@@ -110,6 +110,11 @@ async function main() {
     const invalid = await reflect({ kind: "state", subject: "无效时间", statement: "暂时休息。", situation: "此刻", event_ids: [evidence.eventId], expires_at: "tomorrow" });
     assert.match(invalid, /expires_at/);
     assert.equal((await resumed.growth.recall({ kind: "state" })).length, 1, "invalid manual state did not leave a record");
+    time += 61;
+    const stale = await reflect({ kind: "state", subject: "过时的透气计划", statement: "还想在外面缓一会儿。", situation: "忙碌之后",
+      event_ids: [evidence.eventId], expires_at: time + 999999 });
+    assert.match(stale, /最近两世界小时/);
+    assert.equal((await resumed.growth.recall({ kind: "state" })).length, 1, "the real reflect tool cannot renew old evidence with an arbitrary future expiry");
     console.log("PASS growth integration: actual Agent automatic boundaries, avatar deferral, no-change, fixed-prefix compression/reload, relevant recall and manual state lifetime");
   } finally {
     for (const agent of agents) await agent.stop();

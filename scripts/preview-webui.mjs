@@ -20,6 +20,7 @@ const { Config, introspect, WebCommandRunner } = require(configModule);
 let config = Config({ autoStart: false });
 const fixture = createDeviceFixture();
 const regulation = createRegulationFixture();
+const modelListRequests = [];
 const debugStreams = new Set();
 const liveFixture = createLiveFixture(entry => {for(const res of debugStreams)res.write('data: '+JSON.stringify({channel:'debug',entry,update:true})+'\n\n');});
 const now = Date.now(), at = 4268;
@@ -59,7 +60,7 @@ const growth = [
   { claimId: 'claim_habit', kind: 'habit', subject: '饭后散步', statement: '晚饭后沿河走一会儿，已经成为我结束一天的方式。', situation: '吃过晚饭，天气适合出门，也没有其他约定时。', cues: ['晚饭后', '河边', '结束一天'], active: true, status: 'tentative', records: [{ ...growthRecord('g7','claim_habit','habit','饭后散步','几次饭后散步都让我感到放松。','support',['observed_5'],at-60), origin: 'automatic' }, { ...growthRecord('g8','claim_habit','habit','饭后散步','下雨或有约时会改变安排；没有散步不等于放弃习惯。','revise',['observed_7'],at-5,'g7'), origin: 'automatic', situation: '吃过晚饭，天气适合出门，也没有其他约定时。' }], evidence: [evidence[4],evidence[6]] },
   { claimId: 'claim_trait', kind: 'trait', subject: '与阿青沟通', subjectId: 'person:preview:friend-account-with-a-long-stable-identity-that-must-not-widen-mobile-layout', statement: '与阿青发生分歧时，我比以前更愿意先听他说完。', situation: '和阿青讨论彼此的安排，尤其意见不同的时候。', cues: ['阿青', '分歧', '解释'], active: true, status: 'contested', records: [{ ...growthRecord('g9','claim_trait','trait','与阿青沟通','阿青有自己的难处，我开始愿意先听一听。','support',['observed_6'],at-35), origin: 'automatic' }, { ...growthRecord('g10','claim_trait','trait','与阿青沟通','突然取消约定时，我仍然有些着急，还没总能耐心倾听。','counter',['observed_3'],at-25,'g9'), origin: 'manual' }], evidence: [evidence[5],evidence[2]] },
   { claimId: 'claim_state', kind: 'state', subject: '今天想安静一会儿', statement: '今天有些疲倦，暂时想在窗边安静地待一会儿。', situation: '忙完今天的事情之后，休息恢复以前。', cues: ['疲倦', '休息'], expiresAt: at+100, active: true, status: 'tentative', records: [{ ...growthRecord('g11','claim_state','state','今天想安静一会儿','今天有些疲倦，暂时想在窗边安静地待一会儿。','support',['observed_4'],at-50), origin: 'automatic', expiresAt: at+100 }], evidence: [evidence[3]] },
-  { claimId: 'claim_expired', kind: 'state', subject: '先前的担忧', statement: '暂时担心明天的约定会取消。', situation: '还没有和阿青确认明天的安排时。', expiresAt: at-20, active: false, inactiveReason: 'expired', status: 'tentative', records: [{ ...growthRecord('g12','claim_expired','state','先前的担忧','暂时担心明天的约定会取消。','support',['observed_3'],at-170), origin: 'automatic', expiresAt: at-20 }], evidence: [evidence[2]] },
+  { claimId: 'claim_expired', kind: 'state', subject: '先前的担忧', statement: '暂时担心明天的约定会取消。', situation: '还没有和阿青确认明天的安排时。', expiresAt: at-20, active: false, inactiveReason: 'expired', status: 'tentative', stateTimingCorrection: { recordId:'g12',previousExpiresAt:at+400,expiresAt:at-20,evidenceAt:at-180,reason:'这段担忧来自较早的经历，适用期应从当时计算，不能因晚些整理而重新生效。' }, records: [{ ...growthRecord('g12','claim_expired','state','先前的担忧','暂时担心明天的约定会取消。','support',['observed_3'],at-170), origin: 'automatic', expiresAt: at+400 }], evidence: [evidence[2]] },
   { claimId: 'claim_retired', kind: 'habit', subject: '固定午后出门', statement: '不再沿用每天午后都出门的安排。', active: false, inactiveReason: 'retired', status: 'tentative', records: [{ ...growthRecord('g13','claim_retired','habit','固定午后出门','午后经常和阿青出门。','support',['observed_2'],at-230), origin: 'manual' }, { ...growthRecord('g14','claim_retired','habit','固定午后出门','不再沿用每天午后都出门的安排。','retire',['observed_3'],at-150,'g13'), origin: 'automatic' }], evidence: [evidence[1],evidence[2]] }
 ];
 const debugEntries = Array.from({ length: 45 }, (_, i) => ({ id: i + 1, ts: now - (45 - i) * 27000, kind: i % 7 === 0 ? 'world.tool' : i % 3 === 0 ? 'llm.req' : i % 3 === 1 ? 'llm.res' : 'bot.tool', label: i % 7 === 0 ? '结构化世界·提案校验失败' : i % 3 === 0 ? 'World·请求发送' : i % 3 === 1 ? 'World·已完成·工具调用' : 'Bot·observe', level: i % 7 === 0 ? 'warn' : 'info', detail: JSON.stringify(i % 7 === 0 ? { validation: { message: '开发样本：引用尚未定义的地点', details: [{ entityId: 'cup', field: 'location', targetId: 'missing_room', reason: 'missing' }] } } : i % 3 === 1 ? { ms: 1100 + ((i * 317) % 2500), model: i % 2 ? 'world-model' : 'bot-model', usage: { prompt_tokens: 2600 + i * 12, completion_tokens: 250 + i * 5, total_tokens: 2850 + i * 17 }, content: '', tool_calls: [{ name: 'propose_world', arguments: '{"operations":[]}' }] } : i % 3 === 0 ? { model: 'world-model', messages: [{ role: 'user', content: '开发样本：根据当前世界快照，裁定本次行动。' }] } : { id: 'call_' + i, name: 'observe', args: { modality: 'sight' } }) }));
@@ -140,6 +141,7 @@ const server=http.createServer(async(req,res)=>{
   if(path==='/api/world/state')return json({state:narrativeWorld});
   if(path==='/api/preview/narrative'){narrativeMode=body.enabled!==false;if(player)delete player.observation;return json({ok:true,mode:narrativeMode?'narrative':'structured'});}
   if(path==='/api/bot/growth')return json({growth});
+  if(path==='/api/bot/growth/status')return json({pending:9,deferred:14,reviews:2,rejected:1,failures:2,lastOutcome:'failed',lastFailure:{at:4240,realAt:1789375200000,reason:'成长整理等待或生成超时'},recentFailures:[{at:4240,realAt:1789375200000,reason:'成长整理等待或生成超时'},{at:4239,realAt:1789375000000,reason:'整理响应未包含完整的 changes 数组'}],recent:[{at:4238,records:[],sampledEventIds:['observed_1','observed_2'],rejected:[{index:0,reason:'习惯提案缺少跨情境的自主完成证据。'}]}],backlogs:[{cursor:10,throughCursor:24,reason:'较早经历保留在历史补审队列，先处理近期经历。'}]});
   if(path==='/api/regulation')return json(regulation);
   if(path==='/api/debug')return json({entries:debugEntries,snapshot:45});
   if(path==='/api/calls')return json(liveFixture.list());
@@ -190,6 +192,8 @@ const server=http.createServer(async(req,res)=>{
   if(path==='/api/player/cancel')return json(receipts.has(body.taskId)?{ok:false,status:'too_late',result:receipts.get(body.taskId)}:{ok:true,status:'cancelled'});
   if(path==='/api/player/leave'){if(player?.takeover)fixture.resident(null);player=null;return json({ok:true});}
   if(path==='/api/config'){if(req.method==='POST')config=body.config||body;return json({value:config,schema:introspect(Config),port,version:'preview'});}
+  if(path==='/api/llm/models'){modelListRequests.push(body);return json({models:[body.group.replaceAll('.','-')+'-model-a',body.group.replaceAll('.','-')+'-model-b']});}
+  if(path==='/api/preview/llm/requests')return json({requests:modelListRequests});
   if(path==='/api/crossing')return json({location:null,visitors:[],worlds:[],serverEnabled:true,server:{enabled:true,port:0},invites:[]});
   if(path==='/api/visitors')return json({visitors:[]});
   if(path==='/api/archive')return json({archives:[]});

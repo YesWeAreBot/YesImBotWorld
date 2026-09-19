@@ -8,6 +8,7 @@ import { h } from "koishi";
 import { Config } from "../src/config.js";
 import { Gateway } from "../src/koishi/gateway.js";
 import { MessageStore } from "../src/koishi/messages.js";
+import { ChannelNameResolver } from "../src/koishi/names.js";
 import { MediaRenderer } from "../src/media/render.js";
 import { OwnSendTracker } from "../src/koishi/ownsends.js";
 import { WorldFiles } from "../src/files.js";
@@ -38,8 +39,9 @@ async function main() {
   let rendered = 0;
   const renderer = new MediaRenderer(media as never, { describe: async (ref: any) => { rendered++; return `summary-${ref.id}`; } } as never, () => true, 9);
   const phone = { down: false };
-  const gateway: any = new Gateway(ctx, cfg.messaging, cfg.platformOps, new MessageStore(ctx), media as never, renderer,
-    { isFocused: () => false } as never, {} as never, phone, {} as never, new OwnSendTracker(), {} as never, () => null,
+  const store = new MessageStore(ctx);
+  const gateway: any = new Gateway(ctx, cfg.messaging, cfg.platformOps, store, media as never, renderer,
+    { isFocused: () => false } as never, {} as never, phone, {} as never, new OwnSendTracker(), new ChannelNameResolver(ctx, store), () => null,
     { notify() {}, channelActivity() {}, selfMessage(key, content, msgId, sendArgs) { deliveries.push({ key, content, msgId, sendArgs }); } });
   const emit = (id: string, elements: h[]) => gateway.handleConfirmedSelfSent({ bot, channelId: "room", messageId: id, timestamp: Date.now(), own: false, elements });
   try {
@@ -56,9 +58,11 @@ async function main() {
     // from the actual rich media perceived in its successful tool result.
     const actor: any = Object.create(BotAgent.prototype);
     Object.assign(actor, { config: cfg, clock: { now: () => 1 }, mailbox: [], logger, noteDeferredSelfSent() {} });
-    actor.simulateExternalSend(original.key, original.content, original.msgId, original.sendArgs);
+    const identityText = '本会话使用你的账号：平台 "fixture"，账号 "self"；当前群名片为 "今晚值班的大王"。';
+    actor.simulateExternalSend(original.key, original.content, original.msgId, original.sendArgs, identityText);
     const queued = actor.mailbox[0];
     assert.deepEqual(queued.asToolCall.arguments, { id: original.key, ...original.sendArgs });
+    assert.ok(queued.content.startsWith(identityText), "actual profile context belongs to the receipt, not the outgoing message");
     assert.deepEqual(queued.attachments.map((ref: any) => ref.id), [1, 2]);
     assert.deepEqual(queued.parts.filter((part: any) => part.kind === "media").map((part: any) => part.ref.id), [1, 2]);
     const files = new WorldFiles(root); await files.ensure();
@@ -68,6 +72,7 @@ async function main() {
     await context.appendEvent({ id: "external-result", source: "tool", refToolCallId: "external-send", worldTime: 1, content: queued.content, attachments: queued.attachments, parts: queued.parts });
     const messages = await context.toChatMessages("T=1");
     const wire = JSON.stringify(messages);
+    assert.ok(wire.includes("今晚值班的大王"), "the observed group nickname reaches the actual multimodal model request");
     assert.match(wire, /media:1.*usage=.*sticker.*summary-1.*AQ==.*再看.*media:2.*summary-2.*Ag==/s);
     assert.doesNotMatch(wire, /media id=/);
 

@@ -11,6 +11,8 @@ export interface ConfirmedSelfMessage {
   session?: Session;
   own: boolean;
   timestamp: number;
+  timestampSource?: "platform" | "local-confirmed" | "local-observed";
+  platformSequence?: string | null;
 }
 
 type Receipt = { id?: string; content?: string; elements?: h[] };

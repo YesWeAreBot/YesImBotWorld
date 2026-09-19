@@ -18,6 +18,7 @@ export class NotifyManager {
   private allow = new Set<string>();
   private deny = new Set<string>();
   private loaded = false;
+  private changes = Promise.resolve();
 
   constructor(
     private file: string,
@@ -51,8 +52,8 @@ export class NotifyManager {
     }
   }
 
-  private async save(): Promise<void> {
-    const data: NotifyPersist = { allow: [...this.allow], deny: [...this.deny] };
+  private async save(allow = this.allow, deny = this.deny): Promise<void> {
+    const data: NotifyPersist = { allow: [...allow], deny: [...deny] };
     const tmp = `${this.file}.tmp`;
     await fs.writeFile(tmp, JSON.stringify(data));
     await fs.rename(tmp, this.file);
@@ -80,15 +81,27 @@ export class NotifyManager {
 
   /** Bot 开启/关闭某频道的通知（仅自管模式） */
   async set(key: string, allow: boolean): Promise<void> {
-    if (!this.managed) return;
-    if (allow) {
-      this.deny.delete(key);
-      if (!this.allow.has("*")) this.allow.add(key);
-    } else {
-      this.allow.delete(key);
-      this.deny.add(key);
-    }
-    await this.save().catch(() => {});
+    if (!this.managed) throw new Error("频道通知由管理员配置，当前不能自行修改。");
+    const change = this.changes.then(async () => {
+      const nextAllow = new Set(this.allow), nextDeny = new Set(this.deny);
+      if (allow) {
+        nextDeny.delete(key);
+        // An explicit account grant overrides an older legacy-channel deny, even
+        // with '*'. It must not silently remain muted after a successful receipt.
+        nextAllow.add(key);
+      } else {
+        nextAllow.delete(key);
+        nextDeny.add(key);
+      }
+      await this.save(nextAllow, nextDeny);
+      this.allow = nextAllow; this.deny = nextDeny; this.loaded = true;
+    });
+    this.changes = change.catch(() => {});
+    return change;
+  }
+
+  channelStatusText(key: string): string {
+    return `频道通知：${this.isNotifyChannel(key) ? "开启（放下手机仍可感到震动）" : "免打扰（不主动震动／唤醒；打开频道仍能看见消息）"}；${this.managed ? "可在此频道用 channel_notify 修改" : "由管理员配置，不能自行修改"}。`;
   }
 
   /** 展示用：当前列表摘要 */

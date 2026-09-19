@@ -39,8 +39,10 @@ import { anonymousChatNoticeEvidence } from "./koishi/conversation.js";
 import { MessageStore } from "./koishi/messages.js";
 import { KoishiMessenger } from "./koishi/messenger.js";
 import { ChannelNameResolver } from "./koishi/names.js";
+import { formatMessageSender } from "./koishi/identity.js";
+import { formatMessageTime, MESSAGE_ORDER_GUIDANCE } from "./koishi/message-order.js";
 import { parseChannelKey } from "./koishi/channels.js";
-import { conversationKind, conversationLabel } from "./koishi/conversation.js";
+import { chatMessageEvidence, conversationKind, conversationLabel } from "./koishi/conversation.js";
 import { deviceTools, type DeviceSession, type DeviceControlResult, type DeviceOperationMode } from "./webui/device.js";
 import { NotifyManager } from "./koishi/notify.js";
 import { OwnSendTracker } from "./koishi/ownsends.js";
@@ -124,6 +126,7 @@ export class WorldService extends Service<Config> {
   private promptStore!: Prompts;
   webuiDir!: string;
   private webui: WebUIServer | null = null;
+  private releaseCallStore?: () => void;
   /** 穿越：接待异世界访客的服务（crossing.serverEnabled） */
   private crossingServer: CrossingServer | null = null;
   /** 穿越：Bot 当前所在的异世界连接（null = 在自己的世界） */
@@ -191,13 +194,20 @@ export class WorldService extends Service<Config> {
       notify: (content, wake) => {
         if (this.worldActive && this.bot) this.bot.pushEvent("koishi", content, { wake });
       },
-      selfMessage: async (key, content, msgId, sendArgs) => {
+      selfMessage: async (key, content, msgId, sendArgs, sender) => {
         if (!this.worldActive || !this.bot) return;
         // 自己的账号发出了消息：无论何种呈现模式，先打断对该频道的延期发送意图
         this.bot.noteDeferredSelfSent(key);
         const mode = config.messaging.externalSelfMessages;
         if (mode === "simulate") {
-          this.bot.simulateExternalSend(key, content, msgId, sendArgs);
+          const recipient = this.bot;
+          try {
+            const identity = await this.names.identity(key, { isDirect: sender?.isDirect ?? undefined, guildId: sender?.guildId || undefined });
+            if (!this.worldActive || this.bot !== recipient) return;
+            // This mode intentionally adopts the account's action. Profile metadata
+            // belongs in its receipt, never in the actual send arguments/body.
+            recipient.simulateExternalSend(key, content, msgId, sendArgs, `${identity.text}\n平台记录的发送署名：${JSON.stringify(sender?.username || "昵称未记录")}。`);
+          } catch (error) { this.logger.warn("外发消息认领失败: %s", error); }
         } else if (mode === "event") {
           const recipient = this.bot;
           if (this.phoneStatus.down) {
@@ -206,6 +216,7 @@ export class WorldService extends Service<Config> {
           }
           try {
             const display = await this.names.display(key);
+            const identity = await this.names.identity(key, { isDirect: sender?.isDirect ?? undefined, guildId: sender?.guildId || undefined });
             if (!this.worldActive || this.bot !== recipient) return;
             if (this.phoneStatus.down) {
               recipient.pushEvent("koishi", { text: "放在一边的手机震了一下。", ...anonymousChatNoticeEvidence(content) }, { wake: config.messaging.wakeOnNotify });
@@ -214,7 +225,7 @@ export class WorldService extends Service<Config> {
             const msgTag = msgId && needsMsgIds(config.platformOps) ? `(msg:${msgId}) ` : "";
             recipient.pushEvent(
               "koishi",
-              prefixRichText(`你注意到自己的账号在 ${display} 发出了一条消息，但你没有操作发送。可能来自其他设备或应用，具体原因尚不清楚。消息正文开始：\n${msgTag}`, content, "\n消息正文结束。"),
+              prefixRichText(`${identity.text}\n你注意到自己的账号在 ${display} 发出了一条消息，但你没有操作发送。可能来自其他设备或应用，具体原因尚不清楚。${sender ? `\n${formatMessageSender(sender, identity)}\n` : ""}消息正文开始：\n${msgTag}`, content, "\n消息正文结束。"),
               { wake: config.messaging.wakeOnNotify },
             );
           } catch (error) { this.logger.warn("外发消息通知失败: %s", error); }
@@ -232,7 +243,7 @@ export class WorldService extends Service<Config> {
     const base = path.resolve(this.ctx.baseDir, this.config.basePath);
     this.files = new WorldFiles(base);
     await this.files.ensure();
-    callStore.init(path.join(this.webuiDir, "calls"));
+    this.releaseCallStore = callStore.init(path.join(this.webuiDir, "calls"));
     // 建好收藏夹分类目录（用户可直接把图丢进「未整理」，散落在根目录的文件也会被自动清扫进去）
     await this.gallery.ensureDirs();
 
@@ -299,6 +310,10 @@ export class WorldService extends Service<Config> {
   }
 
   override async stop(): Promise<void> {
+    // Koishi may start the replacement while these asynchronous shutdowns drain.
+    // Capture this lifetime now; a late stop must not release a newer lifetime.
+    const releaseCallStore = this.releaseCallStore;
+    this.releaseCallStore = undefined;
     await this.webui?.stop().catch(() => {});
     this.webui = null;
     // 先退休 Bot 并刷新已完成但延迟投递的回执，再等待角色会话退出。
@@ -313,7 +328,7 @@ export class WorldService extends Service<Config> {
       this.world?.setRemote(null);
       await client.leave().catch(() => {});
     }
-    callStore.dispose();
+    releaseCallStore?.();
     // stopWorld(suspend) 保留离线期间持续流逝的世界时间。
   }
 
@@ -380,7 +395,7 @@ export class WorldService extends Service<Config> {
     // wait 被移除时，行为准则与时间说明不再提及等待
     this.botContext.waitRemoved = this.config.bot.disableWait;
     // 聊天账号列表：Bot 识别 <at id/>、引用等结构里的"自己"的依据。
-    // 惰性取值：autoStart 时适配器可能尚未连接，连上后自然出现（仅 id，保持前缀稳定）
+    // 固定前缀只在首次投影/压缩时取值；迟连接或账号变化在生成边界另追加身份事件。
     this.botContext.accountsProvider = () => {
       const ids = [...new Set(this.ctx.bots.filter((b) => b.selfId).map((b) => `${b.platform}:${b.selfId}`))];
       return ids.sort().join("、");
@@ -533,17 +548,29 @@ export class WorldService extends Service<Config> {
             const messages = await this.store.channelMessages(channel.platform, channel.channelId, 12, channel.selfId);
             const last = messages.at(-1);
             const kind = conversationKind(last?.isDirect, channel.channelId, last?.guildId);
-            const parts: RichTextPart[] = [{ kind: "text", text: `会话 ${key}（${kind === "direct" ? "私聊" : kind === "group" ? "群聊" : "会话类型未知"}）当前显示的消息：\n` }];
+            const identity = await this.names.identity(key!, { isDirect: last?.isDirect ?? undefined, guildId: last?.guildId || undefined });
+            const parts: RichTextPart[] = [{ kind: "text", text: `会话 ${key}（${kind === "direct" ? "私聊" : kind === "group" ? "群聊" : "会话类型未知"}）\n${identity.text}\n${this.notifyMgr.channelStatusText(key!)}\n${MESSAGE_ORDER_GUIDANCE}\n当前显示的消息（回看旧消息不表示对方又发了一遍）：\n` }];
             const attachments: MediaRef[] = [];
             for (const row of messages) {
-              const address = row.self ? "本账号发出的消息，账号身份本身不证明是你亲自发送" : conversationLabel(row.conversation, channel.selfId);
+              const firstPart = parts.length;
+              const address = conversationLabel(row.conversation, channel.selfId);
               // Render only stored message content: names/IDs cannot forge internal media markers.
               const rendered = await this.renderer.render(row.content);
-              parts.push({ kind: "text", text: `${row.self ? "本账号" : row.username || row.userId}（账号 ${JSON.stringify(row.userId)}；${address}）${row.messageId ? ` (msg:${row.messageId})` : ""}: ` });
-              parts.push(...(rendered.parts?.length ? rendered.parts : [{ kind: "text" as const, text: rendered.text }]), { kind: "text", text: "\n" });
+              parts.push({ kind: "text", text: `〔聊天记录 #${row.id} · ${formatMessageTime(row)}${row.messageId ? ` (msg:${row.messageId})` : ""}〕\n发送者：${formatMessageSender(row, identity)}；${address}\n消息正文：\n` });
+              parts.push(...(rendered.parts?.length ? rendered.parts : [{ kind: "text" as const, text: rendered.text }]), { kind: "text", text: "\n〔该条消息结束〕\n" });
+              const observed = chatMessageEvidence(row, channel.selfId);
+              for (let index = firstPart; index < parts.length; index++) parts[index] = {
+                ...parts[index]!, observedMessage: { originEventIds: observed.originEventIds!, experience: observed.experience! },
+              };
               attachments.push(...(rendered.attachments ?? []));
             }
-            return { text: richPartsText(parts), parts, attachments };
+            return { text: richPartsText(parts), parts, attachments,
+              originEventIds: [...new Set(messages.flatMap(row => chatMessageEvidence(row, channel.selfId).originEventIds ?? []))],
+              experience: { agency: "observed", situation: `正在查看聊天频道 ${key}`,
+                chat: { channelKey: key!, kind: "attention" },
+                subjectIds: [...new Set(messages.flatMap(row => chatMessageEvidence(row, channel.selfId).experience?.subjectIds ?? []))],
+              },
+            };
           }
         }
         return null;
@@ -573,6 +600,10 @@ export class WorldService extends Service<Config> {
     await this.world.restorePerceptions("bot", content => this.bot!.pushEvent("world", content), knownWorldSources);
     if (!this.botContext.stream.some(entry => entry.kind === "event" && entry.event.source === "system" && entry.event.content === CHAT_RUNTIME_GUIDANCE)) {
       this.bot.pushEvent("system", CHAT_RUNTIME_GUIDANCE);
+    }
+    if (this.botContext.pinned.memoryDigest === "（压缩输出格式异常，摘要缺失）") {
+      const notice = "（旧记忆摘要完整性提示：此前一次整理的输出格式异常，旧摘要可能不完整，不能据此认定某件事没有发生或某人没有回复。原始记录仍在归档；需要旧聊天语境时回读实际频道记录，需要旧亲历依据时使用 recall_growth 的 evidence 查询。下一次整理须通过完整格式校验才会替换摘要；本提示不代表新经历。）";
+      if (!this.botContext.stream.some(entry => entry.kind === "event" && entry.event.content === notice)) this.bot.pushEvent("system", notice);
     }
     const growthGuidance = this.config.bot.growth?.enabled ? GROWTH_RUNTIME_GUIDANCE : GROWTH_MANUAL_GUIDANCE;
     const previousGrowthGuidance = [...this.botContext.stream].reverse().find(entry => entry.kind === "event" && entry.event.source === "system" && entry.event.content.startsWith("（经历整理方式："));
@@ -1184,6 +1215,7 @@ export class WorldService extends Service<Config> {
   async getRegulation(): Promise<unknown> { return this.bot ? this.bot.regulation.view() : readRegulationView(this.files.base, this.config.bot, this.clock ?? undefined); }
 
   async getGrowth(): Promise<unknown> { return new GrowthLedger(this.files.base).recall({ n: 50, at: this.clock?.now() }); }
+  async getGrowthStatus(): Promise<unknown> { return new GrowthLedger(this.files.base).reviewStatus(); }
 
   getClock() {
     return this.clock ?? null;

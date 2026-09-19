@@ -432,7 +432,15 @@ var PRIMARY = {
 var CFG_ICONS = {root:'sliders', bot:'cpu', world:'gauge', clock:'activity', platformOps:'phone', apps:'monitor', captioners:'image', tts:'film', media:'folder', webui:'sliders', messaging:'edit'};
 var GROWTH_FIELD_LABELS = { enabled:'自动整理与回忆', minEpisodes:'积累几段经历后整理', reviewIntervalMs:'整理间隔（现实毫秒）', reviewTimeoutMs:'等待与生成超时（毫秒）', maxInputChars:'每次整理的输入字符预算', recallCount:'每次最多唤起几条认识' };
 var REGULATION_FIELD_LABELS = { enabled:'启用内在调节（实验性）', decisionEnabled:'让评分参与实际选择', timeoutMs:'评价与选择超时（毫秒）', maxInputChars:'每次调用的输入字符预算', candidateCount:'最多比较几个候选行动', learningRate:'经历学习速率', driftRate:'需要自然变化速率', sexualResponseEnabled:'启用阶段性生理反射模拟' };
-function cfgFieldName(path){ if(path[0] === 'bot' && path[1] === 'regulation') return REGULATION_FIELD_LABELS[path[2]] || path[path.length-1]; return path[0] === 'bot' && path[1] === 'growth' ? GROWTH_FIELD_LABELS[path[2]] || path[path.length-1] : path[path.length-1]; }
+var AUXILIARY_LLM_FIELD_LABELS = {mode:'模型配置方式',baseURL:'模型端点',apiKey:'API 密钥',model:'模型名称',temperature:'采样温度',maxTokens:'最大输出 Token',disableThinking:'关闭思考模式',stream:'流式返回'};
+function isAuxiliaryLlmGroup(path){return path.length===3 && path[0]==='bot' && (path[1]==='growth' || path[1]==='regulation') && path[2]==='llm';}
+function cfgFieldName(path){ if(isAuxiliaryLlmGroup(path.slice(0,-1))) return AUXILIARY_LLM_FIELD_LABELS[path[path.length-1]] || path[path.length-1]; if(path[0] === 'bot' && path[1] === 'regulation') return REGULATION_FIELD_LABELS[path[2]] || path[path.length-1]; return path[0] === 'bot' && path[1] === 'growth' ? GROWTH_FIELD_LABELS[path[2]] || path[path.length-1] : path[path.length-1]; }
+function updateLlmInheritanceNotes(){
+  document.querySelectorAll('[data-llm-inherit-note]').forEach(function(note){
+    var model=cfgCache?.bot;
+    note.textContent='当前继承 Bot 主模型：'+(model?.model || '尚未设置模型')+' · '+(model?.baseURL || '尚未设置端点')+'。密钥与生成参数也随主模型配置；独立配置草稿保留。';
+  });
+}
 var PLAT_CATS = [
   ['消息互动', ['recall','react','emojiLikes','reply','forwardMsgs','poke']],
   ['好友与资料', ['handleRequests','listFriends','userInfo','sendLike','profile','modelShow','deleteFriend']],
@@ -776,7 +784,24 @@ function renderField(node, path, value){
     var sec = el('div', {cls:'section', 'data-config-group':path.join('.')});
     sec.appendChild(el('h3', {text: node.description || path.join('.')}));
     var body = el('div', {cls:'body'});
-    if(node.children) node.children.forEach(function(c){ body.appendChild(renderField(c, path.concat(c.key), getPath(cfgCache, path.concat(c.key)))); });
+    if(isAuxiliaryLlmGroup(path)){
+      var modeNode=(node.children || []).find(function(c){return c.key==='mode';});
+      if(modeNode)body.appendChild(renderField(modeNode,path.concat('mode'),getPath(cfgCache,path.concat('mode'))));
+      var inheritNote=el('p',{cls:'empty',style:'padding:0 0 12px;text-align:left;overflow-wrap:anywhere','data-llm-inherit-note':path.join('.')});
+      var independent=el('div',{'data-llm-independent':path.join('.')});
+      (node.children || []).filter(function(c){return c.key!=='mode';}).forEach(function(c){independent.appendChild(renderField(c,path.concat(c.key),getPath(cfgCache,path.concat(c.key))));});
+      independent.appendChild(el('p',{cls:'empty',style:'padding:0;text-align:left',text:'此组独立使用自己的端点、密钥与生成参数。获取模型列表可以检查端点连接；保存后用于后续请求。'}));
+      body.append(inheritNote,independent);
+      function updateMode(){
+        var inherit=getPath(cfgCache,path.concat('mode'))!=='independent';
+        inheritNote.hidden=!inherit;independent.hidden=inherit;
+        independent.querySelectorAll('input,select,textarea,button').forEach(function(control){control.disabled=inherit;});
+        updateLlmInheritanceNotes();
+        if(inherit)inheritNote.textContent='当前继承 Bot 主模型：'+(cfgCache?.bot?.model || '尚未设置模型')+' · '+(cfgCache?.bot?.baseURL || '尚未设置端点')+'。密钥与生成参数也随主模型配置；独立配置草稿保留。';
+      }
+      sec.updateLlmMode=updateMode;
+      updateMode();
+    } else if(node.children) node.children.forEach(function(c){ body.appendChild(renderField(c, path.concat(c.key), getPath(cfgCache, path.concat(c.key)))); });
     sec.appendChild(body);
     return sec;
   }
@@ -835,13 +860,13 @@ function renderField(node, path, value){
   var ctl2 = el('div', {cls:'ctl'});
   ctl2.appendChild(renderInput(node, path, value));
   if(isModelField(path)){
-    ctl2.appendChild(el('div', {style:'margin-top:4px'}, [el('button', {text:'获取模型列表', style:'font-size:11px;padding:2px 8px', onclick:function(){
+    ctl2.appendChild(el('div', {style:'margin-top:4px'}, [el('button', {text:'获取模型列表', 'data-model-list':path.join('.'), style:'font-size:11px;padding:2px 8px', onclick:function(){
       fetchModelsFor(path, this);
     }})]));
   }
   if(node.role !== 'secret' && node.default !== undefined && t !== 'const'){
     ctl2.appendChild(el('div', {style:'margin-top:4px'}, [el('button', {text:'重置为默认', style:'font-size:11px;padding:2px 8px', onclick:function(){
-      var v = JSON.parse(JSON.stringify(node.default)); setPath(cfgCache, path, v); ctl2.textContent=''; ctl2.appendChild(renderInput(node, path, v));
+      var v = JSON.parse(JSON.stringify(node.default)); setPath(cfgCache, path, v); box2.replaceWith(renderField(node, path, v));
     }})]));
   }
   box2.appendChild(ctl2);
@@ -859,7 +884,7 @@ function renderInput(node, path, value){
     return sw;
   }
   if(t === 'select'){
-    var sel = el('select');
+    var sel = el('select', {'data-config-path':path.join('.'), 'aria-label':cfgFieldName(path)});
     (node.options || []).forEach(function(opt, i){
       var o = el('option', {text: String(opt.value) + (opt.description ? ' — ' + opt.description : '')});
       o.value = String(opt.value);
@@ -906,12 +931,12 @@ function renderInput(node, path, value){
     return dict;
   }
   if(node.role === 'textarea'){
-    var ta = el('textarea', {rows: Math.max(4, Math.min(20, String(value||'').split(NL).length + 1))});
+    var ta = el('textarea', {rows: Math.max(4, Math.min(20, String(value||'').split(NL).length + 1)), 'data-config-path':path.join('.'), 'aria-label':cfgFieldName(path)});
     ta.value = value || '';
     ta.oninput = function(){ setPath(cfgCache, path, ta.value); };
     return ta;
   }
-  var inp = el('input', {type: node.role === 'secret' ? 'password' : 'text', value: value == null ? '' : value});
+  var inp = el('input', {type: node.role === 'secret' ? 'password' : 'text', value: value == null ? '' : value, 'data-config-path':path.join('.'), 'aria-label':cfgFieldName(path)});
   if(node.role === 'secret'){
     var isMasked = value === '******';
     var wrap = el('div', {style:'display:flex;gap:6px;align-items:center'});
@@ -925,6 +950,8 @@ function renderInput(node, path, value){
     wrap.appendChild(inp);
     if(!isMasked){
       wrap.appendChild(el('button', {text:'显示', onclick:function(){ inp.type = inp.type === 'password' ? 'text' : 'password'; }}));
+    } else {
+      wrap.appendChild(el('button', {text:'清除密钥', 'aria-label':'清除 '+path.join('.')+' 的密钥', onclick:function(){setPath(cfgCache,path,'');inp.value='';inp.placeholder='未设置密钥';this.remove();}}));
     }
     inp.oninput = function(){ setPath(cfgCache, path, inp.value); };
     return wrap;
@@ -944,14 +971,13 @@ function defaultFor(node){
 function isModelField(path){
   var last = path[path.length - 1];
   if(last !== 'model') return false;
-  for(var i = path.length - 1; i >= 0; i--){
-    if(path[i] === 'bot' || path[i] === 'world') return true;
-  }
-  return false;
+  var parent=path.slice(0,-1), group=getPath(cfgCache,parent);
+  return !!group && typeof group==='object' && Object.prototype.hasOwnProperty.call(group,'baseURL') && Object.prototype.hasOwnProperty.call(group,'apiKey');
 }
 function fetchModelsFor(path, btn){
   if(!cfgCache) return;
   var parent = path.slice(0, path.length - 1);
+  if(isAuxiliaryLlmGroup(parent) && getPath(cfgCache,parent.concat('mode'))!=='independent'){toast('该组正在继承 Bot 主模型，请在主模型配置中选择模型。','warn');return;}
   var baseURL = getPath(cfgCache, parent.concat('baseURL'));
   var apiKey = getPath(cfgCache, parent.concat('apiKey')) || '';
   if(!baseURL){ toast('请先填写该组的 baseURL', 'warn'); return; }
@@ -1821,4 +1847,6 @@ function setPath(obj, arr, val){
   }
   cur[arr[arr.length-1]] = val;
   markCfgDirty();
+  if(obj===cfgCache && arr[0]==='bot' && (arr[1]==='model' || arr[1]==='baseURL'))updateLlmInheritanceNotes();
+  if(obj===cfgCache && arr[arr.length-1]==='mode' && isAuxiliaryLlmGroup(arr.slice(0,-1))){var group=arr.slice(0,-1).join('.');document.querySelectorAll('[data-config-group]').forEach(function(section){if(section.dataset.configGroup===group)section.updateLlmMode?.();});}
 }

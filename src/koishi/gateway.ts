@@ -6,21 +6,22 @@ import { MEDIA_PLACEHOLDER, mediaPlaceholder, escapeMediaStorageText } from "../
 import type { MediaStore } from "../media/store.js";
 import type { PhoneStatus, RichText } from "../types.js";
 import type { FocusManager } from "./focus.js";
-import { recallNoticeText } from "./markers.js";
-import type { MessageStore } from "./messages.js";
+import type { MessageOrderTicket, MessageStore, WorldMessageRow } from "./messages.js";
 import type { ChannelNameResolver } from "./names.js";
 import type { NotifyManager } from "./notify.js";
 import type { OwnSendTracker } from "./ownsends.js";
 import { SelfMessageCapture, type ConfirmedSelfMessage } from "./self-message-capture.js";
 import type { RequestStore } from "./requests.js";
 import { anonymousChatNoticeEvidence, chatMessageEvidence, conversationKind, conversationLabel, describeConversation, isStickerElement, type ConversationContext } from "./conversation.js";
+import { messageSequence } from "./message-order.js";
+import { firstName, formatMessageSender, isLegacySenderPlaceholder, sessionSenderName } from "./identity.js";
 export { isStickerElement } from "./conversation.js";
 
 export interface GatewayCallbacks {
   /** 向 Bot-LLM 投递通知事件；wake 表示是否唤醒 wait() 中的 Bot */
   notify(content: RichText, wake: boolean): void;
   /** 外部（其他插件/指令输出）以 Bot 账号发出的消息（externalSelfMessages 开启时）；msgId 为平台消息 id（可能为空） */
-  selfMessage(channelKey: string, content: RichText, msgId: string, sendArgs: { msg: string } | null): void | Promise<void>;
+  selfMessage(channelKey: string, content: RichText, msgId: string, sendArgs: { msg: string } | null, sender?: WorldMessageRow): void | Promise<void>;
   /** 任意频道收到了新消息（不管是否聚焦/通知）。用于打断"过会儿再发"的延期发送意图 */
   channelActivity(channelKey: string): void;
 }
@@ -28,7 +29,7 @@ export interface GatewayCallbacks {
 /**
  * Koishi 消息网关：
  * - 所有收到的消息一律入库（图片/音频/视频下载进资产库，存占位符）；
- * - 来自 Bot 正在关注的频道的消息，无视通知策略，必定以完整内容呈现并唤醒 Bot；
+ * - 来自 Bot 正在关注的频道的消息以完整内容呈现；免打扰独立约束主动唤醒；
  * - 来自 Allow Notification 频道列表的消息，按处理策略生成 Event 投递给 Bot-LLM。
  */
 export class Gateway {
@@ -60,7 +61,8 @@ export class Gateway {
       const key = channelKey(session.platform ?? "unknown", session.channelId ?? "unknown", session.selfId ?? session.bot?.selfId);
       // Reserve the same queue position used by confirmed account replies before any
       // media work starts. Never return the queued promise to platform dispatch.
-      const next = this.queueMessage(key, () => this.handle(session));
+      const ticket = this.captureSessionTicket(session);
+      const next = this.queueMessage(key, () => this.handle(session, ticket));
       void next.catch((err) => {
         logger.warn("消息处理失败: %s", err);
       });
@@ -69,22 +71,25 @@ export class Gateway {
     if (cfg.externalSelfMessages !== "off") {
       this.selfCapture = new SelfMessageCapture(ctx, ownSends, (message) => {
         const key = channelKey(message.bot.platform ?? "unknown", message.channelId, message.bot.selfId);
+        const ticket = this.store.captureReceipt(message.bot.platform ?? "unknown", message.channelId, message.bot.selfId, message.messageId, new Date(message.timestamp));
         if (message.own) {
           this.ownMessageIds.add(`${key}\0${message.messageId}`);
           if (this.ownMessageIds.size > 4096) this.ownMessageIds.delete(this.ownMessageIds.values().next().value!);
           return;
         }
-        void this.queueMessage(key, () => this.handleConfirmedSelfSent(message)).catch((err) => {
+        void this.queueMessage(key, () => this.handleConfirmedSelfSent(message, ticket)).catch((err) => {
           logger.warn("已确认外发消息入库失败: %s", err);
         });
       });
-      // Some adapters dispatch account echoes as send; others use message with the
-      // account's own userId. Both enter the same confirmed-ID deduplication path.
-      ctx.on("send", (session) => {
-        const key = channelKey(session.platform ?? "unknown", session.channelId ?? "unknown", session.selfId ?? session.bot?.selfId);
-        void this.queueMessage(key, () => this.handleSelfEcho(session)).catch((err) => logger.warn("账号回声处理失败: %s", err));
-      });
     }
+    // Keep the order of validated account echoes even when external message
+    // simulation/storage is off. This ticket does not claim autonomous authorship.
+    ctx.on("send", (session) => {
+      const key = channelKey(session.platform ?? "unknown", session.channelId ?? "unknown", session.selfId ?? session.bot?.selfId);
+      const ticket = this.captureSessionTicket(session);
+      if (cfg.externalSelfMessages === "off") return;
+      void this.queueMessage(key, () => this.handleSelfEcho(session, ticket)).catch((err) => logger.warn("账号回声处理失败: %s", err));
+    });
 
     // 平台请求事件（好友申请 / 入群邀请 / 入群申请）：登记后以手机通知的形式告知 Bot
     if (ops.handleRequests) {
@@ -110,7 +115,8 @@ export class Gateway {
     // 否则消息已经缓存在记录里，Bot 会一直"看到"一条其实已经不存在了的消息
     ctx.on("message-deleted", (session) => {
       const key = channelKey(session.platform ?? "unknown", session.channelId ?? "unknown", session.selfId ?? session.bot?.selfId);
-      void this.queueMessage(key, () => this.handleRecall(session)).catch((err) => {
+      const ticket = this.store.captureLive();
+      void this.queueMessage(key, () => this.handleRecall(session, ticket)).catch((err) => {
         logger.warn("撤回处理失败: %s", err);
       });
     });
@@ -121,7 +127,7 @@ export class Gateway {
    * 消息它自然记得内容，无需篡改历史）；Bot 正在关注该频道时追加事件告知是哪条被撤回了。
    * 账号自身的撤回也可能来自其他设备；没有操作归属证据时只陈述账号行为。
    */
-  private async handleRecall(session: Session): Promise<void> {
+  private async handleRecall(session: Session, ticket = this.store.captureLive()): Promise<void> {
     const channelId = session.channelId ?? "";
     const messageId = session.messageId ? String(session.messageId) : "";
     if (!channelId || !messageId) return;
@@ -137,44 +143,38 @@ export class Gateway {
     const operatorId = String((session as unknown as { operatorId?: string }).operatorId ?? raw.operator_id ?? "") ||
       (session.isDirect || channelId.startsWith("private:") ? senderId : "");
     const selfOp = !!selfId && operatorId === selfId;
-    const selfSender = !!selfId && senderId === selfId;
     const samePerson = !!operatorId && operatorId === senderId;
-    const operatorName = selfOp ? "你的账号" : await this.lookupUsername(platform, channelId, operatorId);
-    const senderName = selfSender
-      ? "你"
-      : (row?.username || (await this.lookupUsername(platform, channelId, senderId)));
-    const notice = !operatorId ? `${selfSender ? "本账号" : senderName || "未知发送者"}的一条消息被撤回了`
-      : selfOp
-      ? selfSender ? "你的账号撤回了一条消息" : `你的账号撤回了 ${senderName} 的一条消息`
-      : recallNoticeText({ operatorName, selfOp, senderName, selfSender, samePerson });
+    const identity = await this.names.identity(key, { isDirect: session.isDirect, guildId: session.guildId });
+    const operatorNickname = selfOp ? identity.displayName : await this.lookupUsername(platform, channelId, operatorId, selfId);
+    const operatorName = formatMessageSender({ platform, selfId, userId: operatorId, username: operatorNickname }, identity);
+    const senderName = formatMessageSender({ platform, selfId, userId: senderId, username: row?.username || await this.lookupUsername(platform, channelId, senderId, selfId), senderOrigin: row?.senderOrigin }, identity);
+    const notice = !operatorId ? `${senderName}的一条消息被撤回了`
+      : samePerson ? `${operatorName}撤回了该账号的一条消息` : `${operatorName}撤回了 ${senderName} 的一条消息`;
 
+    let saved = row;
     if (row) {
       await this.store.updateContent(row.id, `[${notice}]`);
     } else {
       // 记录里找不到原消息（发出时插件不在线 / 记录被清空过）：撤回本身也是频道里的动态，补记一条
-      await this.store.store({
+      saved = await this.store.store({
         selfId: session.selfId ?? session.bot?.selfId ?? "",
         platform,
         channelId,
         guildId: session.guildId ?? "",
         userId: operatorId,
-        username: selfOp ? "（我）" : operatorName,
+        username: operatorNickname,
         content: `[${notice}]`,
-        timestamp: new Date(),
+        timestamp: ticket.observedAt,
+        timestampSource: "local-observed",
         self: selfOp,
         messageId,
         isDirect: session.isDirect,
-      });
+      }, ticket);
     }
 
-    // The account's operator ID alone is not proof of a known, voluntary action.
-    // 只有正在关注这个频道时才追加事件（翻记录时总能看到撤回标记，不必每条都提醒）
-    if (this.phone.down || !this.focus.isFocused(key)) return;
     const msgTag = needsMsgIds(this.ops) ? `（msg:${messageId}）` : "";
-    this.callbacks.notify(
-      { text: `你正留意着 ${await this.names.display(key)}，看到${notice}${msgTag}。` },
-      true,
-    );
+    await this.deliverChannelNotice(key, async () => ({ text: `你正留意着 ${await this.names.display(key)}，看到${notice}${msgTag}。` }),
+      saved ? chatMessageEvidence(saved) : {}, ticket, true);
   }
 
   /** 别人戳了 Bot：转为手机通知并入库（群里别人互戳与 Bot 自己戳人不理会） */
@@ -195,10 +195,11 @@ export class Gateway {
     const groupId = raw.group_id != null ? String(raw.group_id) : "";
     const channelId = groupId || `private:${pokerId}`;
     const key = channelKey(platform, channelId, session.selfId ?? session.bot?.selfId);
-    const who = await this.lookupUsername(platform, channelId, pokerId);
+    const ticket = this.store.captureLive();
+    const who = await this.lookupUsername(platform, channelId, pokerId, selfId);
 
     // 入库：打开频道时能看到这条互动
-    await this.store.store({
+    const saved = await this.store.store({
       selfId: session.selfId ?? session.bot?.selfId ?? "",
       platform,
       channelId,
@@ -206,20 +207,16 @@ export class Gateway {
       userId: pokerId,
       username: who,
       content: "[戳了戳你]",
-      timestamp: new Date(),
+      timestamp: ticket.observedAt,
+      timestampSource: "local-observed",
       self: false,
       messageId: "",
       isDirect: !groupId,
-    });
+    }, ticket);
 
-    if (this.phone.down) {
-      this.callbacks.notify({ text: "放在一边的手机震了一下。" }, this.cfg.wakeOnNotify);
-      return;
-    }
-    const text = groupId
+    await this.deliverChannelNotice(key, async () => ({ text: groupId
       ? `手机提示：${who} 在群 ${await this.names.display(key)} 里戳了戳你。`
-      : `手机提示：${who} 戳了戳你。`;
-    this.callbacks.notify({ text }, this.cfg.wakeOnNotify);
+      : `手机提示：${who} 戳了戳你。` }), chatMessageEvidence(saved), ticket);
   }
 
   /**
@@ -244,11 +241,12 @@ export class Gateway {
     const key = channelKey(platform, groupId, session.selfId ?? session.bot?.selfId);
     const lift = String(raw.sub_type ?? "") === "lift_ban" || Number(raw.duration ?? 0) <= 0;
     const operatorId = String(raw.operator_id ?? "");
-    const who = operatorId ? await this.lookupUsername(platform, groupId, operatorId) : "管理员";
+    const ticket = this.store.captureLive();
+    const who = operatorId ? await this.lookupUsername(platform, groupId, operatorId, selfId) : "管理员";
     const dur = formatBanDuration(Number(raw.duration ?? 0), this.clockInfo());
 
     // 入库：翻聊天记录时也能看到这条动态
-    await this.store.store({
+    const saved = await this.store.store({
       selfId: session.selfId ?? session.bot?.selfId ?? "",
       platform,
       channelId: groupId,
@@ -262,16 +260,14 @@ export class Gateway {
         : lift
           ? `[${who} 解除了对你的禁言]`
           : `[${who} 禁言了你${dur ? `（${dur}）` : ""}]`,
-      timestamp: new Date(),
+      timestamp: ticket.observedAt,
+      timestampSource: "local-observed",
       self: false,
       messageId: "",
       isDirect: false,
-    });
+    }, ticket);
 
-    if (this.phone.down) {
-      this.callbacks.notify({ text: "放在一边的手机震了一下。" }, this.cfg.wakeOnNotify);
-      return;
-    }
+    await this.deliverChannelNotice(key, async () => {
     const display = await this.names.display(key);
     const text = whole
       ? lift
@@ -280,15 +276,38 @@ export class Gateway {
       : lift
         ? `手机提示：你在群 ${display} 的禁言被${who}解除了，可以说话了。`
         : `手机提示：你在群 ${display} 被${who}禁言了${dur ? `（${dur}）` : ""}，期间没法在这个群里发消息。`;
-    this.callbacks.notify({ text }, this.cfg.wakeOnNotify);
+    return { text };
+    }, chatMessageEvidence(saved), ticket);
+  }
+
+  /** Notification permission and screen visibility are independent, rechecked
+   * after names/media await. A hidden screen never carries channel/subject facts. */
+  private async deliverChannelNotice(key: string, render: () => Promise<RichText>, evidence: Pick<RichText, "originEventIds" | "experience">,
+    ticket: MessageOrderTicket, focusedOnly = false): Promise<void> {
+    const visible = () => !this.phone.down && this.focus.isFocused(key);
+    if (focusedOnly && !visible()) return;
+    if (!visible() && !this.notifyList.isNotifyChannel(key)) return;
+    if (this.phone.down) {
+      this.callbacks.notify({ text: "放在一边的手机震了一下。", ...anonymousChatNoticeEvidence(evidence, ticket.observedAt.getTime()) }, this.cfg.wakeOnNotify);
+      return;
+    }
+    const content = await render();
+    if (focusedOnly && !visible()) return;
+    if (!visible() && !this.notifyList.isNotifyChannel(key)) return;
+    if (this.phone.down) {
+      this.callbacks.notify({ text: "放在一边的手机震了一下。", ...anonymousChatNoticeEvidence(evidence, ticket.observedAt.getTime()) }, this.cfg.wakeOnNotify);
+      return;
+    }
+    this.callbacks.notify({ ...content, ...evidence, experience: { ...evidence.experience, agency: "observed", chat: { channelKey: key, kind: "notice" } } },
+      this.notifyList.isNotifyChannel(key) && (visible() || this.cfg.wakeOnNotify));
   }
 
   /** 从消息记录里查某人的名字（查不到就用 id） */
-  private async lookupUsername(platform: string, channelId: string, userId: string): Promise<string> {
+  private async lookupUsername(platform: string, channelId: string, userId: string, selfId?: string): Promise<string> {
     try {
       const channels = await this.store.knownChannels();
       for (const c of channels) {
-        if (c.platform !== platform) continue;
+        if (c.platform !== platform || c.channelId !== channelId || (selfId && c.selfId !== selfId)) continue;
         const hit = c.participants.find((p) => p.userId === userId && p.username);
         if (hit) return hit.username;
       }
@@ -327,6 +346,16 @@ export class Gateway {
     this.callbacks.notify({ text }, this.cfg.wakeOnNotify);
   }
 
+  private captureSessionTicket(session: Session): MessageOrderTicket {
+    // A validated platform echo is already an observation of the account's
+    // message, even when its send promise settles later. Keep that earlier slot.
+    if (consistentAccountSession(session) && session.messageId && session.channelId && session.bot &&
+      session.userId === session.bot.selfId) {
+      return this.store.captureReceipt(session.bot.platform ?? "unknown", session.channelId, session.bot.selfId, String(session.messageId));
+    }
+    return this.store.captureLive();
+  }
+
   private queueMessage(key: string, run: () => Promise<void>): Promise<void> {
     const previous = this.messageTails.get(key) ?? Promise.resolve();
     const next = previous.catch(() => {}).then(run);
@@ -336,7 +365,7 @@ export class Gateway {
   }
 
   /** Called only for successful adapter receipts, never an attempted before-send. */
-  private async handleConfirmedSelfSent(message: ConfirmedSelfMessage): Promise<void> {
+  private async handleConfirmedSelfSent(message: ConfirmedSelfMessage, ticket = this.store.captureLive()): Promise<void> {
     const { bot, channelId, messageId, session } = message;
     const platform = bot.platform ?? "unknown";
     const key = channelKey(platform, channelId, bot.selfId);
@@ -346,27 +375,32 @@ export class Gateway {
     const content = await this.serializeElements(message.elements, { containerMsgId: messageId });
     if (!content.trim()) return;
     const direct = session?.event?.channel?.type == null ? undefined : session.isDirect;
+    const identity = await this.names.identity(key, { isDirect: direct ?? channelId.startsWith("private:"), guildId: session?.guildId });
+    // before-send may carry the invoking peer's session; only an account-authored
+    // echo may supply the account's observed nickname.
+    const observedName = session?.userId === bot.selfId ? sessionSenderName(session) : "";
     const saved = await this.store.store({
       selfId: bot.selfId, platform, channelId, guildId: session?.guildId ?? "",
-      userId: bot.selfId, username: "（我）", content, timestamp: new Date(message.timestamp), self: true, messageId,
+      userId: bot.selfId, username: firstName(observedName, identity.displayName), content, timestamp: new Date(message.timestamp), timestampSource: message.timestampSource ?? "local-confirmed", platformSequence: message.platformSequence, self: true, senderOrigin: "external", senderOwned: true, messageId,
       isDirect: direct ?? channelId.startsWith("private:"),
       conversation: describeConversation(message.elements,
         conversationKind(direct, channelId, session?.guildId), isStickerElement),
-    });
+    }, ticket);
     // Store all enabled modes, but expand media only when that mode actually exposes
     // the message. A put-down phone event must never smuggle images into awareness.
     const visible = this.cfg.externalSelfMessages === "simulate" || (this.cfg.externalSelfMessages === "event" && !this.phone.down);
     const rendered: RichText = visible
       ? { ...await this.renderer.render(content), ...chatMessageEvidence(saved) }
       : this.cfg.externalSelfMessages === "event"
-        ? { text: "", ...anonymousChatNoticeEvidence(chatMessageEvidence(saved), saved.timestamp.getTime()) }
+        ? { text: "", ...anonymousChatNoticeEvidence(chatMessageEvidence(saved), saved.observedAt?.getTime()) }
         : { text: "", originEventIds: [] };
-    await this.callbacks.selfMessage(key, rendered, messageId, selfSendArguments(message.elements, content));
+    await this.callbacks.selfMessage(key, rendered, messageId, selfSendArguments(message.elements, content), saved);
   }
 
   /** Already-observed platform traffic, including another client logged into this account. */
-  private async handleSelfEcho(session: Session): Promise<void> {
+  private async handleSelfEcho(session: Session, ticket = this.captureSessionTicket(session)): Promise<void> {
     if (this.cfg.externalSelfMessages === "off" || !session.channelId || !session.bot) return;
+    if (!consistentAccountSession(session)) return;
     const key = channelKey(session.platform ?? session.bot.platform, session.channelId, session.selfId ?? session.bot.selfId);
     await this.selfCapture?.waitForPending(key);
     await this.ownSends.waitForPending(key);
@@ -376,17 +410,20 @@ export class Gateway {
     // Sending does not await this consumer, so waiting for adapter receipts above
     // cannot create a transport -> consumer -> transport cycle.
     await this.handleConfirmedSelfSent({ bot: session.bot, channelId: session.channelId, messageId,
-      elements: session.elements ?? h.parse(session.content ?? ""), session, own: false, timestamp: session.timestamp ?? Date.now() });
+      elements: session.elements ?? h.parse(session.content ?? ""), session, own: false, timestamp: session.timestamp ?? ticket.observedAt.getTime(),
+      timestampSource: session.timestamp == null ? "local-observed" : "platform", platformSequence: sessionSequence(session) }, ticket);
   }
 
-  private async handle(session: Session): Promise<void> {
+  private async handle(session: Session, ticket: MessageOrderTicket = this.captureSessionTicket(session)): Promise<void> {
     if (!session.content && !session.elements?.length) return;
-    if (session.userId && session.bot && String(session.userId) === String(session.bot.selfId)) {
-      await this.handleSelfEcho(session);
+    if (!consistentAccountSession(session)) return;
+    if (session.userId && session.bot && session.platform === session.bot.platform && String(session.userId) === String(session.selfId ?? session.bot.selfId)) {
+      await this.handleSelfEcho(session, ticket);
       return;
     }
 
     const selfId = session.selfId ?? session.bot?.selfId ?? undefined;
+    const senderOwned = this.ctx.bots.some(bot => bot.platform === session.platform && bot.selfId === session.userId);
     if (session.messageId && session.channelId && await this.store.findByMessageId(
       session.platform ?? "unknown", session.channelId, String(session.messageId), selfId,
     )) return;
@@ -417,11 +454,14 @@ export class Gateway {
     if (quote && (quote.id || quote.content || quote.elements)) {
       const qUser = quote.user as { name?: string; nick?: string; id?: string } | undefined;
       const quoteUserId = conversation.reply?.userId;
-      const isSelf = !!selfId && quoteUserId === String(selfId);
+      const original = quote.id ? await this.store.findByMessageId(session.platform ?? "unknown", session.channelId ?? "unknown", String(quote.id), selfId) : null;
+      const identity = { platform: session.platform ?? "unknown", selfId, accountIds: this.ctx.bots.filter(bot => bot.platform === session.platform).map(bot => bot.selfId) };
+      const recordedName = original?.userId === selfId && isLegacySenderPlaceholder(original) ? "" : original?.username;
       content =
         quoteTag({
           id: needsMsgIds(this.ops) && quote.id ? quote.id : undefined,
-          name: isSelf ? "本账号" : qUser?.nick || qUser?.name || quoteUserId || undefined,
+          name: formatMessageSender({ platform: session.platform ?? "unknown", selfId, userId: quoteUserId ?? "",
+            username: firstName(recordedName, (quote as unknown as { member?: { nick?: string } }).member?.nick, qUser?.nick, qUser?.name), senderOrigin: original?.senderOrigin ?? (recordedName ? undefined : "unknown"), senderOwned: original?.senderOwned }, identity),
           text: truncate(plainText(quote.elements ?? h.parse(quote.content ?? "")), 40) || undefined,
         }) + ` ${content}`;
     }
@@ -432,45 +472,55 @@ export class Gateway {
       channelId: session.channelId ?? "unknown",
       guildId: session.guildId ?? "",
       userId: session.userId ?? "",
-      username: session.username ?? session.userId ?? "",
+      username: sessionSenderName(session),
       content,
-      timestamp: new Date(session.timestamp ?? Date.now()),
+      timestamp: new Date(session.timestamp ?? ticket.observedAt.getTime()),
+      timestampSource: session.timestamp == null ? "local-observed" : "platform",
+      platformSequence: sessionSequence(session),
       self: false,
+      senderOwned,
       messageId: session.messageId ?? "",
       isDirect: session.isDirect,
       conversation,
-    });
+    }, ticket);
 
     const key = channelKey(session.platform ?? "unknown", session.channelId ?? "unknown", session.selfId ?? session.bot?.selfId);
     // 频道有新动静：先让系统侧（延期发送意图等）知情，再走通知策略
     this.callbacks.channelActivity(key);
-    // Bot 正在关注的频道：无视通知策略与频道列表，必定呈现完整内容并唤醒
+    // 聚焦决定可见正文；通知设置独立决定震动／唤醒。
     const focused = this.focus.isFocused(key);
-    if (!focused && !this.notifyList.isNotifyChannel(key)) return;
+    const mayNotify = this.notifyList.isNotifyChannel(key);
+    if (!focused && !mayNotify) return;
 
     // 手机被放下：本会通知的消息一律降级为"感觉到震动"，不呈现任何内容
     if (this.phone.down) {
+      if (!this.notifyList.isNotifyChannel(key)) return;
       this.callbacks.notify({ text: "放在一边的手机震了一下。",
-        ...anonymousChatNoticeEvidence(chatMessageEvidence(saved), saved.timestamp.getTime()) }, this.cfg.wakeOnNotify);
+        ...anonymousChatNoticeEvidence(chatMessageEvidence(saved), saved.observedAt?.getTime()) }, this.cfg.wakeOnNotify);
       return;
     }
 
     const notification = focused
-      ? await this.renderFocused(key, session, content, conversation)
-      : await this.renderNotification(key, session, content, conversation);
+      ? await this.renderFocused(key, session, content, conversation, saved)
+      : await this.renderNotification(key, session, content, conversation, saved);
     // Rendering images or resolving names can finish after the phone was put down.
     // Recheck the actual delivery boundary before exposing text or participant facts.
     if (this.phone.down) {
+      if (!this.notifyList.isNotifyChannel(key)) return;
       this.callbacks.notify({ text: "放在一边的手机震了一下。",
-        ...anonymousChatNoticeEvidence(chatMessageEvidence(saved), saved.timestamp.getTime()) }, this.cfg.wakeOnNotify);
+        ...anonymousChatNoticeEvidence(chatMessageEvidence(saved), saved.observedAt?.getTime()) }, this.cfg.wakeOnNotify);
       return;
     }
     // Only full message delivery grants the evidence identity and its participants.
     // A vibration/count/channel preview is not the unseen message's body.
-    this.callbacks.notify(focused || this.cfg.notifyPolicy === "content"
-      ? { ...notification, ...chatMessageEvidence(saved) }
-      : { ...notification, ...anonymousChatNoticeEvidence(chatMessageEvidence(saved), saved.timestamp.getTime()) },
-    focused ? true : this.cfg.wakeOnNotify);
+    const evidence = focused || this.cfg.notifyPolicy === "content"
+      ? chatMessageEvidence(saved)
+      : anonymousChatNoticeEvidence(chatMessageEvidence(saved), ticket.observedAt.getTime());
+    if (!focused && this.cfg.notifyPolicy === "channel" && evidence.experience) {
+      evidence.experience.chat = { channelKey: key, kind: "notice" };
+    }
+    this.callbacks.notify({ ...notification, ...evidence },
+      this.notifyList.isNotifyChannel(key) && (focused || this.cfg.wakeOnNotify));
   }
 
   /** 元素树 → 存储文本：媒体下载入资产库并替换为占位符 */
@@ -548,15 +598,17 @@ export class Gateway {
   }
 
   /** 关注中的频道：始终呈现完整内容（相当于强制 content 策略） */
-  private async renderFocused(key: string, session: Session, content: string, conversation: ConversationContext): Promise<RichText> {
+  private async renderFocused(key: string, session: Session, content: string, conversation: ConversationContext, sender: WorldMessageRow): Promise<RichText> {
     const rendered = await this.renderer.render(content);
     const msgTag =
       needsMsgIds(this.ops) && session.messageId ? `(msg:${session.messageId}) ` : "";
-    const header = `你正留意着 ${await this.names.display(key)}，看到新消息（${conversationLabel(conversation, session.selfId ?? session.bot?.selfId)}）\n${msgTag}发送者：${session.username ?? session.userId}（账号 ${JSON.stringify(session.userId ?? "未知")}）\n消息正文：\n`;
+    const identity = await this.names.identity(key, { isDirect: session.isDirect, guildId: session.guildId });
+    const who = formatMessageSender(sender, identity);
+    const header = `你正留意着 ${await this.names.display(key)}，看到新消息（${conversationLabel(conversation, session.selfId ?? session.bot?.selfId)}）\n${identity.text}\n${msgTag}发送者：${who}\n消息正文：\n`;
     return prefixRichText(header, rendered, "\n〔该条消息结束〕");
   }
 
-  private async renderNotification(key: string, session: Session, content: string, conversation: ConversationContext): Promise<RichText> {
+  private async renderNotification(key: string, session: Session, content: string, conversation: ConversationContext, sender: WorldMessageRow): Promise<RichText> {
     switch (this.cfg.notifyPolicy) {
       case "count":
         return { text: "手机响了一下：收到一条新消息。" };
@@ -565,11 +617,19 @@ export class Gateway {
       case "content": {
         const rendered = await this.renderer.render(content);
         const msgTag = needsMsgIds(this.ops) && session.messageId ? `(msg:${session.messageId}) ` : "";
-        const header = `手机响了一下：收到来自 ${await this.names.display(key)} 的消息（${conversationLabel(conversation, session.selfId ?? session.bot?.selfId)}）\n${msgTag}发送者：${session.username ?? session.userId}（账号 ${JSON.stringify(session.userId ?? "未知")}）\n消息正文：\n`;
+        const identity = await this.names.identity(key, { isDirect: session.isDirect, guildId: session.guildId });
+        const who = formatMessageSender(sender, identity);
+        const header = `手机响了一下：收到来自 ${await this.names.display(key)} 的消息（${conversationLabel(conversation, session.selfId ?? session.bot?.selfId)}）\n${identity.text}\n${msgTag}发送者：${who}\n消息正文：\n`;
         return prefixRichText(header, rendered, "\n〔该条消息结束〕");
       }
     }
   }
+}
+
+/** A mismatched adapter event cannot borrow another connection's account identity. */
+function consistentAccountSession(session: Session): boolean {
+  return !session.bot || ((!session.platform || session.platform === session.bot.platform)
+    && (!session.selfId || String(session.selfId) === String(session.bot.selfId)));
 }
 
 /** Both representations must retain sender/channel identity when BotContext uses ordered media parts. */
@@ -684,4 +744,9 @@ function selfSendArguments(elements: h[], content: string): { msg: string } | nu
     (_, id) => `<media ref="media:${id}"/>`,
   );
   return { msg };
+}
+
+function sessionSequence(session: Session): string | null {
+  const raw = ((session as unknown as { onebot?: Record<string, unknown> }).onebot ?? (session.event as unknown as { _data?: Record<string, unknown> })?._data ?? {});
+  return messageSequence(raw.message_seq);
 }

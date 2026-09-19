@@ -21,15 +21,17 @@ import type { MediaRef, MediaType, PickFailure, PickResult, RichText, RichTextPa
 import type { FocusManager } from "./focus.js";
 import { atTag, faceTag, formatBanDuration, isStickerElement } from "./gateway.js";
 import { needsMsgIds, type MessagingConfig, type PlatformOpsConfig } from "../config.js";
-import type { KnownChannel, MessageStore } from "./messages.js";
+import type { KnownChannel, MessageStore, WorldMessageRow } from "./messages.js";
 import type { ChannelNameResolver } from "./names.js";
 import type { NotifyManager } from "./notify.js";
 import type { OwnSendTracker } from "./ownsends.js";
 import type { RequestStore } from "./requests.js";
 import { channelKey as makeChannelKey, parseChannelKey } from "./channels.js";
-import { chatMessageEvidence, evidenceHash, conversationKind, conversationLabel, describeConversation, type ConversationContext } from "./conversation.js";
+import { chatMessageEvidence, chatSubjectId, evidenceHash, conversationKind, conversationLabel, describeConversation, type ConversationContext } from "./conversation.js";
 import { normalizeMsgId } from "./markers.js";
 import { executeSelfCommand } from "./self-commands.js";
+import { formatMessageTime, MESSAGE_ORDER_GUIDANCE, messageSequence } from "./message-order.js";
+import { firstName, formatMessageSender, messageAccountRelation } from "./identity.js";
 
 /** Explicit stable references retain interleaved text/media order without ordinal placeholders. */
 const INLINE_MEDIA = /<media\s+ref=(["'])(media:[1-9]\d*|gallery:[^"'<>]+)\1\s*\/>/g;
@@ -138,11 +140,12 @@ export class KoishiMessenger implements MessengerApi {
     if (!channels.length) return { text: "你翻了翻手机，最近没有任何频道有消息。", originEventIds: [] };
     const lines = await Promise.all(
       channels.map(async ({ key, latest }) => {
-        const time = formatTime(latest.timestamp);
-        const who = latest.self ? "本账号" : latest.username || latest.userId;
+        const time = formatMessageTime(latest);
+        const identity = await this.names.identity(key, { isDirect: latest.isDirect, guildId: latest.guildId });
+        const who = formatMessageSender(latest, identity);
         // 预览只做轻量替换，不触发解释器
         const kind = conversationKind(latest.isDirect, latest.channelId, latest.guildId);
-        return `- ${await this.names.display(key)}（${kind === "direct" ? "私聊" : kind === "group" ? "群聊" : "会话类型未知"}） [${time}] ${who}: ${truncate(stripPlaceholders(latest.content), 80)}`;
+        return `- ${await this.names.display(key)}（${kind === "direct" ? "私聊" : kind === "group" ? "群聊" : "会话类型未知"}）\n${identity.text}\n${this.notify.channelStatusText(key)}\n[${time}] ${who}: ${truncate(stripPlaceholders(latest.content), 80)}`;
       }),
     );
     return {
@@ -160,7 +163,8 @@ export class KoishiMessenger implements MessengerApi {
     await this.focus.focus(makeChannelKey(platform, channelId, selfId));
     const display = await this.names.display(makeChannelKey(platform, channelId, selfId));
     const rows = await this.store.channelMessages(platform, channelId, n, selfId);
-    if (!rows.length) return { text: `频道 ${display} 里还没有任何消息记录。`, originEventIds: [] };
+    const identity = await this.names.identity(makeChannelKey(platform, channelId, selfId), { isDirect: resolved.isDirect, guildId: rows.at(-1)?.guildId });
+    if (!rows.length) return { text: `频道 ${display} 里还没有任何消息记录。\n${identity.text}\n${this.notify.channelStatusText(makeChannelKey(platform, channelId, selfId))}`, originEventIds: [], experience: { agency: "observed", situation: "聊天频道", chat: { channelKey: makeChannelKey(platform, channelId, selfId), kind: "attention" } } };
 
     const attachments: MediaRef[] = [];
     const lines: string[] = [];
@@ -170,12 +174,13 @@ export class KoishiMessenger implements MessengerApi {
     const parts: RichTextPart[] = [];
     for (let idx = 0; idx < rows.length; idx++) {
       const row = rows[idx]!;
-      const who = row.self ? "本账号" : row.username || row.userId;
+      const messagePartsStart = parts.length;
+      const who = formatMessageSender(row, identity);
       const rendered = await this.renderer.render(row.content);
       if (rendered.attachments) attachments.push(...rendered.attachments);
       const msgTag = this.showMsgId && row.messageId ? ` (msg:${row.messageId})` : "";
-      const address = row.self ? "本账号发出的消息" : conversationLabel(row.conversation, selfId);
-      const header = `〔聊天记录 #${row.id} · ${formatTime(row.timestamp)}${msgTag}〕\n发送者：${who}（账号 ${JSON.stringify(row.userId)}；${address}）\n消息正文：\n`;
+      const address = conversationLabel(row.conversation, selfId);
+      const header = `〔聊天记录 #${row.id} · ${formatMessageTime(row)}${msgTag}〕\n发送者：${who}；${address}\n消息正文：\n`;
       const ending = "\n〔该条消息结束〕";
       lines.push(header + rendered.text + ending);
       // 行头作为 text 段，随后依序展开该消息的图文交错分段
@@ -193,10 +198,16 @@ export class KoishiMessenger implements MessengerApi {
         parts.push({ kind: "text", text: header + rendered.text });
       }
       parts.push({ kind: "text", text: ending + (idx < rows.length - 1 ? "\n" : "") });
+      const observed = chatMessageEvidence(row, selfId);
+      // Mark the exact renderer-created row segments. Text or pictures cannot forge
+      // this ownership, and later prepended control banners cannot shift its boundary.
+      for (let partIndex = messagePartsStart; partIndex < parts.length; partIndex++) {
+        parts[partIndex] = { ...parts[partIndex]!, observedMessage: { originEventIds: observed.originEventIds!, experience: observed.experience! } };
+      }
     }
     // 最后一条是自己发的：显式点破，防止 Bot 把自己的消息当成别人的来"接话"
-    let tail = rows[rows.length - 1]?.self
-      ? "\n（最后一条来自本账号，之后还没有其他人的新消息；账号身份本身不证明是你亲自发送）"
+    let tail = ["current", "connected", "historical"].includes(messageAccountRelation(rows.at(-1)!, identity))
+      ? "\n（最后一条来自你的连接账号，当前已保存的记录中，其后没有其他人的消息；账号身份本身不证明是你亲自发送）"
       : "";
     // 打开群聊页时自查禁言状态（像 QQ 顶部的禁言横幅）：
     // 即使禁言发生在插件离线期间（notice 没被捕获），Bot 也能在这里发现
@@ -212,13 +223,14 @@ export class KoishiMessenger implements MessengerApi {
         : `你打开了 ${display} 的聊天记录（最近 ${rows.length} 条）`;
     const channelKind = conversationKind(resolved.isDirect, channelId);
     const channelNote = channelKind === "group" ? "群聊 · 这是多人对话，关注或收到通知只表示看见，不表示每条都在找你。" : "私聊";
-    const heading = `${intro}（${channelNote}）。这是此刻可见记录的快照，按消息时间从早到晚排列；同一频道、同一记录编号或 msg 编号再次出现是回读，不是对方又说了一遍。更早看过的内容仍属于你的经历，不因这次只显示最近几条而作废。\n发送者、时间和对话指向是界面标注；只有“消息正文”内是对方的话，不要把昵称标头当成自己要发送的内容。\n`;
+    const heading = `${intro}（${channelNote}）。这是此刻可见记录的快照。${MESSAGE_ORDER_GUIDANCE}同一频道、同一记录编号或 msg 编号再次出现是回读，不是发送者又说了一遍。更早看过的内容仍属于你的经历，不因这次只显示最近几条而作废。\n${identity.text}\n${this.notify.channelStatusText(makeChannelKey(platform, channelId, selfId))}\n发送者、时间和对话指向是界面标注；“消息正文”内是各条发送者的原文，不要把昵称标头当成自己要发送的内容。\n`;
     return {
       text: `${heading}${lines.join("\n")}${tail}`,
       originEventIds: [...new Set(rows.flatMap(row => chatMessageEvidence(row, selfId).originEventIds ?? []))],
       experience: {
         ...chatMessageEvidence(rows[rows.length - 1]!, selfId).experience,
         subjectIds: [...new Set(rows.flatMap(row => chatMessageEvidence(row, selfId).experience?.subjectIds ?? []))],
+        chat: { channelKey: makeChannelKey(platform, channelId, selfId), kind: "attention" },
       },
       attachments: attachments.length ? attachments : undefined,
       parts: [{ kind: "text", text: heading }, ...parts, ...(tail ? [{ kind: "text" as const, text: tail }] : [])],
@@ -564,7 +576,7 @@ export class KoishiMessenger implements MessengerApi {
       if (target.isDirect) atSender = false;
       if (atSender) {
         const quoted = await this.store.findByMessageId(target.platform, target.channelId, replyTo, target.bot.selfId);
-        if (quoted && !quoted.self && quoted.userId) {
+        if (quoted && quoted.userId !== target.bot.selfId && quoted.userId) {
           add(h("at", { id: quoted.userId, name: quoted.username || undefined }), `@${quoted.username || quoted.userId}`);
           add(h.text(" "), " ");
           atNote = `，并 @ 了 ${quoted.username || quoted.userId}`;
@@ -633,7 +645,7 @@ export class KoishiMessenger implements MessengerApi {
         userId: target.bot.selfId, messageId, timestamp: confirmedAt! }));
       return { originEventIds: [...new Set(metadata.flatMap(item => item.originEventIds ?? []))],
         // Only the action runner knows whether a human or the character chose this.
-        experience: { episodeId: metadata[0]!.experience?.episodeId, situation: metadata[0]!.experience?.situation } };
+        experience: { episodeId: metadata[0]!.experience?.episodeId, situation: metadata[0]!.experience?.situation, chat: { channelKey, kind: "send", senderId: chatSubjectId(target.platform, target.bot.selfId), senderOwn: true } } };
     };
     for (let bi = 0; bi < batches.length; bi++) {
       const batch = batches[bi]!;
@@ -944,15 +956,14 @@ export class KoishiMessenger implements MessengerApi {
     }
 
     const selfId = this.findOnebot()?.selfId ?? "";
+    const identity = { platform: "onebot", selfId, accountIds: this.ctx.bots.filter(bot => bot.platform === "onebot").map(bot => bot.selfId) };
     const lines: string[] = [];
     const shown = nodes.slice(0, 50);
     for (const node of shown) {
       // NapCat/go-cqhttp 的节点形态：{ sender: {nickname}, time?, content|message: 消息段数组 }
       const sender = (node.sender ?? {}) as Record<string, unknown>;
-      const who =
-        selfId && String(sender.user_id ?? "") === String(selfId)
-          ? "本账号"
-          : String(sender.nickname ?? sender.card ?? node.nickname ?? sender.user_id ?? "?");
+      const who = formatMessageSender({ platform: "onebot", selfId, userId: String(sender.user_id ?? node.user_id ?? ""),
+        username: firstName(sender.card, sender.nickname, node.nickname), senderOrigin: "unknown" }, identity);
       const time =
         typeof node.time === "number" && node.time > 0 ? `[${formatTime(new Date(node.time * 1000))}] ` : "";
       const segments = (Array.isArray(node.content) ? node.content : Array.isArray(node.message) ? node.message : []) as Record<string, unknown>[];
@@ -1128,6 +1139,7 @@ export class KoishiMessenger implements MessengerApi {
         if (opts.nickname) params.nickname = opts.nickname;
         if (opts.signature) params.personal_note = opts.signature;
         await callOnebot(bot, "set_qq_profile", params);
+        if (opts.nickname) this.names.invalidateIdentity(bot.platform ?? "onebot", bot.selfId);
         if (opts.nickname) done.push(`昵称改成了「${opts.nickname}」`);
         if (opts.signature) done.push(`签名改成了「${opts.signature}」`);
       }
@@ -1176,6 +1188,7 @@ export class KoishiMessenger implements MessengerApi {
     } catch (err) {
       return `（修改群名片失败：${(err as Error).message ?? err}）`;
     }
+    this.names.invalidateIdentity(target.platform, target.bot.selfId, target.channelId);
     return `你在群 ${id} 里显示的名称改成了「${card}」。`;
   }
 
@@ -1636,7 +1649,8 @@ export class KoishiMessenger implements MessengerApi {
     msg: string,
     messageId?: string,
   ): Promise<void> {
-    await executeSelfCommand(this.ctx, target, msg, messageId);
+    const identity = await this.names.identity(makeChannelKey(target.platform, target.channelId, target.bot.selfId), { isDirect: target.isDirect });
+    await executeSelfCommand(this.ctx, target, msg, messageId, identity);
   }
 
   private findOnebot(): Bot | undefined {
@@ -1738,109 +1752,72 @@ export class KoishiMessenger implements MessengerApi {
     return { total, channels };
   }
 
-  /**
-   * 单个群的离线历史补拉：以群内已存消息的最大时间为水位线，向前翻 get_group_msg_history。
-   * 按 messageId 去重（含边界上同一秒实时入库的新消息）；早于水位线 / 未来的消息跳过。
-   * count=50/页，最多 4 页，按时间正序入库；取本页最小 message_seq（或响应的 next_seq）
-   * 继续往前翻，翻到水位线以内、页不满或 seq 不再递减时终止。
-   */
+  /** Bounded overlap by platform IDs/sequence, never by the host clock. */
   private async syncGroupHistory(platform: string, channelId: string, accountId?: string): Promise<number> {
     const bot = accountId
       ? this.ctx.bots.find((b) => b.platform === platform && b.selfId === accountId && b.isActive)
       : this.findOnebot();
     if (!bot) return 0;
-
-    // 水位线：群内最后一条已存消息的时间（毫秒）；群还没有记录就不拉
-    const latest = await this.store.channelMessages(platform, channelId, 1, bot.selfId);
-    if (!latest.length) return 0;
-    const watermarkMs = latest[0]!.timestamp.getTime();
-    // 去重依据：该群已存的最近消息 id（也覆盖边界上同一秒实时入库的新消息）
-    const known = new Set<string>();
-    for (const row of await this.store.channelMessages(platform, channelId, 500, bot.selfId)) {
-      if (row.messageId) known.add(row.messageId);
-    }
-
+    const fence = this.store.captureLive();
+    const prior = await this.store.channelMessages(platform, channelId, 500, bot.selfId);
+    if (!prior.length) return 0;
+    const known = new Map(prior.filter(row => row.messageId).map(row => [row.messageId, row]));
     const params: Record<string, unknown> = { group_id: toIdValue(channelId), count: 50 };
-    const selfId = String(bot.selfId ?? "");
-    let added = 0;
+    const collected = new Map<string, Record<string, unknown>>();
     for (let page = 0; page < 4; page++) {
-      const data = ((await callOnebot(bot, "get_group_msg_history", params)) ?? {}) as {
-        messages?: unknown[];
-        next_seq?: number | string;
-      };
+      const data = ((await callOnebot(bot, "get_group_msg_history", params)) ?? {}) as { messages?: unknown[]; next_seq?: number | string };
       const messages = (Array.isArray(data.messages) ? data.messages : []) as Record<string, unknown>[];
       if (!messages.length) break;
-
-      const rows: { timeMs: number; msgId: string; seq: number; self: boolean; userId: string; username: string; content: string; conversation?: ConversationContext }[] = [];
-      let minSeq = Infinity;
-      let anyOlderThanWatermark = false;
+      let minSeq: bigint | undefined;
+      let overlap = false;
       for (const raw of messages) {
-        const timeMs = Number(raw.time ?? 0) * 1000;
-        if (timeMs > 0 && timeMs < watermarkMs) anyOlderThanWatermark = true;
-        const msgId = String(raw.message_id ?? "");
-        if (!msgId || known.has(msgId)) continue;
-        known.add(msgId);
-        if (timeMs <= 0 || timeMs < watermarkMs || timeMs > Date.now()) continue;
-        const seq = Number(raw.message_seq ?? 0);
-        if (Number.isFinite(seq) && seq > 0 && seq < minSeq) minSeq = seq;
-        const sender = (raw.sender ?? {}) as Record<string, unknown>;
-        const senderId = String(sender.user_id ?? "");
-        const self = !!selfId && senderId === selfId;
-        const username = self ? "（我）" : String(sender.card ?? sender.nickname ?? sender.user_id ?? "?");
-        let content = "";
-        let conversation: ConversationContext | undefined;
-        if (Array.isArray(raw.message)) {
-          content = await this.serializeRawSegments(raw.message as Record<string, unknown>[]);
-          conversation = rawGroupConversation(raw.message as Record<string, unknown>[]);
-        } else if (typeof raw.message === "string") {
-          content = raw.message;
-        } else if (Array.isArray(raw.content)) {
-          content = await this.serializeRawSegments(raw.content as Record<string, unknown>[]);
-          conversation = rawGroupConversation(raw.content as Record<string, unknown>[]);
-        } else if (typeof raw.content === "string") {
-          content = raw.content;
-        }
-        if (!content.trim()) continue;
-        rows.push({ timeMs, msgId, seq, self, userId: senderId, username, content, conversation });
+        const seq = messageSequence(raw.message_seq);
+        if (seq && (minSeq === undefined || BigInt(seq) < minSeq)) minSeq = BigInt(seq);
+        const id = String(raw.message_id ?? "");
+        if (!id) continue;
+        if (known.has(id)) overlap = true;
+        collected.set(id, raw);
       }
-
-      rows.sort((a, b) => a.timeMs - b.timeMs || a.seq - b.seq);
-      for (const r of rows) {
-        if (r.conversation?.reply?.messageId) {
-          const original = await this.store.findByMessageId(platform, channelId, r.conversation.reply.messageId, bot.selfId);
-          if (original?.userId) r.conversation.reply.userId = original.userId;
-        }
-        await this.store.store({
-          platform,
-          channelId,
-          selfId: bot.selfId,
-          guildId: "",
-          userId: r.userId,
-          username: r.username,
-          content: r.content,
-          timestamp: new Date(r.timeMs),
-          self: r.self,
-          messageId: r.msgId,
-          isDirect: false,
-          conversation: r.conversation,
-        });
-        added++;
-      }
-
-      // 本页已翻到水位线以内 → 前面的都更早，无需再翻
-      if (anyOlderThanWatermark) break;
-      // 页不满说明到底了
-      if (messages.length < 50) break;
-      const nextSeq = (() => {
-        const fromResp = Number(data.next_seq ?? 0);
-        if (Number.isFinite(fromResp) && fromResp > 0) return fromResp;
-        return Number.isFinite(minSeq) && minSeq < Infinity ? minSeq : 0;
-      })();
-      // seq 没有往前推进（与上一页相同）说明没有更早的消息了
-      if (nextSeq <= 0 || nextSeq === params.message_seq) break;
+      if (overlap || messages.length < 50) break;
+      const nextSeq = messageSequence(data.next_seq) ?? minSeq?.toString();
+      if (!nextSeq || (params.message_seq != null && BigInt(nextSeq) >= BigInt(String(params.message_seq)))) break;
       params.message_seq = nextSeq;
     }
-    return added;
+    const rawRows = [...collected.values()];
+    const allSequenced = rawRows.every(raw => messageSequence(raw.message_seq));
+    rawRows.sort((a, b) => {
+      if (allSequenced) return BigInt(String(a.message_seq)) < BigInt(String(b.message_seq)) ? -1 : BigInt(String(a.message_seq)) > BigInt(String(b.message_seq)) ? 1 : 0;
+      return Number(a.time ?? 0) - Number(b.time ?? 0);
+    });
+    const rows: Omit<WorldMessageRow, "id">[] = [];
+    for (const raw of rawRows) {
+      const msgId = String(raw.message_id);
+      // Retain overlapping rows as anchors, without rerendering their media or names.
+      const existing = known.get(msgId) ?? await this.store.findByMessageId(platform, channelId, msgId, bot.selfId);
+      if (existing) { rows.push(existing); continue; }
+      const timeMs = Number(raw.time ?? 0) * 1000;
+      if (!Number.isFinite(timeMs) || timeMs <= 0) continue;
+      const sender = (raw.sender ?? {}) as Record<string, unknown>;
+      const senderId = String(sender.user_id ?? raw.user_id ?? "");
+      const self = !!bot.selfId && senderId === bot.selfId;
+      let content = "";
+      let conversation: ConversationContext | undefined;
+      const body = raw.message ?? raw.content;
+      if (Array.isArray(body)) {
+        content = await this.serializeRawSegments(body as Record<string, unknown>[]);
+        conversation = rawGroupConversation(body as Record<string, unknown>[]);
+      } else if (typeof body === "string") content = body;
+      if (!content.trim()) continue;
+      if (conversation?.reply?.messageId) {
+        const original = await this.store.findByMessageId(platform, channelId, conversation.reply.messageId, bot.selfId);
+        if (original?.userId) conversation.reply.userId = original.userId;
+      }
+      rows.push({ platform, channelId, selfId: bot.selfId, guildId: "", userId: senderId,
+        username: firstName(sender.card, sender.nickname), content, timestamp: new Date(timeMs),
+        platformSequence: messageSequence(raw.message_seq), self, senderOrigin: "unknown", senderOwned: self ? true : null,
+        messageId: msgId, isDirect: false, conversation });
+    }
+    return this.store.importHistory(rows, fence);
   }
 
   // ---------- 内部 ----------
@@ -2002,19 +1979,24 @@ export class KoishiMessenger implements MessengerApi {
     messageId?: string,
     timestamp = new Date(),
   ): Promise<void> {
+    const ticket = this.store.captureReceipt(target.platform, target.channelId, target.bot.selfId, messageId ?? "", timestamp);
+    const identity = await this.names.identity(makeChannelKey(target.platform, target.channelId, target.bot.selfId), { isDirect: target.isDirect });
     await this.store.store({
       platform: target.platform,
       channelId: target.channelId,
       selfId: target.bot.selfId,
       guildId: "",
       userId: target.bot.selfId ?? "self",
-      username: "（我）",
+      username: identity.displayName,
       content,
       timestamp,
+      timestampSource: "local-confirmed",
       self: true,
+      senderOrigin: "tool",
+      senderOwned: true,
       messageId: messageId ?? "",
       isDirect: target.isDirect,
-    });
+    }, ticket);
   }
 
   /** Best-effort bookkeeping may add a warning, but can never turn a confirmed send into failure. */

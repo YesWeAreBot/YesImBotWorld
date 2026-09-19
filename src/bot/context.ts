@@ -3,7 +3,7 @@ import { appendJsonLine } from "../jsonl.js";
 import type { WorldFiles } from "../files.js";
 import type { ChatMessage, ChatToolDef, ContentPart } from "../llm/chat.js";
 import type { AttachmentLoadFn } from "../media/parts.js";
-import { BOT_PROMPT_DEFAULTS, type Prompts } from "../prompts.js";
+import { BOT_PROMPT_DEFAULTS, CHAT_ACCOUNTS_NOTICE_PREFIX, CHAT_IDENTITY_GUIDANCE, WORLD_PERCEPTION_SCOPE, type Prompts } from "../prompts.js";
 import type {
   BotEvent,
   CompressionResult,
@@ -15,6 +15,14 @@ import type {
 import { renderToolsText } from "./tools.js";
 import { canonicalizeArgs } from "./repeatGuard.js";
 import { mediaOpen, mediaPart, mediaText, richPartsText } from "../media/presentation.js";
+
+// Exact program-authored legacy receipts only; ordinary dialogue about sleep stays intact.
+const LEGACY_REST_INTERRUPTS = new Set([
+  "动静把你从小憩中弄醒了。", "一点动静把你从浅睡里惊醒了。", "你被一阵动静叫醒，睁开了眼。",
+  "外面有了响动，你迷迷糊糊醒了过来。", "你被某个动静从打盹里拽了出来。", "睡意被打断，你重新清醒过来。",
+  "什么东西响了一下，你从浅睡中转醒。", "你迷迷糊糊睁眼，原来是旁边有动静。", "一阵声响惊动了你，小憩到此为止。",
+  "你从半睡半醒中被拉回现实。",
+]);
 
 export interface CompressionSnapshot {
   entries: StreamEntry[];
@@ -245,6 +253,23 @@ export class BotContext {
   timeInfo = "";
   /** 聊天账号列表提供者（service 注入）：只含 platform:id，保持前缀稳定 */
   accountsProvider: (() => string) | null = null;
+
+  /** Append account changes at a generation boundary; never rebuild a frozen prefix. */
+  async refreshChatAccounts(worldTime: number): Promise<BotEvent | undefined> {
+    if (!this.accountsProvider) return;
+    return this.mutate(async () => {
+      const accounts = this.accountsProvider!().trim();
+      const content = CHAT_ACCOUNTS_NOTICE_PREFIX +
+        (accounts ? `现在供你使用的聊天账号（平台:账号）：${accounts}。` : "目前没有确认可用的聊天账号；这不否定旧记录中的历史归属。") +
+        "当前频道的群名片以该频道身份说明为准；账号或名片变化不改写历史，也不证明某条消息由你自主发送。";
+      const previous = [...this.stream].reverse().find(entry => entry.kind === "event" && entry.event.source === "system" && entry.event.content.startsWith(CHAT_ACCOUNTS_NOTICE_PREFIX));
+      if (previous?.kind === "event" && previous.event.content === content) return;
+      const event: BotEvent = { id: this.nextEventId(), source: "system", worldTime, originEventIds: [], content };
+      await this.appendEntry({ kind: "event", event });
+      await this.persistPinnedUnlocked();
+      return event;
+    });
+  }
   /** 常驻 Bot 名字提供者：只在建立新固定前缀时读取。 */
   botNameProvider: (() => string) | null = null;
   /** wait 工具被移除（service 按 bot.disableWait 注入）：行为准则不再提及等待 */
@@ -302,7 +327,7 @@ export class BotContext {
     return [
       ...(original ? ["# 最初的你\n" + original] : []),
       "# 你是谁\n" + (this.pinned.persona.trim() || "（角色设定缺失）"),
-      ...(botName ? [`# 你的名字\n你叫「${botName}」。群里仅提到同名不证明在和你说话，结合 @ 的账号、引用对象与上下文判断。`] : []),
+      ...(botName ? [`# 你的名字\n你叫「${botName}」。这是角色姓名，可以与账号昵称及各群的群名片不同。群里仅提到同名不证明在和你说话，结合 @ 的账号、引用对象与上下文判断。`] : []),
       c.constitutionHead +
         "\n\n" +
         (nativeToolCalls ? c.outputFormatNative : c.outputFormatText) +
@@ -316,9 +341,7 @@ export class BotContext {
         ? [
             "# 你的聊天账号\n" +
               accounts +
-              (botName
-                ? `\n消息里的 <at id=\"…\"/> 指向这些 id 时，那是别人在 @ 你、在叫「${botName}」（你的名字）——这是直接提及本账号的信号，是否需要回应仍看语境；说话人标为「你自己」的消息来自你的账号，不一定由你亲自发送；不要当成他人新消息或自动纳入自己的经历。`
-                : `\n消息里的 <at id=\"…\"/> 指向这些 id、或说话人标为「你自己」时，那都是你——被 @ 是别人在叫你，「你自己」只标识账号，不证明你亲自说过这些话。`),
+              `\n消息里的 <at id=\"…\"/> 在同一平台指向这些账号时，是直接提及你的账号的信号，是否回应仍看语境。后续账号归属更新及频道身份说明优先。\n${CHAT_IDENTITY_GUIDANCE}`,
           ]
         : []),
       "# 基础工具说明（以当前展开和有效的工具为准）\n" + this.pinned.toolsText,
@@ -488,10 +511,20 @@ export class BotContext {
   /** 供压缩用：序列化当前工作窗口（把连续重复的工具调用折叠成一条汇总，避免千篇一律的历史占满压缩输入） */
   serializeForCompression(entries: StreamEntry[] = this.stream): string {
     const lines: string[] = [];
+    const calls = new Map(entries.flatMap(entry => entry.kind === "tool_call" ? [[entry.call.id, entry.call] as const] : []));
     let i = 0;
     while (i < entries.length) {
       const entry = entries[i]!;
       if (entry.kind !== "tool_call") {
+        const call = entry.event.refToolCallId ? calls.get(entry.event.refToolCallId) : undefined;
+        if (entry.event.source === "system" && call?.name === "rest" && LEGACY_REST_INTERRUPTS.has(entry.event.content)) {
+          // Read projection only: the original event and frozen Bot prefix stay byte-identical.
+          lines.push(BotContext.renderEventLine({ ...entry.event, contextText: undefined,
+            content: `（旧版休息计时中断回执：从调用到本回执经过 ${Math.max(0, entry.event.worldTime - call.issuedAt).toFixed(1)} TU。旧版自动写入了睡醒叙述，它不是身体观测，不能据此认定入睡、醒来或恢复体力。）`,
+          }));
+          i++;
+          continue;
+        }
         lines.push(BotContext.renderEventLine(entry.event));
         i++;
         continue;
@@ -652,6 +685,7 @@ function narrativeContextText(event: BotEvent, toolName?: string): string | unde
     const body = typeof observation.narrative === "string" ? observation.narrative : observation.scene?.text ?? parsed.scene?.text;
     if (typeof body !== "string" || !body.trim()) return undefined;
     const sections = controlNote ? [controlNote] : [];
+    sections.push(WORLD_PERCEPTION_SCOPE);
     if (parsed.recovered === true) sections.push("（以下是已保存处境的回读，不是新发生的行动。）");
     if (parsed.action && typeof parsed.action === "object") {
       if (typeof parsed.action.intent === "string" && parsed.action.intent.trim()) sections.push(`本次操作：${parsed.action.intent}`);

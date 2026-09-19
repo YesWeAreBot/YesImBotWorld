@@ -17,6 +17,7 @@ import smokeLayout from './webui-smoke-layout.mjs';
 import smokeNotes from './webui-smoke-notes.mjs';
 import smokeNarrative from './webui-smoke-narrative.mjs';
 import smokeRegulation from './webui-smoke-regulation.mjs';
+import smokeLlmConfig from './webui-smoke-llm-config.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const children = [];
@@ -99,7 +100,7 @@ try {
   assert.ok(await evaluate("document.querySelector('.studio-avatar img').alt.includes('样本平台账号')"));
   const helpers = { evaluate, wait, assert, navigate, page };
   const regulationOnly = process.env.STUDIO_SMOKE_ONLY_REGULATION === '1';
-  if (regulationOnly) console.log('PASS', await smokeRegulation(helpers));
+  if (regulationOnly) { console.log('PASS', await smokeRegulation(helpers)); console.log('PASS', await smokeLlmConfig(helpers)); }
   if (!regulationOnly) {
   const routes = ['overview', 'world', 'growth', 'devices', 'player', 'live', 'debug', 'usage', 'state', 'crossing', 'config', 'prompts', 'gallery', 'media', 'data', 'visitors'];
   for (const width of [1440, 768, 375]) {
@@ -154,8 +155,8 @@ try {
   await navigate('config');
   await evaluate("gotoCfg('bot')");
   await wait("document.querySelector('[data-config-group=\"bot.growth\"]')");
-  assert.equal(await evaluate("document.querySelectorAll('[data-config-group=\"bot.growth\"] input').length"), 6);
-  assert.ok(await evaluate("!document.querySelector('[data-config-group=\"bot.growth\"]').closest('details') && Array.from(document.querySelectorAll('[data-config-group=\"bot.growth\"] input')).every(input=>input.getClientRects().length && input.getAttribute('aria-label'))"), 'Growth configuration is directly discoverable and accessible');
+  assert.equal(await evaluate("document.querySelectorAll('[data-config-group=\"bot.growth\"] > .body > .fld input, [data-config-group=\"bot.growth\"] > .body > .sw-row input').length"), 6);
+  assert.ok(await evaluate("!document.querySelector('[data-config-group=\"bot.growth\"]').closest('details') && Array.from(document.querySelectorAll('[data-config-group=\"bot.growth\"] > .body > .fld input, [data-config-group=\"bot.growth\"] > .body > .sw-row input')).every(input=>input.getClientRects().length && input.getAttribute('aria-label'))"), 'Growth configuration is directly discoverable and accessible');
   await evaluate("window.__originalGrowthConfig=JSON.parse(JSON.stringify(cfgCache.bot.growth));document.querySelector('[data-config-path=\"bot.growth.enabled\"]').click();[['minEpisodes',5],['reviewIntervalMs',180000],['reviewTimeoutMs',60000],['maxInputChars',26000],['recallCount',2]].forEach(([key,value])=>{const input=document.querySelector('[data-config-path=\"bot.growth.'+key+'\"]');input.value=value;input.dispatchEvent(new Event('change',{bubbles:true}))});");
   assert.ok(await evaluate('cfgDirty && cfgCache.bot.growth.recallCount===2 && cfgCache.bot.growth.reviewIntervalMs===180000'));
   await evaluate("document.querySelector('.cfg-savebar .primary').click()");
@@ -185,6 +186,7 @@ try {
   console.log('PASS', await smokeCommands(helpers));
   console.log('PASS', await smokeNarrative(helpers));
   console.log('PASS', await smokeRegulation(helpers));
+  console.log('PASS', await smokeLlmConfig(helpers));
   }
   assert.deepEqual(errors, [], 'Browser exceptions or unexpected external requests');
   if (process.env.STUDIO_SCREENSHOT_DIR) {

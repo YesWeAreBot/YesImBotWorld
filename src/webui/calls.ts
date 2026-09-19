@@ -56,6 +56,7 @@ export class CallStore {
   private directory = "";
   private temporary = false;
   private storageWarning?: string;
+  private owner?: symbol;
   constructor(
     private readonly maxBytes = 32 * 1024 * 1024,
     private readonly maxCallBytes = 8 * 1024 * 1024,
@@ -63,10 +64,15 @@ export class CallStore {
     private readonly notify: (meta: CallMeta, debugId?: number) => number | undefined = () => undefined,
   ) {}
 
-  /** Called before agents start; a plugin reload restores its own history from this directory. */
-  init(directory: string): void {
+  /**
+   * Called before agents start. Release the returned lifetime, rather than calling
+   * dispose(), when an asynchronously stopping service can overlap its replacement.
+   */
+  init(directory: string): () => void {
     const resolved = path.resolve(directory);
-    if (this.directory === resolved && !this.temporary) return;
+    // Even a same-directory reload must claim a new lifetime: the previous
+    // service can still be awaiting shutdown when its replacement reaches here.
+    if (this.directory === resolved && !this.temporary) return this.claim();
     this.dispose();
     this.directory = resolved;
     this.temporary = false;
@@ -109,6 +115,12 @@ export class CallStore {
       for (const entry of restored) { this.calls.set(entry.meta.callId, entry); this.checkpoint(entry, true); }
       this.enforceHistory();
     } catch (error) { this.storageWarning = this.warning(error); }
+    return this.claim();
+  }
+
+  private claim(): () => void {
+    const owner = this.owner = Symbol("call-store-lifetime");
+    return () => { if (this.owner === owner) this.dispose(); };
   }
 
   begin(input: { source: string; model: string; url: string; requestBody: string; unicodeRepairedStrings?: number }): string {
@@ -215,6 +227,7 @@ export class CallStore {
 
   /** Flush and release descriptors on plugin shutdown; persistent history stays on disk. */
   dispose(): void {
+    this.owner = undefined;
     for (const entry of this.calls.values()) {
       if (!terminal(entry.meta)) {
         entry.meta.status = "cancelled"; entry.meta.endedAt = Date.now(); entry.meta.updatedAt = entry.meta.endedAt;

@@ -58,9 +58,13 @@ export interface PickFailure {
 }
 
 /** RichText 的一个有序分段：文本段 或 原生媒体段（图文混排按此顺序铺开） */
-export type RichTextPart =
+export type RichTextPart = (
   | { kind: "text"; text: string }
-  | { kind: "media"; ref: MediaRef; name?: string; summary?: string; sticker?: boolean; marker: string };
+  | { kind: "media"; ref: MediaRef; name?: string; summary?: string; sticker?: boolean; marker: string }
+) & {
+  /** Program-assigned message ownership; renderers never infer this from message-body delimiters. */
+  observedMessage?: { originEventIds: string[]; experience: ExperienceMetadata };
+};
 
 /** Facts about an already delivered experience, never access to hidden controller intent. */
 export interface ExperienceMetadata {
@@ -72,6 +76,14 @@ export interface ExperienceMetadata {
   outcome?: "completed" | "failed" | "unknown";
   situation?: string;
   subjectIds?: string[];
+  /** Program-verified visible conversation scope; anonymous device signals must omit it. */
+  chat?: {
+    channelKey: string;
+    kind: "message" | "notice" | "attention" | "send";
+    /** Stable chatSubjectId, never a display name. */
+    senderId?: string;
+    senderOwn?: boolean;
+  };
   /** Roots of messages explicitly quoted by this delivered message; never inferred from proximity. */
   responseToRoots?: string[];
   /** Only an observed opportunity can support a decision not to repeat a habit. */
@@ -113,6 +125,8 @@ export interface PhoneStatus {
 
 export interface BotEvent {
   id: string;
+  /** A read-only message slice of an already delivered parent, not a newly performed action. */
+  perceptionOf?: { eventId: string; partIndexes: number[] };
   experience?: ExperienceMetadata;
   growthReferences?: { claimId: string; recordId: string }[];
   /** Original perceived causes, for evidence deduplication (never a global event access grant). */

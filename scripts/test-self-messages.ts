@@ -1,3 +1,4 @@
+import { ChannelNameResolver } from "../src/koishi/names.js";
 /** Real local Koishi sessions, command permissions and MessageEncoder lifecycle.
  * Transport is an in-memory encoder; no network, production files or model calls. */
 import assert from "node:assert/strict";
@@ -57,7 +58,7 @@ async function main() {
   const gateway = new Gateway(app, { ...cfg.messaging, externalSelfMessages: "event" }, cfg.platformOps,
     store, {} as never, { render: async (text: string) => ({ text }) } as never,
     { isFocused: (key: string) => focusedKeys.has(key) } as never, { isNotifyChannel: () => false } as never,
-    { down: false }, {} as never, tracker, { display: async (key: string) => key } as never, () => null,
+    { down: false }, {} as never, tracker, new ChannelNameResolver(app, store), () => null,
     { notify(value) { deliveryOrder.push({ kind: "incoming", content: value.text }); }, channelActivity() {}, async selfMessage(key, rich, id) { const content = rich.text; await deliveryDelays.get(content); selfEvents.push({ key, content, id }); deliveryOrder.push({ kind: "self", content }); } });
   const drain = async () => {
     for (let i = 0; i < 5; i++) {
@@ -207,12 +208,12 @@ async function main() {
     await drain();
     assert.ok(deliveryOrder.slice(ownRecallStart).some(event => /账号.*撤回/.test(event.content)));
     assert.ok(deliveryOrder.slice(ownRecallStart).every(event => !/你撤回了/.test(event.content)));
-    assert.ok(deliveryOrder.slice(ownRecallStart).some(event => /本账号的一条消息被撤回了/.test(event.content)), "missing group operator metadata must not be attributed to the author");
+    assert.ok(deliveryOrder.slice(ownRecallStart).some(event => /当前会话使用的你的账号.*的一条消息被撤回了/.test(event.content)), "missing group operator metadata must not be attributed to the author");
     const explicitSelfRecall = bot.session({ type: "message-deleted", channel: { id: "group" }, user: { id: "account" },
       message: { id: "another-account-recall" } });
     (explicitSelfRecall as any).operatorId = "account";
     bot.dispatch(explicitSelfRecall); await drain();
-    assert.ok(deliveryOrder.slice(ownRecallStart).some(event => /你的账号撤回了一条消息/.test(event.content)), "an account operator is observable but is not proof of the character's voluntary intent");
+    assert.ok(deliveryOrder.slice(ownRecallStart).some(event => /当前会话使用的你的账号.*撤回了该账号的一条消息/.test(event.content)), "an account operator is observable but is not proof of the character's voluntary intent");
     focusedKeys.delete("fixture@account:group");
 
     // Other login devices arrive as account messages, without any local send call.
@@ -239,19 +240,25 @@ async function main() {
     // Actual Koishi authority and command aliases, with a real originating message ID.
     await app.database.createUser("fixture", "account", { authority: 1 });
     let invoked = 0, management = 0, protectedCount = 0;
+    let expectedCommandName = "真实群名片";
     app.command("fixture_echo <value:text>", { authority: 1 }).action(({ session }, value) => {
       invoked++; assert.equal(session!.userId, "account");
       assert.equal(session!.messageId, "sent-command-id");
+      assert.equal(session!.username, expectedCommandName);
+      assert.equal(session!.event.member?.nick, expectedCommandName === "真实群名片" ? "真实群名片" : undefined);
       return `command result ${value}`;
     });
     app.command("fixture_admin", { authority: 4 }).action(() => { protectedCount++; return "forbidden"; });
     app.command("world.status", { authority: 0 }).alias("hidden_world_alias").action(() => { management++; return "private world"; });
     app.command("fixture_nested", { authority: 0 }).action(({ session }) => session!.execute("hidden_world_alias"));
     const target = { bot, platform: "fixture", channelId: "group", isDirect: false };
-    await executeSelfCommand(app, target, "fixture_echo hello", "sent-command-id");
+    await executeSelfCommand(app, target, "fixture_echo hello", "sent-command-id", {
+      platform: "fixture", selfId: "account", channelId: "group", displayName: "真实群名片", source: "group_card",
+    });
     await drain();
     assert.equal(invoked, 1);
     assert.equal(selfEvents.filter(event => event.content === "command result hello").length, 1);
+    expectedCommandName = "昵称未知";
     await executeSelfCommand(app, target, "/fixture_echo prefix is not bare", "sent-command-id");
     assert.equal(invoked, 1);
     await executeSelfCommand(app, target, "fixture_admin");
@@ -260,6 +267,9 @@ async function main() {
     await executeSelfCommand(app, target, "hidden_world_alias");
     await executeSelfCommand(app, target, "fixture_nested");
     await executeSelfCommand(app, target, "fixture_echo $(hidden_world_alias)", "sent-command-id");
+    await executeSelfCommand(app, target, "fixture_echo no fake card", "sent-command-id", {
+      platform: "fixture", selfId: "someone-else", channelId: "group", displayName: "不是本账号的名片", source: "group_card",
+    });
     await drain();
     assert.equal(management, 0);
     (gateway as any).selfCapture.dispose();

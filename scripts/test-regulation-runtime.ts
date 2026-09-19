@@ -63,7 +63,7 @@ async function lifecycleAndLearning() {
   const f = await fixture(true), prefix = await f.context.toChatMessages("T10"), before = JSON.stringify(f.context.stream);
   await f.runtime.choose(proposal, tools, scope);
   assert.deepEqual(f.requests[0].freshEvidence, [], "enabling starts at a baseline, without replaying all historical stimuli");
-  assert.ok(f.requests[0].recentContext.some((event: any) => event.id === "old"));
+  assert.ok(f.requests[0].recentContext.some((event: any) => event.contextEvidenceId === "old"));
   assert.equal(JSON.stringify(f.context.stream), before, "prediction alone does not append a performed action");
   const initialNotices = await f.runtime.drain(); assert.equal(initialNotices.length, 1);
   const afterNotice = await f.context.toChatMessages("T11");
@@ -223,6 +223,70 @@ async function delayedSocialOutcome() {
   assert.deepEqual((await timeout.view()).state.learning, {}, "expiration of an unconfirmed response does not fabricate rejection or failed reward");
 }
 
+async function replyBeforeUnsampledReceipt() {
+  const f = await fixture(), send = { name: "send", arguments: { msg: "一起散步吗？", id: "mock:private:alice" } };
+  f.setReply(payload => ({ ...response(payload), candidates: [forecast("proposed", payload.proposed.name === "send" ? { settlement: "reply" } : {})] }));
+  const invitation = await f.runtime.choose(send, tools, scope); await bind(f, invitation, "tc_unsampled_invitation");
+  // Oldest two fill the recovery quota; the send receipt sits in the middle
+  // and cannot be among the six most recent perceptions either.
+  for (let i = 0; i < 3; i++) await f.deliver(perception(`older-pending-${i}`));
+  await f.deliver(perception("unsampled-send-receipt", { source: "tool", refToolCallId: "tc_unsampled_invitation", originEventIds: ["actual-unsampled-invite"],
+    experience: { agency: "self", outcome: "completed" } }));
+  f.advance();
+  for (let i = 0; i < 6; i++) await f.deliver(perception(`recent-pending-${i}`, { worldTime: f.clock.now() }));
+  f.advance();
+  await f.deliver(perception("new-explicit-answer", { source: "koishi", worldTime: f.clock.now(), content: "对先前邀请的明确回复：好啊。", originEventIds: ["actual-explicit-answer"],
+    experience: { agency: "observed", outcome: "unknown", responseToRoots: ["actual-unsampled-invite"] } }));
+  await f.runtime.choose(proposal, tools, scope);
+  const payload = f.requests.at(-1), view = await f.view();
+  assert.equal(payload.freshEvidence.some((event: any) => event.id === "unsampled-send-receipt"), false);
+  assert.equal(payload.freshEvidence.some((event: any) => event.id === "new-explicit-answer"), true);
+  assert.equal(payload.pendingExpectations.length, 1);
+  const learned = Object.values(view.state.learning) as any[];
+  assert.equal(learned.length, 1, "program-confirmed delivery must enable learning even before its receipt enters the sampled appraisal batch");
+  assert.deepEqual(learned[0].last.rootIds, ["actual-explicit-answer"]);
+  assert.equal(view.pendingExpectations, 0);
+  const durable = JSON.stringify(view.state);
+  await f.reload(); assert.equal(JSON.stringify((await f.view()).state), durable);
+  await f.runtime.choose(proposal, tools, scope);
+  assert.equal((Object.values((await f.view()).state.learning)[0] as any).samples, 1, "later receipt appraisal cannot restore an already settled expectation or learn from the same reply twice");
+  assert.equal((await f.view()).pendingExpectations, 0);
+}
+
+async function delayedImpulseAndBody() {
+  const immediate = await fixture(), delayed = await fixture();
+  for (const f of [immediate, delayed]) {
+    f.cfg.regulation.sexualResponseEnabled = true;
+    await f.deliver(perception("body-and-connection", { content: "先前发生的明确身体感知；其中可靠联系的影响仍然持续。" }));
+    f.setReply(payload => ({ appraisals: payload.freshEvidence.map((event: any) => ({ eventIds: [event.id], needEffects: { connection: .2 },
+      salience: 1, novelty: 1, control: 1, uncertainty: 1, physiology: { stimulation: 1, inhibition: 0 }, explanation: "根据实际感知评价，联系的影响仍有持续依据。" })), candidates: [forecast()] }));
+  }
+  delayed.advance(300); // 300 TU × 60 world seconds = five world hours.
+  await immediate.runtime.choose(proposal, tools, scope); await delayed.runtime.choose(proposal, tools, scope);
+  const live = (await immediate.view()).state, old = (await delayed.view()).state;
+  assert.deepEqual(old.needs, live.needs, "delayed appraisal can still update an explicitly persistent need effect");
+  assert.equal(live.physiology.phase, "peak");
+  assert.equal(old.physiology.phase, "idle"); assert.equal(old.physiology.peaks, 0, "a five-hour-old body stimulus cannot create a new present peak");
+  for (const name of Object.keys(live.modulators)) {
+    assert.ok(Math.abs(old.modulators[name].phasic) < 1e-12, "historical fast pulses must have decayed, without erasing the persistent need result");
+    assert.ok(Math.abs((old.modulators[name].tonic - .5) - (live.modulators[name].tonic - .5) / 32) < 1e-12, "delayed tonic change uses the existing one-hour half-life");
+  }
+  const beforeReload = JSON.stringify(old);
+  await delayed.reload(); assert.equal(JSON.stringify((await delayed.view()).state), beforeReload, "persisted observedAt makes delayed impulse filtering deterministic on replay");
+
+  const learning = await fixture();
+  const chosen = await learning.runtime.choose(proposal, tools, scope); await bind(learning, chosen, "tc_old_result");
+  await learning.deliver(perception("old-confirmed-result", { refToolCallId: "tc_old_result", experience: { agency: "self", outcome: "failed" } }));
+  learning.advance(300);
+  learning.setReply(payload => ({ appraisals: payload.freshEvidence.map((event: any) => ({ eventIds: [event.id], needEffects: {},
+    salience: 0, novelty: 0, control: .5, uncertainty: .5, explanation: "实际尝试失败，没有获得预测的进展。" })), candidates: [forecast()] }));
+  await learning.runtime.choose(proposal, tools, scope);
+  const learned = await learning.view();
+  assert.equal(Object.keys(learned.state.learning).length, 1, "late confirmed outcomes still correct learned expectations");
+  assert.ok(Math.abs(learned.state.modulators.dopamine.phasic) < 1e-12, "the old prediction-error pulse must not restart at full strength");
+  const durable = JSON.stringify(learned.state); await learning.reload(); assert.equal(JSON.stringify((await learning.view()).state), durable);
+}
+
 async function fallbackCancellationAndStaleness() {
   const f = await fixture(); await f.deliver(perception("waiting"));
   f.setReply(() => { throw Error("isolated 400"); });
@@ -254,7 +318,7 @@ async function fallbackCancellationAndStaleness() {
 }
 
 async function main() {
-  try { await lifecycleAndLearning(); await agencyAndUnknown(); await advisoryRetainsExpectation(); await bindingIntegrity(); await replyIdentityScope(); await delayedSocialOutcome(); await fallbackCancellationAndStaleness();
+  try { await lifecycleAndLearning(); await agencyAndUnknown(); await advisoryRetainsExpectation(); await bindingIntegrity(); await replyIdentityScope(); await delayedSocialOutcome(); await replyBeforeUnsampledReceipt(); await delayedImpulseAndBody(); await fallbackCancellationAndStaleness();
     console.log("PASS regulation runtime: baseline/fresh roots, causal choice, bind/outcome learning, durable KV/restart/archive, agency/unknown/failure, advisory/binding integrity, scoped delayed quoted replies/expiry and cancellation/fallback."); }
   finally { await Promise.all(directories.map(base => fs.rm(base, { recursive: true, force: true }))); }
 }

@@ -33,7 +33,7 @@ var InnerRegulation = (function () {
                 var next = JSON.stringify(result);
                 if (next === stamp) return;
                 value = result; stamp = next;
-                badge.textContent = !value.enabled ? '未启用' : value.decisionEnabled === false ? '观察模式' : '运行中';
+                badge.textContent = !value.enabled ? '未启用' : value.decisionEnabled === false ? '观察模式' : '已启用';
                 badge.className = 'studio-badge' + (value.enabled ? '' : ' muted');
                 if (detail.open) draw();
             }).catch(function (error) { if (alive) { stamp = null; badge.textContent = '暂时不可用'; Studio.error(body, error, refresh); } }).finally(function () { busy = false; });
@@ -57,6 +57,7 @@ var InnerRegulation = (function () {
             });
             body.append(el('h3', { text: '当前需要' }), el('p', { cls: 'regulation-note', text: '缺口范围 0–1；越高表示越需要满足，不代表某种情绪。' }), needGrid);
             body.appendChild(el('div', { cls: 'regulation-metrics' }, [metric('可控制程度', number(state.control)), metric('结果不确定性', number(state.uncertainty)), metric('已学习的处境与行动', String(Number.isFinite(value.learningCount) ? value.learningCount : Object.keys(state.learning || {}).length)), metric('等待实际结果', Number.isFinite(value.pendingExpectations) ? String(value.pendingExpectations) : '未记录', '包含执行结果或明确回应')]));
+            if (Number.isFinite(value.pendingEvidence)) body.appendChild(metric('待评价经历', String(value.pendingEvidence), '尚未得到有效评价，保留等待后续处理'));
             drawPlot(state);
             drawHistory();
             drawLearning(state);
@@ -94,7 +95,7 @@ var InnerRegulation = (function () {
             body.appendChild(plot);
             body.appendChild(el('p', { cls: 'regulation-note', text: '曲线使用已记录时点；横向按记录排列，点按可读世界时间。背景与适应范围 0–1，脉冲范围 −1–1。' }));
         }
-        function recordType(entry) { return { decision: '行动选择', appraisal: '经历评价', learning: '预期更新', outcome: '结果学习', failure: '保持原有路径', fallback: '保持原有路径', error: '评价未完成，沿用原候选' }[entry.type] || '调节记录'; }
+        function recordType(entry) { if (entry.type === 'decision' && !entry.selectedId && entry.rejections?.length) return entry.appraisals?.length ? '经历已评价，沿用原候选' : entry.unresolvedEvidenceIds?.length ? '经历仍待评价，沿用原候选' : '评价提案未通过'; return { decision: '行动选择', appraisal: '经历评价', learning: '预期更新', outcome: '结果学习', failure: '保持原有路径', fallback: '保持原有路径', error: '评价未完成，沿用原候选' }[entry.type] || '调节记录'; }
         function drawHistory() {
             var records = (value.recent || []).filter(function (entry) { return entry.type !== 'tick'; }).slice().sort(function(a,b){return b.at-a.at;}).slice(0, 30);
             body.appendChild(el('h3', { text: '选择与实际经历' }));
@@ -106,6 +107,14 @@ var InnerRegulation = (function () {
             panel.append(el('h4', { text: recordType(item) }), el('small', { text: time(item.at) }));
             if (item.summary) panel.appendChild(el('p', { text: item.summary }));
             if (item.reason) panel.appendChild(el('p', { text: item.reason }));
+            if (item.rejections?.length) {
+                var accepted = (item.effects || []).filter(function (effect) { return effect.applied; }).length;
+                var resultText = accepted ? '本次已更新 ' + accepted + ' 项经历影响' : item.appraisals?.length ? '本次保留 ' + item.appraisals.length + ' 项有效评价，未新增经历影响' : item.unresolvedEvidenceIds?.length ? '本次经历仍待有效评价，未更新其影响' : '本次未新增经历评价';
+                panel.appendChild(el('p', { cls: 'regulation-note regulation-validation-result', text: resultText + '；以下 ' + item.rejections.length + ' 项提案未通过校验。' + (accepted ? '有效评价仍然保留。' : '') }));
+                var sections = { appraisals: '经历评价', candidates: '候选预测', appraisal: '经历评价', candidate: '候选预测' };
+                panel.appendChild(el('ul', { cls: 'regulation-rejections' }, item.rejections.map(function (rejection) { return el('li', { text: (sections[rejection.section] || rejection.section) + ' ' + (rejection.index + 1) + '：' + rejection.reason + (rejection.eventIds?.length ? '（关联 ' + rejection.eventIds.length + ' 项经历）' : '') }); })));
+            }
+            if (item.unresolvedEvidenceIds?.length) panel.appendChild(el('p', { cls: 'regulation-note regulation-unresolved', text: '本次仍有 ' + item.unresolvedEvidenceIds.length + ' 项经历未得到有效评价，保留在待处理队列中，不视作已评价。' }));
             if (item.candidates?.length) {
                 panel.appendChild(el('p', { cls: 'regulation-note', text: '选择表示提交到执行路径的意图；是否完成以实际结果为准。分数用于同一次比较，不代表快乐程度。' }));
                 item.candidates.forEach(function (scored) {

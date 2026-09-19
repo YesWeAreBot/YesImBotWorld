@@ -1,3 +1,4 @@
+import { ChannelNameResolver } from "../src/koishi/names.js";
 /**
  * 完全离线的权限、账号路由、设备与 MCP 回归测试。
  * node_modules/.bin/esbuild scripts/test-platform-regressions.ts --bundle --platform=node --format=cjs --alias:koishi="$PWD/node_modules/koishi/lib/index.cjs" --outfile=/tmp/yibw-platform-regressions.cjs
@@ -149,7 +150,7 @@ async function accounts(root: string) {
   const renderer = { render: async (text: string) => ({ text }) };
   const focus = { focus: async () => {}, isFocused: () => false };
   const notify = new NotifyManager(path.join(root, "notify.json"), ["fixture:private:peer"], false);
-  const messenger = new KoishiMessenger(ctx, store, renderer as never, {} as never, {} as never, {} as never, null, focus as never, notify, cfg.platformOps, { ...cfg.messaging, coldChannelMsgs: 0, selfCommands: false }, {} as never, new OwnSendTracker(), { display: async (key: string) => key } as never, () => null);
+  const messenger = new KoishiMessenger(ctx, store, renderer as never, {} as never, {} as never, {} as never, null, focus as never, notify, cfg.platformOps, { ...cfg.messaging, coldChannelMsgs: 0, selfCommands: false }, {} as never, new OwnSendTracker(), new ChannelNameResolver(ctx, store), () => null);
   assert.equal((await messenger.resolveKey("fixture@b:private:peer") as any).key, "fixture@b:private:peer");
   await messenger.send("fixture:private:peer", "ambiguous");
   assert.deepEqual(sends, []);
@@ -160,7 +161,7 @@ async function accounts(root: string) {
   assert.deepEqual(sends, ["b"]); // 账号离线时不能改用 a 发出。
   assert.ok(notify.isNotifyChannel("fixture@b:private:peer"));
   const activity: string[] = [];
-  const gateway = new Gateway(ctx, { ...cfg.messaging, externalSelfMessages: "off" }, cfg.platformOps, store, {} as never, renderer as never, focus as never, notify, { down: false }, {} as never, new OwnSendTracker(), { display: async (key: string) => key } as never, () => null, { notify() {}, selfMessage() {}, channelActivity: (key) => activity.push(key) });
+  const gateway = new Gateway(ctx, { ...cfg.messaging, externalSelfMessages: "off" }, cfg.platformOps, store, {} as never, renderer as never, focus as never, notify, { down: false }, {} as never, new OwnSendTracker(), new ChannelNameResolver(ctx, store), () => null, { notify() {}, selfMessage() {}, channelActivity: (key) => activity.push(key) });
   await (gateway as any).handle({ ...entry, messageId: "incoming-b-id", selfId: "b", bot: ctx.bots[1], content: "incoming b" });
   assert.equal(rows.at(-1)!.selfId, "b");
   assert.equal(activity[0], "fixture@b:private:peer");

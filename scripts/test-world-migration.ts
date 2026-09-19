@@ -91,18 +91,31 @@ async function structuredMigration(root: string): Promise<void> {
     f.setInfer(async (messages, tools) => {
       assert.equal(tools[0]!.function.name, "resolve_world");
       const body = JSON.parse([...messages].reverse().find(message => message.role === "user")!.content as string);
-      assert.equal(body.time, 123, "an imported clock ahead of clock.json must not send a past present-time to World");
-      assert.equal(body.stateUpdatedAt, 123); assert.ok(body.time >= body.stateUpdatedAt);
+      assert.equal(body.time, 110, "the current clock remains authoritative; importing a future record cannot silently move the present");
+      assert.equal(body.timeAuthority.tu, 110); assert.equal(body.stateUpdatedAt, 123); assert.equal(body.stateAsOf.tu, 123);
+      assert.match(body.stateAheadOfClock, /晚于当前程序时钟/); assert.equal(body.elapsedWorldSeconds, 0, "a future imported snapshot cannot create negative elapsed time or an invented advance");
       assert.match(body.worldState, /今天想吃什么/); assert.match(body.worldState, /NPC_PRIVATE_SECRET/, "World receives omniscient state while Bot never does");
+      return result({ perceptions: [] });
+    });
+    await current.runtime.evolve("程序时钟尚未赶上迁移记录，没有可结算的正向流逝。"); assert.equal(f.requests(), 1);
+    assert.deepEqual(store.snapshot(), snapshot, "an idle pass with an ahead-of-clock record cannot rewind or rewrite the imported snapshot");
+    assert.equal(await fs.readFile(f.files.narrativeJournal, "utf8"), beforeReplays, "read-time temporal diagnostics are not a migration rewrite");
+    await current.runtime.shutdown();
+    const aligned = f.create(124); await aligned.runtime.ensure();
+    f.setInfer(async messages => {
+      const body = JSON.parse([...messages].reverse().find(message => message.role === "user")!.content as string);
+      assert.equal(body.timeAuthority.tu, 124); assert.equal(body.stateAsOf.tu, 123); assert.equal(body.elapsedWorldSeconds, 1);
+      assert.equal(body.stateAheadOfClock, undefined);
       return result({ worldState: body.worldState + "\n现在店员告知今日面食需要等十分钟。", actorStates: [{ actorId: "bot", state: "你仍在柜台前，得知面食要等十分钟。" }], perceptions: [{ actorId: "bot", text: "店员补充道：“面要等十分钟，你可以先看看其他的。”" }] });
     });
-    await current.runtime.evolve("店员继续说明等待时间。"); assert.equal(f.requests(), 1);
-    const committed = store.snapshot(), perception = await current.runtime.peek(); await current.runtime.shutdown();
+    await aligned.runtime.evolve("店员继续说明等待时间。"); assert.equal(f.requests(), 2);
+    const committed = (await aligned.runtime.store()).snapshot(), perception = await aligned.runtime.peek(); await aligned.runtime.shutdown();
+    assert.equal(committed.effectiveAt, 124); assert.deepEqual(committed.actions, snapshot.actions, "new progress leaves imported action dates intact");
     f.setInfer(async () => { throw Error("Restart must reuse current persisted prose"); });
-    const restarted = f.create(124); await restarted.runtime.ensure();
+    const restarted = f.create(125); await restarted.runtime.ensure();
     assert.deepEqual((await restarted.runtime.store()).snapshot(), committed); assert.deepEqual(await restarted.runtime.peek(), perception);
     assert.match(await restarted.files.readWorldStatus(), /现在店员告知今日面食需要等十分钟/); assert.match(await restarted.files.readBotStatus(), /十分钟/);
-    assert.equal(f.requests(), 1, "restart cannot regenerate or remigrate the world");
+    assert.equal(f.requests(), 2, "restart cannot regenerate or remigrate the world");
     assert.equal(await fs.readFile(f.files.worldJournal, "utf8"), originalJournal); await assertBackup(f);
     console.log("PASS v0.3 runtime migration preserves private facts, dialogue, old action idempotency, interrupted failures, visitor absence and latest prose across restart");
   } finally { await f.shutdown(); }

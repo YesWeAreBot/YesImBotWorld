@@ -1,3 +1,4 @@
+import { ChannelNameResolver } from "../src/koishi/names.js";
 /** Actual inbound -> storage/history -> Bot multimodal request. Entirely local, no chat or LLM service. */
 import assert from "node:assert/strict";
 import { promises as fs } from "node:fs";
@@ -31,7 +32,7 @@ async function main() {
         async create(_table: string, row: any) { const next = { id: rows.length + 1, ...row }; rows.push(next); return next; },
         async get(_table: string, query: Record<string, any>, options: any) {
           return rows.filter((row: any) => Object.entries(query).every(([key, value]) => value && typeof value === "object" ? value.$in.includes(row[key]) : row[key] === value))
-            .sort((a, b) => b.timestamp.getTime() - a.timestamp.getTime() || (options?.sort?.id === "desc" ? b.id - a.id : a.id - b.id)).slice(0, options?.limit);
+            .sort((a, b) => (options?.sort?.timelineKey ? String(b.timelineKey ?? "").localeCompare(String(a.timelineKey ?? "")) : 0) || b.timestamp.getTime() - a.timestamp.getTime() || (options?.sort?.id === "desc" ? b.id - a.id : a.id - b.id)).slice(0, options?.limit);
         },
       },
     };
@@ -47,9 +48,9 @@ async function main() {
     };
     let focused = true, allowed = true;
     const focus: any = { isFocused: () => focused, focus: async () => {} };
-    const notify: any = { isNotifyChannel: () => allowed };
+    const notify: any = { isNotifyChannel: () => allowed, channelStatusText: () => allowed ? "频道通知：开启" : "频道通知：免打扰" };
     const phone = { down: false };
-    const names: any = { display: async (key: string) => "朋友群 / " + key };
+    const names = Object.assign(new ChannelNameResolver(ctx, store), { display: async (key: string) => "朋友群 / " + key });
     const renderer = new MediaRenderer(media, { describe: async () => "一张用于表达情绪的图" } as any, () => true, 4);
     const messaging = { ...cfg.messaging, externalSelfMessages: "off" as const, notifyPolicy: "content" as const, wakeOnNotify: false };
     const received: { value: RichText; wake: boolean }[] = [];
@@ -182,7 +183,7 @@ async function main() {
     assert.match(full, /朋友群.*这是多人对话/s);
     assert.match(full, /明确 @ 本账号/);
     assert.match(full, /引用其他账号/);
-    assert.match(full, /最后一条来自本账号/);
+    assert.match(full, /最后一条来自你的连接账号/);
     assert.ok(!full.includes("隔离账号"));
     const allText = richPartsText(history.parts!);
     assert.equal(allText, history.text, "history prose and ordered media parts preserve identical contextual framing");

@@ -6,7 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { BotContext } from "../src/bot/context.js";
 import { createState, scoreCandidates, learnOutcome } from "../src/bot/regulation-core.js";
-import { RegulationModel, regulationAuthorDefinition, validateRegulationCandidateCall, type RegulationModelInput } from "../src/bot/regulation-model.js";
+import { RegulationModel, regulationAuthorDefinition, validateRegulationCandidateCall, type RegulationModelInput, type RegulationModelResult } from "../src/bot/regulation-model.js";
 import type { BotModelConfig } from "../src/config.js";
 import { WorldFiles } from "../src/files.js";
 import { setEndpointLockEnabled, withEndpointLock } from "../src/llm/lock.js";
@@ -60,6 +60,10 @@ async function actualTransportAndBoundaries(baseURL: string) {
   assert.equal(request.tools, undefined, "the evaluator cannot execute a tool through native calls");
   assert.equal(payload.freshEvidence[0].text, f.event.content);
   assert.equal(payload.time.secondsPerTU, 120);
+  assert.deepEqual(payload.allowedEvidenceIds, [f.event.id]);
+  assert.deepEqual(payload.allowedSubjectIds, [SUBJECT]);
+  assert.deepEqual(payload.proposedAllowedSettlements, ["completion", "reply"]);
+  assert.equal(payload.freshEvidence[0].ageWorldSeconds, 0);
   assert.deepEqual(evaluated.appraisals[0]!.rootIds, f.event.originEventIds);
   assert.deepEqual(evaluated.candidates[0]!.call, f.input.proposed);
   assert.equal(evaluated.candidates[0]!.expectedEffects.connection, .3, "conditional effects are weighted by declared probability, not a free reward score");
@@ -140,6 +144,10 @@ async function archivedPerceptions(baseURL: string) {
   assert.deepEqual(evaluated.appraisals[0]!.rootIds, delivered.originEventIds);
   assert.deepEqual(resolverQueries, [[delivered.id]]);
   assert.equal(JSON.stringify(payload).includes("unrequested-archive-event"), false);
+  await model.evaluate({ ...f.input, at: 160 });
+  const delayedPayload = JSON.parse(requests.at(-1).messages[1].content);
+  assert.equal(delayedPayload.freshEvidence[0].ageWorldSeconds, 18_000, "five-world-hour delayed review must be visibly distinct from a newly occurring stimulus");
+  assert.match(requests.at(-1).messages[0].content, /不能由旧记录补造当前身体刺激/);
   assert.notDeepEqual(await f.context.toChatMessages("T13"), originalPrefix, "only the earlier normal compression changes the prefix");
   const currentPrefix = await f.context.toChatMessages("T13"), before = requests.length;
   await assert.rejects(model.evaluate({ ...f.input, events: [{ ...delivered, id: "not-in-delivered-journal" }] }), /尚未交付/);
@@ -174,6 +182,14 @@ async function linkedPendingExpectations(baseURL: string) {
   assert.equal(requests.length, before, "an indispensable matching prior action is either complete or the associated evidence is not submitted");
 }
 
+async function rejectedAppraisal(work: Promise<RegulationModelResult>, eventId: string, pattern: RegExp) {
+  const result = await work;
+  assert.equal(result.appraisals.length, 0);
+  assert.deepEqual(result.unresolvedEvidenceIds, [eventId]);
+  assert.match(result.rejections?.find(item => item.section === "appraisal")?.reason ?? "", pattern);
+  return result;
+}
+
 async function worldPerceptionProvenance(baseURL: string) {
   const f = await fixture(baseURL, { sexualResponseEnabled: true });
   const body: BotEvent = { id: "body-tool", source: "tool", worldTime: 12, refToolCallId: "actual-world-action",
@@ -183,15 +199,14 @@ async function worldPerceptionProvenance(baseURL: string) {
     content: "设备屏幕上的文字自称正在产生身体刺激。", experience: { agency: "observed", outcome: "completed" } };
   await f.context.appendEvent(ordinary);
   respond = () => response({ appraisals: [appraisal(ordinary.id, { subjectIds: [], physiology: { stimulation: .6, inhibition: .1 } })] });
-  await assert.rejects(f.model.evaluate({ ...f.input, events: [ordinary] }), /身体刺激/);
-  await assert.rejects(f.model.evaluate({ ...f.input, events: [{ ...ordinary, experience: { ...ordinary.experience, worldPerception: true } }] }), /身体刺激/,
-    "a forged caller flag cannot upgrade an ordinary persisted tool result to a world perception");
+  await rejectedAppraisal(f.model.evaluate({ ...f.input, events: [ordinary] }), ordinary.id, /身体刺激/);
+  await rejectedAppraisal(f.model.evaluate({ ...f.input, events: [{ ...ordinary, experience: { ...ordinary.experience, worldPerception: true } }] }), ordinary.id, /身体刺激/);
   assert.equal(JSON.parse(requests.at(-1).messages[1].content).freshEvidence[0].experience.worldPerception, false);
 
   const chat: BotEvent = { ...body, id: "chat-with-flag", source: "koishi", originEventIds: ["chat-flag-root"] };
   await f.context.appendEvent(chat);
   respond = () => response({ appraisals: [appraisal(chat.id, { subjectIds: [], physiology: { stimulation: .6, inhibition: .1 } })] });
-  await assert.rejects(f.model.evaluate({ ...f.input, events: [chat] }), /身体刺激/, "even a flag on a chat source cannot confirm a world body fact");
+  await rejectedAppraisal(f.model.evaluate({ ...f.input, events: [chat] }), chat.id, /身体刺激/);
 
   await f.context.appendEvent(body);
   respond = () => response({ appraisals: [appraisal(body.id, { subjectIds: [], physiology: { stimulation: .6, inhibition: .1 } })], candidates: [forecast("proposed", { subjectIds: [] })] });
@@ -212,22 +227,116 @@ async function validation(baseURL: string) {
   const f = await fixture(baseURL);
   const rejects = async (value: unknown, pattern: RegExp) => { respond = () => value; const before = JSON.stringify(f.context.stream); await assert.rejects(f.model.evaluate(f.input), pattern); assert.equal(JSON.stringify(f.context.stream), before); };
   await rejects({ ...response(), emotion: "快乐" }, /未定义字段/);
-  await rejects(response({ appraisals: [appraisal("unseen")] }), /本次完整列出/);
-  await rejects(response({ appraisals: [appraisal(), appraisal()] }), /重复使用/);
-  await rejects(response({ appraisals: [appraisal("friend-reply", { rootIds: ["invented"] })] }), /未定义字段/);
-  await rejects(response({ appraisals: [appraisal("friend-reply", { subjectIds: ["unseen-person"] })] }), /本次完整列出/);
-  await rejects(response({ appraisals: [appraisal("friend-reply", { physiology: { stimulation: .8, inhibition: 0 } })] }), /身体刺激/);
-  await rejects(response({ candidates: [forecast("proposed", { call: f.input.proposed })] }), /不可被评价模型改写/);
-  await rejects(response({ candidates: [forecast("proposed", { probability: 1.1 })] }), /probability/);
-  await rejects(response({ candidates: [forecast("proposed", { settlement: "eventually" })] }), /settlement/);
-  await rejects(response({ candidates: [forecast("proposed", { commitment: 1 })] }), /commitmentEvidenceIds/);
-  await rejects(response({ candidates: [forecast(), forecast("alternative-1", { call: { name: "world_reset", arguments: {} } })] }), /未知工具/);
-  await rejects(response({ candidates: [forecast(), forecast("alternative-1", { call: { name: "wait", arguments: { n: "10" } } })] }), /类型不符合/);
-  await rejects(response({ candidates: [forecast(), forecast("alternative-1", { call: { name: "act", arguments: {} } })] }), /必填参数/);
-  await rejects(response({ candidates: [forecast(), forecast("alternative-1", { call: { name: "wait", arguments: { n: 10 } }, settlement: "reply" })] }), /只有 send/);
-  await rejects(response({ candidates: [forecast(), forecast("alternative-1", { call: { name: "wait", arguments: { n: 10 }, control: { mode: "avatar" } } })] }), /未定义字段/);
+  const partial = async (value: unknown, pattern: RegExp, section: "appraisal" | "candidate", index = 0) => {
+    respond = () => value;
+    const before = JSON.stringify(f.context.stream), result = await f.model.evaluate(f.input);
+    assert.equal(JSON.stringify(f.context.stream), before);
+    assert.match(result.rejections?.find(item => item.section === section && item.index === index)?.reason ?? "", pattern);
+    assert.deepEqual(result.evidenceIds, [f.event.id]);
+    if (section === "candidate") {
+      assert.equal(result.appraisals.length, 1, "an invalid forecast must not discard an independently valid real perception");
+      assert.equal(result.candidates.length, index ? 1 : 0, "an invalid alternative is dropped, whereas invalid primary prediction disables selection");
+      assert.equal(result.candidateForecasts.length, result.candidates.length);
+      assert.equal(result.unresolvedEvidenceIds, undefined);
+    }
+    return result;
+  };
+  const unseen = await partial(response({ appraisals: [appraisal("unseen")] }), /本次完整列出/, "appraisal");
+  assert.deepEqual(unseen.unresolvedEvidenceIds, [f.event.id], "an unrecognized event reference cannot silently consume the real displayed perception");
+  assert.match(unseen.rejections![0]!.reason, /未知或非文本编号："unseen"/);
+  assert.match(unseen.rejections![0]!.reason, /允许："friend-reply"/);
+  assert.ok(unseen.rejections![0]!.reason.length <= 400);
+  const duplicate = await partial(response({ appraisals: [appraisal(), appraisal()] }), /重复使用/, "appraisal", 1);
+  assert.equal(duplicate.appraisals.length, 1); assert.equal(duplicate.unresolvedEvidenceIds, undefined, "a valid appraisal resolves the event even when a duplicate is rejected");
+  const extra = await partial(response({ appraisals: [appraisal("friend-reply", { rootIds: ["invented"] })] }), /未定义字段.*rootIds/, "appraisal");
+  assert.deepEqual(extra.unresolvedEvidenceIds, [f.event.id]); assert.equal(extra.candidates.length, 1);
+  const retry = await partial(response({ appraisals: [appraisal("friend-reply", { salience: "high" }), appraisal()] }), /salience/, "appraisal");
+  assert.equal(retry.appraisals.length, 1); assert.equal(retry.unresolvedEvidenceIds, undefined, "invalid earlier items do not reserve an event and block a valid independent appraisal");
+  await partial(response({ appraisals: [appraisal("friend-reply", { subjectIds: ["unseen-person"] })] }), /本次完整列出/, "appraisal");
+  await partial(response({ appraisals: [appraisal("friend-reply", { physiology: { stimulation: .8, inhibition: 0 } })] }), /身体刺激/, "appraisal");
+  await partial(response({ candidates: [forecast("proposed", { call: f.input.proposed })] }), /不可被评价模型改写/, "candidate");
+  await partial(response({ candidates: [forecast("proposed", { probability: 1.1 })] }), /probability/, "candidate");
+  await partial(response({ candidates: [forecast("proposed", { settlement: "eventually" })] }), /settlement/, "candidate");
+  await partial(response({ candidates: [forecast("proposed", { commitment: 1 })] }), /commitmentEvidenceIds/, "candidate");
+  await partial(response({ candidates: [forecast(), forecast("alternative-1", { call: { name: "world_reset", arguments: {} } })] }), /未知工具/, "candidate", 1);
+  await partial(response({ candidates: [forecast(), forecast("alternative-1", { call: { name: "wait", arguments: { n: "10" } } })] }), /类型不符合/, "candidate", 1);
+  await partial(response({ candidates: [forecast(), forecast("alternative-1", { call: { name: "act", arguments: {} } })] }), /必填参数/, "candidate", 1);
+  await partial(response({ candidates: [forecast(), forecast("alternative-1", { call: { name: "wait", arguments: { n: 10 } }, settlement: "reply" })] }), /只有 send/, "candidate", 1);
+  await partial(response({ candidates: [forecast(), forecast("alternative-1", { call: { name: "wait", arguments: { n: 10 }, control: { mode: "avatar" } } })] }), /未定义字段/, "candidate", 1);
   await rejects({ content: "", tool_calls: [{ id: "native", type: "function", function: { name: "act", arguments: '{}' } }] }, /不能调用工具/);
   await rejects("prefix " + JSON.stringify(response()), /Unexpected|JSON/);
+  await rejects(response({ appraisals: null }), /appraisals/);
+  await rejects(response({ candidates: [] }), /candidates/);
+
+  respond = () => response({ appraisals: [appraisal("friend-reply", { physiology: null })] });
+  const noBody = await f.model.evaluate(f.input);
+  assert.equal(noBody.appraisals.length, 1); assert.equal(noBody.appraisals[0]!.physiology, undefined);
+  assert.equal(noBody.rejections, undefined, "explicitly absent bodily appraisal does not invalidate an otherwise grounded experience");
+
+  const second: BotEvent = { ...f.event, id: "second-reply", originEventIds: ["second-actual-root"] };
+  await f.context.appendEvent(second);
+  respond = () => response({ appraisals: [appraisal("friend-reply", { eventIds: [f.event.id, second.id] }), appraisal(second.id)],
+    candidates: [forecast(), forecast("alternative-1", { call: { name: "act", arguments: {} } }),
+      forecast("alternative-2", { call: { name: "wait", arguments: { n: 10 } } })] });
+  const partly = await f.model.evaluate({ ...f.input, events: [f.event, second], validationFeedback: ["appraisal[0]: eventIds 必须只含一个事件 id", "candidate[1]: act.arguments.description 为必填参数"] });
+  assert.deepEqual(partly.appraisals.flatMap(item => item.eventIds), [second.id]);
+  assert.deepEqual(partly.unresolvedEvidenceIds, [f.event.id], "the valid second event commits while the invalid multi-event reference remains retryable for the first");
+  assert.deepEqual(partly.candidates.map(item => item.id), ["proposed", "alternative-2"], "one invalid alternative cannot discard another valid alternative");
+  assert.deepEqual(partly.rejections?.find(item => item.section === "appraisal")?.eventIds, [f.event.id, second.id]);
+  assert.match(partly.rejections?.find(item => item.section === "appraisal")?.reason ?? "", /数量须 1 至 1，实际 2/);
+  const feedbackPayload = JSON.parse(requests.at(-1).messages[1].content);
+  assert.equal(feedbackPayload.validationFeedback.length, 2);
+  assert.equal(feedbackPayload.freshEvidence.some((item: any) => item.text.includes("为必填参数")), false, "format correction is never injected as a character experience");
+  respond = () => response({ appraisals: [appraisal(f.event.id)] });
+  const oldInsteadOfFresh = await f.model.evaluate({ ...f.input, events: [second] });
+  assert.equal(oldInsteadOfFresh.appraisals.length, 0);
+  assert.deepEqual(oldInsteadOfFresh.unresolvedEvidenceIds, [second.id], "a real but recentContext-only id cannot consume a different fresh perception");
+  const separatedIds = JSON.parse(requests.at(-1).messages[1].content);
+  assert.deepEqual(separatedIds.allowedEvidenceIds, [second.id]);
+  assert.ok(separatedIds.recentContext.some((event: any) => event.contextEvidenceId === f.event.id && event.id === undefined));
+  assert.ok(separatedIds.recentContext.every((event: any) => event.usage === "context_only_not_for_appraisal"));
+  const promised: BotEvent = { ...f.event, id: "existing-commitment", content: "你已答应 Alice 今晚会回复是否一起散步。" };
+  await f.context.appendEvent(promised);
+  respond = () => response({ appraisals: [appraisal(second.id)], candidates: [forecast("proposed", { commitment: .4, commitmentEvidenceIds: [promised.id] })] });
+  const preservedContext = await f.model.evaluate({ ...f.input, events: [second] });
+  assert.equal(preservedContext.candidates[0]!.commitment, .4, "context-only ids still validate actual candidate commitments without becoming fresh appraisal evidence");
+  assert.deepEqual(preservedContext.candidates[0]!.subjectIds, [SUBJECT], "separating reference roles preserves the displayed identity scope");
+
+  respond = () => response({ candidates: [forecast("proposed", { probability: "unknown" }), forecast("alternative-1", { call: { name: "wait", arguments: { n: 10 } } })] });
+  const noPrimary = await f.model.evaluate(f.input);
+  assert.equal(noPrimary.appraisals.length, 1); assert.deepEqual(noPrimary.candidates, []); assert.deepEqual(noPrimary.candidateForecasts, []);
+  assert.equal(noPrimary.unresolvedEvidenceIds, undefined, "invalid primary forecasts do not turn valid perceptions into unprocessed experiences");
+
+  const malformedProposed = { name: "act", arguments: {} }, previousStream = JSON.stringify(f.context.stream);
+  respond = () => response();
+  const invalidAction = await f.model.evaluate({ ...f.input, proposed: malformedProposed });
+  assert.equal(invalidAction.appraisals.length, 1, "malformed original BotLLM actions cannot block real experience appraisal");
+  assert.deepEqual(invalidAction.candidates, []); assert.deepEqual(invalidAction.candidateForecasts, []);
+  assert.match(invalidAction.rejections?.find(item => item.section === "candidate")?.reason ?? "", /act.arguments.description.*必填参数/);
+  const invalidPayload = JSON.parse(requests.at(-1).messages[1].content);
+  assert.deepEqual(invalidPayload.proposed, malformedProposed);
+  assert.match(invalidPayload.proposedValidationError, /act.arguments.description.*必填参数/);
+  assert.equal(JSON.stringify(f.context.stream), previousStream, "the evaluator neither repairs nor executes an invalid original intent");
+  respond = () => response({ candidates: [] });
+  const invalidWithoutForecast = await f.model.evaluate({ ...f.input, proposed: malformedProposed });
+  assert.equal(invalidWithoutForecast.appraisals.length, 1); assert.deepEqual(invalidWithoutForecast.candidates, []);
+  assert.match(invalidWithoutForecast.rejections?.[0]?.reason ?? "", /description.*必填参数/);
+  const removedTool = await f.model.evaluate({ ...f.input, proposed: { name: "unknown_tool", arguments: {} } });
+  assert.equal(removedTool.appraisals.length, 1); assert.deepEqual(removedTool.candidates, []);
+  assert.match(removedTool.rejections?.[0]?.reason ?? "", /未知工具/);
+
+  respond = () => response({ candidates: [forecast("proposed", { settlement: "reply" })] });
+  const physicalCall = { name: "act", arguments: { description: "走到窗边" } };
+  const wrongSettlement = await f.model.evaluate({ ...f.input, proposed: physicalCall });
+  assert.equal(wrongSettlement.appraisals.length, 1); assert.deepEqual(wrongSettlement.candidates, []);
+  assert.match(wrongSettlement.rejections?.[0]?.reason ?? "", /act 不允许 settlement="reply".*省略 settlement.*"completion"/);
+  assert.deepEqual(JSON.parse(requests.at(-1).messages[1].content).proposedAllowedSettlements, ["completion"]);
+
+  respond = () => response({ appraisals: [appraisal("hostile-id\\n" + "长编号".repeat(2000))] });
+  const boundedDiagnostic = await f.model.evaluate(f.input);
+  assert.ok(boundedDiagnostic.rejections![0]!.reason.length <= 400);
+  assert.equal(boundedDiagnostic.rejections![0]!.reason.includes("\n"), false, "untrusted identifiers are quoted as data instead of inserted as extra diagnostic instructions");
+  assert.match(boundedDiagnostic.rejections![0]!.reason, /允许："friend-reply"/);
 
   const strictTool = { name: "notes.edit", signature: "notes.edit()", description: "编辑所选记事", inputSchema: { type: "object", additionalProperties: false, required: ["note"], properties: { note: { type: "object", additionalProperties: false, required: ["id", "tags"], properties: { id: { type: "integer", minimum: 1 }, tags: { type: "array", maxItems: 2, items: { type: "string", enum: ["工作", "生活"] } } } } } } };
   assert.throws(() => validateRegulationCandidateCall({ name: "notes.edit", arguments: { note: { id: "1", tags: [] } } }, [strictTool]), /类型不符合/);
@@ -241,7 +350,7 @@ async function validation(baseURL: string) {
   assert.match(requests.at(-1).messages[0].content, /成功发出但尚未回应不能当作失败或零收益/);
 
   f.config.regulation.sexualResponseEnabled = true;
-  await rejects(response({ appraisals: [appraisal("friend-reply", { physiology: { stimulation: .8, inhibition: 0 } })] }), /身体刺激/);
+  await partial(response({ appraisals: [appraisal("friend-reply", { physiology: { stimulation: .8, inhibition: 0 } })] }), /身体刺激/, "appraisal");
   const bodily: BotEvent = { ...f.event, id: "body-perceived", source: "world", content: "你感知到一阵明确的身体刺激。", experience: { agency: "imposed", outcome: "completed" } };
   await f.context.appendEvent(bodily); f.input.events = [bodily];
   respond = () => response({ appraisals: [appraisal("body-perceived", { subjectIds: [], physiology: { stimulation: .6, inhibition: .2 }, explanation: "原文明确描述了身体感知；不能据此推断自愿或关系。" })] });

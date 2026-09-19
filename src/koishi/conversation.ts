@@ -6,7 +6,7 @@ import { channelKey } from "./channels.js";
 
 /** A record identity is independent of notification/read/tool-call IDs. Opaque roots
  * cannot accidentally reveal a hidden message's sender or content to a later reader. */
-export function chatMessageEvidence(row: Pick<WorldMessageRow, "id" | "platform" | "selfId" | "channelId" | "userId" | "messageId" | "timestamp" | "conversation">, accountId = row.selfId ?? ""): Pick<RichText, "originEventIds" | "experience"> {
+export function chatMessageEvidence(row: Pick<WorldMessageRow, "id" | "platform" | "selfId" | "channelId" | "userId" | "messageId" | "timestamp" | "conversation" | "senderOwned" | "senderOrigin">, accountId = row.selfId ?? ""): Pick<RichText, "originEventIds" | "experience"> {
   const account = row.selfId || accountId;
   const channel = [row.platform, account, row.channelId];
   const timestamp = new Date(row.timestamp).getTime();
@@ -23,6 +23,10 @@ export function chatMessageEvidence(row: Pick<WorldMessageRow, "id" | "platform"
       // A quotation/forwarded author's name does not make them a live participant.
       // Account ownership also does not prove voluntary authorship of a self message.
       subjectIds: row.userId ? [chatSubjectId(row.platform, row.userId)] : [],
+      chat: { channelKey: channelKey(row.platform, row.channelId, account || undefined), kind: "message",
+        ...(row.userId ? { senderId: chatSubjectId(row.platform, row.userId) } : {}),
+        ...(row.senderOwned != null ? { senderOwn: row.senderOwned } : row.senderOrigin === "tool" || (!!account && row.userId === account) ? { senderOwn: true } : {}),
+      },
       // A platform quote gives an exact causal link, scoped like the actual send
       // receipt. The root itself grants no access to an unseen original message.
       ...(typeof replyId === "string" && replyId.length ? { responseToRoots: ["chat-message:" + evidenceHash([...channel, "platform", replyId])] } : {}),

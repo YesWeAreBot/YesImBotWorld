@@ -12,13 +12,19 @@ const choice = (episodeId: string, situation = "晚饭结束后在家门口", ex
 const event = (id: string, at: number, experience?: ExperienceMetadata, content = "晚饭后主动去河边散步，回来觉得轻松。"): BotEvent => ({
   id, worldTime: at, source: "world", content, ...(experience ? { experience } : {}),
 });
-const habit = (evidenceIds: string[]): ReflectionInput => ({ kind: "habit", subject: "饭后散步", situation: "晚饭结束后",
+const habit = (evidenceIds: string[]): ReflectionInput => ({ kind: "habit", subject: "饭后散步", behavior: "沿河散步", situation: "晚饭结束后",
   cues: ["晚饭", "河边", "饭后"], statement: "最近晚饭后常去河边散步；天气不好或有人相约时，也会选择别的安排。", evidenceIds });
+
+// Behavioral fixtures use one TU = two world days; explicit state-expiry checks retain their one-second scale.
+class FixtureLedger extends GrowthLedger {
+  override reflect(input: ReflectionInput, at: number, secondsPerTU = input.kind === "habit" || input.kind === "trait" ? 172800 : 1) { return super.reflect(input, at, secondsPerTU); }
+  override commitReview(snapshot: any, proposals: ReflectionInput[], at: number, signal?: AbortSignal, secondsPerTU = 172800) { return super.commitReview(snapshot, proposals, at, signal, secondsPerTU); }
+}
 
 async function main() {
   const base = await fs.mkdtemp(path.join(os.tmpdir(), "yesimbot-evolution-"));
   try {
-    const ledger = new GrowthLedger(path.join(base, "behavior"));
+    const ledger = new FixtureLedger(path.join(base, "behavior"));
     await ledger.perceive(event("forced1", 1, choice("forced1", undefined, { agency: "imposed" })));
     await ledger.perceive(event("forced2", 2, choice("forced2", undefined, { agency: "imposed" })));
     await ledger.perceive(event("forced3", 3, choice("forced3", undefined, { agency: "imposed" })));
@@ -53,7 +59,6 @@ async function main() {
 
     const state: ReflectionInput = { kind: "state", subject: "自己", situation: "今晚和朋友争吵之后", cues: ["争吵"],
       statement: "暂时不太想说话，需要独处一会儿。", evidenceIds: ["rain"] };
-    await assert.rejects(ledger.reflect(state, 18), /expiresAt/);
     await assert.rejects(ledger.reflect({ ...state, expiresAt: 18 }, 18), /expiresAt/);
     await assert.rejects(ledger.reflect({ ...state, situation: undefined, expiresAt: 20 }, 18), /situation/);
     const temporary = await ledger.reflect({ ...state, expiresAt: 20 }, 18);
@@ -68,8 +73,8 @@ async function main() {
     assert.equal(retired.view.records.length, 3);
     assert.deepEqual(await ledger.retrieve({ text: "晚饭结束，去河边走走？", at: 21 }), []);
 
-    const broad = new GrowthLedger(path.join(base, "trait"));
-    const traits: ReflectionInput = { kind: "trait", subject: "面对分歧", situation: "和熟人讨论不同意见时", cues: ["不同意见", "分歧"],
+    const broad = new FixtureLedger(path.join(base, "trait"));
+    const traits: ReflectionInput = { kind: "trait", subject: "面对分歧", behavior: "先听对方解释", situation: "和熟人讨论不同意见时", cues: ["不同意见", "分歧"],
       statement: "比以前更愿意先听别人解释，再表达自己的判断。", evidenceIds: [] };
     for (let i = 1; i <= 6; i++) {
       const id = `patient${i}`; traits.evidenceIds.push(id);
@@ -89,14 +94,14 @@ async function main() {
       .some(view => view.claimId === friendship.view.claimId), "a shared topic must not transfer one person's relationship to a different person");
     assert.ok(!(await broad.retrieve({ text: "青哥愿意帮我准备出游用品。", subjectIds: ["onebot:456"], at: 10 }))
       .some(view => view.claimId === friendship.view.claimId), "even an identical nickname cannot override a different stable identity");
-    await broad.perceive(event("namesake", 10, { agency: "observed", subjectIds: ['chat-user:["onebot","456"]'] }, "另一位也叫青哥的人愿意帮我准备出游用品。"));
+    await broad.perceive(event("namesake", 10, { agency: "observed", subjectIds: ['chat-user:["onebot","456"]'] , chat: { channelKey: "fixture@self:group", kind: "message", senderId: 'chat-user:["onebot","456"]', senderOwn: false } }, "另一位也叫青哥的人愿意帮我准备出游用品。"));
     const namesake = await broad.reflect({ kind: "relationship", subject: "青哥", subjectId: 'chat-user:["onebot","456"]', statement: friendship.view.statement, evidenceIds: ["namesake"] }, 10);
     assert.notEqual(namesake.view.claimId, friendship.view.claimId, "same words about different people are separate claims");
     assert.match(growthViewText(namesake.view), /onebot 账号 456/);
     assert.match(await broad.summary(10), /onebot 账号 456/);
     assert.match(await broad.summary(10), /身份 onebot:123/);
 
-    const longHistory = new GrowthLedger(path.join(base, "old-counter"));
+    const longHistory = new FixtureLedger(path.join(base, "old-counter"));
     for (let i = 1; i <= 9; i++) await longHistory.perceive(event(`history${i}`, i, choice(`history${i}`)));
     const originalHabit = habit(["history1", "history2", "history3"]);
     const lasting = await longHistory.reflect(originalHabit, 9);
@@ -107,7 +112,7 @@ async function main() {
     assert.ok(abbreviated.records.length <= 5, "review still bounds recent history plus the unresolved counterexample");
     assert.match(growthViewText(abbreviated), /膝盖受伤/, "later support does not hide an unresolved older counterexample from the next review");
 
-    const reviewed = new GrowthLedger(path.join(base, "reviews"));
+    const reviewed = new FixtureLedger(path.join(base, "reviews"));
     for (let i = 1; i <= 4; i++) await reviewed.perceive(event(`review${i}`, i, choice(`review${i}`)));
     const snap = (await reviewed.snapshotReview({ at: 4 }))!;
     assert.ok(snap); assert.equal(snap.episodeIds.length, 4);
@@ -130,18 +135,18 @@ async function main() {
     try { await assert.rejects(reviewed.commitReview(snap, [valid], 4), /injected disk failure/); }
     finally { fs.appendFile = originalAppend; }
     assert.equal((await reviewed.stats()).records, 0);
-    assert.equal((await new GrowthLedger(path.dirname(reviewed.file)).snapshotReview({ at: 4 }))?.id, snap.id);
+    assert.equal((await new FixtureLedger(path.dirname(reviewed.file)).snapshotReview({ at: 4 }))?.id, snap.id);
     const committed = await reviewed.commitReview(snap, [valid, { kind: "preference", subject: "河边", statement: "最近觉得河边很放松。", evidenceIds: ["review4"] }], 4);
     assert.equal(committed.records.length, 2); assert.ok(committed.records.every(record => record.origin === "automatic"));
     assert.equal((await reviewed.pendingReviews()).length, 1);
     assert.equal((await reviewed.commitReview(snap, [valid], 4)).duplicate, true);
     assert.equal((await reviewed.stats()).records, 2, "retrying a committed review cannot duplicate its records");
     assert.equal(await reviewed.snapshotReview({ at: 4 }), null);
-    const resumed = new GrowthLedger(path.dirname(reviewed.file));
+    const resumed = new FixtureLedger(path.dirname(reviewed.file));
     assert.equal(await resumed.snapshotReview({ at: 4 }), null);
     assert.deepEqual((await resumed.pendingReviews())[0]?.records, committed.records, "outbox survives a crash before context delivery");
     await resumed.ackReview(committed.id); await resumed.ackReview(committed.id);
-    assert.deepEqual(await new GrowthLedger(path.dirname(reviewed.file)).pendingReviews(), []);
+    assert.deepEqual(await new FixtureLedger(path.dirname(reviewed.file)).pendingReviews(), []);
     const lines = (await fs.readFile(reviewed.file, "utf8")).trim().split("\n").map(line => JSON.parse(line));
     assert.equal(lines.filter(line => line.type === "review_committed").length, 1);
     assert.equal(lines.find(line => line.type === "review_committed").records.length, 2, "records and cursor use a single durable JSONL transaction");
@@ -151,7 +156,7 @@ async function main() {
     assert.ok(none.claims.some(claim => claim.claimId === committed.records[0]?.claimId));
     assert.ok(none.evidence.some(e => e.eventId === "review1"), "a consumed no-change batch does not erase useful original evidence");
     await resumed.commitReview(none, [], 8);
-    assert.equal(await new GrowthLedger(path.dirname(resumed.file)).snapshotReview({ at: 8 }), null);
+    assert.equal(await new FixtureLedger(path.dirname(resumed.file)).snapshotReview({ at: 8 }), null);
     assert.deepEqual(await resumed.pendingReviews(), [], "no-change creates no synthetic growth event");
     for (let i = 9; i <= 12; i++) await resumed.perceive(event(`review${i}`, i, choice(`review${i}`)));
     const stale = (await resumed.snapshotReview({ at: 12 }))!;
@@ -165,7 +170,7 @@ async function main() {
     assert.equal((await resumed.snapshotReview({ at: 12 }))?.afterCursor, current.afterCursor,
       "a stopped runtime cannot consume the evidence prefix through a delayed commit");
 
-    const repaired = new GrowthLedger(path.join(base, "recovery"));
+    const repaired = new FixtureLedger(path.join(base, "recovery"));
     const delivered: StreamEntry[] = [
       { kind: "event", event: event("delivered", 1, choice("delivered")) },
       { kind: "tool_call", call: { id: "reflect-call", role: "agent", name: "reflect", arguments: {}, issuedAt: 2, expectedAt: 2 } },
@@ -176,9 +181,9 @@ async function main() {
     await repaired.restorePerceptions(delivered); await repaired.restorePerceptions(delivered);
     assert.equal((await repaired.recallEvidence()).length, 1);
     assert.equal((await repaired.recallEvidence())[0]?.experience?.episodeId, "delivered", "metadata survives durable context recovery");
-    assert.deepEqual(await new GrowthLedger(path.dirname(repaired.file), "visitor").recallEvidence(), []);
+    assert.deepEqual(await new FixtureLedger(path.dirname(repaired.file), "visitor").recallEvidence(), []);
 
-    const busy = new GrowthLedger(path.join(base, "busy-conversation"));
+    const busy = new FixtureLedger(path.join(base, "busy-conversation"));
     for (let i = 1; i <= 25; i++) await busy.perceive(event(`busy${i}`, i, choice("same-chat-episode", "群聊讨论", {
       ...(i === 8 ? { outcome: "failed" as const } : {}), ...(i === 12 ? { agency: "imposed" as const } : {}),
     }), `群聊讨论中的第 ${i} 条已读消息。`));
@@ -194,12 +199,12 @@ async function main() {
       assert.ok(busySnapshot.evidence.some(e => e.eventId === id), `${id}: retain episode coverage, failed/imposed outcomes and completed choices`);
     }
     await busy.commitReview(busySnapshot, [], 28);
-    assert.equal(await new GrowthLedger(path.dirname(busy.file)).snapshotReview({ at: 28 }), null,
+    assert.equal(await new FixtureLedger(path.dirname(busy.file)).snapshotReview({ at: 28 }), null,
       "a committed sampled batch consumes its explicit prefix and cannot recur after restart");
     for (let i = 29; i <= 32; i++) await busy.perceive(event(`busy${i}`, i, choice(`later-episode${i}`)));
     assert.equal((await busy.snapshotReview({ at: 32 }))?.afterCursor, 28, "new episodes remain reviewable after a dense batch");
 
-    const interleaved = new GrowthLedger(path.join(base, "interleaved"));
+    const interleaved = new FixtureLedger(path.join(base, "interleaved"));
     for (let i = 1; i <= 260; i++) await interleaved.perceive(event(`interleaved${i}`, i, choice(`channel${i % 2}`)));
     const finiteBatch = await interleaved.snapshotReview({ at: 260 });
     assert.ok(finiteBatch, "a bounded scan of a large interleaving must allow progress instead of returning null forever");
@@ -209,7 +214,7 @@ async function main() {
     await interleaved.commitReview(finiteBatch, [], 260);
     assert.equal((await interleaved.snapshotReview({ at: 260, minimumEpisodes: 1 }))?.afterCursor, 256);
 
-    const sparse = new GrowthLedger(path.join(base, "sparse-habit"));
+    const sparse = new FixtureLedger(path.join(base, "sparse-habit"));
     for (let batch = 0; batch < 2; batch++) {
       const id = `old-walk${batch}`;
       await sparse.perceive(event(id, batch + 1, choice(id)));
@@ -227,7 +232,7 @@ async function main() {
     assert.equal((await sparse.commitReview(withPast, [habit(["old-walk0", "old-walk1", currentChoice.eventId])], 33)).records.length, 1,
       "a sparse habit can form across earlier no-change reviews despite a dense current episode");
 
-    const configured = new GrowthLedger(path.join(base, "configured-minimum"));
+    const configured = new FixtureLedger(path.join(base, "configured-minimum"));
     for (let i = 1; i <= 24; i++) await configured.perceive(event(`configured${i}`, i, choice(`configured${i}`)));
     assert.equal((await configured.snapshotReview({ at: 24, minimumEpisodes: 24 }))?.episodeIds.length, 24,
       "the implicit maximum episode count must be clamped to a larger configured minimum");

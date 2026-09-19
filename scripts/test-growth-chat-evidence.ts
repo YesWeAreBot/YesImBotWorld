@@ -1,3 +1,4 @@
+import { ChannelNameResolver } from "../src/koishi/names.js";
 /** Platform delivery -> history -> durable context/growth. No live platform or model. */
 import assert from "node:assert/strict";
 import { promises as fs } from "node:fs";
@@ -30,7 +31,7 @@ async function main() {
         async create(_table: string, row: any) { const next = { id: rows.length + 1, ...row }; rows.push(next); return next; },
         async get(_table: string, query: Record<string, any>, options: any) {
           return rows.filter((row: any) => Object.entries(query).every(([key, value]) => value && typeof value === "object" ? value.$in.includes(row[key]) : row[key] === value))
-            .sort((a, b) => b.timestamp.getTime() - a.timestamp.getTime() || b.id - a.id).slice(0, options?.limit);
+            .sort((a, b) => (options?.sort?.timelineKey ? String(b.timelineKey ?? "").localeCompare(String(a.timelineKey ?? "")) : 0) || b.timestamp.getTime() - a.timestamp.getTime() || b.id - a.id).slice(0, options?.limit);
         },
       },
     };
@@ -38,9 +39,9 @@ async function main() {
     const renderer: any = { render: async (text: string) => ({ text, parts: [{ kind: "text", text }] }) };
     let focused = true;
     const focus: any = { isFocused: () => focused, focus: async () => {} };
-    const notify: any = { isNotifyChannel: () => true };
+    const notify: any = { isNotifyChannel: () => true, channelStatusText: () => "频道通知：开启" };
     const phone = { down: false };
-    const names: any = { display: async (key: string) => "朋友群 / " + key };
+    const names = Object.assign(new ChannelNameResolver(ctx, store), { display: async (key: string) => "朋友群 / " + key });
     const messaging = { ...cfg.messaging, externalSelfMessages: "event" as const, notifyPolicy: "content" as const };
     const received: RichText[] = [], external: RichText[] = [];
     const gateway: any = new Gateway(ctx, messaging, cfg.platformOps, store, {} as any, renderer, focus, notify, phone, {} as any, new OwnSendTracker(), names, () => null, {

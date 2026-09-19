@@ -60,18 +60,19 @@ export const BOT_TOOLS: BotToolDef[] = [
       "要做什么（如「去厨房泡一杯咖啡」「走到窗边看看外面」），**不要写剧情**：不要描写环境、心情，" +
       "也不要在行动里预设结果或替别人说话。世界会返回你实际能感知的经过、他人的反应和行动结果，无需再调用 observe 才能知道这次发生了什么。needs_input 表示已经推进到需要你作新决定的地方，整体目标尚未完成，请据此给出下一步意图，不要当作仍在后台自动执行。记得给出合理的 duration；target 可直接写对象的名字或足以辨认的自然语言描述，不需要 ID，也不要求行动前先观察。" +
       "要在物理世界开口说话时，speech 写你自己决定说出的逐字原话；世界只负责传播和他人的反应，不替你生成台词。" +
+      "act 不读取聊天消息、软件界面或设备文件，也不执行收发消息、打开应用或设备命令；这些必须使用实际设备工具。拿起物件的身体动作不等于应用已打开或消息已读；不要把拿手机和读消息混成一个 act。需要切换手机持有状态时使用 pick_up_phone/put_down_phone。" +
       "上一个相同的动作还在进行中时，重复的 act 会被拦截（结果会自动送达，无需再发起一次）；确实要同时再做一遍时加 repeat: true。",
   },
   {
     name: "rest",
     signature: "rest(duration?: number)",
     description:
-      "主动暂停自主思考一段时间，duration 以 TU 为单位，缺省或非正数使用 300 TU。有重要动静可提前恢复。此工具是休息计时，不提交睡姿或体力恢复；身体动作需要 act，身体状态以真实感知为准，需要进一步检查时才 observe。记忆整理独立进行。",
+      "主动暂停自主思考一段时间，duration 以 TU 为单位，缺省或非正数使用 300 TU。有重要动静可提前恢复。到期和中断只记录计时，不表示睡过或醒来；身体的休息、睡姿等动作需要 act，身体状态以真实感知为准，需要进一步检查时才 observe。记忆整理独立进行。",
   },
   {
     name: "observe",
     signature: 'observe(intent?: string, target?: string, modality?: "all" | "sight" | "self")',
-    description: "主动把注意力放到自己、周围或某个细节。intent 写想了解什么，如「看看菜单上有哪些菜」「检查左手的伤口」；target 可补充对象名字或描述，也可用 self 指自身；modality 可选 all（默认）、sight（视觉）或 self（自身感受）。世界根据当前位置、感官和遮挡给出自然语言感知，必要时确立并记住尚未描写的合理细节；不会替你打开抽屉、移动身体、决定心情或透露不可感知的秘密。普通行动结果、眼前动静和通知会主动送达，不必反复观察；手机或电脑的真实界面请用 observe_device。",
+    description: "主动把注意力放到自己、周围或某个细节。intent 写想了解什么，如「看看菜单上有哪些菜」「检查左手的伤口」；target 可补充对象名字或描述，也可用 self 指自身；modality 可选 all（默认）、sight（视觉）或 self（自身感受）。世界根据当前位置、感官和遮挡给出自然语言感知，必要时确立并记住尚未描写的合理细节；不会替你打开抽屉、移动身体、决定心情或透露不可感知的秘密。普通行动结果、眼前动静和通知会主动送达，不必反复观察。此工具不能读取平台消息、设备通知、软件界面或设备文件；设备界面请用 observe_device，聊天正文用 select_channel/read_channel 等当前可用的专用工具。",
   },
   {
     name: "observe_device",
@@ -80,8 +81,8 @@ export const BOT_TOOLS: BotToolDef[] = [
   },
   {
     name: "reflect",
-    signature: 'reflect(kind: "relationship" | "commitment" | "preference" | "state" | "habit" | "trait", subject: string, statement: string, event_ids: string[], relation?: "support" | "counter" | "revise" | "retire", claim_id?: string, situation?: string, cues?: string[], subject_id?: string, expires_at?: number)',
-    description: "主动整理或修正关系、承诺、偏好、临时状态、情境习惯和性格倾向。event_ids 引用至少一个实际感知事件。state/habit/trait 必须写 situation（适用情境），cues 写想起它的情境词；subject_id 只能使用已感知的稳定身份。state 的 expires_at 为未来 TU，省略为两世界小时，最长一天，不代表永久性格。habit 至少有3段独立的自主完成选择，trait 至少6段且跨3种情境；次数只是核验底线，还须真实支持判断。已有认识给 claim_id；support 补证、counter 反例、revise 修正、retire 停止沿用。重读、失败重试和被迫行为不证明自主习惯；没有实践机会不等于习惯消退。",
+    signature: 'reflect(kind: "relationship" | "commitment" | "preference" | "state" | "habit" | "trait", subject: string, statement: string, event_ids: string[], relation?: "support" | "counter" | "revise" | "retire", claim_id?: string, situation?: string, cues?: string[], subject_id?: string, behavior?: string, expires_at?: number)',
+    description: "主动整理或修正关系、承诺、偏好、临时状态、情境习惯和性格倾向。event_ids 引用至少一个实际感知事件。state/habit/trait 必须写 situation（适用情境），cues 写想起它的情境词；subject_id 只能使用已感知的稳定身份。聊天关系必须提供 subject_id，并有该对象确实发出的非本人消息；自己的旧话、通知和频道列表不能替代对方的行为证据。state 必须有最近两世界小时内实际身体处境或当前注意界面的证据，通知、频道列表、拿起手机不证明正在留意谁；expires_at 为未来 TU，省略时从支持证据的最新 observedAt 起算两世界小时，显式指定也最长到证据时刻加一天，回顾旧事不能为旧状态续命。habit/trait 必须给 behavior，逐字摘取所引用已完成自主 action 中共同出现的明确动作短语；其他 kind 不填写 behavior。habit 至少有3段实际支持同一 behavior 的独立自主完成选择并跨一个世界日，trait 至少6段、跨3种情境和七个世界日；不能用无关动作凑次数，也不能更换近义标题重复新建同一行为倾向。已有认识给 claim_id；support 补证、counter 反例、revise 修正、retire 停止沿用。重读、失败重试和被迫行为不证明自主习惯；没有实践机会不等于习惯消退。",
   },
   {
     name: "recall_growth",
@@ -111,8 +112,8 @@ export const BOT_TOOLS: BotToolDef[] = [
     name: "put_down_phone",
     signature: "put_down_phone()",
     description:
-      "把手机放到一边：关闭打开着的应用，不再留意任何频道。之后再有消息你只会感觉到手机震了一下" +
-      "（不呈现内容也不知道来自哪里），直到你用 pick_up_phone 拿起手机。想清静时用。",
+      "把手机放到一边：关闭打开着的应用，不再留意任何频道。允许通知的频道有消息时，你仍只会感觉到手机震了一下" +
+      "（不呈现内容也不知道来自哪里）。这不会开启免打扰；要更改通知，先 pick_up_phone 拿起手机，再打开聊天应用、进入目标频道并用 channel_notify 设置。",
   },
   {
     name: "travel",
@@ -440,7 +441,7 @@ export function availableTools(opts: {
   notifyManaged?: boolean;
   /** bot.blockingAct：act 专注模式（上一个动作未完成前拒绝新的 act） */
   blockingAct?: boolean;
-  /** bot.waitRateThreshold > 0：等待占比过高时新的 wait 需要 confirm: true */
+  /** bot.waitRateThreshold > 0: wait/rest share the autonomous pause budget. */
   waitConfirm?: boolean;
   /** bot.disableWait：移除 wait 工具 */
   disableWait?: boolean;
@@ -534,14 +535,17 @@ export function availableTools(opts: {
   // 各分支按顺序叠加
   return tools.map((t) => {
     let def = t;
-    // 等待占比拦截：只有开启时才在 wait 描述里说明 confirm 参数
-    if (def.name === "wait" && opts.waitConfirm) {
+    if ((def.name === "wait" || def.name === "rest") && opts.waitConfirm) {
       def = {
         ...def,
+        signature: def.name === "wait" ? "wait(n: number, confirm?: boolean)" : "rest(duration?: number, confirm?: boolean)",
         description:
           def.description +
-          "最近大部分时间都在干等时，新的等待会被拦下——先考虑做点别的；确实要等的话，按拦截提示操作即可。",
+          "wait/rest 共用实际自主暂停的时长占比，被通知打断的部分也计入。近期暂停占比过高会先给出具体窗口反馈；确需继续休息或等待已有操作时，紧接着再调用同一工具并加 confirm: true，只确认该次。",
       };
+    }
+    if (def.name === "rest" && opts.disableWait) {
+      def = { ...def, description: def.description + "当前 wait 已关闭；rest 仍用于确有需要的休息，不要把它当成持续空等消息的替代。" };
     }
     // blockingAct 专注模式：上一个动作未完成前新的 act 会被拒绝（不可绕过）——只有开启时才在描述里说明
     if (def.name === "act" && opts.blockingAct) {

@@ -6,6 +6,18 @@ export interface ModalitySupport {
   video: boolean;
 }
 
+/** Optional for saved configurations created before separate maintenance models existed. */
+export interface CognitiveModelConfig {
+  mode: "inherit" | "independent";
+  baseURL: string;
+  apiKey: string;
+  model: string;
+  temperature: number;
+  maxTokens: number;
+  disableThinking: boolean;
+  stream: boolean;
+}
+
 export interface BotModelConfig {
   growth: GrowthConfig;
   regulation: RegulationConfig;
@@ -45,6 +57,7 @@ export interface BotModelConfig {
 }
 
 export interface RegulationConfig {
+  llm?: CognitiveModelConfig;
   enabled: boolean;
   decisionEnabled: boolean;
   timeoutMs: number;
@@ -56,6 +69,7 @@ export interface RegulationConfig {
 }
 
 export interface GrowthConfig {
+  llm?: CognitiveModelConfig;
   enabled: boolean;
   minEpisodes: number;
   reviewIntervalMs: number;
@@ -333,6 +347,22 @@ export interface Config {
   crossing: CrossingConfig;
 }
 
+function cognitiveModelSchema() {
+  return Schema.object({
+    mode: Schema.union([
+      Schema.const("inherit").description("沿用 Bot LLM"),
+      Schema.const("independent").description("独立配置"),
+    ]).default("inherit").description("模型来源；独立模式的连接与生成参数单独设置，不借用 Bot 的密钥"),
+    baseURL: Schema.string().default("").description("独立 API 地址（OpenAI 兼容根路径，含 /v1）；独立模式必须填写"),
+    apiKey: Schema.string().role("secret").default("").description("独立 API Key；本地服务可留空，留空不会使用 Bot 的密钥"),
+    model: Schema.string().default("").description("独立模型名；独立模式必须填写"),
+    temperature: Schema.number().min(0).max(2).default(0.3).description("独立采样温度，直接使用此值"),
+    maxTokens: Schema.natural().min(256).default(4096).description("独立请求的最大输出 token 数；结构化结果过长时需预留足够空间"),
+    disableThinking: Schema.boolean().default(false).description("关闭独立模型的思考模式（仅对支持此开关的后端生效）"),
+    stream: Schema.boolean().default(true).description("独立请求使用流式输出；不支持流式的后端可关闭"),
+  }).description("LLM 配置");
+}
+
 export const Config: Schema<Config> = Schema.intersect([
   Schema.object({
     basePath: Schema.string()
@@ -344,20 +374,21 @@ export const Config: Schema<Config> = Schema.intersect([
     serializeSameEndpoint: Schema.boolean()
       .default(true)
       .description(
-        "同源推理端点互斥：Bot-LLM 与 World-LLM 的 baseURL 同源（协议+主机+端口相同）时，" +
-          "双方的请求排队执行、绝不并发——World 任务（act 裁定、Tingle 等）期间 Bot 的生成会短暂等待。" +
+        "同源推理端点互斥：Bot、World、成长整理和内在调节实际使用的 baseURL 同源（协议+主机+端口相同）时，" +
+          "请求排队执行、绝不并发——World 任务（act 裁定、Tingle 等）期间同端点的 Bot 生成会短暂等待。" +
           "适用于并发请求下会饿死请求甚至崩溃的后端（模型换载层、单实例本地部署等）。" +
-          "若你的后端能真正并发处理多个请求，关闭本项可让两个 LLM 并行工作。" +
-          "两个 baseURL 不同源时本项没有任何影响",
+          "若你的后端能真正并发处理多个请求，关闭本项可让各 LLM 并行工作。" +
+          "不同源的 baseURL 使用各自的队列、互不等待",
       ),
   }).description("基础配置"),
 
   Schema.object({
     bot: Schema.object({
       regulation: Schema.object({
-        enabled: Schema.boolean().default(false).description("实验性内在调节：依据已交付经历维护需要、递质样信号与行动期待。每次自主决策增加一次 Bot 模型请求；失败保留原候选，历史与原始证据持久保存"),
+        enabled: Schema.boolean().default(false).description("实验性内在调节：依据已交付经历维护需要、递质样信号与行动期待。每次自主决策增加一次评价请求，模型可独立配置；失败保留原候选，历史与原始证据持久保存"),
+        llm: cognitiveModelSchema(),
         decisionEnabled: Schema.boolean().default(true).description("让需要、风险、成本与已学期待的评分参与实际行动选择；关闭后只评价原候选并学习实际结果"),
-        timeoutMs: Schema.natural().min(1000).max(300000).default(20000).description("单次评价超时（现实毫秒），包含共享端点排队；超时不虚构奖励或学习结果"),
+        timeoutMs: Schema.natural().min(1000).max(300000).default(90000).description("单次评价超时（现实毫秒），包含共享端点排队；本地模型可能需要数十秒完成结构化输出，过短会持续回退；超时不虚构奖励或学习结果"),
         maxInputChars: Schema.natural().min(4000).max(200000).default(64000).description("评价请求字符预算，完整作者边界和可用工具不可截断；预算不足时沿用原候选"),
         candidateCount: Schema.natural().min(1).max(3).default(3).description("最多比较几个候选（含原候选）；只有最终选中的一个会执行"),
         learningRate: Schema.number().min(0).max(1).default(0.3).description("新结果修正同一身份、情境和策略期待的基础速率；0 暂停期待更新"),
@@ -365,10 +396,11 @@ export const Config: Schema<Config> = Schema.intersect([
         sexualResponseEnabled: Schema.boolean().default(false).description("启用独立的性生理反射模拟：积累明确身体感知中的刺激与抑制，模拟峰值及恢复期。内部阶段不等于世界已发生的生理事件，也不代表自愿、愉悦或关系认同"),
       }).description("内在调节与经验学习（实验）"),
       growth: Schema.object({
-        enabled: Schema.boolean().default(true).description("自动整理已感知经历，形成可修订的关系、习惯和性格倾向，并在相关情境中唤起记忆；使用 Bot 的模型配置，独立请求，不改写当前上下文前缀"),
+        enabled: Schema.boolean().default(true).description("自动整理已感知经历，形成可修订的关系、习惯和性格倾向，并在相关情境中唤起记忆；模型可独立配置，请求不改写当前上下文前缀"),
+        llm: cognitiveModelSchema(),
         minEpisodes: Schema.natural().min(1).max(24).default(4).description("积累多少段不同经历后尝试整理；这是调用节流条件，不是习惯或性格升级阈值"),
         reviewIntervalMs: Schema.natural().min(1000).default(120000).description("两次自动整理的最短现实间隔（毫秒），无变化或失败也等待该间隔"),
-        reviewTimeoutMs: Schema.natural().min(1000).max(300000).default(45000).description("一次自动整理的超时（毫秒），包含等待共享模型端点的时间；超时保留经历供后续重试"),
+        reviewTimeoutMs: Schema.natural().min(1000).max(300000).default(90000).description("一次自动整理的超时（毫秒），包含等待共享模型端点的时间；本地模型的多项认识整理可能需要数十秒，超时保留经历供后续重试"),
         maxInputChars: Schema.natural().min(4000).max(100000).default(24000).description("自动整理请求的输入预算（字符），超长证据以明确的节选呈现，原文继续保存在账本"),
         recallCount: Schema.natural().min(0).max(6).default(3).description("相关情境中最多自动想起几条认识；0 关闭自动回忆，仍可主动 recall_growth"),
       }).description("关系、习惯与性格变化"),
@@ -435,14 +467,14 @@ export const Config: Schema<Config> = Schema.intersect([
         .max(100)
         .default(80)
         .description(
-          "等待时长占比拦截阈值（百分比）：最近一个观察窗口内，实际处于 wait 中的世界时间占比达到该值后，" +
-            "新的 wait 会被拦下并提示它做点别的（act、翻手机、记笔记）；确实要等必须加 confirm: true 二次确认" +
-            "（开启时 wait 的工具描述会说明该参数）。少量多次的短等不受影响，针对的是「几乎全部时间都在干等」。" +
+          "自主暂停占比拦截阈值（百分比）：最近一个观察窗口内，实际处于 wait/rest 的世界时间占比达到该值后，" +
+            "新的自主暂停会被拦下并提示它做点别的；确有休息或等待需要时，须紧接着对同一工具加 confirm: true 确认一次。" +
+            "被通知打断或主动取消前已经暂停的时间仍会计入；记忆整理不会清零。接管者操作不受此自主行为约束。" +
             "0 表示禁用",
         ),
       waitRateWindow: Schema.natural()
         .default(3600)
-        .description("等待时长占比的观察窗口（TU）：统计最近多少 TU 内的等待占比。默认 3600（同步模式下即最近 1 小时）"),
+        .description("自主暂停占比的观察窗口（TU）：统计最近多少 TU 内 wait/rest 的实际占比。默认 3600（同步模式下即最近 1 小时）"),
       restCompressMinChars: Schema.natural()
         .default(8000)
         .description(

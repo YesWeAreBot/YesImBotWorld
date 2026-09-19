@@ -6,6 +6,7 @@ import path from "node:path";
 import { BotContext } from "../src/bot/context.js";
 import { WorldFiles } from "../src/files.js";
 import { mediaPart } from "../src/media/presentation.js";
+import { WORLD_PERCEPTION_SCOPE } from "../src/prompts.js";
 import type { BotEvent, MediaRef, ToolCallRecord } from "../src/types.js";
 
 const body = "你走进餐厅。\n店员问：“想吃什么？”";
@@ -32,7 +33,7 @@ async function main() {
     const saved = context.stream.find(entry => entry.kind === "event" && entry.event.id === "ev_2");
     assert.equal(saved?.kind, "event"); if (saved?.kind !== "event") throw new Error("missing event");
     assert.equal(saved.event.content, fresh.content, "raw receipt remains available to debugging and evidence");
-    assert.equal(saved.event.contextText, body); assert.equal(fresh.contextText, undefined, "append does not mutate the runtime receipt object");
+    assert.equal(saved.event.contextText, WORLD_PERCEPTION_SCOPE + "\n\n" + body); assert.equal(fresh.contextText, undefined, "append does not mutate the runtime receipt object");
     assert.deepEqual(saved.event.originEventIds, fresh.originEventIds);
     const readable = BotContext.renderEventLine(saved.event);
     assert.equal(readable.split(body).length - 1, 1); assert.ok(!readable.includes('"entities"'));
