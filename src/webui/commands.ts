@@ -17,11 +17,16 @@ export class CommandRequestError extends Error {
   constructor(message: string, readonly status: number = 400) { super(message); }
 }
 
+const lifecycleCommands = new Set(["world.init", "world.start", "world.stop", "world.reset", "world.reload"]);
+function interruptsLifecycle(command: string, args: Record<string, string | boolean>): boolean {
+  return command === "world.stop" || command === "world.reset" || command === "world.init" && args.force === true;
+}
+
 /** Kept for the lifetime of this server. A new instance ID forbids replay after a restart. */
 export class WebCommandRunner {
   readonly instanceId = randomUUID();
   private runs = new Map<string, CommandRun>();
-  private mutating: string | null = null;
+  private mutating = new Map<string, AbortController>();
   constructor(private host: WorldCommandHost) {}
 
   catalog() {
@@ -30,7 +35,8 @@ export class WebCommandRunner {
       commands: WORLD_COMMANDS,
       worlds: [{ name: "home", label: "自己的世界" }, ...this.host.config.crossing.worlds.filter(world => world.name.trim() && world.url.trim()).map(world => ({ name: world.name.trim(), label: world.name.trim() }))],
       runs: [...this.runs.values()].slice(-50).reverse(),
-      busy: this.mutating,
+      busy: [...this.mutating.keys()].at(-1) ?? null,
+      interruptible: this.mutating.size > 0 && [...this.mutating.keys()].every(id => lifecycleCommands.has(this.runs.get(id)!.command)),
     };
   }
 
@@ -53,16 +59,24 @@ export class WebCommandRunner {
     }
     if (commandConfirmation(input.command, args) && input.confirmed !== true) throw new CommandRequestError("此操作需要在网页确认后执行。", 409);
     const definition = commandDefinition(input.command);
-    if (definition.mutates && this.mutating) throw new CommandRequestError("另一个管理指令正在执行，请等待完成后再操作。", 409);
+    if (definition.mutates && this.mutating.size && !(interruptsLifecycle(input.command, args) &&
+        [...this.mutating.keys()].every(id => lifecycleCommands.has(this.runs.get(id)!.command)))) {
+      throw new CommandRequestError("另一个管理指令正在执行，请等待完成后再操作。世界生命周期任务可用暂停、重置或强制重新创世中断。", 409);
+    }
     // Retain every accepted ID, including failed runs; never evict and then replay a mutation.
     if (this.runs.size >= 1000) throw new CommandRequestError("本次服务已保留 1000 条执行记录，请重载插件后继续。", 429);
     const run: CommandRun = { id: input.id, command: input.command, args, status: "running", startedAt: Date.now(), messages: [] };
     this.runs.set(run.id, run);
-    if (definition.mutates) this.mutating = run.id;
-    void executeWorldCommand(this.host, run.command, run.args, message => { run.messages.push(message); }).then(
+    const controller = new AbortController();
+    if (definition.mutates) {
+      // Keep cancellation scoped to accepted lifecycle requests; the host owns draining.
+      if (interruptsLifecycle(run.command, run.args)) for (const active of this.mutating.values()) active.abort(new DOMException("管理操作已被后续世界操作取消。", "AbortError"));
+      this.mutating.set(run.id, controller);
+    }
+    void executeWorldCommand(this.host, run.command, run.args, message => { run.messages.push(message); }, controller.signal).then(
       result => { run.result = result; run.status = "completed"; },
       error => { run.error = String((error as Error).message ?? error); run.status = "failed"; },
-    ).finally(() => { run.finishedAt = Date.now(); if (this.mutating === run.id) this.mutating = null; });
+    ).finally(() => { run.finishedAt = Date.now(); this.mutating.delete(run.id); });
     return run;
   }
 }

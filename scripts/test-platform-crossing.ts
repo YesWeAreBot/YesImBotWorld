@@ -50,6 +50,7 @@ async function hostProtocol() {
     },
     visitorWait: async (_s: any, n: number) => { waitDurations.push(n); return true; },
     visitorLeave: async (session: any) => { actors.delete(session.id); return true; },
+    disconnectVisitor: async (session: any) => { actors.delete(session.id); },
     visitorCheckTime: async () => true,
     visitorQuery: async () => "query result",
     observe: async (id: string) => { observed.push(id); return observation(id); },
@@ -258,6 +259,7 @@ async function lifecycleProtocol() {
       return true;
     },
     visitorLeave: async (session: any) => { leaves.push(session.name); await leave.promise; actors.delete(session.id); return true; },
+    disconnectVisitor: async (session: any) => { actors.delete(session.id); },
     cancelPending() {}, notePresenceChange() {}, setVisitorsProvider() {},
   } } as never);
   const listeningServer = { closeAllConnections() {}, close(done: () => void) { socketClosed = true; done(); } };
@@ -298,5 +300,50 @@ async function lifecycleProtocol() {
   } finally { action.resolve(); leave.resolve(); await server.stop(); }
 }
 
-async function main() { await hostProtocol(); await clientProtocol(); await lifecycleProtocol(); }
+async function quietLifecycleProtocol() {
+  const actors = new Set<string>(), detached: string[] = [];
+  const lifetime = new AbortController(); let leaveStarted = false, models = 0;
+  const world = {
+    residentBotName: "resident", wakeDormant: async () => {},
+    visitorArrive: async (session: any) => { actors.add(session.id); return true; },
+    visitorLeave: async () => {
+      models++; leaveStarted = true;
+      await new Promise<void>((_resolve, reject) => lifetime.signal.addEventListener("abort", () => reject(lifetime.signal.reason), { once: true }));
+      return true;
+    },
+    disconnectVisitor: async (session: any) => { detached.push(session.name); actors.delete(session.id); },
+    cancelPending() {}, notePresenceChange() {}, setVisitorsProvider() {},
+  };
+  const server = new CrossingServer({ cfg: { ...config.crossing, maxVisitors: 4 }, logger, ready: () => true, clock: () => null, notifyHostBot() {}, world } as never);
+  try {
+    const leaving = server.arrivePlayer("leaving-before-pause", "persona"), waiting = server.arrivePlayer("still-present", "persona");
+    assert.ok(leaving.ok && waiting.ok);
+    const session = (server as any).sessions.get(leaving.ok ? leaving.token : "");
+    await session.ready; await tick();
+    (server as any).depart(session, "returned");
+    await until(() => leaveStarted);
+    lifetime.abort(); await tick();
+    // The existing leave Promise has already rejected; merely changing new departures
+    // to quiet mode would otherwise leave this retained cleanup poisoning every reset.
+    await server.disconnectVisitors("world paused", { narrate: false });
+    assert.equal(models, 1, "shutdown cannot start another narrative leave");
+    assert.deepEqual(detached.sort(), ["leaving-before-pause", "still-present"]);
+    assert.equal(actors.size, 0); assert.equal((server as any).pendingCleanups.size, 0);
+    assert.equal((server as any).disconnecting, null);
+    assert.ok(server.arrivePlayer("after-resume", "persona").ok, "a completed quiet teardown must not poison later sessions");
+    await tick(); await server.stop(); assert.equal(actors.size, 0);
+  } finally { lifetime.abort(); await server.stop(); }
+
+  const diskError = new Error("fixture disk write failed");
+  const broken = new CrossingServer({ cfg: config.crossing, logger, ready: () => true, clock: () => null, notifyHostBot() {}, world: {
+    ...world, disconnectVisitor: async () => { throw diskError; },
+  } } as never);
+  assert.ok(broken.arrivePlayer("must-not-be-forgotten", "persona").ok); await tick();
+  await assert.rejects(broken.disconnectVisitors("reset", { narrate: false }), error => error === diskError);
+  assert.equal(broken.arrivePlayer("unsafe-new-generation", "persona").ok, false);
+  await assert.rejects(broken.stop(), error => error === diskError);
+  console.log("PASS: 暂停以确定性登记清理访客；只恢复明确取消的旧离场，持久化错误仍阻断重置");
+}
+
+async function main() { await hostProtocol(); await clientProtocol(); await lifecycleProtocol(); await quietLifecycleProtocol(); }
 main().catch((error) => { console.error(error); process.exitCode = 1; });

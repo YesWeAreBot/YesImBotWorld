@@ -74,6 +74,8 @@ export class WorldFiles {
   readonly growthJournal: string;
   readonly regulationJournal: string;
   readonly contextCommit: string;
+  /** Present until all genesis metadata and the initial character context are saved. */
+  readonly genesisPending: string;
   readonly botDef: string;
   readonly worldDef: string;
   readonly botStatus: string;
@@ -100,6 +102,7 @@ export class WorldFiles {
     this.narrativeJournal = path.join(base, "world-narrative.jsonl");
     this.growthJournal = path.join(base, "growth.jsonl");
     this.regulationJournal = path.join(base, "regulation.jsonl");
+    this.genesisPending = path.join(this.base, "genesis-pending.json");
     this.contextCommit = path.join(base, "context-commit.json");
     this.botDef = path.join(base, "Bot_Definition.md");
     this.worldDef = path.join(base, "World_Definition.md");
@@ -171,6 +174,7 @@ export class WorldFiles {
   }
 
   async isInitialized(): Promise<boolean> {
+    if (await this.exists(this.genesisPending)) return false;
     if (this.narrative) return this.narrative.snapshot().initialized;
     if ((await this.readText(this.narrativeJournal)).trim()) return true;
     return !!this.kernel?.snapshot().entities.bot || (await this.readText(this.worldJournal)).trim().length > 0 || ((await this.exists(this.botStatus)) && (await this.exists(this.worldStatus)));
@@ -363,6 +367,7 @@ export class WorldFiles {
       this.growthJournal,
       this.regulationJournal,
       this.contextCommit,
+      this.genesisPending,
       this.botStatus,
       this.worldStatus,
       this.news,
@@ -373,6 +378,8 @@ export class WorldFiles {
       this.meta,
       this.focus,
       this.notify,
+      this.browserCache,
+      this.phoneShell,
     ]) {
       if (file === this.narrativeJournal && narrativeSnapshot !== undefined) {
         if (narrativeSnapshot.trim()) {
@@ -429,6 +436,7 @@ export class WorldFiles {
       this.growthJournal,
       this.regulationJournal,
       this.contextCommit,
+      this.genesisPending,
       this.botStatus,
       this.worldStatus,
       this.news,
@@ -439,6 +447,8 @@ export class WorldFiles {
       this.meta,
       this.focus,
       this.notify,
+      this.browserCache,
+      this.phoneShell,
     ]) {
       const src = path.join(snapDir, path.basename(file));
       if (await this.exists(src)) await fs.copyFile(src, file);
@@ -491,6 +501,7 @@ export class WorldFiles {
       this.growthJournal,
       this.regulationJournal,
       this.contextCommit,
+      this.genesisPending,
       this.botStatus,
       this.worldStatus,
       this.news,
@@ -502,6 +513,7 @@ export class WorldFiles {
       this.focus,
       this.notify,
       this.browserCache,
+      this.phoneShell,
     ]) {
       await fs.rm(file, { force: true });
     }

@@ -40,10 +40,10 @@ export const WORLD_COMMANDS: readonly WorldCommandDefinition[] = [
   { name: "world.status", title: "查看运行状态", description: "读取世界、时钟、Bot 与应用的当前运行状态。", declaration: ".status", authority: 1, mutates: false, fields: [] },
   { name: "world.start", title: "启动世界", description: "让世界开始或恢复运转。", declaration: ".start", authority: 3, mutates: true, fields: [] },
   { name: "world.stop", title: "暂停世界", description: "暂停世界与 Bot；与现实同步的时钟继续走时，其它时钟随暂停静止。", declaration: ".stop", authority: 3, mutates: true, fields: [] },
-  { name: "world.reload", title: "重载世界设定", description: "根据已保存的定义调整世界状态，并以世界内的事件告知 Bot。", declaration: ".reload", authority: 3, mutates: true, fields: [], progress: "正在重载定义：World-LLM 正在调整世界状态，请稍候……" },
+  { name: "world.reload", title: "重载世界设定", description: "根据已保存的定义调整世界状态，并以世界内的事件告知 Bot。", declaration: ".reload", authority: 3, mutates: true, fields: [], progress: "正在检查并重载世界设定，请稍候……" },
   { name: "world.inject", title: "注入意识事件", description: "向运行中的 Bot 注入一条系统事件并唤醒它，用于调试。", declaration: ".inject <text:text>", authority: 3, mutates: true, fields: [{ name: "text", label: "事件内容", type: "textarea", required: true, hint: "内容会进入 Bot 的意识流。" }] },
   { name: "world.travel", title: "强制穿越", description: "把 Bot 送到已配置的世界，或送回自己的世界。", declaration: ".travel <name:text>", authority: 3, mutates: true, fields: [{ name: "name", label: "目标世界", type: "world", required: true }], confirmation: "这会强制改变 Bot 所在的世界。确认执行穿越？" },
-  { name: "world.init", title: "创世", description: "由 World-LLM 根据定义生成初始世界，并清空 Bot 的聊天消息记录；可能需要几分钟。完成后需启动世界。", declaration: ".init", authority: 3, mutates: true, fields: [{ name: "force", label: "强制重新创世", type: "boolean", hint: "已有世界将先归档，再重置并重新生成；定义与固定小事记保留。" }], progress: "开始创世：World-LLM 正在依据定义生成世界，可能需要几分钟，请稍候……" },
+  { name: "world.init", title: "创世", description: "由 World-LLM 根据定义生成初始世界，并清空 Bot 的聊天消息记录；可能需要几分钟。完成后需启动世界。", declaration: ".init", authority: 3, mutates: true, fields: [{ name: "force", label: "强制重新创世", type: "boolean", hint: "已有世界将先归档，再重置并重新生成；定义与固定小事记保留。" }], progress: "正在检查创世条件；开始生成后可能需要几分钟，暂停或重置可取消当前操作。" },
   { name: "world.clearmsg", title: "清空聊天记录", description: "清空 Bot 的聊天消息记录，保留媒体缓存、世界状态与定义。", declaration: ".clearmsg", authority: 4, mutates: true, fields: [], confirmation: "确认清空 Bot 的全部聊天消息记录？此操作无法撤销。" },
   { name: "world.reset", title: "重置世界", description: "停止世界，归档并重置世界状态与笔记，保留定义与固定小事记。此指令不清空聊天记录或媒体；之后需要重新创世。", declaration: ".reset", authority: 4, mutates: true, fields: [], confirmation: "确认归档并重置当前世界？世界状态与笔记将重置，定义与固定小事记保留，之后需要重新创世。" },
   { name: "world.webui", title: "查看工作室地址", description: "查看配置中的 WebUI 访问地址。", declaration: ".webui", authority: 1, mutates: false, fields: [] },
@@ -83,19 +83,24 @@ export function commandConfirmation(name: string, args: Record<string, unknown>)
 }
 
 /** No command text parsing, sessions, message sending or dynamic property dispatch. */
-export async function executeWorldCommand(host: WorldCommandHost, name: string, input: unknown, progress?: (text: string) => void | Promise<void>): Promise<string> {
+export async function executeWorldCommand(host: WorldCommandHost, name: string, input: unknown, progress?: (text: string) => void | Promise<void>, signal?: AbortSignal): Promise<string> {
   const definition = commandDefinition(name), args = commandArguments(name, input);
+  signal?.throwIfAborted();
   if (!host.getClock()) return "插件尚未就绪，请稍候。";
-  if (name === "world.init" && (!(await host.isInitialized()) || args.force)) await progress?.(definition.progress!);
-  if (name === "world.reload" && await host.isInitialized()) await progress?.(definition.progress!);
+  const report = () => {
+    // The lifecycle is reserved before progress delivery. A slow/failed chat send must
+    // neither reorder a later reset ahead of an old init nor misreport accepted work.
+    try { void Promise.resolve(progress?.(definition.progress!)).catch(() => {}); }
+    catch { /* Progress transport errors do not change the world operation's result. */ }
+  };
   switch (name) {
     case "world.status": return host.statusText();
     case "world.start": return host.startWorld();
     case "world.stop": return host.stopWorld();
-    case "world.reload": return host.reloadWorld();
+    case "world.reload": { const pending = host.reloadWorld(); report(); return pending; }
     case "world.inject": return host.injectEvent(String(args.text));
     case "world.travel": return host.crossingForce(String(args.name));
-    case "world.init": return host.initWorld(args.force === true);
+    case "world.init": { const pending = host.initWorld(args.force === true); report(); return pending; }
     case "world.clearmsg": return host.clearMsg();
     case "world.reset": return host.resetWorld();
     case "world.webui": {

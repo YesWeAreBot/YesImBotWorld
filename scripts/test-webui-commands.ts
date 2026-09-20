@@ -59,7 +59,7 @@ async function execution() {
   await tick(); assert.equal(active.status, "running"); assert.equal(active.messages.length, 1);
   assert.equal(runner.start(payload("request_1", "world.reload")), active);
   assert.throws(() => runner.start(payload("request_1", "world.stop")), /请求 ID/);
-  assert.throws(() => runner.start(payload("request_2", "world.stop")), /另一个/);
+  assert.throws(() => runner.start(payload("request_2", "world.start")), /另一个/);
   const status = runner.start(payload("request_3", "world.status")); await tick(); assert.equal(status.status, "completed", "read-only status remains available during mutation");
   blocker.resolve(); await tick(); assert.equal(active.status, "completed"); assert.equal(active.result, "reloaded");
   runner.start(payload("request_1", "world.reload")); assert.equal(calls.filter(call => call[0] === "reload").length, 1);
@@ -71,6 +71,42 @@ async function execution() {
   assert.equal(calls.filter(call => call[0] === "failure").length, 1, "failed operations are never replayed under the same ID");
   assert.equal(runner.catalog().busy, null);
   console.log("PASS commands: fixed allowlist, strict fields, confirmation, restart fence, active/completed/failed deduplication and mutation exclusion");
+}
+
+async function interruption() {
+  for (const activeCommand of ["world.init", "world.start", "world.stop", "world.reset", "world.reload", "world.clearmsg", "world.travel"]) {
+    for (const interrupt of ["world.stop", "world.reset", "world.init"]) {
+      const { host } = fixture(), blocker = gate();
+      const method = { "world.init": "initWorld", "world.start": "startWorld", "world.stop": "stopWorld", "world.reset": "resetWorld", "world.reload": "reloadWorld", "world.clearmsg": "clearMsg", "world.travel": "crossingForce" }[activeCommand]!;
+      let first = true;
+      (host as any)[method] = async () => { if (first) { first = false; await blocker.promise; } return "done"; };
+      const runner = new WebCommandRunner(host), request = (id: string, command: string, args: unknown = {}) => ({ id, command, args, confirmed: true, instanceId: runner.instanceId });
+      const active = runner.start(request("active_command", activeCommand, activeCommand === "world.travel" ? { name: "home" } : {}));
+      await tick();
+      const interruptible = !["world.clearmsg", "world.travel"].includes(activeCommand);
+      assert.equal(runner.catalog().interruptible, interruptible);
+      assert.throws(() => runner.start(request("normal_init", "world.init", { force: false })), /另一个/);
+      const input = request("interrupt_command", interrupt, interrupt === "world.init" ? { force: true } : {});
+      if (interruptible) {
+        const stop = runner.start(input); await tick(); assert.equal(stop.status, "completed");
+        assert.equal(runner.catalog().busy, active.id, "a quick interrupter cannot unlock an older mutation which is still draining");
+        assert.throws(() => runner.start(request("conflicting_clear", "world.clearmsg")), /另一个/);
+      } else assert.throws(() => runner.start(input), /另一个/);
+      blocker.resolve(); await tick(); assert.equal(runner.catalog().busy, null);
+    }
+  }
+  // Both Koishi and WebUI reserve the service lifecycle synchronously, before any
+  // slow isInitialized read or progress message could let a newer reset overtake it.
+  const { host, calls } = fixture(), progress = gate();
+  host.isInitialized = async () => { throw new Error("command dispatch must not await this read"); };
+  const init = executeWorldCommand(host, "world.init", { force: true }, async () => { await progress.promise; throw new Error("progress delivery failed"); });
+  assert.deepEqual(calls, [["init", true]], "init has already reserved the lifecycle before command dispatch returns");
+  await executeWorldCommand(host, "world.stop", {});
+  assert.equal(await init, "fixture: init", "completion does not depend on progress delivery");
+  progress.resolve(); await tick();
+  assert.deepEqual(calls, [["init", true], ["stop"]]);
+  assert.equal(await executeWorldCommand(host, "world.reload", {}, () => { throw new Error("sync progress failure"); }), "fixture: reload");
+  console.log("PASS commands: lifecycle interruption only, force/confirmation gates, draining ownership, and dispatch before progress delivery");
 }
 
 async function httpAccess(dir: string) {
@@ -107,7 +143,7 @@ async function httpAccess(dir: string) {
 
 async function main() {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "yesimbot-commands-"));
-  try { await sharedCommands(); await execution(); await httpAccess(dir); }
+  try { await sharedCommands(); await execution(); await interruption(); await httpAccess(dir); }
   finally { await fs.rm(dir, { recursive: true, force: true }); }
 }
 main().catch(error => { console.error(error); process.exitCode = 1; });

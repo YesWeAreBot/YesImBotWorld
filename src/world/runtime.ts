@@ -34,35 +34,61 @@ export class NarrativeWorld {
       timeLine: typeof this.clock.timeLine === "function" ? this.clock.timeLine(tu) : `T=${tu}（未提供日期映射）`,
       timeZone: "未提供时区映射", utcOffset: null, calendarKind: "unavailable", unitRealSeconds: this.clock.unitRealSeconds ?? 1, unitWorldSeconds: this.clock.unitWorldSeconds ?? 1 };
   }
-  async store(): Promise<NarrativeStore> {
-    if (!this.opening) this.opening = NarrativeStore.open(this.files.base, { now: () => this.clock.now() }).then(async store => {
-      await store.migrateLegacy(this.files); this.files.bindNarrativeStore(store); await this.recover(store); return store;
-    }).catch(error => { this.opening = undefined; throw error; });
+  async store(inspection = false): Promise<NarrativeStore> {
+    if (!this.opening) {
+      // Explicit administrative inspection may load a paused world, but grants no inference
+      // permission. The service's lifecycle read barrier and shutdown both join this opening.
+      const signal = inspection && this.lifetime.signal.aborted ? new AbortController().signal : this.lifetime.signal;
+      signal.throwIfAborted();
+      const opening = NarrativeStore.open(this.files.base, { now: () => this.clock.now() }).then(async store => {
+        signal.throwIfAborted();
+        await store.migrateLegacy(this.files);
+        signal.throwIfAborted();
+        await this.recover(store, signal);
+        signal.throwIfAborted();
+        this.files.bindNarrativeStore(store);
+        return store;
+      });
+      this.opening = opening;
+      void opening.catch(() => { if (this.opening === opening) this.opening = undefined; });
+    }
     return this.opening;
   }
-  private async recover(store: NarrativeStore): Promise<void> {
+  private async recover(store: NarrativeStore, signal?: AbortSignal): Promise<void> {
     for (const action of Object.values(store.snapshot().actions)) if (action.status === "pending") {
       await store.commit({ idempotencyKey: `recovery:${action.id}`, source: "recovery", actorId: action.actorId, actionId: action.id,
         actions: { [action.id]: { ...action, status: "failed", finishedAt: Math.max(this.clock.now(), store.snapshot().effectiveAt, action.startedAt), reason: "执行进程中断，未提交动作结果。" } },
-        perceptions: [{ actorId: action.actorId, text: `先前尝试的「${action.intent}」没有确认完成。请根据当前处境决定下一步。` }] });
+        perceptions: [{ actorId: action.actorId, text: `先前尝试的「${action.intent}」没有确认完成。请根据当前处境决定下一步。` }] }, { signal });
     }
   }
   resume(): void { if (this.lifetime.signal.aborted) this.lifetime = new AbortController(); }
   stop(): void { this.epoch++; this.lifetime.abort(); for (const c of this.controllers.values()) c.abort(); }
-  async shutdown(): Promise<void> { this.stop(); await Promise.allSettled([...this.active.values()].map(item => item.promise)); await this.tail; }
+  async shutdown(): Promise<void> {
+    this.stop();
+    // Opening/replay may repair mirrors or import a legacy journal. Reset must wait for it,
+    // even when no model task has reached the serial queue yet.
+    await Promise.allSettled([...(this.opening ? [this.opening] : []), ...[...this.active.values()].map(item => item.promise)]);
+    await this.tail;
+  }
   async reload(): Promise<void> {
     await this.shutdown();
     if (this.opening) { const store = await this.opening; await store.reload(); await store.migrateLegacy(this.files); await this.recover(store); }
-    this.resume();
+    // Reload is administrative IO, not permission to restart inference.
+  }
+  private operationSignal(signal?: AbortSignal): AbortSignal {
+    const combined = signal ? AbortSignal.any([this.lifetime.signal, signal]) : this.lifetime.signal;
+    combined.throwIfAborted();
+    return combined;
   }
   cancel(actorId: string): void { for (const [id, c] of this.controllers) if (id.startsWith(`${actorId}:`)) c.abort(); }
   private serial<T>(fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
     const pending = this.tail.then(() => { signal?.throwIfAborted(); return fn(); });
     this.tail = pending.catch(() => {}); return pending;
   }
-  async ensure(botDef?: string, worldDef?: string): Promise<void> {
-    const store = await this.store(); if (store.snapshot().initialized) return;
-    const signal = this.lifetime.signal;
+  async ensure(botDef?: string, worldDef?: string, requestSignal?: AbortSignal): Promise<void> {
+    const signal = this.operationSignal(requestSignal);
+    const store = await this.store(); signal.throwIfAborted();
+    if (store.snapshot().initialized) return;
     await this.serial(async () => {
       if (store.snapshot().initialized) return;
       const definitions = { character: botDef ?? await this.files.readText(this.files.botDef), world: worldDef ?? await this.files.readText(this.files.worldDef) };
@@ -91,14 +117,14 @@ export class NarrativeWorld {
     return store.readPerceptions(actorId, sequence).flatMap(p => { const safe = physicalPerception(p, p.actionId ? snapshot.actions[p.actionId]?.speech : undefined, this.timeAuthority(p.worldTime)); return safe ? [observationOf(safe)] : []; });
   }
   async inspect(): Promise<unknown> {
-    const store = await this.store(), snapshot = store.snapshot();
+    const store = await this.store(true), snapshot = store.snapshot();
     return { mode: "narrative", snapshot: { ...snapshot, entities: {} }, events: store.readEvents(Math.max(0, snapshot.sequence - 100), 1000) };
   }
   async observe(actorId = "bot", args: { intent?: string; target?: string; modality?: string } = {}): Promise<NarrativeObservation> {
+    const signal = this.operationSignal();
     if (detectDeviceRequest([args.intent?.trim() || "查看", args.target].filter(Boolean).join(" "))) throw new Error(DEVICE_TOOL_GUIDANCE);
-    await this.ensure();
+    await this.ensure(undefined, undefined, signal);
     if (args.modality && !["all", "sight", "self"].includes(args.modality)) throw new Error("不支持这种观察方式。");
-    const signal = this.lifetime.signal;
     return this.serial(async () => {
       if (!(await this.store()).snapshot().actors[actorId]?.present) throw new Error("角色当前不在这个世界中。");
       const result = await this.change(`主动观察：${JSON.stringify({ intent: args.intent?.trim() || "了解当前处境", target: args.target?.trim() || (args.modality === "self" ? "自己的身体与处境" : "周围"), modality: args.modality || "all" })}。返回当下可感知的场景。开门、翻动或走动才能发现的内容只能说明限制，不能代为行动。可合理确定此前未描写的可见细节并同步记住；已有菜单、布局和话语不能因再看一次随机变化。`,
@@ -110,10 +136,11 @@ export class NarrativeWorld {
   async query(actorId: string, task: string): Promise<string> { return JSON.stringify({ query: task, observation: await this.peek(actorId) }); }
   /** Internal virtual-device read. Unlike physical observe, this cannot establish missing files. */
   async observeVirtualApp(actorId: string, task: string): Promise<NarrativeObservation> {
+    const signal = this.operationSignal();
     assertVirtualAppTarget(task);
     const meta = await this.files.readMeta();
     if (meta.realWorld ?? this.clock.syncRealTime) throw new Error("该应用必须通过设备提供的读取能力获取内容，此读取入口不可用。");
-    await this.ensure(); const signal = this.lifetime.signal;
+    await this.ensure(undefined, undefined, signal);
     return this.serial(async () => {
       if (!(await this.store()).snapshot().actors[actorId]?.present) throw new Error("角色当前不在这个世界中。");
       const result = await this.change(`仅通过角色可使用的应用读取已经确立的内容：${task}\n这次仅可返回该actorId的一份perceptions，不可填写worldState、actorStates、outcome，不可发送其他角色事件。只读取已存在的文件、页面、记录或已明确预报。文件原文逐字保留；没有记载的内容说明未知或不可用，不猜测不存在、不创建新原文，不执行写入、命令或外部网络请求。`,
@@ -124,14 +151,15 @@ export class NarrativeWorld {
   }
   /** App writes change device records; only the caller's attention/control gate may expose output. */
   async executeVirtualApp(actorId: string, task: string, signal?: AbortSignal): Promise<RichText> {
+    const lifetime = this.operationSignal(signal);
     assertVirtualAppTarget(task);
     const meta = await this.files.readMeta();
     if (meta.realWorld ?? this.clock.syncRealTime) throw new Error("该应用必须通过设备提供的操作能力执行，此操作入口不可用。");
     const id = `${actorId}:app:${randomUUID()}`, controller = new AbortController();
     this.controllers.set(id, controller);
-    const combined = AbortSignal.any([this.lifetime.signal, controller.signal, ...(signal ? [signal] : [])]);
+    const combined = AbortSignal.any([lifetime, controller.signal]);
     try {
-      combined.throwIfAborted(); await this.ensure();
+      combined.throwIfAborted(); await this.ensure(undefined, undefined, combined);
       return await this.serial(async () => {
         if (!(await this.store()).snapshot().actors[actorId]?.present) throw new Error("角色当前不在这个世界中。");
         const result = await this.change(`仅执行角色可用设备上的应用请求：${task}\n这是应用操作，不是角色身体或意识的行动，不代表角色已经看过结果。必须显式返回worldState全文：根据实际影响更新，未发生变化时返回原文，必须保留既有精确文件内容；不能改actorStates、代替角色行动或给其他角色发送感知。perceptions只放该actorId一份私有应用回执，outcome明确completed、failed或needs_input。回执只输出实际应用结果；未执行、能力不足或失败要如实说明，不以猜测当作成功。`,
@@ -144,7 +172,7 @@ export class NarrativeWorld {
     } finally { if (this.controllers.get(id) === controller) this.controllers.delete(id); }
   }
   act(actorId: string, call: ToolCallRecord, deliver: (text: string) => void, signal?: AbortSignal, beforeCommit?: () => boolean): Promise<boolean> {
-    if (signal?.aborted) return Promise.reject(signal.reason ?? new Error("Cancelled"));
+    if (this.lifetime.signal.aborted || signal?.aborted) return Promise.reject(this.lifetime.signal.reason ?? signal?.reason ?? new Error("Cancelled"));
     if (detectDeviceRequest([call.arguments.description, call.arguments.target].filter(value => typeof value === "string").join(" "))) return Promise.reject(new Error(DEVICE_TOOL_GUIDANCE));
     const epoch = this.epoch, id = `${actorId}:${call.id}`;
     const fingerprint = createHash("sha256").update(JSON.stringify({ actorId, arguments: call.arguments, expectedAt: call.expectedAt })).digest("hex");
@@ -173,11 +201,12 @@ export class NarrativeWorld {
     });
   }
   private async runAct(actorId: string, id: string, fingerprint: string, call: ToolCallRecord, signal?: AbortSignal, beforeCommit?: () => boolean): Promise<boolean> {
+    const lifetime = this.lifetime.signal;
     const controller = new AbortController(); this.controllers.set(id, controller);
-    const combined = AbortSignal.any([controller.signal, this.lifetime.signal, ...(signal ? [signal] : [])]);
+    const combined = AbortSignal.any([controller.signal, lifetime, ...(signal ? [signal] : [])]);
     let store: NarrativeStore | undefined;
     try {
-      combined.throwIfAborted(); await this.ensure(); store = await this.store();
+      combined.throwIfAborted(); await this.ensure(undefined, undefined, combined); store = await this.store();
       const intent = typeof call.arguments.description === "string" ? call.arguments.description.trim() : "";
       if (!intent) throw new Error("动作意图不能为空。");
       if (!Number.isFinite(call.expectedAt) || call.expectedAt < 0) throw new Error("动作完成时间必须非负且有限。");
@@ -205,9 +234,9 @@ export class NarrativeWorld {
       const outcome = store.snapshot().actions[id]; return outcome?.status === "completed" || outcome?.status === "needs_input";
     } catch (error) {
       const pending = store?.snapshot().actions[id];
-      if (store && pending?.status === "pending" && pending.requestFingerprint === fingerprint) await store.commit({ idempotencyKey: `${id}:end`, source: "action", actorId, actionId: id,
+      if (this.lifetime.signal === lifetime && store && pending?.status === "pending" && pending.requestFingerprint === fingerprint) await store.commit({ idempotencyKey: `${id}:end`, source: "action", actorId, actionId: id,
         actions: { [id]: { ...pending, status: combined.aborted ? "cancelled" : "failed", finishedAt: Math.max(this.clock.now(), store.snapshot().effectiveAt), reason: String(error) } },
-        perceptions: [{ actorId, text: combined.aborted ? `这次「${pending.intent}」已在结果提交前取消。` : `这次「${pending.intent}」没有确认完成，请根据当前处境决定下一步。` }] });
+        perceptions: [{ actorId, text: combined.aborted ? `这次「${pending.intent}」已在结果提交前取消。` : `这次「${pending.intent}」没有确认完成，请根据当前处境决定下一步。` }] }, { beforeCommit: () => this.lifetime.signal === lifetime });
       throw error;
     } finally { if (this.controllers.get(id) === controller) this.controllers.delete(id); }
   }
@@ -223,11 +252,13 @@ export class NarrativeWorld {
     signal.throwIfAborted();
   }
   async evolve(reason: string): Promise<void> {
-    await this.ensure(); const signal = this.lifetime.signal;
+    const signal = this.operationSignal();
+    await this.ensure(undefined, undefined, signal);
     await this.serial(async () => { await this.change(reason, { kind: "evolve", id: `evolve:${randomUUID()}`, signal }); }, signal);
   }
   async arrive(actorId: string, name: string, persona: string, signal?: AbortSignal): Promise<void> {
-    await this.ensure(); const combined = AbortSignal.any([this.lifetime.signal, ...(signal ? [signal] : [])]);
+    const combined = this.operationSignal(signal);
+    await this.ensure(undefined, undefined, combined);
     await this.serial(async () => {
       const previous = (await this.store()).snapshot().actors[actorId]; if (previous?.present) return;
       const actor: NarrativeActor = { id: actorId, name, controller: "player", present: true, persona, state: previous?.state ?? "", perception: "" };
@@ -236,24 +267,39 @@ export class NarrativeWorld {
     }, combined);
   }
   async leave(actorId: string): Promise<void> {
+    const signal = this.operationSignal();
     this.cancel(actorId); await Promise.allSettled([...this.active].filter(([id]) => id.startsWith(`${actorId}:`)).map(([, item]) => item.promise));
-    const signal = this.lifetime.signal;
     await this.serial(async () => {
       const actor = (await this.store()).snapshot().actors[actorId]; if (!actor?.present) return;
       await this.change(`访客${actor.name}的连接结束，登记离场及对环境的影响，只通知能感知到变化的在场角色，不能代写访客离场后的主观经历。`,
         { kind: "leave", actorId, actors: { [actorId]: { ...actor, present: false } }, id: `leave:${randomUUID()}`, signal });
     }, signal);
   }
-  async rename(name: string): Promise<void> {
+  /** Administrative session cleanup after inference has stopped; never invents a narrated departure. */
+  async disconnectVisitor(actorId: string): Promise<void> {
+    if (!actorId.startsWith("visitor:")) throw new Error("只能登记访客会话离场。");
+    this.cancel(actorId);
+    await Promise.allSettled([...this.active].filter(([id]) => id.startsWith(`${actorId}:`)).map(([, item]) => item.promise));
+    await this.serial(async () => {
+      const store = await this.store(true), snapshot = store.snapshot(), actor = snapshot.actors[actorId];
+      if (!actor?.present) return;
+      await store.commit({ idempotencyKey: `disconnect:${actorId}:${snapshot.sequence}`, source: "administrator", actorId,
+        actors: { [actorId]: { ...actor, present: false } },
+        worldState: snapshot.worldState + `\n会话登记：访客${actor.name}的连接已结束，当前不在场；没有裁定其离开方式或主观经历。` });
+    });
+  }
+  async rename(name: string, requestSignal?: AbortSignal): Promise<void> {
+    const signal = this.operationSignal(requestSignal);
     const store = await this.store(), trimmed = name.trim(); if (!trimmed) return;
     await this.serial(async () => {
       const snapshot = store.snapshot(), actor = snapshot.actors.bot; if (!actor || actor.name === trimmed) return;
       await store.commit({ idempotencyKey: `rename:${randomUUID()}`, source: "administrator", actors: { bot: { ...actor, name: trimmed, state: actor.state + `\n角色现名为${trimmed}，与此前的${actor.name}是同一个人。` } },
         worldState: snapshot.worldState + `\n身份更正：常驻角色${actor.name}现名为${trimmed}，这是同一个人，既往经历保持不变。`,
-        perceptions: actor.present ? [{ actorId: "bot", text: `你的名字现已更正为${trimmed}；你仍是此前的${actor.name}，既往经历没有改变。` }] : [] });
-    });
+        perceptions: actor.present ? [{ actorId: "bot", text: `你的名字现已更正为${trimmed}；你仍是此前的${actor.name}，既往经历没有改变。` }] : [] }, { signal });
+    }, signal);
   }
   private async change(task: string, options: Change): Promise<NarrativeCommitResult | undefined> {
+    options.signal?.throwIfAborted();
     const store = await this.store(), previous = store.findCommit(`${options.id}:commit`); if (previous) return previous;
     const definitions = await this.files.readDefinitions();
     const meta = await this.files.readMeta(), virtual = !(meta.realWorld ?? this.clock.syncRealTime);
@@ -365,7 +411,7 @@ function assertDeviceResolution(input: Resolution, context: { virtual: boolean; 
     // The actor may literally talk about a message; only its supplied words are authorized.
     const checked = context.speech ? text.split(context.speech).join("〈角色本次提供的原话〉") : text;
     const found = detectDeviceClaim(checked, { virtualApp });
-    if (found) throw new Error(`${found.code}: ${field}：${found.message} 该字段未提交。只保留可裁定的物理事实，不得改写、续写或复用旧设备断言。`);
+    if (found) throw new Error(`${found.code}: ${field}：${found.message} 违规片段：${JSON.stringify(Array.from(found.excerpt).slice(0, 180).join(""))}。该字段未提交。只保留可裁定的物理事实，不得改写、续写或复用旧设备断言。`);
   };
   const previousFile = context.virtual ? splitVirtualFileBody(context.previousWorld).body : "";
   for (const perception of input.perceptions) {

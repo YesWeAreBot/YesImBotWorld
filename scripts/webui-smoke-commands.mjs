@@ -42,7 +42,13 @@ export default async function smokeCommands({ evaluate, wait, assert, navigate }
     await wait("document.querySelector('.commands-detail .commands-run-state').textContent==='执行中'");
     await menu();
     assert(await evaluate("document.querySelector('[data-command=\"world.reload\"]').disabled && !document.querySelector('[data-command=\"world.status\"]').disabled"), 'A running mutation disables conflicting menu actions while reads remain available');
-    await evaluate("document.querySelector('.commands-history-toggle').click()");
+    assert(await evaluate("!document.querySelector('[data-command=\"world.reset\"]').disabled && !document.querySelector('[data-command=\"world.init\"]').disabled && !document.querySelector('.studio-hero-actions > button').disabled && document.querySelector('.studio-hero-actions > button').textContent.includes('取消当前世界操作')"), 'Lifecycle work keeps reset, force-init and the welcome cancellation button reachable');
+    await choose('world.init');
+    assert(await evaluate("document.querySelector('[data-command-execute]').disabled"), 'Ordinary initialization cannot overtake a running lifecycle operation');
+    await evaluate("var force=document.querySelector('[data-command-field=\"force\"]');force.checked=true;force.dispatchEvent(new Event('change'));");
+    assert(await evaluate("!document.querySelector('[data-command-execute]').disabled"), 'Selecting force enables explicit cancellation and reinitialization');
+    await menu();
+    await evaluate("document.querySelector('.commands-history-toggle').click();document.querySelector('.commands-run[data-run-command=\"world.reload\"]').click();");
     await wait("document.querySelector('.commands-output')?.textContent==='开发样本定义已重载。'");
     await evaluate("window.confirm=()=>false;window.__commandsBeforeCancel=window.__commandPosts.length");
     await choose('world.reset');

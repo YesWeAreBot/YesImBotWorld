@@ -12,7 +12,7 @@ export interface DeviceBoundaryViolation {
 
 export const DEVICE_TOOL_GUIDANCE = "消息、通知、软件界面及设备读写由专用工具提供实际结果。请用 observe_device 查看设备，按当前工具用 open_app、select_channel/read_channel 读取真实聊天，用 send 等工具发送。act 只能裁定身体与物理环境；混合请求尚未执行，不能把消息内容、已读或发送成功当作世界行动结果。";
 
-export const WORLD_DEVICE_AUTHORITY = "代码限定的事实归属：普通任务只裁定物理世界。真实聊天平台在现实或虚构世界中都由外部服务独占；本次没有提供其消息原文、收发回执或设备运行状态。不得新建、续写、转述或确认平台消息、通知、未读/已读、聊天对象、发信结果、应用页面和开关状态，也不得依据旧世界叙述中的这类内容继续创作。初始化、演化、观察、离场和所有状态字段同样受限。手机等物品的位置、外观及身体拿放可裁定，软件与消息须由设备工具提供。只有明确的内部app_observe/app_action可按读写协议处理虚构软件，仍无真实平台权限。既有虚构文件原文仅供相应内部应用读取，普通裁定只能原样保留，不能作为普通角色感知。缺少设备事实时省略它们，不猜测有或没有。";
+export const WORLD_DEVICE_AUTHORITY = "代码限定的事实归属：普通任务只裁定物理世界。真实聊天平台在现实或虚构世界中都由外部服务独占；本次没有提供其消息原文、收发回执或设备运行状态。不得新建、续写、转述或确认平台消息、通知、未读/已读、聊天对象、发信结果、应用页面和开关状态，也不得依据旧世界叙述中的这类内容继续创作。初始化、演化、观察、离场和所有状态字段同样受限。手机等物品的位置、外观及身体拿放可裁定，软件与消息须由设备工具提供。只有明确的内部app_observe/app_action可按读写协议处理虚构软件，仍无真实平台权限。既有虚构文件原文仅供相应内部应用读取，普通裁定只能原样保留，不能作为普通角色感知。缺少设备事实时省略它们，不猜测有或没有。创世也不要描述屏幕亮暗、熄屏、锁定、电量或是否有通知：暗屏不是安全替代说法，仍在断言未知设备状态。可写“手机平放在床头柜上，机身留有握持余温”，不要加“屏幕暗着”。";
 
 const platform = /(?:\b(?:qq|wechat|weixin|telegram|discord|slack|whatsapp|messenger|email|e-mail|sms|imessage)\b|微信|钉钉|飞书|私聊|群聊|私信|短信|电子邮件|聊天(?:记录|窗口|界面|列表|频道|软件|应用|平台)|社交平台)/i;
 const digital = /(?:手机|电脑|平板|屏幕|显示器|终端|浏览器|软件|应用|网页|网站|网络|互联网|邮箱|收件箱|通知栏|状态栏|\b(?:phone|computer|screen|desktop|terminal|browser|app|inbox|online)\b)/i;
@@ -29,7 +29,12 @@ function clauses(text: string): string[] {
   return text.replace(/\n+/g, " ").split(/[，,。；;！？!?]|(?:然后|接着|并且|同时|顺便)|并(?=给|向|收|查|发|看|读|打)/).filter(part => part.trim());
 }
 function violation(kind: DeviceBoundaryViolation["kind"], text: string): DeviceBoundaryViolation {
-  return { code: "WORLD_DEVICE_BOUNDARY", kind, message: kind === "chat" ? "World 没有平台消息或收发回执的事实权限，请通过真实聊天工具操作。" : "World 没有软件界面、通知或设备读写结果的事实权限，请通过专用设备工具操作。", excerpt: text.slice(0, 180) };
+  const screenState = kind === "software" && /(?:屏幕|显示器|screen|display).{0,55}(?:亮|暗|黑|熄|锁|关闭|off|dark|lit|locked)/i.test(text);
+  return { code: "WORLD_DEVICE_BOUNDARY", kind, message: kind === "chat"
+    ? "World 没有平台消息或收发回执的事实权限。删除虚构的消息、界面和收发结果，通过真实聊天工具取得；不要改写成‘没有消息’。"
+    : screenState
+      ? "屏幕亮暗、熄屏或锁定同样是未知设备状态，不能由 World 设定。删除这部分子句，不要换成另一种屏幕状态；只保留物理描述，例如‘手机平放在床头柜上，机身留有握持余温’。实际屏幕由 observe_device 等专用设备工具提供。"
+      : "World 没有软件界面、通知或设备读写结果的事实权限。删除这些断言，只保留物品的位置、外壳等物理处境；实际结果由专用设备工具提供。", excerpt: text.slice(0, 180) };
 }
 
 /** Call on the user's tool intent/target, not on arbitrary file contents or quoted history. */
@@ -72,6 +77,10 @@ function claimClause(input: string, options: { virtualApp?: boolean }): DeviceBo
   if (/(?:发来|发来了|收到|收到了|接到|推送|发出|发给|发送|回复|回了|读到|看完|看过|已读|未读|提醒).{0,45}(?:消息|私信|短信|邮件|聊天)|(?:消息|私信|短信|邮件).{0,45}(?:发来|发出|发送|来自|写着|内容|显示|已读|未读|已发|收到|送达|回复|发送成功)|(?:发送|发信|投递|转发)(?:已|已经)?(?:成功|完成)|\b(?:received|sent|unread|delivered)\s+(?:a |the |new )?(?:message|email|notification)|\b(?:message|email)\s+(?:from|sent|delivered|reads|says)\b/i.test(text)) return violation("chat", input);
   if (digital.test(text) && /(?:通知|未读|已读|红点|消息|私信|聊天|邮件|来电|铃声|震动|振动|提示音|\b(?:notification|unread|message|inbox|ringtone|vibrat)\w*)/i.test(text)) return violation("chat", input);
   if (options.virtualApp) return null;
+  // A narrowly shaped surface-defect statement is physical appearance, not a
+  // display state. Do not exempt a whole clause merely because it mentions glass.
+  if (/^(?:(?:手机|电脑|平板)(?:的)?|这块|这台|它的)?(?:屏幕|显示器)(?:的)?(?:玻璃|玻璃表面|表面|外层玻璃|边框)?(?:上)?(?:有|留有|带有|沾着)[^。；\n]{0,48}(?:划痕|裂纹|裂痕|指纹|灰尘)$/.test(text.trim()) &&
+    !/(?:界面|按钮|图标|窗口|文字|菜单|应用|软件|程序|网页|显示|亮起|亮着|暗着|黑屏|熄|锁|登录|打开|关闭|运行)/.test(text)) return null;
   if (/(?:屏幕|界面|显示器|浏览器|网页|网站|应用|软件|终端|\b(?:screen|desktop|browser|app|terminal)\b).{0,55}(?:显示|亮|熄|黑|暗|打开|关闭|停留|停在|切换|锁|运行|加载|呈现|内容|页面|写着|读出|可见|[「“"：:]|\b(?:show|display|open|closed|locked|running|loaded|reads)\w*)|(?:打开|关闭|进入|切换|解锁|锁住|启动|运行).{0,24}(?:应用|软件|浏览器|终端|聊天|界面)|(?:手机|电脑|平板).{0,30}(?:开机|关机|锁屏|解锁|电量|联网|断网)|(?:文件(?!柜|袋|盒|架|箱)|目录).{0,30}(?:写入|删除|保存|创建|读取|下载|上传|原文|内容如下)|(?:写入|保存|下载|上传|删除|命令执行).{0,20}(?:成功|完成)|\b(?:file|command)\s+.{0,25}\b(?:written|saved|deleted|executed|succeeded)\b/i.test(text)) return violation("software", input);
   if (/(?:电脑|系统|Windows)桌面.{0,35}(?:显示|打开|亮|图标|窗口)|桌面(?:上)?(?:显示|出现|打开).{0,25}(?:应用|程序|窗口|图标)/i.test(text)) return violation("software", input);
   if (softwareTarget.test(text) && /(?:已|已经|正在|成功).{0,15}(?:打开|关闭|进入|切换|搜索|刷新|登录|写入|读取|执行|下载|上传)|(?:打开|关闭|进入|切换|登录|读取|执行).{0,20}(?:成功|完成)/i.test(text)) return violation("software", input);

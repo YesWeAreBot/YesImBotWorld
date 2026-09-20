@@ -58,6 +58,7 @@ import { TtsClient } from "./media/tts.js";
 import type { MediaRef, PhoneStatus, RichTextPart } from "./types.js";
 import { WorldAgent } from "./world/agent.js";
 import { TingleTimer } from "./world/tingle.js";
+import { WorldLifecycle } from "./world/lifecycle.js";
 
 declare module "koishi" {
   interface Context {
@@ -122,6 +123,40 @@ export class WorldService extends Service<Config> {
   private deviceTail: Promise<void> = Promise.resolve();
   private devicePending = 0;
   private worldActive = false;
+  private lifecycle?: WorldLifecycle;
+  private serviceStopped = false;
+  private serviceStopTask?: Promise<void>;
+  private backgroundAbort = new AbortController();
+  private backgroundTasks = new Set<Promise<unknown>>();
+  private retiringBot?: Promise<void>;
+
+  private transitions(): WorldLifecycle {
+    return this.lifecycle ??= new WorldLifecycle(() => this.cancelWorldWork());
+  }
+
+  /** Synchronous cancellation precedes the queue barrier; reset never waits for model timeouts. */
+  private cancelWorldWork(): void {
+    this.worldActive = false;
+    this.world?.stop();
+    this.tingle?.stop();
+    this.remoteDesktopApp?.abortInput();
+    this.backgroundAbort?.abort();
+    if (this.bot && !this.retiringBot) {
+      this.retiringBot = this.bot.stop();
+      void this.retiringBot.catch(() => {});
+    }
+  }
+
+  private trackBackground(task: Promise<unknown>): void {
+    this.backgroundTasks ??= new Set();
+    this.backgroundTasks.add(task);
+    void task.finally(() => this.backgroundTasks.delete(task)).catch(() => {});
+  }
+
+  private lifecycleOperation<T>(name: string, run: (signal: AbortSignal) => Promise<T>, interrupt = false): Promise<T> {
+    if (this.serviceStopped) return Promise.reject(new Error("插件正在停止，无法进行世界操作。"));
+    return this.transitions().run(name, run, interrupt);
+  }
   /** 提示词容器：默认值 + WebUI 覆盖（覆盖持久化于 <basePath>/webui/prompts.json） */
   private promptStore!: Prompts;
   webuiDir!: string;
@@ -309,83 +344,126 @@ export class WorldService extends Service<Config> {
     }
   }
 
-  override async stop(): Promise<void> {
+  override stop(): Promise<void> {
+    if (this.serviceStopTask) return this.serviceStopTask;
+    this.serviceStopped = true;
     // Koishi may start the replacement while these asynchronous shutdowns drain.
     // Capture this lifetime now; a late stop must not release a newer lifetime.
     const releaseCallStore = this.releaseCallStore;
     this.releaseCallStore = undefined;
-    await this.webui?.stop().catch(() => {});
-    this.webui = null;
-    // 先退休 Bot 并刷新已完成但延迟投递的回执，再等待角色会话退出。
-    await this.stopWorld({ suspend: true });
-    await this.crossingServer?.stop().catch(() => {});
-    this.crossingServer = null;
-    // 插件停止时若 Bot 在异世界：礼貌地离开（穿越状态不跨重启，重启后回到自己的世界）
-    if (this.crossingClient) {
-      const client = this.crossingClient;
-      this.crossingClient = null;
-      this.crossingLocation = null;
-      this.world?.setRemote(null);
-      await client.leave().catch(() => {});
-    }
-    releaseCallStore?.();
-    // stopWorld(suspend) 保留离线期间持续流逝的世界时间。
+    this.serviceStopTask = (async () => {
+      await this.webui?.stop().catch(() => {});
+      this.webui = null;
+      // 先退休 Bot 并刷新已完成但延迟投递的回执，再等待角色会话退出。
+      await this.stopWorld({ suspend: true });
+      await this.crossingServer?.stop().catch(() => {});
+      this.crossingServer = null;
+      // 插件停止时若 Bot 在异世界：礼貌地离开（穿越状态不跨重启，重启后回到自己的世界）
+      if (this.crossingClient) {
+        const client = this.crossingClient;
+        this.crossingClient = null;
+        this.crossingLocation = null;
+        this.world?.setRemote(null);
+        await client.leave().catch(() => {});
+      }
+      releaseCallStore?.();
+      // stopWorld(suspend) 保留离线期间持续流逝的世界时间。
+    })();
+    return this.serviceStopTask;
   }
 
   // ---------- 世界生命周期 ----------
 
   /** 初始化：读取用户定义，由 World-LLM 生成初始状态文件 */
   async initWorld(force = false): Promise<string> {
+    return this.lifecycleOperation("创世", signal => this.initializeWorld(force, signal), force);
+  }
+
+  private async initializeWorld(force: boolean, signal: AbortSignal): Promise<string> {
+    // An interrupt has already retired the previous lifetime, even if validation fails.
+    if (force) await this.stopWorldInternal();
+    signal.throwIfAborted();
     if ((await this.files.isInitialized()) && !force) {
       return "世界已经初始化过了。如需重新创世，使用 world.init -f（会归档并清空当前世界状态）。";
     }
-    await this.stopWorld();
-    if (force) {
-      await this.files.reset();
-      await this.focus.clear();
-      await this.notifyMgr.reset();
-      this.phoneStatus.down = false;
-    }
-
     const { botDef, worldDef } = await this.files.readDefinitions();
+    signal.throwIfAborted();
     if (!botDef.trim() || botDef.includes(DEF_PLACEHOLDER)) {
       return `请先编写 Bot 角色定义：${this.files.botDef}`;
     }
     if (!worldDef.trim() || worldDef.includes(DEF_PLACEHOLDER)) {
       return `请先编写世界定义：${this.files.worldDef}`;
     }
+    await this.stopWorldInternal();
+    try {
+      signal.throwIfAborted();
+      if (force) {
+        await this.files.reset();
+        await this.focus.clear();
+        await this.notifyMgr.reset();
+        this.world.resetSessionState();
+        this.phoneStatus.down = false;
+      }
+      signal.throwIfAborted();
+      let resuming = false;
+      if (!force) {
+        try { resuming = JSON.parse(await this.files.readText(this.files.genesisPending)).prepared === true; }
+        catch { /* no prepared genesis to resume */ }
+      }
+      await this.files.atomicWrite(this.files.genesisPending, JSON.stringify({ startedAt: Date.now(), prepared: resuming }));
 
-    // 创世 = 全新的开始：清空聊天消息记录（否则 Bot 仍能翻到"上辈子"的聊天历史）
-    await this.store.clear();
+      // 创世 = 全新的开始：清空聊天消息记录（否则 Bot 仍能翻到"上辈子"的聊天历史）
+      if (!resuming) await this.store.clear();
 
-    // 创世：世界时间归零；历法与初始时刻由 World-LLM 在初始化时依据定义生成并持久化
-    await this.clock.reset();
+      // 创世：世界时间归零；历法与初始时刻由 World-LLM 在初始化时依据定义生成并持久化
+      if (!resuming) await this.clock.reset();
+      await this.files.atomicWrite(this.files.genesisPending, JSON.stringify({ prepared: true }));
 
-    this.logger.info("开始创世：调用 World-LLM 生成初始状态…");
-    // 生成空的 News.jsonl 与 facts.jsonl
-    if (!(await this.files.exists(this.files.news))) await fs.writeFile(this.files.news, "");
-    if (!(await this.files.exists(this.files.facts))) await fs.writeFile(this.files.facts, "");
-    await this.world.initialize(botDef, worldDef);
+      this.logger.info("开始创世：调用 World-LLM 生成初始状态…");
+      // 生成空的 News.jsonl 与 facts.jsonl
+      if (!(await this.files.exists(this.files.news))) await fs.writeFile(this.files.news, "");
+      if (!(await this.files.exists(this.files.facts))) await fs.writeFile(this.files.facts, "");
+      signal.throwIfAborted();
+      this.world.resume();
+      await this.world.initialize(botDef, worldDef);
+      signal.throwIfAborted();
 
-    // 建立全新的 Bot 上下文（角色设定来自刚生成的 Bot_Status.md；
-    // 「最初设定」= Bot_Definition.md 原文，此后只在压缩时随定义文件刷新）
-    await fs.writeFile(this.files.stream, "");
-    const context = new BotContext(this.files, this.pinnedToolsText(), this.promptStore);
-    context.pinned.botDefinition = botDef;
-    context.pinned.persona = botDef;
-    await context.persistPinned();
+      // 建立全新的 Bot 上下文（角色设定来自刚生成的 Bot_Status.md；
+      // 「最初设定」= Bot_Definition.md 原文，此后只在压缩时随定义文件刷新）
+      await fs.writeFile(this.files.stream, "");
+      const context = new BotContext(this.files, this.pinnedToolsText(), this.promptStore);
+      context.pinned.botDefinition = botDef;
+      context.pinned.persona = botDef;
+      await context.persistPinned();
+      signal.throwIfAborted();
+      await fs.rm(this.files.genesisPending, { force: true });
 
-    this.logger.info("创世完成");
-    return `创世完成，自然语言世界已保存至 ${this.files.narrativeJournal}。\n使用 world.start 让世界开始运转。`;
+      this.logger.info("创世完成");
+      return `创世完成，自然语言世界已保存至 ${this.files.narrativeJournal}。\n使用 world.start 让世界开始运转。`;
+    } finally { await this.stopWorldInternal(); }
   }
 
   async startWorld(): Promise<string> {
+    return this.lifecycleOperation("启动", signal => this.startWorldInternal(signal));
+  }
+
+  private async startWorldInternal(signal: AbortSignal): Promise<string> {
+    try { return await this.startWorldResources(signal); }
+    catch (error) { await this.stopWorldInternal(); throw error; }
+  }
+
+  private async startWorldResources(signal: AbortSignal): Promise<string> {
+    signal.throwIfAborted();
     if (this.worldActive) return "世界已在运行中。";
     if (!(await this.files.isInitialized())) {
-      return "世界尚未初始化。请先编写定义文件并执行 world.init。";
+      return "世界尚未完成创世。请先编写定义文件并执行 world.init（中断后可重试以完成创世）。";
     }
 
+    signal.throwIfAborted();
+    this.backgroundAbort = new AbortController();
+    this.world.resume();
     await this.world.ensureWorld();
+    signal.throwIfAborted();
 
     // 实际可用的工具集（如未配置 TTS 则没有 send_voice；平台扩展操作按配置开关）。
     // 置顶列表只放 core 层常驻工具；chat/channel/group 层在打开应用/进入频道时以事件展开
@@ -577,8 +655,11 @@ export class WorldService extends Service<Config> {
       },
     );
 
+    signal.throwIfAborted();
+    const recipient = this.bot;
     if (definitionChanged) this.bot.pushEvent("system", `（角色定义已由世界管理者更新。以下是新的作者定义，从现在起据此行动；固定定义会在下次记忆整理时同步。）\n${authoredDefinition}`);
     await this.clock.resume();
+    signal.throwIfAborted();
 
     // 上次运行时 Bot 还在异世界（进程崩溃/重启）：告知它已被拉回自己的世界
     if (await this.consumeCrossingMarker()) {
@@ -597,7 +678,7 @@ export class WorldService extends Service<Config> {
       ...this.botContext.stream.flatMap(entry => entry.kind === "event" ? entry.event.originEventIds ?? [] : []),
       ...archivedPerceptions.flatMap(entry => entry.rootEventIds),
     ])];
-    await this.world.restorePerceptions("bot", content => this.bot!.pushEvent("world", content), knownWorldSources);
+    await this.world.restorePerceptions("bot", content => recipient.pushEvent("world", content), knownWorldSources);
     if (!this.botContext.stream.some(entry => entry.kind === "event" && entry.event.source === "system" && entry.event.content === CHAT_RUNTIME_GUIDANCE)) {
       this.bot.pushEvent("system", CHAT_RUNTIME_GUIDANCE);
     }
@@ -614,7 +695,7 @@ export class WorldService extends Service<Config> {
     const offline = this.clock.consumeOfflineGap();
     const min = this.config.clock.offlineNarrateMinUnits;
     if (offline && min > 0 && offline.gapTU >= min) {
-      void this.world.resolveOfflineGap(offline.fromTU, content => this.bot?.pushEvent("world", content))
+      void this.world.resolveOfflineGap(offline.fromTU, content => recipient.pushEvent("world", content))
         .catch(err => this.logger.warn("离线自然过程结算失败: %s", err));
     }
 
@@ -623,18 +704,19 @@ export class WorldService extends Service<Config> {
     if (toolsNotice) this.bot.pushEvent("system", toolsNotice);
 
     // 世界提交后，只向常驻角色投递其实际感知；完整世界状态留在 World 一侧。
-    this.world.setHostBotDeliver((content) => this.bot?.pushEvent("world", content, { wake: true }));
+    this.world.setHostBotDeliver((content) => recipient.pushEvent("world", content, { wake: true }));
 
     // 旧世界 meta.json 缺 botName（新字段）：从定义补判一次（不阻塞启动，失败下次启动再试）
     void this.world.ensureBotName().catch((err) => this.logger.warn("Bot 名字补判失败: %s", err));
 
+    signal.throwIfAborted();
     this.bot.start();
     this.tingle = new TingleTimer(
       this.config.clock,
       this.clock,
       this.world,
       // 只有实际可感知变化才会投递，避免无事发生的心跳打断休息。
-      (content) => this.bot?.pushEvent("world", content, { wake: true }),
+      (content) => recipient.pushEvent("world", content, { wake: true }),
       this.logger,
     );
     this.tingle.start();
@@ -643,20 +725,22 @@ export class WorldService extends Service<Config> {
     // 离线历史补拉：把插件离线期间（Bot 掉线/世界未启动）错过的目标群消息写进消息记录，
     // 不注入逐条事件打扰上下文；完成后若确实补到了，推一条汇总事件让 Bot 知道去翻记录
     if (this.config.messaging.offlineHistory) {
-      void messenger
-        .syncOfflineHistory()
+      const backgroundSignal = this.backgroundAbort.signal;
+      this.trackBackground(messenger
+        .syncOfflineHistory(backgroundSignal)
         .then(async ({ total, channels }) => {
-          if (!total || !this.bot) return;
+          if (!total || backgroundSignal.aborted || this.bot !== recipient) return;
           const shown = channels.slice(0, 5);
           const labels = await Promise.all(shown.map((c) => this.names.display(c.key)));
           const namesText =
             labels.join("、") + (channels.length > shown.length ? ` 等 ${channels.length} 个群` : "");
-          this.bot.pushEvent(
+          if (backgroundSignal.aborted || this.bot !== recipient) return;
+          recipient.pushEvent(
             "system",
             `离线期间你在 ${namesText} 错过的 ${total} 条消息已补录到聊天记录里（用 check_msg / select_channel / read_channel 翻看）。`,
           );
         })
-        .catch((err) => this.logger.warn("离线历史补拉失败: %s", err));
+        .catch((err) => { if (!backgroundSignal.aborted) this.logger.warn("离线历史补拉失败: %s", err); }));
     }
 
     this.logger.info("世界开始运转：%s", this.clock.timeLine());
@@ -665,17 +749,23 @@ export class WorldService extends Service<Config> {
 
   async stopWorld(opts: { suspend?: boolean } = {}): Promise<string> {
     const wasActive = this.worldActive;
+    return this.transitions().run("暂停", () => this.stopWorldInternal(opts, wasActive), true);
+  }
+
+  private async stopWorldInternal(opts: { suspend?: boolean } = {}, wasActive = this.worldActive): Promise<string> {
+    this.cancelWorldWork();
     this.worldActive = false;
     this.crossingServer?.stopResidentPerceptions?.();
     this.world.stop();
     this.tingle?.stop();
     this.tingle = null;
     this.remoteDesktopApp?.abortInput();
-    await this.bot?.stop();
+    await (this.retiringBot ?? this.bot?.stop());
+    this.retiringBot = undefined;
     await this.deviceTail;
-    await this.crossingServer?.disconnectVisitors("世界暂停或正在切换存档");
-    await this.world.runtime.shutdown();
-    if (!wasActive) return "世界并未在运行。";
+    await this.crossingServer?.disconnectVisitors("世界暂停或正在切换存档", { narrate: false });
+    await this.world.shutdown();
+    await Promise.allSettled([...(this.backgroundTasks ?? [])]);
     // Bot 还在异世界：礼貌地离开。标记文件保留——下次启动时向 Bot 解释"你回到了自己的世界"
     if (this.crossingClient) {
       const client = this.crossingClient;
@@ -686,6 +776,8 @@ export class WorldService extends Service<Config> {
     }
     this.world.setHostBotDeliver(null);
     this.bot = null;
+    this.botContext = null;
+    this.residentSession = null;
     await this.appManager?.closeAll().catch(() => {});
     this.appManager = null;
     // 关闭电脑设备（断开远程桌面等连接）并关机：本插件自建的容器一并关闭（下次打开电脑时自动再开机）
@@ -694,13 +786,14 @@ export class WorldService extends Service<Config> {
     this.remoteDesktopApp = null;
     await this.computer?.shutdown().catch(() => {});
     this.computer = null;
-    if (opts.suspend) {
+    if (opts.suspend && wasActive) {
       // 插件停止：世界时间不冻结，离线期间继续按现实流速流逝
       await this.clock.suspend();
       this.logger.info("插件停止，世界时间将在离线期间继续流逝：%s", this.clock.timeLine());
       return `插件已停止（当前 ${this.clock.timeLine()}，世界时间将继续流逝）。`;
     }
     await this.clock.pause();
+    if (!wasActive) return "世界并未在运行，未完成的任务已取消。";
     if (this.clock.syncRealTime) {
       // 同步模式下时间无法冻结：只停下 Bot 与世界心跳
       this.logger.info("世界已暂停（时间与现实同步，继续流逝）：%s", this.clock.timeLine());
@@ -1209,7 +1302,7 @@ export class WorldService extends Service<Config> {
   }
 
   async getStructuredWorld(): Promise<unknown> {
-    return this.world.runtime.inspect();
+    return this.transitions().read(() => this.world.runtime.inspect());
   }
 
   async getRegulation(): Promise<unknown> { return this.bot ? this.bot.regulation.view() : readRegulationView(this.files.base, this.config.bot, this.clock ?? undefined); }
@@ -1331,39 +1424,54 @@ export class WorldService extends Service<Config> {
     await Prompts.save(this.webuiDir, overrides);
   }
 
-  /** 用户手动设置常驻 Bot 名字：写 meta + 刷内存，并通知 World 这是同一角色改名（异步，不阻塞保存） */
+  /** 用户手动设置常驻 Bot 名字：写 meta + 刷内存，并通知 World 这是同一角色改名 */
   async setBotName(name: string): Promise<void> {
-    const trimmed = name.trim().slice(0, 64);
-    const oldName = this.world.residentBotName;
-    await this.world.setBotName(trimmed);
-    if (trimmed === oldName) return; // 没变化，不折腾 World
-    // 世界在运行时，异步让 World 知道「同一角色改名」并同步状态/告知 Bot 本人
-    if (this.worldActive && this.bot) {
-      void this.world
-        .notifyBotRename(oldName, trimmed, (content) => this.bot?.pushEvent("world", content, { wake: true }))
-        .catch((err) => this.logger.warn("Bot 改名通知 World 失败: %s", err));
-    }
+    return this.lifecycleOperation("修改角色名字", async signal => {
+      const paused = !this.worldActive;
+      if (paused) this.world.resume();
+      try {
+        signal.throwIfAborted();
+        const trimmed = name.trim().slice(0, 64);
+        const oldName = this.world.residentBotName;
+        await this.world.setBotName(trimmed);
+        signal.throwIfAborted();
+        if (trimmed === oldName) return; // 没变化，不折腾 World
+        // 世界在运行时，交付「同一角色改名」的已保存感知
+        if (this.worldActive && this.bot) {
+          const recipient = this.bot;
+          await this.world.notifyBotRename(oldName, trimmed, (content) => recipient.pushEvent("world", content, { wake: true }));
+        }
+      } finally { if (paused) await this.world.shutdown(); }
+    });
   }
 
   /** 重载定义：与 world.reload 指令行为一致（World-LLM 调整世界状态并告知 Bot） */
   async reloadWorld(): Promise<string> {
-    if (this.notReady()) return this.notReady()!;
-    if (!(await this.files.isInitialized())) return "世界尚未初始化。";
-    const { botDef, worldDef } = await this.files.readDefinitions();
-    await this.world.reconcileDefinitions(botDef, worldDef, (content) => {
-      this.bot?.pushEvent("world", content);
+    return this.lifecycleOperation("重载定义", async signal => {
+      if (this.notReady()) return this.notReady()!;
+      if (!(await this.files.isInitialized())) return "世界尚未初始化。";
+      const { botDef, worldDef } = await this.files.readDefinitions();
+      signal.throwIfAborted();
+      const recipient = this.bot;
+      await this.world.reconcileDefinitions(botDef, worldDef, (content) => {
+        recipient?.pushEvent("world", content);
+      });
+      signal.throwIfAborted();
+      return "定义已重新载入，世界状态已调整。";
     });
-    return "定义已重新载入，世界状态已调整。";
   }
 
   async resetWorld(): Promise<string> {
-    await this.stopWorld();
-    await this.files.reset();
-    await this.clock.reset();
-    await this.focus.clear();
-    await this.notifyMgr.reset();
-    this.phoneStatus.down = false;
-    return "世界已重置。定义文件保留，可重新 world.init。";
+    return this.lifecycleOperation("重置", async () => {
+      await this.stopWorldInternal();
+      await this.files.reset();
+      await this.clock.reset();
+      await this.focus.clear();
+      await this.notifyMgr.reset();
+      this.phoneStatus.down = false;
+      this.world.resetSessionState();
+      return "世界已重置。定义文件保留，可重新 world.init。";
+    }, true);
   }
 
   async clearMsg(): Promise<string> {
@@ -1382,25 +1490,32 @@ export class WorldService extends Service<Config> {
 
   /** 手动存档：把当前全部世界状态复制成一份新快照（不影响运行中的世界） */
   async saveArchive(label: string): Promise<string> {
-    const name = await this.files.snapshot(String(label ?? ""));
-    this.logger.info("手动存档：archive/%s", name);
-    return `已存档到 archive/${name}`;
+    return this.lifecycleOperation("保存存档", async () => {
+      const name = await this.files.snapshot(String(label ?? ""));
+      this.logger.info("手动存档：archive/%s", name);
+      return `已存档到 archive/${name}`;
+    });
   }
 
   /** 回档到某个快照：当前状态先自动存档，随后被快照覆盖并重启世界 */
   async restoreArchive(name: string): Promise<string> {
+    const wasRunning = this.worldActive;
+    return this.lifecycleOperation("恢复存档", signal => this.restoreArchiveInternal(name, wasRunning, signal), true);
+  }
+
+  private async restoreArchiveInternal(name: string, wasRunning: boolean, signal: AbortSignal): Promise<string> {
+    await this.stopWorldInternal();
+    signal.throwIfAborted();
     if (!/^[\w\u4e00-\u9fa5.-]+$/.test(name)) throw new Error("非法归档名");
     const snapDir = path.join(this.files.archiveDir, name);
     const stat = await fs.stat(snapDir).catch(() => null);
     if (!stat?.isDirectory()) throw new Error("归档不存在（仅支持文件夹形式的快照回档）");
-    const wasRunning = this.worldActive;
-    await this.stopWorld();
     // 回档前自动存档当前状态，防误操作
     const backup = await this.files.snapshot("回档前");
     await this.files.restoreFrom(snapDir);
     await this.clock.load();
     await this.world.runtime.reload();
-    this.world.resetPerceptionDelivery();
+    this.world.resetSessionState();
     await this.focus.load();
     await this.notifyMgr.load();
     this.phoneStatus.down = false;
@@ -1408,7 +1523,8 @@ export class WorldService extends Service<Config> {
     let msg = `已回档到「${name}」（回档前的状态已自动存档为 archive/${backup}）。`;
     if (wasRunning) {
       try {
-        await this.startWorld();
+        signal.throwIfAborted();
+        await this.startWorldInternal(signal);
         msg += " 世界已自动重新开始运转。";
       } catch (err) {
         msg += ` 世界自动重启失败：${(err as Error).message ?? err}（可用 world.start 手动启动）。`;
@@ -1453,6 +1569,7 @@ export class WorldService extends Service<Config> {
     if (!parent?.update) {
       throw new Error("找不到插件作用域，无法热重载（可手动重启插件应用新配置）");
     }
+    await this.stop();
     parent.update(config, true);
   }
 

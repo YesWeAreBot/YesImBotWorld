@@ -43,6 +43,7 @@ export class GrowthRuntime {
   private controller: AbortController | null = null;
   private work: Promise<void> | null = null;
   private epoch = 0;
+  private stopped = false;
   private nextReviewAt = 0;
   private deliveryTail: Promise<void> = Promise.resolve();
   private recallPending: GrowthMemoryEvent | null = null;
@@ -61,19 +62,27 @@ export class GrowthRuntime {
   }
 
   get working(): boolean { return this.work !== null; }
-  async settled(): Promise<void> { await this.work; }
+  /** Join disk work too: aborting inference cannot undo an append already in progress. */
+  async settled(): Promise<void> { await Promise.all([this.work, this.deliveryTail]); }
+  resume(): void { this.stopped = false; }
 
-  private async correctStateTiming(): Promise<void> {
-    if (this.stateTimingChecked) return;
+  private async correctStateTiming(current: () => boolean): Promise<void> {
+    if (this.stateTimingChecked || !current()) return;
     await this.ledger.correctStaleAutomaticStates({ at: this.clock.now(), secondsPerTU: this.clock.unitWorldSeconds });
+    if (!current()) return;
     await this.ledger.isolateUnverifiedClaims(this.clock.now());
-    this.stateTimingChecked = true;
+    if (current()) this.stateTimingChecked = true;
   }
 
   /** Does not await the endpoint or block the next action. Force lowers only the episode threshold. */
   tick(signal?: AbortSignal, force = false): void {
-    if (!this.cfg.growth?.enabled || this.work || signal?.aborted || this.realNow() < this.nextReviewAt) return;
+    if (this.stopped || !this.cfg.growth?.enabled || this.work || signal?.aborted || this.realNow() < this.nextReviewAt) return;
     const controller = new AbortController(), epoch = this.epoch;
+    const current = () => !this.stopped && epoch === this.epoch && !signal?.aborted;
+    const guard = () => {
+      controller.signal.throwIfAborted();
+      if (!current()) throw new DOMException("成长整理已停止", "AbortError");
+    };
     this.controller = controller;
     const aborted = () => controller.abort(signal?.reason);
     signal?.addEventListener("abort", aborted, { once: true });
@@ -82,23 +91,27 @@ export class GrowthRuntime {
     let attempted = false;
     let reviewId: string | undefined;
     const work = (async () => {
-      controller.signal.throwIfAborted();
-      await this.correctStateTiming();
+      guard();
+      await this.correctStateTiming(() => current() && !controller.signal.aborted);
+      guard();
       const at = this.clock.now();
       const unit = Number.isFinite(this.clock.unitWorldSeconds) && this.clock.unitWorldSeconds > 0 ? this.clock.unitWorldSeconds : 1;
       await this.ledger.prioritizeRecent({ at, since: Math.max(0, at - 1800 / unit) });
+      guard();
       const snapshot = await this.ledger.snapshotReview({ at, minimumEpisodes: force ? 1 : bounded(this.cfg.growth.minEpisodes, 4, 1, 100), maxEvidence: 24 });
+      guard();
       if (!snapshot) return;
       reviewId = snapshot.id;
       attempted = true;
-      controller.signal.throwIfAborted();
       const status = await this.ledger.reviewStatus();
+      guard();
       const feedback = (status.recent[0]?.rejected ?? []).map(item => `第 ${item.index + 1} 项未采用：${item.reason}`);
       if (status.lastOutcome === "failed" && status.lastFailure) feedback.push(`上次整理未完成：${status.lastFailure.reason}；不能因此虚构经历或结论。`);
       const modelConfig = resolveCognitiveModelConfig(this.cfg, "growth");
       const client = new ChatClient(modelConfig);
       let definition = "", request: ReviewRequest | undefined;
       const result = await withEndpointLock(modelConfig.baseURL, () => {
+        guard();
         // A queued review may wait while a newer author definition is delivered.
         // Use only the durable character context, never a concurrently edited file.
         definition = deliveredAuthorDefinition(this.context);
@@ -106,8 +119,7 @@ export class GrowthRuntime {
           bounded(this.cfg.growth.maxInputChars, 24_000, 4000, 200_000), feedback, this.context.accountsProvider?.() ?? "");
         return this.infer ? this.infer(request.messages, controller.signal) : client.complete(request.messages, { signal: controller.signal });
       }, controller.signal);
-      controller.signal.throwIfAborted();
-      if (epoch !== this.epoch) return;
+      guard();
       if (deliveredAuthorDefinition(this.context) !== definition) throw new Error("人物的作者定义在本次整理期间已更新，旧定义下的结果未采用；原经历未被消费");
       const changes = parseChanges(result);
       const reviewedAt = this.clock.now();
@@ -128,11 +140,11 @@ export class GrowthRuntime {
         }
         return change;
       }, controller.signal, [...request!.evidenceIds], this.clock.unitWorldSeconds);
+      guard();
       if (committed.rejected?.length) this.logger.warn("成长整理完成：采用 %d 条认识，拒绝 %d 条未通过校验的提案；原始经历保留可检索。%s",
         committed.records.length, committed.rejected.length, committed.rejected.map(item => `第 ${item.index + 1} 项：${item.reason}`).join("；"));
     })().catch(async error => {
       attempted = true;
-      const current = () => epoch === this.epoch && !signal?.aborted;
       if (!current()) return;
       const cause = controller.signal.aborted ? controller.signal.reason ?? error : error;
       const reason = cause instanceof Error ? cause.message : String(cause);
@@ -148,8 +160,8 @@ export class GrowthRuntime {
     this.work = work;
   }
 
-  /** Stop this lifecycle. A later explicit tick may start a new lifecycle; old results cannot commit. */
-  stop(): void { this.epoch++; this.controller?.abort(new Error("成长整理已停止")); this.controller = null; }
+  /** Close admission before joining writes; only an explicit resume opens a new lifecycle. */
+  stop(): void { this.stopped = true; this.epoch++; this.controller?.abort(new Error("成长整理已停止")); this.controller = null; }
 
   private serial<T>(run: () => Promise<T>): Promise<T> {
     const next = this.deliveryTail.then(run);
@@ -159,10 +171,15 @@ export class GrowthRuntime {
 
   /** Durable outbox: a failed context append or acknowledgement is retried with the same event id. */
   drain(): Promise<BotEvent[]> {
+    const epoch = this.epoch;
+    const current = () => !this.stopped && epoch === this.epoch;
     return this.serial(async () => {
       const delivered: BotEvent[] = [];
-      await this.correctStateTiming();
+      if (!current()) return delivered;
+      await this.correctStateTiming(current);
+      if (!current()) return delivered;
       for (const result of await this.ledger.pendingReviews(50)) {
+        if (!current()) return delivered;
         const views = result.views.filter(view => view.active && !view.needsReview && (view.kind !== "state" || (view.expiresAt ?? 0) > this.clock.now()))
           .filter(view => view.kind === "state" || result.records.some(record => record.claimId === view.claimId && (!record.previousId || record.relation !== "support")));
         if (!views.length) { await this.ledger.ackReview(result.id); continue; }
@@ -172,30 +189,39 @@ export class GrowthRuntime {
         const exists = this.context.stream.some(entry => entry.kind === "event" && entry.event.id === event.id);
         // Even an existing journal entry must finish its pinned/counter checkpoint before acknowledgement.
         await this.context.appendEvent(event);
+        if (!current()) return delivered;
         await this.ledger.ackReview(result.id);
         if (!exists) delivered.push(event);
       }
       for (const correction of await this.ledger.pendingStateTimingCorrections(50)) {
+        if (!current()) return delivered;
         const event: BotEvent = { id: `ev_${correction.id}`, source: "system", originEventIds: [], worldTime: correction.at,
           content: `（回顾时间更正：此前把过去的“${correction.subject}”记成了当前临时状态，但所引经历只支持世界时刻 ${correction.expiresAt} 之前的处境，不能说明现在仍然如此。这里只校正旧回顾的适用时间，不表示你的身体此刻发生变化，也不是新经历或新的成长。）` };
         const exists = this.context.stream.some(entry => entry.kind === "event" && entry.event.id === event.id);
         await this.context.appendEvent(event);
+        if (!current()) return delivered;
         await this.ledger.ackStateTimingCorrection(correction.id);
         if (!exists) delivered.push(event);
       }
       for (const correction of await this.ledger.pendingCorrections(50)) {
+        if (!current()) return delivered;
         const event: BotEvent = { id: `ev_${correction.id}`, source: "system", originEventIds: [], worldTime: correction.at,
           content: `（回顾依据更正：此前关于“${correction.subject}”的判断“${correction.statement}”已撤回，不应继续把它当成已确认的认识。核对原因：${correction.reason}。这里只更正旧回顾；原始经历和真实发送记录仍然保留，不表示现在发生了新的事情，也不是新的成长。）` };
         const exists = this.context.stream.some(entry => entry.kind === "event" && entry.event.id === event.id);
-        await this.context.appendEvent(event); await this.ledger.ackCorrection(correction.id);
+        await this.context.appendEvent(event);
+        if (!current()) return delivered;
+        await this.ledger.ackCorrection(correction.id);
         if (!exists) delivered.push(event);
       }
       for (const isolation of await this.ledger.pendingIsolations(1)) {
+        if (!current()) return delivered;
         const event: BotEvent = { id: `ev_${isolation.id}`, source: "system", originEventIds: [], worldTime: isolation.at,
           content: "（旧回顾待复核：所有缺少可信发送者/频道范围或共同动作与跨日依据的旧认识，从现在起暂不作为当前事实或行动依据，包含旧摘要内相关判断，不限于下面这一批。不要据此认定某人刚发话、找你聊天、触发通知或自己必须重复某行为。已发出的消息和真实经历仍然保留。这里只澄清旧认识的适用性，不是新经历，也不证明这些判断全部相反。以下仅列本批待复核索引；完整原文及依据仍在审计记录，后续批次会继续交付。）\n" +
             isolation.claims.map(claim => `待复核 ${claim.claimId}｜${boundedText(claim.subject, 80)}\n旧判断摘录（不是事实确认）：${boundedText(claim.statement, 140)}\n原因：${boundedText(claim.reason, 120)}。`).join("\n") };
         const exists = this.context.stream.some(entry => entry.kind === "event" && entry.event.id === event.id);
-        await this.context.appendEvent(event); await this.ledger.ackIsolation(isolation.id);
+        await this.context.appendEvent(event);
+        if (!current()) return delivered;
+        await this.ledger.ackIsolation(isolation.id);
         if (!exists) delivered.push(event);
       }
       return delivered;
@@ -204,10 +230,14 @@ export class GrowthRuntime {
 
   /** Retrieve from what was actually delivered, never from a live world snapshot or hidden device audit. */
   remember(events?: BotEvent[]): Promise<BotEvent[]> {
+    const epoch = this.epoch;
+    const current = () => !this.stopped && epoch === this.epoch;
     return this.serial(async () => {
+      if (!current()) return [];
       if (this.recallPending) {
         const event = this.recallPending;
         await this.context.appendEvent(event);
+        if (!current()) return [];
         this.recallPending = null;
         return [event];
       }
@@ -224,6 +254,7 @@ export class GrowthRuntime {
       const subjectIds = [...new Set(candidates.flatMap(event => event.experience?.subjectIds ?? []))];
       const channelKeys = [...new Set(candidates.flatMap(event => event.experience?.chat ? [event.experience.chat.channelKey] : []))];
       const views = await this.ledger.retrieve({ text, subjectIds, channelKeys, at: this.clock.now(), n: bounded(this.cfg.growth.recallCount, 3, 1, 12) });
+      if (!current()) return [];
       const seen = new Set(delivered.flatMap(event => {
         const metadata = (event as GrowthMemoryEvent).growthReferences;
         if (metadata) return metadata.map(referenceKey);
@@ -241,6 +272,7 @@ export class GrowthRuntime {
         growthReferences: refs };
       this.recallPending = event;
       await this.context.appendEvent(event);
+      if (!current()) return [];
       this.recallPending = null;
       return [event];
     });

@@ -11,6 +11,7 @@ import type { WorldAgent } from "./agent.js";
 export class TingleTimer {
   private timer: ReturnType<typeof setTimeout> | null = null;
   private running = false;
+  private generation = 0;
 
   constructor(
     private cfg: ClockConfigData,
@@ -23,7 +24,9 @@ export class TingleTimer {
   start(): void {
     if (this.running || this.cfg.tingleEveryUnits <= 0) return;
     this.running = true;
-    this.scheduleNext(this.cfg.tingleEveryUnits);
+    const generation = ++this.generation;
+    this.lastInterval = this.cfg.tingleEveryUnits;
+    this.scheduleNext(this.cfg.tingleEveryUnits, generation);
     this.logger.info(
       "Tingle 已启动：%s（默认 %d TU，即 %d 现实秒）",
       this.cfg.tingleMode === "auto" ? "auto 模式（间隔由 World 动态决定）" : "固定间隔",
@@ -34,26 +37,32 @@ export class TingleTimer {
 
   stop(): void {
     this.running = false;
+    this.generation++;
     if (this.timer) clearTimeout(this.timer);
     this.timer = null;
   }
 
-  private scheduleNext(intervalTU: number): void {
-    if (!this.running) return;
+  private scheduleNext(intervalTU: number, generation: number): void {
+    if (!this.running || generation !== this.generation) return;
     const delayMs = Math.max(0, intervalTU) * this.clock.unitRealSeconds * 1000;
     this.timer = setTimeout(() => {
-      void this.fire().finally(() => this.scheduleNext(this.lastInterval));
+      if (generation !== this.generation || !this.running) return;
+      this.timer = null;
+      void this.fire(generation).finally(() => this.scheduleNext(this.lastInterval, generation));
     }, delayMs);
   }
 
   /** auto 模式下上一次 Tingle 之后 World 决定的下一次间隔（TU）；fixed 模式恒为配置值 */
   private lastInterval = 0;
 
-  private async fire(): Promise<void> {
-    if (!this.running) return;
+  private async fire(generation: number): Promise<void> {
+    if (!this.running || generation !== this.generation) return;
     this.logger.debug("Tingle 触发");
     try {
-      const next = await this.world.tingle(this.deliver);
+      const next = await this.world.tingle(content => {
+        if (this.running && generation === this.generation) this.deliver(content);
+      });
+      if (!this.running || generation !== this.generation) return;
       // World 动态决定的间隔：限制在配置的上下限内；没决定则沿用默认
       let interval = this.cfg.tingleEveryUnits;
       if (this.cfg.tingleMode === "auto" && next !== null && next > 0) {
@@ -63,6 +72,7 @@ export class TingleTimer {
       }
       this.lastInterval = interval;
     } catch (err) {
+      if (!this.running || generation !== this.generation) return;
       this.logger.warn("Tingle 处理失败: %s", err);
       this.lastInterval = this.cfg.tingleEveryUnits;
     }

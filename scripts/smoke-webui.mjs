@@ -94,7 +94,7 @@ try {
   };
   await page('Emulation.setDeviceMetricsOverride', { width: 1440, height: 1050, deviceScaleFactor: 1, mobile: false });
   await page('Page.navigate', { url: base });
-  await wait("typeof Studio !== 'undefined' && !!document.querySelector('.studio-hero')");
+  await wait("typeof Studio !== 'undefined' && !!document.querySelector('.studio-hero h2')?.textContent");
   assert.equal(await evaluate("document.querySelector('.studio-hero h2').textContent"), '你好，欢迎回来。');
   await wait("document.querySelector('.studio-avatar img')?.naturalWidth > 0");
   assert.ok(await evaluate("document.querySelector('.studio-avatar img').alt.includes('样本平台账号')"));
@@ -130,7 +130,7 @@ try {
   await growthFilter('.growth-kind-filters', '习惯');
   assert.ok(await evaluate("document.querySelector('.growth-situation').textContent.includes('天气适合出门') && document.querySelector('.growth-cues').textContent.includes('晚饭后')"));
   assert.ok(await evaluate("document.querySelector('.growth-detail').textContent.includes('自动整理') && document.querySelector('.growth-detail').textContent.includes('修订原有判断')"));
-  await growthFilter('.growth-lifecycle-filters', '已结束');
+  await growthFilter('.growth-lifecycle-filters', '未在沿用');
   assert.equal(await evaluate("document.querySelectorAll('.growth-claim').length"), 1);
   assert.ok(await evaluate("document.querySelector('.growth-detail').textContent.includes('停止沿用这条认识')"));
   await growthFilter('.growth-kind-filters', '临时状态');

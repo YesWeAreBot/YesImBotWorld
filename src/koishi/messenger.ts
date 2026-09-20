@@ -981,9 +981,10 @@ export class KoishiMessenger implements MessengerApi {
   }
 
   /** 原始 OneBot 消息段 → 存储文本（媒体入资产库，嵌套聊天记录保留为标签） */
-  private async serializeRawSegments(segments: Record<string, unknown>[]): Promise<string> {
+  private async serializeRawSegments(segments: Record<string, unknown>[], signal?: AbortSignal): Promise<string> {
     let out = "";
     for (const seg of segments) {
+      signal?.throwIfAborted();
       const d = (seg.data ?? {}) as Record<string, unknown>;
       switch (seg.type) {
         case "text":
@@ -994,19 +995,19 @@ export class KoishiMessenger implements MessengerApi {
         case "sticker": {
           const src = String(d.url ?? d.file ?? "");
           const sticker = isStickerElement(h(seg.type === "image" ? "img" : String(seg.type), d));
-          const id = src ? await this.media.ingest(src, "image", undefined, undefined, sticker) : null;
+          const id = src ? await abortableHistory(() => this.media.ingest(src, "image", undefined, undefined, sticker), signal) : null;
           out += id !== null ? mediaPlaceholder(id, "image", sticker) : sticker ? "[表情包（获取失败）]" : "[图片（获取失败）]";
           break;
         }
         case "record": {
           const src = String(d.url ?? d.file ?? "");
-          const id = src ? await this.media.ingest(src, "audio") : null;
+          const id = src ? await abortableHistory(() => this.media.ingest(src, "audio"), signal) : null;
           out += id !== null ? mediaPlaceholder(id, "audio") : "[语音（获取失败）]";
           break;
         }
         case "video": {
           const src = String(d.url ?? d.file ?? "");
-          const id = src ? await this.media.ingest(src, "video") : null;
+          const id = src ? await abortableHistory(() => this.media.ingest(src, "video"), signal) : null;
           out += id !== null ? mediaPlaceholder(id, "video") : "[视频（获取失败）]";
           break;
         }
@@ -1718,7 +1719,8 @@ export class KoishiMessenger implements MessengerApi {
    * 目标群 = 正在关注的 + 通知列表里的 + 最近活跃的，且仅限 OneBot 群（私聊无此接口）。
    * 返回各群补到的消息条数；群还没有任何已存消息时不拉（尊重创世 / 清空记录）。
    */
-  async syncOfflineHistory(): Promise<{ total: number; channels: { key: string; count: number }[] }> {
+  async syncOfflineHistory(signal?: AbortSignal): Promise<{ total: number; channels: { key: string; count: number }[] }> {
+    signal?.throwIfAborted();
     const empty = { total: 0, channels: [] as { key: string; count: number }[] };
     if (!this.messaging.offlineHistory) return empty;
 
@@ -1729,21 +1731,25 @@ export class KoishiMessenger implements MessengerApi {
     }
     // 通知列表里配了 "*" 时用最近活跃的频道兜底（"*" 本身不是具体频道）
     for (const { key } of await this.store.recentChannels(10)) keys.add(key);
+    signal?.throwIfAborted();
 
     const channels: { key: string; count: number }[] = [];
     let total = 0;
     for (const key of keys) {
+      signal?.throwIfAborted();
       const resolved = await this.resolveChannel(key);
+      signal?.throwIfAborted();
       if ("error" in resolved) continue;
       const { platform, channelId, selfId } = resolved;
       if (platform !== "onebot" || channelId.startsWith("private:")) continue;
       try {
-        const count = await this.syncGroupHistory(platform, channelId, selfId);
+        const count = await this.syncGroupHistory(platform, channelId, selfId, signal);
         if (count > 0) {
           channels.push({ key, count });
           total += count;
         }
       } catch (err) {
+        signal?.throwIfAborted();
         this.ctx
           .logger("yesimbot-world")
           .warn("离线历史补拉失败 %s: %s", key, (err as Error).message ?? err);
@@ -1753,19 +1759,22 @@ export class KoishiMessenger implements MessengerApi {
   }
 
   /** Bounded overlap by platform IDs/sequence, never by the host clock. */
-  private async syncGroupHistory(platform: string, channelId: string, accountId?: string): Promise<number> {
+  private async syncGroupHistory(platform: string, channelId: string, accountId?: string, signal?: AbortSignal): Promise<number> {
+    signal?.throwIfAborted();
     const bot = accountId
       ? this.ctx.bots.find((b) => b.platform === platform && b.selfId === accountId && b.isActive)
       : this.findOnebot();
     if (!bot) return 0;
     const fence = this.store.captureLive();
     const prior = await this.store.channelMessages(platform, channelId, 500, bot.selfId);
+    signal?.throwIfAborted();
     if (!prior.length) return 0;
     const known = new Map(prior.filter(row => row.messageId).map(row => [row.messageId, row]));
     const params: Record<string, unknown> = { group_id: toIdValue(channelId), count: 50 };
     const collected = new Map<string, Record<string, unknown>>();
     for (let page = 0; page < 4; page++) {
-      const data = ((await callOnebot(bot, "get_group_msg_history", params)) ?? {}) as { messages?: unknown[]; next_seq?: number | string };
+      const data = ((await abortableHistory(() => callOnebot(bot, "get_group_msg_history", params), signal)) ?? {}) as { messages?: unknown[]; next_seq?: number | string };
+      signal?.throwIfAborted();
       const messages = (Array.isArray(data.messages) ? data.messages : []) as Record<string, unknown>[];
       if (!messages.length) break;
       let minSeq: bigint | undefined;
@@ -1791,9 +1800,11 @@ export class KoishiMessenger implements MessengerApi {
     });
     const rows: Omit<WorldMessageRow, "id">[] = [];
     for (const raw of rawRows) {
+      signal?.throwIfAborted();
       const msgId = String(raw.message_id);
       // Retain overlapping rows as anchors, without rerendering their media or names.
       const existing = known.get(msgId) ?? await this.store.findByMessageId(platform, channelId, msgId, bot.selfId);
+      signal?.throwIfAborted();
       if (existing) { rows.push(existing); continue; }
       const timeMs = Number(raw.time ?? 0) * 1000;
       if (!Number.isFinite(timeMs) || timeMs <= 0) continue;
@@ -1804,12 +1815,14 @@ export class KoishiMessenger implements MessengerApi {
       let conversation: ConversationContext | undefined;
       const body = raw.message ?? raw.content;
       if (Array.isArray(body)) {
-        content = await this.serializeRawSegments(body as Record<string, unknown>[]);
+        content = await this.serializeRawSegments(body as Record<string, unknown>[], signal);
+        signal?.throwIfAborted();
         conversation = rawGroupConversation(body as Record<string, unknown>[]);
       } else if (typeof body === "string") content = body;
       if (!content.trim()) continue;
       if (conversation?.reply?.messageId) {
         const original = await this.store.findByMessageId(platform, channelId, conversation.reply.messageId, bot.selfId);
+        signal?.throwIfAborted();
         if (original?.userId) conversation.reply.userId = original.userId;
       }
       rows.push({ platform, channelId, selfId: bot.selfId, guildId: "", userId: senderId,
@@ -1817,7 +1830,12 @@ export class KoishiMessenger implements MessengerApi {
         platformSequence: messageSequence(raw.message_seq), self, senderOrigin: "unknown", senderOwned: self ? true : null,
         messageId: msgId, isDirect: false, conversation });
     }
-    return this.store.importHistory(rows, fence);
+    signal?.throwIfAborted();
+    // Unlike platform/media reads, an import already admitted must finish before
+    // stop returns. Reset may clear the table only after this promise settles.
+    const count = await this.store.importHistory(rows, fence);
+    signal?.throwIfAborted();
+    return count;
   }
 
   // ---------- 内部 ----------
@@ -2016,6 +2034,19 @@ export class KoishiMessenger implements MessengerApi {
  * 调用 OneBot 底层 API（adapter-onebot 的 internal._request），返回 data 部分。
  * 用于 Koishi 通用接口未覆盖的实现端扩展（set_msg_emoji_like / friend_poke / set_qq_profile 等）。
  */
+/** Stop waiting on external reads without letting their late results resume an old import. */
+async function abortableHistory<T>(run: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+  signal?.throwIfAborted();
+  const work = run();
+  if (!signal) return work;
+  return new Promise<T>((resolve, reject) => {
+    const abort = () => reject(signal.reason ?? new DOMException("This operation was aborted", "AbortError"));
+    signal.addEventListener("abort", abort, { once: true });
+    work.then(resolve, reject).finally(() => signal.removeEventListener("abort", abort));
+    if (signal.aborted) abort();
+  });
+}
+
 async function callOnebot(bot: Bot, action: string, params: Record<string, unknown>): Promise<unknown> {
   const internal = (
     bot as unknown as {

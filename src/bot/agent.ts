@@ -176,6 +176,7 @@ export class BotAgent {
   readonly growth: GrowthLedger;
   readonly regulation: RegulationRuntime;
   private readonly growthRuntime: GrowthRuntime;
+  private growthToolWrites = new Set<Promise<string | RichText>>();
   private operationCalls = new Map<string, ToolCallRecord>();
   private readonly receipts: ReceiptInbox;
   private retired = false;
@@ -534,6 +535,7 @@ export class BotAgent {
     if (this.running || this.loopPromise) return;
     this.running = true;
     this.retired = false;
+    this.growthRuntime.resume();
     this.receipts.activate(() => { this.receiptsPending = true; this.wakeFn?.(); });
     this.wakeTimeLine = this.clock.timeLine();
     this.abort = new AbortController();
@@ -555,6 +557,9 @@ export class BotAgent {
     if (!this.running && !this.loopPromise) {
       this.scheduler.stopAll();
       for (const id of this.operationCalls.keys()) if (!this.scheduler.isPending(id)) this.operationCalls.delete(id);
+      await this.settleGrowthWrites();
+      await this.draining;
+      await this.context.settled();
       await this.receipts.settled(); await this.regulation.settled(); return;
     }
     this.running = false;
@@ -565,6 +570,9 @@ export class BotAgent {
     this.waiting = null;
     this.wakeFn?.();
     await this.loopPromise;
+    // Stop returns before a reset can reuse these paths. A cancelled model request
+    // exits promptly, while a journal append already begun must finish first.
+    await this.settleGrowthWrites();
     await this.drainMailbox();
     await this.context.settled();
     await this.receipts.settled();
@@ -2329,7 +2337,18 @@ export class BotAgent {
 
   private dispatchLocal(call: ToolCallRecord, run: () => Promise<string | RichText>): void {
     this.ackStart(call);
-    this.schedule(call, { executeAt: "now", run });
+    this.schedule(call, { executeAt: "now", run: async () => {
+      const result = run();
+      if (call.name !== "reflect") return result;
+      // A completed platform send may outlive stop, but a local reflection writes
+      // into the world's reusable directory and must finish before reset removes it.
+      this.growthToolWrites.add(result);
+      try { return await result; } finally { this.growthToolWrites.delete(result); }
+    } });
+  }
+
+  private async settleGrowthWrites(): Promise<void> {
+    await Promise.all([this.growthRuntime.settled(), Promise.allSettled([...this.growthToolWrites])]);
   }
 
   private classifyDevice(name: string): DeviceKind | null {

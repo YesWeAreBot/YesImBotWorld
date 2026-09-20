@@ -35,6 +35,43 @@ async function main(): Promise<void> {
   for (const text of ["你当面向店员点头，并收到一条Touch Night发来的消息：“我马上到了。”", "你放下纸信然后收到Touch Night发来的消息。", "当面点头并收到一条新消息。"]) assert.ok(detectDeviceClaim(text), text);
   for (const text of ["木质桌面上的台灯亮着", "木质桌面上摊着一本打开的书", "文件柜已经打开，里面放着几份合同。"]) assert.equal(detectDeviceClaim(text), null, text);
 
+  const physicalPhone = "手机平放在床头柜上，机身还残留一点握持余温。";
+  const darkPhone = "手机平放在床头柜上，屏幕暗着，机身还残留一点握持余温。";
+  assert.equal(detectDeviceClaim(physicalPhone), null);
+  const screenError = detectDeviceClaim(darkPhone)!;
+  assert.equal(screenError.kind, "software");
+  assert.match(screenError.message, /屏幕亮暗.*删除这部分子句.*手机平放在床头柜/);
+  assert.equal(screenError.excerpt.trim(), "屏幕暗着");
+  for (const text of ["屏幕亮着", "屏幕没有亮起", "屏幕已经熄灭", "手机锁屏了", "屏幕上没有通知", "手机上没有消息", "屏幕表面有一道暗色划痕，屏幕暗着", "手机外壳有一道划痕且屏幕显示聊天列表"])
+    assert.ok(detectDeviceClaim(text), text);
+  for (const text of ["屏幕玻璃上有一道暗色划痕", "手机屏幕表面留有黑色裂纹", "屏幕上有一枚指纹"])
+    assert.equal(detectDeviceClaim(text), null, text);
+
+  // The real initialization protocol repairs the precise offending clause, without
+  // weakening the gate or inventing an opposite screen/notification state.
+  const repairedGenesis = await fixture();
+  try {
+    let attempts = 0;
+    repairedGenesis.infer(async messages => {
+      const value = initial();
+      if (++attempts === 1) value.worldState = darkPhone;
+      else {
+        const feedback = messages.filter(m => m.role === "tool").map(m => String(m.content)).join("\n");
+        assert.match(feedback, /屏幕暗着/);
+        assert.match(feedback, /删除这部分子句/);
+        value.worldState = physicalPhone;
+        value.actorStates[0]!.state = "你站在床边，手指还记得机身的温度。";
+        value.perceptions[0]!.text = "手机平放在床头柜上。";
+      }
+      return resolution(value);
+    });
+    await repairedGenesis.runtime.ensure();
+    assert.equal(attempts, 2);
+    const snapshot = (await repairedGenesis.runtime.store()).snapshot();
+    assert.equal(snapshot.initialized, true); assert.equal(snapshot.worldState, physicalPhone);
+    assert.doesNotMatch(await repairedGenesis.files.readText(repairedGenesis.files.narrativeJournal), /屏幕暗着/);
+  } finally { await repairedGenesis.close(); }
+
   // Initialization and every ordinary commit surface use the same rejection boundary.
   for (const field of ["worldState", "actorStates", "perceptions"] as const) {
     const f = await fixture();

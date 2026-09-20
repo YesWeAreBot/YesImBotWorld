@@ -31,6 +31,10 @@ export class NotesApp implements WorldApp {
   readonly id = "notes";
   readonly name = "记事本";
   readonly description = "你的私人笔记：备忘、值得注意的事、对人的印象、日记，随时翻看";
+  private pending = new Set<Promise<unknown>>();
+  private closed = false;
+  private generation = 0;
+  private closing: Promise<void> = Promise.resolve();
 
   constructor(
     private files: WorldFiles,
@@ -39,6 +43,14 @@ export class NotesApp implements WorldApp {
   ) {}
 
   async open(): Promise<{ tools: AppRawTool[]; opening: string }> {
+    const generation = this.generation;
+    await this.closing;
+    if (generation !== this.generation) throw new Error("记事本的打开操作已取消，请重新打开应用。");
+    this.closed = false;
+    return this.track(() => this.openNotebook());
+  }
+
+  private async openNotebook(): Promise<{ tools: AppRawTool[]; opening: string }> {
     const notes = await this.loadAll();
     const recent = notes
       .slice(0, 5)
@@ -105,6 +117,10 @@ export class NotesApp implements WorldApp {
   }
 
   async call(tool: string, args: Record<string, unknown>): Promise<string> {
+    return this.track(() => this.callOpen(tool, args));
+  }
+
+  private async callOpen(tool: string, args: Record<string, unknown>): Promise<string> {
     switch (tool) {
       case "list_notes":
         return this.listNotes(args);
@@ -122,7 +138,20 @@ export class NotesApp implements WorldApp {
   }
 
   async close(): Promise<void> {
-    /* 无连接可释放 */
+    this.closed = true;
+    this.generation++;
+    // Tool cancellation may stop its caller waiting before local disk IO has
+    // finished. Join accepted operations before reset archives/removes Notes.
+    this.closing = Promise.allSettled([...this.pending]).then(() => {});
+    await this.closing;
+  }
+
+  private async track<T>(operation: () => Promise<T>): Promise<T> {
+    if (this.closed) throw new Error("记事本已关闭，请重新打开应用后操作。");
+    const task = operation();
+    this.pending.add(task);
+    try { return await task; }
+    finally { this.pending.delete(task); }
   }
 
   // ---------- 操作 ----------

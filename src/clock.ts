@@ -58,6 +58,8 @@ export interface ClockAuthority {
 export class WorldClock {
   private state: ClockPersist = { accumulatedTU: 0, runningSince: null };
   private checkpointTimer: ReturnType<typeof setInterval> | null = null;
+  /** Ordered, immutable snapshots; a late checkpoint must never overwrite a later reset. */
+  private saveTail: Promise<void> = Promise.resolve();
   /** 本次进程启动时，上次退出时刻的世界时间（仅当上次退出时世界正在运行） */
   private offlineFromTU: number | null = null;
 
@@ -67,6 +69,7 @@ export class WorldClock {
   ) {}
 
   async load(): Promise<void> {
+    await this.saveTail;
     try {
       const raw = JSON.parse(await fs.readFile(this.file, "utf8")) as ClockPersist;
       if (typeof raw.accumulatedTU === "number") this.state = raw;
@@ -142,13 +145,20 @@ export class WorldClock {
     return this.cfg.tingleMaxUnits;
   }
 
-  private async save(): Promise<void> {
-    // 原子写入：避免进程在写入途中被杀导致 clock.json 损坏（那会让世界时间归零）
-    const tmp = `${this.file}.${randomUUID()}.tmp`;
-    try {
-      await fs.writeFile(tmp, JSON.stringify(this.state), { flag: "wx" });
-      await fs.rename(tmp, this.file);
-    } finally { await fs.rm(tmp, { force: true }); }
+  private save(): Promise<void> {
+    // Preserve invocation order as well as atomicity: an older checkpoint may
+    // still be writing when pause/reset publishes its newer state.
+    const snapshot = JSON.stringify(this.state);
+    const saved = this.saveTail.then(async () => {
+      const tmp = `${this.file}.${randomUUID()}.tmp`;
+      try {
+        await fs.writeFile(tmp, snapshot, { flag: "wx" });
+        await fs.rename(tmp, this.file);
+      } finally { await fs.rm(tmp, { force: true }); }
+    });
+    // A failed save is reported to its caller but does not poison later saves.
+    this.saveTail = saved.catch(() => {});
+    return saved;
   }
 
   /** 运行中周期性落盘：崩溃时离线起点最多比实际提前一个检查点间隔 */
@@ -215,7 +225,10 @@ export class WorldClock {
    */
   async pause(): Promise<void> {
     this.stopCheckpoints();
-    if (this.state.runningSince === null) return;
+    if (this.state.runningSince === null) {
+      await this.saveTail;
+      return;
+    }
     this.state.accumulatedTU = this.now();
     if (this.cfg.syncRealTime) {
       this.state.runningSince = Date.now();
@@ -236,7 +249,7 @@ export class WorldClock {
       this.state.accumulatedTU = this.now();
       this.state.runningSince = Date.now();
       await this.save();
-    }
+    } else await this.saveTail;
   }
 
   /**

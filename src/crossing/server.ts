@@ -84,8 +84,9 @@ export class CrossingServer {
   private sessions = new Map<string, VisitorSession>(); // token → session
   private heartbeat: NodeJS.Timeout | null = null;
   /** 包含已从 sessions 移除、但仍在旧世界完成任务/离场的会话。 */
-  private pendingCleanups = new Set<Promise<void>>();
+  private pendingCleanups = new Map<Promise<void>, { session: VisitorSession; leave: boolean }>();
   private disconnecting: Promise<void> | null = null;
+  private quietDisconnect = false;
   private stopping = false;
 
   constructor(private host: CrossingServerHost) {}
@@ -309,7 +310,7 @@ export class CrossingServer {
     this.stopping = true;
     if (this.heartbeat) clearInterval(this.heartbeat);
     this.heartbeat = null;
-    await this.disconnectVisitors("主世界的穿越服务关闭了");
+    await this.disconnectVisitors("主世界的穿越服务关闭了", { narrate: false });
     this.host.world.setVisitorsProvider(null);
     const server = this.server;
     this.server = null;
@@ -320,8 +321,9 @@ export class CrossingServer {
   }
 
   /** 等待所有旧世界工作收尾；保留监听器，供暂停后恢复/切换存档继续使用。 */
-  disconnectVisitors(reason: string): Promise<void> {
+  disconnectVisitors(reason: string, options: { narrate?: boolean } = {}): Promise<void> {
     if (this.disconnecting) return this.disconnecting;
+    this.quietDisconnect = options.narrate === false;
     this.stopResidentPerceptions();
     const drain = Promise.resolve().then(async () => {
       for (const session of [...this.sessions.values()]) {
@@ -329,11 +331,23 @@ export class CrossingServer {
         this.depart(session, "lost");
       }
       // depart/expel 在移除 token 后仍保留清理屏障，不能只检查 sessions.size。
-      await Promise.all([...this.pendingCleanups]);
+      await Promise.all([...this.pendingCleanups].map(async ([cleanup, { session, leave }]) => {
+        try { await cleanup; }
+        catch (error) {
+          // A departure started just before the service stopped can already have been
+          // cancelled. Finish that explicit cancellation administratively; disk/protocol
+          // failures still block reset rather than silently dropping a saved actor.
+          if (!this.quietDisconnect || !leave || !isAbortError(error)) throw error;
+          await this.host.world.disconnectVisitor(session);
+          this.pendingCleanups.delete(cleanup);
+        }
+      }));
     });
     this.disconnecting = drain;
     // 失败时保持拒绝接待；调用方不得继续切换到新世界。
-    void drain.then(() => { if (this.disconnecting === drain) this.disconnecting = null; }, () => {});
+    void drain.then(() => {
+      if (this.disconnecting === drain) { this.disconnecting = null; this.quietDisconnect = false; }
+    }, () => {});
     return drain;
   }
 
@@ -640,10 +654,13 @@ export class CrossingServer {
     const cleanup = (async () => {
       await session.ready;
       await Promise.all([...session.tasks.values()].map((task) => task.promise));
-      if (leave) await this.host.world.visitorLeave(session);
+      if (leave) {
+        if (this.quietDisconnect) await this.host.world.disconnectVisitor(session);
+        else await this.host.world.visitorLeave(session);
+      }
       else if (session.residentControl) await this.host.releaseResidentControl?.(session.id, cause);
     })();
-    this.pendingCleanups.add(cleanup);
+    this.pendingCleanups.set(cleanup, { session, leave });
     // 拒绝的清理保留在集合中，让后续 disconnect 明确失败，避免覆盖新世界。
     void cleanup.then(() => this.pendingCleanups.delete(cleanup), (err) => {
       this.host.logger.warn("[穿越] 离开善后失败: %s", err);
@@ -778,6 +795,10 @@ function escapeHtml(s: string): string {
 }
 
 // ---------- 辅助 ----------
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && (error.name === "AbortError" || (error as NodeJS.ErrnoException).code === "ABORT_ERR");
+}
 
 function sseFrame(msg: CrossingSseMsg): string {
   const id = msg.type === "event" && msg.eventId && !/[\r\n\0]/.test(msg.eventId) ? `id: ${msg.eventId}\n` : "";

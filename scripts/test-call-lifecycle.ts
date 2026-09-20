@@ -53,6 +53,8 @@ async function main() {
     };
     const oldStop = WorldService.prototype.stop.call(service as unknown as WorldService);
     await entered;
+    assert.equal(WorldService.prototype.stop.call(service as unknown as WorldService), oldStop,
+      "a second disposal must await the original shutdown instead of reporting an early completion");
     // Also cover a restarted service object: stop must use the captured release,
     // not whichever callback now occupies the instance field after its await.
     service.releaseCallStore = callStore.init(path.join(directory, "service"));

@@ -3,8 +3,9 @@
     // Keep drafts and uncertain requests across navigation, scoped to the administrator session.
     var sessions = Object.create(null);
     var icons = { status: 'activity', start: 'play', stop: 'pause', reload: 'refresh', inject: 'message', travel: 'portal', init: 'world', clearmsg: 'message', reset: 'refresh', webui: 'link' };
-    window.WorldCommands = { mount: function (container) {
+    window.WorldCommands = { mount: function (container, options) {
         if (isVisitor()) return function () {};
+        options = options || {};
         var authToken = TOKEN || '', state = sessions[authToken] || (sessions[authToken] = { drafts: Object.create(null), pending: null, sending: false, selected: '', selectedRun: '', historyOpen: false });
         var disposed = false, catalog = null, requestBusy = false, historySignature = '', showingCatalog = true;
         var wrapper = el('span', { cls: 'commands-menu' });
@@ -43,6 +44,9 @@
         function action(label, callback, extra) { return el('button', { type: 'button', cls: 'commands-button ' + (extra || ''), text: label, onclick: callback }); }
         function command(name) { return catalog && catalog.commands.find(function (item) { return item.name === (name || state.selected); }); }
         function draft() { return state.drafts[state.selected] || (state.drafts[state.selected] = {}); }
+        function canInterrupt(item, values, choosing) {
+            return catalog && catalog.interruptible && (item.name === 'world.stop' || item.name === 'world.reset' || item.name === 'world.init' && (choosing || values && values.force === true));
+        }
         function syncPanels() {
             var item = command();
             chooser.hidden = !showingCatalog;
@@ -70,11 +74,15 @@
         }
         function syncExecute() {
             if (!catalog) return;
-            Array.from(chooser.querySelectorAll('[data-command]')).forEach(function (button) { var item = command(button.dataset.command); button.disabled = state.sending || !!state.pending || !!(item.mutates && catalog.busy); });
+            Array.from(chooser.querySelectorAll('[data-command]')).forEach(function (button) { var item = command(button.dataset.command); button.disabled = state.sending || !!state.pending || !!(item.mutates && catalog.busy && !canInterrupt(item, state.drafts[item.name], true)); });
             toggle.querySelector('.commands-pending-dot').hidden = !(state.sending || state.pending || catalog.busy);
             toggle.title = state.sending || state.pending || catalog.busy ? '更多世界操作 · 有操作正在进行' : '更多世界操作';
             var button = form.querySelector('[data-command-execute]'), item = command();
-            if (button && item) { button.disabled = state.sending || !!state.pending || !!(item.mutates && catalog.busy); button.textContent = state.sending ? '正在提交…' : state.pending ? '正在确认提交结果…' : item.mutates && catalog.busy ? '等待当前操作完成' : '执行' + item.title; }
+            if (button && item) {
+                var interrupting = canInterrupt(item, state.drafts[item.name]);
+                button.disabled = state.sending || !!state.pending || !!(item.mutates && catalog.busy && !interrupting);
+                button.textContent = state.sending ? '正在提交…' : state.pending ? '正在确认提交结果…' : item.mutates && catalog.busy && !interrupting ? item.name === 'world.init' && catalog.interruptible ? '勾选强制重新创世以中断当前操作' : '等待当前操作完成' : interrupting ? '中断当前操作并' + item.title : '执行' + item.title;
+            }
         }
         function drawForm() {
             var item = command();
@@ -85,7 +93,7 @@
             form.appendChild(el('p', { cls: 'commands-description', text: item.description }));
             item.fields.forEach(function (field) {
                 var input;
-                if (field.type === 'boolean') input = el('input', { type: 'checkbox', checked: values[field.name] === true, onchange: function () { values[field.name] = input.checked; } });
+                if (field.type === 'boolean') input = el('input', { type: 'checkbox', checked: values[field.name] === true, onchange: function () { values[field.name] = input.checked; syncExecute(); } });
                 else if (field.type === 'world') {
                     input = el('select', { onchange: function () { values[field.name] = input.value; } });
                     input.appendChild(el('option', { value: '', text: '选择一个世界' }));
@@ -144,6 +152,7 @@
             if (disposed) return;
             var first = !catalog;
             catalog = next;
+            if (options.onState) options.onState({ busy: catalog.busy, interruptible: !!catalog.interruptible, instanceId: catalog.instanceId });
             if (state.pending) {
                 var found = catalog.runs.find(function (run) { return run.id === state.pending.id; });
                 if (found) { state.selectedRun = found.id; state.pending = null; say('请求已接收，下方会持续显示执行状态。'); }
@@ -162,7 +171,7 @@
         function execute() {
             if (state.sending || state.pending || !catalog) return;
             var item = command(), values = draft(), args = {};
-            if (!item || item.mutates && catalog.busy) return;
+            if (!item || item.mutates && catalog.busy && !canInterrupt(item, values)) return;
             for (var i = 0; i < item.fields.length; i++) {
                 var field = item.fields[i], value = field.type === 'boolean' ? values[field.name] === true : String(values[field.name] || '').trim();
                 if (field.required && !value) { say('请填写' + field.label + '。', true); var target = form.querySelector('[data-command-field="' + field.name + '"]'); if (target) target.focus(); return; }

@@ -253,30 +253,37 @@ var Studio = (function () {
         var liveCleanup = liveHost ? window.LiveCalls.mount(liveHost, { compact: true }) : null;
         // Keep the welcome actions and their open popover connected during live refreshes.
         var headingHost = el('div'), heroHost = el('div'), bodyHost = el('div'), currentOverview = null, worldActionPending = false;
+        var commandState = { busy: null, interruptible: false };
         var hero = el('section', { cls: 'studio-hero' }), eyebrow = el('div', { cls: 'studio-eyebrow' }), welcome = el('h2'), introduction = el('p');
         var heroCopy = el('div', { cls: 'studio-hero-copy' }, [eyebrow, welcome, introduction]);
         var actions = el('div', { cls: 'studio-hero-actions' });
         var worldButton = !isVisitor() ? button('正在加载…', 'activity', function () {
             var o = currentOverview;
-            if (!o || worldActionPending) return;
-            if (!o.initialized) { navigate('state'); return; }
+            if (worldActionPending || !commandState.instanceId || !o && !commandState.interruptible || commandState.busy && !commandState.interruptible) return;
+            var stopping = commandState.interruptible || o && o.worldRunning;
+            if (!stopping && !o.initialized) { navigate('state'); return; }
             worldActionPending = true; updateWorldButton();
-            api('POST', '/api/world/' + (o.worldRunning ? 'stop' : 'start'), {}).then(function (r) { toast(r.text || '已完成', 'ok'); refresh(); }).catch(showErr).finally(function () { worldActionPending = false; updateWorldButton(); });
+            var request = { id: 'cmd_' + (window.crypto && crypto.randomUUID ? crypto.randomUUID() : Date.now().toString(36) + '_' + Math.random().toString(36).slice(2)), instanceId: commandState.instanceId, command: stopping ? 'world.stop' : 'world.start', args: {} };
+            api('POST', '/api/commands', request).then(function (r) {
+                if (r.run && r.run.status === 'running') { commandState.busy = r.run.id; commandState.interruptible = true; }
+                toast(r.run && r.run.result || (stopping ? '取消／暂停请求已接收，可在更多操作的执行记录中查看结果。' : '启动请求已接收。'), 'ok'); refresh();
+            }).catch(showErr).finally(function () { worldActionPending = false; updateWorldButton(); });
         }, true) : null;
         if (worldButton) actions.appendChild(worldButton);
         if (can('world')) actions.appendChild(button('探索世界', 'arrow', function () { navigate('world'); }));
         else if (can('devices')) actions.appendChild(button('打开设备', 'phone', function () { navigate('devices'); }));
-        var commandCleanup = !isVisitor() && window.WorldCommands ? window.WorldCommands.mount(actions) : null;
+        var commandCleanup = !isVisitor() && window.WorldCommands ? window.WorldCommands.mount(actions, { onState: function (state) { commandState = state; updateWorldButton(); } }) : null;
         heroCopy.appendChild(actions);
         hero.append(heroCopy, el('div', { cls: 'studio-hero-visual', html: art() }), el('span', { cls: 'studio-hero-footnote', text: 'POSSIBILITIES / UNFOLDING' }));
-        holder.append(headingHost, heroHost);
+        heroHost.appendChild(hero); holder.append(headingHost, heroHost);
         function updateWorldButton() {
-            if (!worldButton || !currentOverview) return;
+            if (!worldButton) return;
             var o = currentOverview;
-            worldButton.disabled = worldActionPending;
-            worldButton.firstChild.innerHTML = icon(!o.initialized ? 'edit' : o.worldRunning ? 'pause' : 'play');
-            worldButton.lastChild.textContent = worldActionPending ? '正在处理…' : !o.initialized ? '准备世界设定' : o.worldRunning ? '暂停世界' : '继续世界';
+            worldButton.disabled = worldActionPending || !commandState.instanceId || !!(commandState.busy && !commandState.interruptible) || !o && !commandState.interruptible;
+            worldButton.firstChild.innerHTML = icon(commandState.interruptible ? 'pause' : !o ? 'activity' : !o.initialized ? 'edit' : o.worldRunning ? 'pause' : 'play');
+            worldButton.lastChild.textContent = worldActionPending ? '正在处理…' : commandState.interruptible ? '取消当前世界操作' : !o ? '正在加载…' : !o.initialized ? '准备世界设定' : o.worldRunning ? '暂停世界' : '继续世界';
         }
+        updateWorldButton();
         if (liveHost) holder.appendChild(liveHost);
         holder.appendChild(bodyHost);
         bodyHost.appendChild(el('div', { cls: 'studio-skeleton' }));
@@ -286,20 +293,23 @@ var Studio = (function () {
             refreshing = true;
             var worldPromise = isVisitor() ? Promise.resolve(null) : fetchWorld().catch(function () { return null; });
             var growthPromise = can('growth') ? fetchGrowth().catch(function () { return []; }) : Promise.resolve([]);
-            Promise.all([refreshOverview(false), worldPromise, growthPromise]).then(function (result) { if (alive)
+            var overviewPromise = refreshOverview(false).then(function (o) { if (alive) updateWelcome(o); return o; });
+            Promise.all([overviewPromise, worldPromise, growthPromise]).then(function (result) { if (alive)
                 draw(result[0], result[1], result[2]); }).catch(function (e) { if (alive)
                 error(bodyHost, e, refresh); }).finally(function () { refreshing = false; });
         }
-        function draw(o, world, growth) {
-            var snapshot = world?.snapshot, actors = Object.values(snapshot?.actors || {}), events = world?.events || [], bot = snapshot?.actors?.bot;
-            var running = Object.values(snapshot?.actions || {}).filter(function (a) { return a.status === 'pending'; });
-            headingHost.replaceChildren(title('AN OPEN WORLD, ALWAYS BECOMING', '世界总览', '看见世界如何变化，也参与角色的每一个当下。', [button('走进世界', 'door', function () { navigate('player'); }, true)].filter(function () { return can('player'); })));
+        function updateWelcome(o) {
             currentOverview = o;
             eyebrow.textContent = o.initialized ? 'OPEN WORLDS / 无界的可能' : 'OPEN WORLDS / 从此刻生长';
             welcome.textContent = o.initialized ? '你好，欢迎回来。' : '从一个世界开始。';
             introduction.textContent = !o.initialized ? '写下角色与世界设定，让第一组事实成为故事的起点。' : o.worldRunning ? '世界正在运转。观察发生了什么，或拿起设备，与角色共享此刻。' : '世界目前未运行。你可以先探索已有状态，再继续角色的生活。';
             updateWorldButton();
-            if (!heroHost.contains(hero)) heroHost.appendChild(hero);
+        }
+        function draw(o, world, growth) {
+            var snapshot = world?.snapshot, actors = Object.values(snapshot?.actors || {}), events = world?.events || [], bot = snapshot?.actors?.bot;
+            var running = Object.values(snapshot?.actions || {}).filter(function (a) { return a.status === 'pending'; });
+            headingHost.replaceChildren(title('AN OPEN WORLD, ALWAYS BECOMING', '世界总览', '看见世界如何变化，也参与角色的每一个当下。', [button('走进世界', 'door', function () { navigate('player'); }, true)].filter(function () { return can('player'); })));
+            updateWelcome(o);
             bodyHost.replaceChildren();
             bodyHost.appendChild(el('div', { cls: 'studio-kpi-row' }, [
                 kpi('世界角色', snapshot ? actors.length : '—', snapshot ? '以文字记录当前处境与未完的故事' : '完整世界仅管理员可见', 'world'),

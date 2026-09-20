@@ -19,8 +19,13 @@ export default async function smokeRegulation({ evaluate, wait, assert, navigate
   await evaluate("Array.from(document.querySelectorAll('.regulation-record-choice')).find(node=>node.querySelector('strong').textContent==='经历仍待评价，沿用原候选').click()");
   assert.ok(await evaluate("document.querySelector('.regulation-validation-result').textContent.includes('本次经历仍待有效评价，未更新其影响') && !document.querySelector('.regulation-validation-result').textContent.includes('已更新 0') && !document.querySelector('.regulation-validation-result').textContent.includes('有效评价仍然保留') && document.querySelectorAll('.regulation-candidate').length===0 && document.querySelector('.regulation-unresolved').textContent.includes('仍有 1 项经历')"), 'All-invalid proposals with unresolved evidence cannot be presented as successful appraisal');
   await page('Emulation.setTouchEmulationEnabled', { enabled: true, maxTouchPoints: 1 });
-  await evaluate("document.querySelector('.regulation-panel .insight-plot-viewport').scrollIntoView({block:'center',behavior:'instant'})");
-  const target = await evaluate("(()=>{const m=document.querySelector('.regulation-chart .insight-plot-mark:nth-last-child(2)').getBoundingClientRect(),v=document.querySelector('.regulation-panel .insight-plot-viewport').getBoundingClientRect();return {x:(m.left+m.right)/2,y:v.top+75}})()");
+  // Selecting a record redraws the SVG and restores its horizontal position in
+  // requestAnimationFrame. Measure only after that restoration has finished.
+  await evaluate("new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)))");
+  await evaluate("document.querySelector('.regulation-chart [data-plot-key=regulation_decision]').scrollIntoView({block:'center',inline:'center',behavior:'instant'})");
+  await evaluate("new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)))");
+  const target = await evaluate("(()=>{const m=document.querySelector('.regulation-chart [data-plot-key=regulation_decision] rect').getBoundingClientRect();return {x:(m.left+m.right)/2,y:(m.top+m.bottom)/2}})()");
+  assert.equal(await evaluate(`document.elementFromPoint(${target.x},${target.y})?.closest('[data-plot-key]')?.dataset.plotKey`), 'regulation_decision', 'Touch coordinates must hit the visible fixture point after layout settles');
   await page('Input.dispatchTouchEvent', { type:'touchStart',touchPoints:[target] });
   await page('Input.dispatchTouchEvent', { type:'touchEnd',touchPoints:[] });
   await wait("document.querySelector('.regulation-panel .insight-plot-detail').textContent.includes('4750.0')");
@@ -41,7 +46,9 @@ export default async function smokeRegulation({ evaluate, wait, assert, navigate
   assert.ok(await evaluate("document.querySelector('.regulation-learning').textContent.includes('最近 2 项，全部已学习 120 项') && document.querySelector('.regulation-learning').textContent.includes('已收到用于更新预期的明确回应') && document.querySelector('.regulation-learning').textContent.includes('消息发送已完成；对方是否回应或答应仍未由此确定')"), 'Reply settlement and successful message delivery stay semantically distinct');
   await evaluate("window.fetch=window.__regulationFetch;delete window.__regulationFetch");
   await evaluate("window.__growthStatusOriginalFetch=Studio.fetchGrowth;Studio.fetchGrowth=()=>Promise.resolve([]);window.dispatchEvent(new CustomEvent('studio:refresh'))");
-  await wait("document.querySelector('.growth-review-status')?.textContent.includes('历史待补审')");
+  // The audit panel also exists behind a disclosure while claims are present.
+  // Wait for this refresh's empty ledger, not that earlier copy of the audit.
+  await wait("document.querySelector('.growth-empty') && !document.querySelector('[data-growth-claim]') && !document.querySelector('.growth-review-disclosure') && document.querySelector('.growth-review-status')?.textContent.includes('历史待补审')");
   assert.ok(await evaluate("document.querySelector('.growth-review-status').textContent.includes('待审阅经历9') && document.querySelector('.growth-review-status').textContent.includes('历史待补审14') && document.querySelector('.growth-review-rejections').textContent.includes('提案 1：习惯提案缺少跨情境的自主完成证据') && document.activeElement===regulationSearch && regulationSearch.selectionStart===1"), 'An empty growth ledger exposes review progress and specific rejections without stealing focus');
   assert.ok(await evaluate("document.querySelector('.growth-review-status').textContent.includes('审阅未完成2') && document.querySelector('.growth-review-outcome').textContent.includes('最近一次审阅未完成') && document.querySelectorAll('.growth-review-failure').length===2 && document.querySelector('.growth-review-failure').textContent.includes('成长整理等待或生成超时')"), 'Unfinished generation and its specific reason remain visible alongside completed zero-change reviews');
   await evaluate("window.__growthCompletedOriginalApi=api;api=function(method,url){return window.__growthCompletedOriginalApi.apply(this,arguments).then(result=>url==='/api/bot/growth/status'?Object.assign({},result,{lastOutcome:'completed'}):result);};window.dispatchEvent(new CustomEvent('studio:refresh'))");

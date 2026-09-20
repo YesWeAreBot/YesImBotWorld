@@ -7,7 +7,7 @@ import { type CalendarSpec, describeCalendar, gregorian, parseCalendarSpec, pars
 import type { WorldClock } from "../clock.js";
 import type { WorldModelConfig } from "../config.js";
 import type { WorldFiles } from "../files.js";
-import { ChatClient, type ChatMessage } from "../llm/chat.js";
+import { ChatClient, type ChatMessage, type ChatResult } from "../llm/chat.js";
 import { parseCompression } from "./compression.js";
 import { withEndpointLock } from "../llm/lock.js";
 import { extractHtml } from "../apps/html.js";
@@ -71,18 +71,59 @@ export interface RemoteWorldLink {
 export class WorldAgent {
   private client: ChatClient;
   private maintenanceAbort = new AbortController();
-  stop(): void { this.maintenanceAbort.abort(); this.runtime.stop(); }
+  /** Only the service's serialized lifecycle transition may start a new generation. */
+  resume(): void {
+    if (this.maintenanceAbort.signal.aborted) this.maintenanceAbort = new AbortController();
+    this.runtime.resume();
+  }
+  stop(): void {
+    this.maintenanceAbort.abort(); this.runtime.stop();
+    for (const task of this.queue.splice(0)) { this.pending--; task.reject(this.maintenanceAbort.signal.reason); }
+  }
+  private maintenanceRuns = new Set<Promise<unknown>>();
+  async shutdown(): Promise<void> {
+    this.stop();
+    await this.runtime.shutdown();
+    await this.drainTask;
+    // Endpoint-lock cancellation can settle its caller before the worker has finished an
+    // already-started file write. Join the workers as well before reset changes their files.
+    while (this.maintenanceRuns.size) await Promise.allSettled([...this.maintenanceRuns]);
+    await Promise.allSettled([...this.deliveryTails.values()]);
+  }
+  private trackMaintenance<T>(fn: () => Promise<T>, signal: AbortSignal): Promise<T> {
+    signal.throwIfAborted();
+    const job = fn();
+    this.maintenanceRuns.add(job);
+    void job.finally(() => this.maintenanceRuns.delete(job)).catch(() => {});
+    return job;
+  }
+  private async maintenanceComplete(messages: ChatMessage[], signal: AbortSignal): Promise<ChatResult> {
+    signal.throwIfAborted();
+    const result = await abortable(this.client.complete(messages, { signal }), signal);
+    signal.throwIfAborted();
+    return result;
+  }
   readonly runtime: NarrativeWorld;
   private perceptionCursors = new Map<string, number>();
   private directlyObserved = new Map<string, Set<string>>();
   private pendingReceiptActions = new Map<string, string>();
   private deliveryTails = new Map<string, Promise<void>>();
-  async ensureWorld(): Promise<void> { if (this.maintenanceAbort.signal.aborted) this.maintenanceAbort = new AbortController(); this.runtime.resume(); await this.runtime.ensure(); }
+  async ensureWorld(): Promise<void> {
+    const signal = this.maintenanceAbort.signal;
+    signal.throwIfAborted();
+    await this.runtime.ensure(undefined, undefined, signal);
+  }
   /** Used after an explicit world reset/reload; old sequence cursors cannot address a new journal. */
   resetPerceptionDelivery(): void { this.perceptionCursors.clear(); this.directlyObserved.clear(); }
+  /** Call only after shutdown, when replacing the saved world rather than merely pausing it. */
+  resetSessionState(): void {
+    this.botName = ""; this.dormantSinceTU = null; this.remote = null;
+    this.resetPerceptionDelivery(); this.pendingReceiptActions.clear(); this.deliveryTails.clear();
+  }
   /** Resume after the last known delivered cause, without replaying an entire compressed lifetime. */
   async restorePerceptions(actorId: string, deliver: (content: string) => void, knownSourceIds: string[] = []): Promise<void> {
-    const observations = await this.runtime.perceptionsSince(actorId, 0);
+    const signal = this.maintenanceAbort.signal; signal.throwIfAborted();
+    const observations = await this.runtime.perceptionsSince(actorId, 0); signal.throwIfAborted();
     const known = new Set(knownSourceIds);
     let anchor = -1;
     for (let i = 0; i < observations.length; i++) {
@@ -97,17 +138,19 @@ export class WorldAgent {
     // A migrated world may have no matching source IDs in the old Bot archive. Its saved current
     // view is a safe baseline; replaying every old scene would turn a summary into repeated life.
     const latest = observations.at(-1) ?? await this.runtime.latestObservation(actorId);
+    signal.throwIfAborted();
     if (latest) {
       deliver(JSON.stringify({ recovered: true, observation: latest }));
       this.perceptionCursors.set(actorId, latest.worldSequence);
     }
   }
   async observe(actorId = "bot", args: {intent?: string; target?: string; modality?: string} = {}): Promise<WorldObservation> {
+    const lifetime = this.maintenanceAbort.signal; lifetime.throwIfAborted();
     if (this.remote && actorId === "bot") {
       if (!this.remote.observe) throw new Error("远方世界不支持主动观察");
       return this.remote.observe(args);
     }
-    const observation = await this.runtime.observe(actorId, args);
+    const observation = await this.runtime.observe(actorId, args); lifetime.throwIfAborted();
     // A concurrently committed passive event may precede this observation. Acknowledge only
     // this exact result; advancing the entire cursor here would silently drop that earlier event.
     const observed = this.directlyObserved.get(actorId) ?? new Set<string>();
@@ -118,14 +161,16 @@ export class WorldAgent {
   private visitorId(v: VisitorRef): string { return "visitor:" + (v.id ?? v.name); }
   /** Read already committed perceptions; passive delivery must never invoke observe or the model. */
   private async publishActor(actorId: string, deliver: (content: string) => void, receipt?: string): Promise<void> {
+    const signal = this.maintenanceAbort.signal; signal.throwIfAborted();
     const prior = this.deliveryTails.get(actorId) ?? Promise.resolve();
     const run = prior.catch(() => {}).then(async () => {
+      signal.throwIfAborted();
       let receiptObservation: NarrativeObservation | undefined;
       if (receipt) {
         try { const parsed = JSON.parse(receipt); receiptObservation = parsed.observation ?? parsed; } catch { /* preserve a readable remote/error receipt below */ }
       }
       const cursor = this.perceptionCursors.get(actorId) ?? 0;
-      const pending = await this.runtime.perceptionsSince(actorId, cursor);
+      const pending = await this.runtime.perceptionsSince(actorId, cursor); signal.throwIfAborted();
       const deliveredAhead = this.directlyObserved.get(actorId) ?? new Set<string>();
       this.directlyObserved.set(actorId, deliveredAhead);
       let receiptDelivered = false;
@@ -164,6 +209,7 @@ export class WorldAgent {
   /** 元数据生成与记忆维护的队列；世界裁定由 runtime 独立串行。 */
   private queue: { fn: () => Promise<unknown>; priority: number; cancelKey?: string; resolve: (v: unknown) => void; reject: (e: unknown) => void }[] = [];
   private draining = false;
+  private drainTask?: Promise<void>;
   private pending = 0;
   /**
    * 穿越：Bot 当前所在的远方世界。设置后，act 裁定 / wait 补叙 / 查看时间 /
@@ -236,24 +282,27 @@ export class WorldAgent {
 
   /** 世界启动时：把 meta 里的 botName 刷进内存字段；若还没有（旧世界），从定义补判一次 */
   async ensureBotName(): Promise<void> {
-    const meta = await this.files.readMeta();
-    if (meta.botName) {
-      this.botName = meta.botName;
-      return;
-    }
-    const { botDef } = await this.files.readDefinitions();
-    await this.setupBotName(botDef);
+    return this.enqueue(async signal => {
+      const meta = await this.files.readMeta(); signal.throwIfAborted();
+      if (meta.botName) { this.botName = meta.botName; return; }
+      const { botDef } = await this.files.readDefinitions(); signal.throwIfAborted();
+      await this.setupBotName(botDef, signal);
+    });
   }
 
   /** 用户手动设置常驻 Bot 名字（WebUI 编辑）：写 meta.json 并刷新内存字段，立即生效 */
-  async setBotName(name: string): Promise<void> {
-    const trimmed = name.trim().slice(0, 64);
-    const meta = await this.files.readMeta();
-    await this.files.writeMeta({ ...meta, botName: trimmed || undefined });
-    const actor = (await this.runtime.store()).snapshot().actors.bot;
-    if (trimmed && actor && actor.name !== trimmed) await this.runtime.rename(trimmed);
-    this.botName = trimmed || actor?.name || "";
-    this.logger.info("常驻 Bot 名字（用户设置）：%s", trimmed || "（清空）");
+  async setBotName(name: string, signal: AbortSignal = this.maintenanceAbort.signal): Promise<void> {
+    return this.trackMaintenance(async () => {
+      const trimmed = name.trim().slice(0, 64);
+      const meta = await this.files.readMeta(); signal.throwIfAborted();
+      await this.files.writeMeta({ ...meta, botName: trimmed || undefined });
+      signal.throwIfAborted();
+      const actor = (await this.runtime.store()).snapshot().actors.bot; signal.throwIfAborted();
+      if (trimmed && actor && actor.name !== trimmed) await this.runtime.rename(trimmed, signal);
+      signal.throwIfAborted();
+      this.botName = trimmed || actor?.name || "";
+      this.logger.info("常驻 Bot 名字（用户设置）：%s", trimmed || "（清空）");
+    }, signal);
   }
 
   /**
@@ -282,9 +331,10 @@ export class WorldAgent {
       stream: cfg.stream,
       label: "World",
     });
-    this.runtime = new NarrativeWorld(files, clock, (messages, tools, signal) => withEndpointLock(cfg.baseURL, () => this.client.complete(messages, {
-      tools, signal, toolChoice: { type: "function", function: { name: "resolve_world" } },
-    }), signal), prompts);
+    this.runtime = new NarrativeWorld(files, clock, (messages, tools, signal) => withEndpointLock(cfg.baseURL, () => {
+      const pending = this.client.complete(messages, { tools, signal, toolChoice: { type: "function", function: { name: "resolve_world" } } });
+      return signal ? abortable(pending, signal) : pending;
+    }, signal), prompts);
   }
 
   /**
@@ -295,14 +345,14 @@ export class WorldAgent {
    */
   /**
    * 维护任务入队。priority 越大越靠前，同优先级保持先后顺序。
-   * 正在执行中的任务不会被抢占（LLM 推理无法安全中断）。
+   * 所有阶段使用入队时的取消信号；停止后不能借用下一轮的信号继续。
    */
-  private enqueue<T>(fn: () => Promise<T>, priority = 0, cancelKey?: string): Promise<T> {
+  private enqueue<T>(fn: (signal: AbortSignal) => Promise<T>, priority = 0, cancelKey?: string, signal = this.maintenanceAbort.signal): Promise<T> {
+    if (signal.aborted) return Promise.reject(signal.reason);
     this.pending++;
-    const signal = this.maintenanceAbort.signal;
     return new Promise<T>((resolve, reject) => {
       const wrapped = () =>
-        withEndpointLock(this.cfg.baseURL, fn, signal).finally(() => this.pending--);
+        withEndpointLock(this.cfg.baseURL, () => this.trackMaintenance(() => fn(signal), signal), signal).finally(() => this.pending--);
       const entry = {
         fn: wrapped as () => Promise<unknown>,
         priority,
@@ -318,7 +368,7 @@ export class WorldAgent {
       } else {
         this.queue.push(entry);
       }
-      void this.drain();
+      if (!this.draining) this.drainTask = this.drain();
     });
   }
 
@@ -349,12 +399,14 @@ export class WorldAgent {
 
   /** 裁定 Bot 的 act 动作。产出的事件通过 deliver 交付（由调度器压到期望完成时刻） */
   async adjudicateAct(call: ToolCallRecord, deliver: (content: string) => void, signal?: AbortSignal, beforeCommit?: () => boolean): Promise<boolean> {
+    const lifetime = this.maintenanceAbort.signal; lifetime.throwIfAborted();
     if (this.remote) return this.remote.adjudicateAct(call, deliver, signal, beforeCommit);
     const actionId = `bot:${call.id}`;
     this.pendingReceiptActions.set(actionId, "bot");
     try {
       const receipts: string[] = [];
       const ok = await this.runtime.act("bot", call, content => receipts.push(content), signal, beforeCommit);
+      lifetime.throwIfAborted();
       for (const receipt of receipts) await this.publishActor("bot", deliver, receipt);
       await this.publishAll("bot");
       return ok;
@@ -379,14 +431,18 @@ export class WorldAgent {
 
   /** Tingle：世界心跳，推进世界演化。返回 World 为下一次心跳设定的间隔（TU），未设定则返回 null */
   async tingle(deliver: (content: string) => void): Promise<number | null> {
+    const lifetime = this.maintenanceAbort.signal; lifetime.throwIfAborted();
     if (this.remote && !(this.visitorsProvider?.().length)) { this.notePresenceChange(); return null; }
     await this.runtime.evolve("世界心跳：按距离当前状态时刻的实际经过时间，结算自然过程及 NPC 的自主行动。承接正在进行的工作、交谈、等待和角色行动造成的影响，以自然语言写明真正发生的经过，分别向在场角色提供他们实际能感知的新动静。常驻角色及玩家的主动选择由他们自己决定。没有合理变化时保持安静，不强制制造冲突或奇遇，也不要重播旧场景。");
+    lifetime.throwIfAborted();
     await this.publishAll(undefined, deliver); return null;
   }
 
   /** 补叙离线期间的自然演化，向恢复连接的角色交付当前可感知变化。 */
   async resolveOfflineGap(fromTU: number, deliver: (content: string) => void): Promise<boolean> {
+    const lifetime = this.maintenanceAbort.signal; lifetime.throwIfAborted();
     await this.runtime.evolve('结算离线期间自然过程：fromTU=' + fromTU + '，现在=' + this.clock.now() + '。禁止替受控角色编造离线期间的决定、发言或主观经历。只把恢复感知时实际可知的变化送给角色。');
+    lifetime.throwIfAborted();
     await this.publishAll(undefined, deliver); return true;
   }
 
@@ -418,12 +474,15 @@ export class WorldAgent {
   }
 
   private async presentQuery(actorId: string, task: string): Promise<string> {
-    const observation = await this.runtime.query(actorId, task);
     const signal = AbortSignal.any([AbortSignal.timeout(60_000), this.maintenanceAbort.signal]);
+    signal.throwIfAborted();
+    const observation = await this.runtime.query(actorId, task);
+    signal.throwIfAborted();
     const result = await withEndpointLock(this.cfg.baseURL, () => this.client.complete([
       { role: "system", content: this.prompts.world.presentationSystem },
       { role: "user", content: observation },
     ], { signal }), signal);
+    signal.throwIfAborted();
     if (!result.content.trim() || result.toolCalls.length) throw new Error("只读呈现失败");
     return result.content;
   }
@@ -439,17 +498,28 @@ export class WorldAgent {
 
   /** 访客到达：生成到达场景（deliver 送达访客）并记录进 World_Status */
   async visitorArrive(v: VisitorRef, deliver: (content: string) => void, signal?: AbortSignal): Promise<boolean> {
+    const lifetime = this.maintenanceAbort.signal; lifetime.throwIfAborted();
     const actorId = this.visitorId(v);
-    await this.runtime.arrive(actorId, v.name, v.persona, signal);
+    await this.runtime.arrive(actorId, v.name, v.persona, signal); lifetime.throwIfAborted();
     await this.publishActor(actorId, deliver);
     await this.publishAll(actorId); return true;
   }
 
   /** 独立访客离场；常驻角色的扮演/操纵由控制会话管理，不进入此路径。 */
-  async visitorLeave(v: VisitorRef): Promise<boolean> { await this.runtime.leave(this.visitorId(v)); await this.publishAll(this.visitorId(v)); return true; }
+  async visitorLeave(v: VisitorRef): Promise<boolean> {
+    const signal = this.maintenanceAbort.signal; signal.throwIfAborted();
+    await this.runtime.leave(this.visitorId(v)); signal.throwIfAborted();
+    await this.publishAll(this.visitorId(v)); return true;
+  }
+
+  /** Lifecycle teardown only: the caller closes the session and joins its tasks first. */
+  async disconnectVisitor(v: VisitorRef): Promise<void> {
+    await this.runtime.disconnectVisitor(this.visitorId(v));
+  }
 
   /** 裁定访客的 act 动作（时刻按本世界时钟换算） */
   async visitorAct(v: VisitorRef, desc: string, duration: number, deliver: (content: string) => void, signal?: AbortSignal, taskId?: string, options: { speech?: string; target?: string } = {}): Promise<boolean> {
+    const lifetime = this.maintenanceAbort.signal; lifetime.throwIfAborted();
     const actorId = this.visitorId(v);
     const at = this.clock.now();
     const callId = taskId ?? randomUUID(), actionId = `${actorId}:${callId}`;
@@ -457,6 +527,7 @@ export class WorldAgent {
     try {
       const receipts: string[] = [];
       const ok = await this.runtime.act(actorId, { id: callId, name: 'act', role: 'world', arguments: { description: desc, ...options }, duration, issuedAt: at, expectedAt: at + duration }, content => receipts.push(content), signal);
+      lifetime.throwIfAborted();
       for (const receipt of receipts) await this.publishActor(actorId, deliver, receipt);
       await this.publishAll(actorId);
       return ok;
@@ -478,54 +549,56 @@ export class WorldAgent {
   // ---------- 创世 ----------
 
   /** 创世判定：这个世界是否是现实地球世界（决定天气应用查真实天气还是生成） */
-  private async assessRealWorld(worldDef: string): Promise<boolean | null> {
+  private async assessRealWorld(worldDef: string, signal: AbortSignal): Promise<boolean | null> {
     const system = this.prompts.world.assessRealWorldSystem;
     const user = fill(this.prompts.world.assessRealWorldUser, { worldDef });
-    const result = await this.client.complete([
+    const result = await this.maintenanceComplete([
       { role: "system", content: system },
       { role: "user", content: user },
-    ], { signal: this.maintenanceAbort.signal });
+    ], signal);
     const parsed = extractJson(result.content) as Record<string, unknown> | null;
     return parsed && typeof parsed.real_world === "boolean" ? parsed.real_world : null;
   }
 
   /** 创世第一步：判定世界性质并持久化（天气应用等依赖它区分现实/虚构） */
-  private async assessBotName(botDef: string): Promise<string | null> {
+  private async assessBotName(botDef: string, signal: AbortSignal): Promise<string | null> {
     const system = this.prompts.world.assessBotNameSystem;
     const user = fill(this.prompts.world.assessBotNameUser, { botDef });
-    const result = await this.client.complete([
+    const result = await this.maintenanceComplete([
       { role: "system", content: system },
       { role: "user", content: user },
-    ]);
+    ], signal);
     const parsed = extractJson(result.content) as Record<string, unknown> | null;
     const name = parsed && typeof parsed.name === "string" ? parsed.name.trim() : "";
     return name || null;
   }
 
-  private async setupWorldMeta(worldDef: string): Promise<void> {
+  private async setupWorldMeta(worldDef: string, signal: AbortSignal): Promise<void> {
     let real: boolean | null = null;
     try {
-      real = await this.assessRealWorld(worldDef);
+      real = await this.assessRealWorld(worldDef, signal);
     } catch (err) {
+      signal.throwIfAborted();
       this.logger.warn("世界性质判定调用失败: %s", err);
     }
     // 判定失败时回退：与现实时间同步的世界更可能是现实设定
     const realWorld = real ?? this.clock.syncRealTime;
     if (real === null) this.logger.warn("World-LLM 未能判定世界性质，按 %s 处理", realWorld ? "现实世界" : "虚构世界");
-    const meta = await this.files.readMeta();
+    const meta = await this.files.readMeta(); signal.throwIfAborted();
     await this.files.writeMeta({ ...meta, realWorld });
     this.logger.info("世界性质：%s", realWorld ? "现实地球世界" : "虚构世界");
   }
 
   /** 创世/改定义：从 Bot_Definition 判定常驻 Bot 名字并持久化到 meta.json（供访客 prompt 硬区分） */
-  private async setupBotName(botDef: string): Promise<void> {
+  private async setupBotName(botDef: string, signal: AbortSignal): Promise<void> {
     let name: string | null = null;
     try {
-      name = await this.assessBotName(botDef);
+      name = await this.assessBotName(botDef, signal);
     } catch (err) {
+      signal.throwIfAborted();
       this.logger.warn("Bot 名字判定调用失败: %s", err);
     }
-    const meta = await this.files.readMeta();
+    const meta = await this.files.readMeta(); signal.throwIfAborted();
     if (name) {
       await this.files.writeMeta({ ...meta, botName: name });
       this.botName = name;
@@ -536,11 +609,12 @@ export class WorldAgent {
   }
 
   /** 创世：依据世界定义与用户设定的初始时刻，生成世界的历法 */
-  private async setupCalendar(worldDef: string): Promise<void> {
+  private async setupCalendar(worldDef: string, signal: AbortSignal): Promise<void> {
     let spec: CalendarSpec | null = null;
     try {
-      spec = await this.generateCalendar(worldDef);
+      spec = await this.generateCalendar(worldDef, signal);
     } catch (err) {
+      signal.throwIfAborted();
       this.logger.warn("历法生成调用失败: %s", err);
     }
     if (!spec) {
@@ -552,7 +626,9 @@ export class WorldAgent {
     // Keep authored custom calendars intact: an ISO-looking input alone cannot disprove
     // a custom calendar explicitly required by the world definition.
     if (spec.kind === "gregorian" && parseGregorianEpoch(this.clock.configuredEpoch) !== null) spec = gregorian(this.clock.configuredEpoch);
+    signal.throwIfAborted();
     await this.clock.setCalendar(spec);
+    signal.throwIfAborted();
     this.logger.info("世界历法：%s；创世时刻 %s", describeCalendar(spec), this.clock.clockString(0));
   }
 
@@ -562,12 +638,12 @@ export class WorldAgent {
    * - 浏览器启用时，由 World-LLM 生成契合世界观的带壳截图外壳 HTML。
    * 分辨率持久化到 meta.json；外壳 HTML 存到独立的 phoneShell.html。任一步失败都不阻塞创世（回退默认/内置值）。
    */
-  private async setupPhone(botDef: string, worldDef: string): Promise<void> {
+  private async setupPhone(botDef: string, worldDef: string, signal: AbortSignal): Promise<void> {
     const wantAuto = (this.phoneCfg.resolution || "auto").trim().toLowerCase() === "auto";
     const wantShell = this.phoneCfg.generateShell;
     if (!wantAuto && !wantShell) return;
 
-    const meta = await this.files.readMeta();
+    const meta = await this.files.readMeta(); signal.throwIfAborted();
     // 外壳生成需要知道目标分辨率：显式配置优先，auto 则先判定
     let res = wantAuto
       ? DEFAULT_PHONE_RESOLUTION
@@ -575,7 +651,7 @@ export class WorldAgent {
 
     if (wantAuto) {
       try {
-        const spec = await this.generatePhoneSpec(botDef, worldDef);
+        const spec = await this.generatePhoneSpec(botDef, worldDef, signal);
         if (spec) {
           res = spec;
           meta.phone = spec;
@@ -584,32 +660,36 @@ export class WorldAgent {
           this.logger.warn("World-LLM 未能给出有效的手机分辨率，使用默认 %dx%d", res.width, res.height);
         }
       } catch (err) {
+        signal.throwIfAborted();
         this.logger.warn("手机分辨率判定调用失败: %s", err);
       }
     }
 
     if (wantShell) {
       try {
-        const html = await this.generatePhoneShell(botDef, worldDef, res);
+        const html = await this.generatePhoneShell(botDef, worldDef, res, signal);
         if (html) {
+          signal.throwIfAborted();
           await this.files.writePhoneShell(html);
           this.logger.info("浏览器带壳截图外壳已生成（%d 字符，存于 phoneShell.html，可手动编辑）", html.length);
         } else {
           this.logger.warn("World-LLM 未能生成有效的外壳 HTML（缺少 {{screen}} 占位符），截图将使用内置外壳");
         }
       } catch (err) {
+        signal.throwIfAborted();
         this.logger.warn("手机外壳生成调用失败: %s", err);
       }
     }
 
+    signal.throwIfAborted();
     await this.files.writeMeta(meta);
   }
 
-  private async generatePhoneSpec(botDef: string, worldDef: string): Promise<PhoneResolution | null> {
-    const result = await this.client.complete([
+  private async generatePhoneSpec(botDef: string, worldDef: string, signal: AbortSignal): Promise<PhoneResolution | null> {
+    const result = await this.maintenanceComplete([
       { role: "system", content: this.prompts.world.phoneSpecSystem },
       { role: "user", content: fill(this.prompts.world.phoneSpecUser, { botDef, worldDef }) },
-    ]);
+    ], signal);
     const parsed = extractJson(result.content) as Record<string, unknown> | null;
     if (!parsed) return null;
     const width = Number(parsed.width);
@@ -622,8 +702,9 @@ export class WorldAgent {
     botDef: string,
     worldDef: string,
     res: PhoneResolution,
+    signal: AbortSignal,
   ): Promise<string | null> {
-    const result = await this.client.complete([
+    const result = await this.maintenanceComplete([
       { role: "system", content: this.prompts.world.phoneShellSystem },
       {
         role: "user",
@@ -634,40 +715,54 @@ export class WorldAgent {
           height: res.height,
         }),
       },
-    ]);
+    ], signal);
     const html = extractHtml(result.content);
     // 必须保留 {{screen}} 占位符才能合成；不合格则弃用（退回内置外壳）
     return html && html.includes("{{screen}}") ? html : null;
   }
 
-  private async generateCalendar(worldDef: string): Promise<CalendarSpec | null> {
+  private async generateCalendar(worldDef: string, signal: AbortSignal): Promise<CalendarSpec | null> {
     const system = this.prompts.world.generateCalendarSystem + "\n配置的初始时刻是T=0锚点，作者定义决定历法规则。不得把作者指定的过去或未来改成现实今天，不得自行改写明确的公历日期；自定义纪年必须按作者与配置解析。世界是否连接现实应用不决定历法或时间同步模式。";
     const user = fill(this.prompts.world.generateCalendarUser, {
       worldDef,
       epoch: this.clock.configuredEpoch,
       unitWorldSeconds: this.clock.unitWorldSeconds,
     });
-    const result = await this.client.complete([
+    const result = await this.maintenanceComplete([
       { role: "system", content: system },
       { role: "user", content: user },
-    ]);
+    ], signal);
     return parseCalendarSpec(extractJson(result.content));
   }
 
   /** 初始化：判定世界性质、生成历法（同步模式跳过）、判定手机规格，再根据用户定义生成状态文件 */
   async initialize(botDef: string, worldDef: string): Promise<void> {
-    if (this.maintenanceAbort.signal.aborted) this.maintenanceAbort = new AbortController();
-    this.runtime.resume();
-    await this.enqueue(() => this.setupWorldMeta(worldDef));
-    if (!this.clock.syncRealTime) await this.enqueue(() => this.setupCalendar(worldDef));
-    await this.runtime.ensure(botDef, worldDef);
-    await this.setBotName((await this.runtime.store()).snapshot().actors.bot!.name);
-    await this.enqueue(() => this.setupPhone(botDef, worldDef));
+    const signal = this.maintenanceAbort.signal;
+    return this.trackMaintenance(async () => {
+      // A previous attempt may have committed the world before phone/context setup failed.
+      // Completing that attempt must not roll its calendar or world classification again.
+      const initialized = (await this.runtime.store()).snapshot().initialized;
+      signal.throwIfAborted();
+      if (!initialized) {
+        await this.enqueue(s => this.setupWorldMeta(worldDef, s), 0, undefined, signal);
+        signal.throwIfAborted();
+        if (!this.clock.syncRealTime) await this.enqueue(s => this.setupCalendar(worldDef, s), 0, undefined, signal);
+      }
+      signal.throwIfAborted();
+      await this.runtime.ensure(botDef, worldDef, signal);
+      signal.throwIfAborted();
+      const store = await this.runtime.store(); signal.throwIfAborted();
+      await this.setBotName(store.snapshot().actors.bot!.name, signal);
+      await this.enqueue(s => this.setupPhone(botDef, worldDef, s), 0, undefined, signal);
+      signal.throwIfAborted();
+    }, signal);
   }
 
   /** 用户修改了定义文件：世界据此调整状态，并告知 Bot 能感知到的变化 */
   async reconcileDefinitions(botDef: string, worldDef: string, deliver: (content: string) => void): Promise<void> {
+    const lifetime = this.maintenanceAbort.signal; lifetime.throwIfAborted();
     await this.runtime.evolve('管理员更新世界定义。只应用与现有状态兼容的环境变化，不重写角色记忆、已发生事件或身份。定义=' + JSON.stringify({botDef, worldDef}));
+    lifetime.throwIfAborted();
     await this.publishAll(undefined, deliver);
   }
 
@@ -681,7 +776,7 @@ export class WorldAgent {
     timeLine: string;
     chatAccounts?: string;
   }): Promise<CompressionResult> {
-    return this.enqueue(async () => {
+    return this.enqueue(async signal => {
       // 输入长度防护：意识流超过单次上限时不再丢弃最早内容，而是按时间序
       // 切成多段、分次总结——每一轮都把上一轮产出的摘要作为"旧摘要"续喂，
       // 一口一口把整段意识流吃完（map-reduce 式滚动压缩）。
@@ -737,7 +832,7 @@ export class WorldAgent {
           { role: "user", content: user },
         ];
         for (let attempt = 0; attempt < 2; attempt++) {
-          const result = await this.client.complete(messages, { signal: this.maintenanceAbort.signal });
+          const result = await this.maintenanceComplete(messages, signal);
           try {
             const parsed = parseCompression(result.content);
             historySummary = parsed.historySummary;
@@ -746,7 +841,7 @@ export class WorldAgent {
           } catch (err) {
             // Exactly one format repair; transport errors and aborts propagate directly.
             // No partial result reaches the caller, so its durable snapshot remains intact.
-            if (attempt > 0 || this.maintenanceAbort.signal.aborted) throw err;
+            if (attempt > 0 || signal.aborted) throw err;
             this.logger.warn("压缩第 %d 段格式校验失败，尝试修正一次：%s", i + 1, String(err));
             messages.push({ role: "assistant", content: result.content }, {
               role: "user", content: `${String(err)}\n请依据上面的全部输入重新给出完整的两个标签；只修正输出格式，不添加经历、不丢弃已交付内容。`,
@@ -790,4 +885,14 @@ function extractJson(text: string): unknown {
   } catch {
     return null;
   }
+}
+
+/** Cancel noncooperative model test doubles/transports without letting their late output advance a task. */
+function abortable<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const abort = () => { signal.removeEventListener("abort", abort); reject(signal.reason ?? new Error("Cancelled")); };
+    signal.addEventListener("abort", abort, { once: true });
+    promise.then(value => { signal.removeEventListener("abort", abort); resolve(value); }, error => { signal.removeEventListener("abort", abort); reject(error); });
+    if (signal.aborted) abort();
+  });
 }
