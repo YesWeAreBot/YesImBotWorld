@@ -76,7 +76,7 @@ function readPackageVersion(): string {
     const require = createRequire(import.meta.url);
     return require("koishi-plugin-yesimbot-world/package.json").version as string;
   } catch {
-    return "0.3.0";
+    return "0.3.1";
   }
 }
 
