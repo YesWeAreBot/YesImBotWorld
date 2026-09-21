@@ -1,3 +1,5 @@
+import type { NarrativePresentation } from "./narrative-types.js";
+
 /** JSON values are the only values admitted to the authoritative world. */
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 export type AttributeVisibility = "public" | "owner" | "hidden";
@@ -83,7 +85,7 @@ export interface WorldExperience {
   correlationId?: string;
   details?: Record<string, JsonValue>;
 }
-export interface WorldObservation {
+export interface WorldObservation extends NarrativePresentation {
   observationId: string;
   actorId: string;
   worldSequence: number;

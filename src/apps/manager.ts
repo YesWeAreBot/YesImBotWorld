@@ -55,7 +55,9 @@ export class AppManager {
     const defs: AppToolDef[] = [];
     for (const t of tools) {
       let exposed = t.name;
-      const occupied = new Set([...this.reserved, ...this.otherToolNames(), ...toolMap.keys()]);
+      // Retired world `observe` can remain in a frozen historical tool declaration.
+      // Namespace an application's homonym so its current capability is unambiguous.
+      const occupied = new Set([...this.reserved, "observe", ...this.otherToolNames(), ...toolMap.keys()]);
       if (occupied.has(exposed)) exposed = `${app.id}.${t.name}`;
       if (occupied.has(exposed)) continue; // 仍冲突（重复工具名），丢弃
       toolMap.set(exposed, t.name);

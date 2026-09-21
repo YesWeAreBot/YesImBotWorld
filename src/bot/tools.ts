@@ -47,6 +47,12 @@ export function toolLayer(name: string): ToolLayer {
 
 export const BOT_TOOLS: BotToolDef[] = [
   {
+    name: "think",
+    signature: "think(thought: string)",
+    description: "留下一段简短的角色内心独白：可以回想、犹豫、猜测、整理打算，也可以只是想一想而不采取行动。刚经历的事情、牵挂的人或尚未决定的打算，都可能自然浮上心头；身体行动尚未返回也不妨碍想自己的事，但不必为了填满等待时间而强行独白。thought 为 1 至 1200 个 Unicode 字符的非空文本，写角色此刻的主观想法，不输出模型的隐藏推理过程。它立即在本地保留，duration 不推进时间或延后确认；不传给世界，不获取新信息、推进动作或改变身体，不发送给别人，也不触发内在调节评价。区分已知事实、回忆与猜测或设想；想到、希望或打算发生的事不等于已经发生，不能作为成长或奖励证据。不要求每次行动前都调用；没有新的实际感知或操作结果时，至多保留两段自主独白，然后本工具暂时不可用，不必改用其他工具重复相同想法。",
+    inputSchema: { type: "object", properties: { thought: { type: "string", minLength: 1, maxLength: 1200 } }, required: ["thought"], additionalProperties: false },
+  },
+  {
     name: "wait",
     signature: 'wait(n: number)',
     description:
@@ -58,21 +64,16 @@ export const BOT_TOOLS: BotToolDef[] = [
     description:
       "在世界中做一件事，用自然语言描述。description 只写**行动本身**——简短、明确地说你" +
       "要做什么（如「去厨房泡一杯咖啡」「走到窗边看看外面」），**不要写剧情**：不要描写环境、心情，" +
-      "也不要在行动里预设结果或替别人说话。世界会返回你实际能感知的经过、他人的反应和行动结果，无需再调用 observe 才能知道这次发生了什么。needs_input 表示已经推进到需要你作新决定的地方，整体目标尚未完成，请据此给出下一步意图，不要当作仍在后台自动执行。记得给出合理的 duration；target 可直接写对象的名字或足以辨认的自然语言描述，不需要 ID，也不要求行动前先观察。" +
+      "也不要在行动里预设结果或替别人说话。主动观察、辨认或聆听也用 act 表达，普通感官信息和行动结果会自动送达，不必反复刷新场景。世界会返回连贯经过、他人的反应、可知处境，以及可能的行动建议；建议可忽略，不保证结果，始终允许自由行动。needs_input 表示已经推进到需要你作新决定的地方，整体目标尚未完成，请据此给出下一步意图，不要当作仍在后台自动执行。duration 给出预计耗时；先裁定当下进展，短动作可当下结束，确需持续的过程先交付开始感知并在到期后再结算，不必先空等 duration；开始感知不代表整体行动完成。target 可直接写对象的名字或足以辨认的自然语言描述，不需要 ID，也不要求行动前先观察。" +
       "要在物理世界开口说话时，speech 写你自己决定说出的逐字原话；世界只负责传播和他人的反应，不替你生成台词。" +
       "act 不读取聊天消息、软件界面或设备文件，也不执行收发消息、打开应用或设备命令；这些必须使用实际设备工具。拿起物件的身体动作不等于应用已打开或消息已读；不要把拿手机和读消息混成一个 act。需要切换手机持有状态时使用 pick_up_phone/put_down_phone。" +
-      "上一个相同的动作还在进行中时，重复的 act 会被拦截（结果会自动送达，无需再发起一次）；确实要同时再做一遍时加 repeat: true。",
+      "受理确认不代表动作已开始或完成；专注模式开启时待上一 act 返回后才能再 act，关闭时允许并行表达新的意图；独立设备操作与思考不受 act 专注设置影响。上一个相同的动作尚未返回时，重复的 act 会被拦截（结果会自动送达，无需再发起一次）；当前能力允许并行且确实要同时再做一遍时加 repeat: true。",
   },
   {
     name: "rest",
     signature: "rest(duration?: number)",
     description:
-      "主动暂停自主思考一段时间，duration 以 TU 为单位，缺省或非正数使用 300 TU。有重要动静可提前恢复。到期和中断只记录计时，不表示睡过或醒来；身体的休息、睡姿等动作需要 act，身体状态以真实感知为准，需要进一步检查时才 observe。记忆整理独立进行。",
-  },
-  {
-    name: "observe",
-    signature: 'observe(intent?: string, target?: string, modality?: "all" | "sight" | "self")',
-    description: "主动把注意力放到自己、周围或某个细节。intent 写想了解什么，如「看看菜单上有哪些菜」「检查左手的伤口」；target 可补充对象名字或描述，也可用 self 指自身；modality 可选 all（默认）、sight（视觉）或 self（自身感受）。世界根据当前位置、感官和遮挡给出自然语言感知，必要时确立并记住尚未描写的合理细节；不会替你打开抽屉、移动身体、决定心情或透露不可感知的秘密。普通行动结果、眼前动静和通知会主动送达，不必反复观察。此工具不能读取平台消息、设备通知、软件界面或设备文件；设备界面请用 observe_device，聊天正文用 select_channel/read_channel 等当前可用的专用工具。",
+      "主动选择暂停自主思考一段时间，不是等待其他操作结果的必经步骤；已有 act 尚未返回时，仍可思考或处理独立设备操作。duration 以 TU 为单位，缺省或非正数使用 300 TU。有重要动静可提前恢复。到期和中断只记录计时，不表示睡过或醒来；身体的休息、睡姿等动作需要 act，身体状态以真实感知为准，需要主动检查时用 act 表达。记忆整理独立进行。",
   },
   {
     name: "observe_device",
@@ -541,7 +542,9 @@ export function availableTools(opts: {
         signature: def.name === "wait" ? "wait(n: number, confirm?: boolean)" : "rest(duration?: number, confirm?: boolean)",
         description:
           def.description +
-          "wait/rest 共用实际自主暂停的时长占比，被通知打断的部分也计入。近期暂停占比过高会先给出具体窗口反馈；确需继续休息或等待已有操作时，紧接着再调用同一工具并加 confirm: true，只确认该次。",
+          "wait/rest 共用实际自主暂停的时长占比，被通知打断的部分也计入。近期暂停占比过高会先给出具体窗口反馈；" +
+          (def.name === "rest" ? "确实想暂停自主思考时" : "确需继续等待时") +
+          "，紧接着再调用同一工具并加 confirm: true，只确认该次。",
       };
     }
     if (def.name === "rest" && opts.disableWait) {
@@ -554,7 +557,7 @@ export function availableTools(opts: {
         description:
           def.description +
           "开启 blockingAct（同时只能专注做一件事）时：上一个动作还没完成前，新的 act 会被直接拒绝，" +
-          "也不能用 repeat 绕过——手头的事照常推进，等它的结果自动送达即可。",
+          "也不能用 repeat 绕过。受理不证明已经开始；实际进展以随后交付的感知和结果为准。这里只暂停新的 act，仍可思考或处理独立设备操作，不必因此调用 rest。",
       };
     }
     // open_app 的描述里列出已安装的应用

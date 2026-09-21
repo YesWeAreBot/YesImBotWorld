@@ -131,7 +131,7 @@ async function actionAndVisitorRouting() {
     assert.equal(id, "visitor:guest"); assert.equal(call.arguments.target, "桌上的茶杯");
     await f.store.commit({ idempotencyKey: "guest-action", source: "fixture", actionId: "visitor:guest:call1", perceptions: [{ actorId: id, text: "你拿起茶杯，阿青提醒：“小心烫。”" }, { actorId: "bot", text: "访客拿起了茶杯，阿青提醒他小心烫。" }] });
     expectedReceipt = JSON.stringify({ observation: await f.world.runtime.peek(id), action: { id: "visitor:guest:call1", intent: String(call.arguments.description), status: "needs_input" } });
-    deliver(expectedReceipt); return true;
+    await deliver(expectedReceipt); return true;
   };
   assert.ok(await f.world.visitorAct(v, "拿起茶杯", 0, text => guest.push(text), undefined, "call1", { target: "桌上的茶杯" }));
   assert.equal(arrivals, 1, "acting cannot re-arrive or resurrect a departed character");
@@ -158,7 +158,8 @@ async function activeAttentionKeepsPendingEvents() {
   await f.world.resolveWait({} as any, text => delivered.push(text)); assert.equal(delivered.length, 1);
   const actDef = BOT_TOOLS.find(tool => tool.name === "act")!;
   assert.ok(!actDef.signature.includes("observationId")); assert.ok(!actDef.description.includes("observedId"));
-  assert.match(BOT_TOOLS.find(tool => tool.name === "observe")!.description, /不会替你打开抽屉/);
+  assert.ok(!BOT_TOOLS.some(tool => tool.name === "observe"), "internal reads do not reintroduce a public observer");
+  assert.match(actDef.description, /主动观察、辨认或聆听也用 act/);
   await f.world.runtime.shutdown();
 }
 async function physicalClockUsesWorldBoundary() {
@@ -199,7 +200,7 @@ async function heartbeatCannotBypassControlledActionReceipt() {
   f.world.runtime.act = async (id, call, deliver) => {
     await f.store.commit({ idempotencyKey: "controlled", source: "fixture", actionId: `${id}:${call.id}`, perceptions: [{ actorId: id, text: "你的手抬起来，碰到了桌上的杯子。" }] });
     committed(); await held;
-    deliver(JSON.stringify({ observation: await f.world.runtime.peek(id), action: { id: `${id}:${call.id}`, intent: "抬起手", status: "completed" } })); return true;
+    await deliver(JSON.stringify({ observation: await f.world.runtime.peek(id), action: { id: `${id}:${call.id}`, intent: "抬起手", status: "completed" } })); return true;
   };
   const pending = f.world.adjudicateAct({ id: "controlled", name: "act", arguments: { description: "抬起手" }, role: "agent", issuedAt: 10, expectedAt: 10, duration: 0 }, text => receipts.push(text));
   await ready;

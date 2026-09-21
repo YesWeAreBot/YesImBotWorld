@@ -46,6 +46,8 @@ export interface BotStatusSummary {
   pendingTasks: number;
   /** 手动驾驶（管理员接管 Bot）是否暂停了自主生成 */
   paused?: boolean;
+  awaitingToolRetry?: boolean;
+  opportunities?: import("../bot/opportunities.js").ActionOpportunity[];
   /** 手机界面状态（设备页窥视用）；老版本 Bot 可能不提供 */
   phoneUi?: { chatOpen: boolean; channelKey: string | null; channelIsGroup: boolean; forwardDepth: number };
 }

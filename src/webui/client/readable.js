@@ -3,7 +3,7 @@
     'use strict';
     var labels = {
         mode: '运行方式', narrative: '所见所闻', worldState: '世界当前情境', actors: '角色处境', perception: '角色感知', present: '是否在场', scene: '场景', intent: '行动意图', id: '编号', name: '名称', type: '类型', kind: '类别', role: '角色', content: '内容', text: '正文', description: '说明', desc: '意图', reason: '原因', message: '消息', messages: '消息列表',
-        arguments: '调用参数', parameters: '参数定义', properties: '字段', required: '必填字段', tools: '可用工具', tool_calls: '工具调用', toolCalls: '工具调用', function: '函数', result: '结果', response: '返回内容', request: '请求内容',
+        arguments: '调用参数', parameters: '参数定义', properties: '字段', required: '必填字段', tools: '可用工具', tool_calls: '工具调用', toolCalls: '工具调用', function: '函数', result: '结果', response: '返回内容', request: '请求内容', thought: '内心独白', internalThought: '主观想法', situation: '眼前处境', opportunities: '可以尝试', exclusiveGroup: '需要取舍的同组建议',
         status: '状态', ok: '是否成功', error: '错误', detail: '详情', payload: '事件内容', topic: '事件主题', sequence: '序列', emittedAt: '发生时间戳', ts: '时间戳',
         actorId: '行动角色', causationId: '上游事件', correlationId: '关联链路', ref: '关联编号', refToolCallId: '关联工具调用', sourceEventIds: '来源事件', action: '行动', actionId: '行动编号',
         entities: '可见实体', entityIds: '实体编号', changedEntityIds: '变更实体', entityId: '实体编号', observedId: '观测编号', observationId: '观测编号', observation: '观测结果', utterances: '听到的话语', speakerName: '说话人', speakerId: '说话人编号',
@@ -34,6 +34,33 @@
         return value;
     }
     function scalar(value) { return value == null ? (value === null ? '未设置（null）' : '未提供') : typeof value === 'boolean' ? value ? '是（true）' : '否（false）' : value === '' ? '空文本' : String(value); }
+    function thoughtText(value) {
+        var decoded = decode(value);
+        if (decoded && typeof decoded === 'object' && typeof decoded.thought === 'string') return decoded.thought;
+        // Native tool arguments arrive a few characters at a time. Decode only
+        // the thought string, including escaped quotes and split Unicode escapes.
+        var match = typeof value === 'string' && /^\s*\{\s*"thought"\s*:\s*"([\s\S]*)$/.exec(value);
+        if (!match) return null;
+        var encoded = match[1], end = encoded.length;
+        for (var i = 0; i < encoded.length; i++) { if (encoded[i] === '\\') i++; else if (encoded[i] === '"') { end = i; break; } }
+        encoded = encoded.slice(0, end);
+        for (var trim = 0; trim <= Math.min(6, encoded.length); trim++) {
+            try { return JSON.parse('"' + encoded.slice(0, encoded.length - trim) + '"'); } catch (_) {}
+        }
+        return null;
+    }
+    function thoughtCall(value) {
+        if (typeof value === 'string') {
+            var decoded = decode(value);
+            if (decoded && typeof decoded === 'object') value = decoded;
+            else {
+                var partial = /^\s*\{\s*"name"\s*:\s*"think"\s*,\s*"arguments"\s*:\s*([\s\S]*)$/.exec(value);
+                return partial ? thoughtText(partial[1]) : null;
+            }
+        }
+        var call = value && typeof value === 'object' && (value.function || value);
+        return call && call.name === 'think' ? thoughtText(call.arguments || call.args) : null;
+    }
     function rawText(value) {
         if (typeof value === 'string') return value;
         var ancestors = [];
@@ -107,6 +134,12 @@
     function renderValue(original, depth, options, ancestors, path) {
         var value = decode(original), state = options.state[JSON.stringify(path)] || (options.state[JSON.stringify(path)] = {});
         if (options.renderSpecial) { var special = options.renderSpecial(value, path); if (special) return special; }
+        var thought = thoughtCall(value);
+        if (thought !== null) {
+            var inner = element('section', 'readable-thought');
+            inner.append(element('strong', 'readable-thought-label', '内心独白 · 主观想法'), longText(thought, 'readable-prose', options.textLimit, state), element('small', 'readable-thought-note', '角色心里浮现的想法；没有向外说出，不代表事情已经发生。'));
+            return inner;
+        }
         if (!value || typeof value !== 'object') {
             if (typeof value === 'string') return longText(value || '空文本', 'readable-prose', options.textLimit, state);
             return element('span', 'readable-scalar readable-' + (value == null ? 'null' : typeof value), scalar(value));
@@ -148,5 +181,29 @@
         if (options.raw !== false && (!options.compact || options.raw === true)) root.appendChild(raw(value, { state: options.state.raw || (options.state.raw = {}) }));
         return root;
     }
-    window.ReadableData = { render: render, text: text, rawText: rawText, raw: raw, label: label };
+    function opportunities(items, options) {
+        options = options || {};
+        var root = element('section', 'readable-opportunities'), list = element('div', 'opportunity-list'), groups = new Map();
+        root.appendChild(element('div', 'opportunity-heading', options.historical ? '当时可以尝试' : '此刻可以尝试'));
+        root.appendChild(element('p', 'opportunity-note', options.select ? '点选填入操作台，再由你决定是否执行；也可以自由输入。' : '这些是待选择的建议，还没有执行，也不保证结果。'));
+        (Array.isArray(items) ? items : []).filter(function (item) { return item && typeof item.label === 'string' && typeof item.intent === 'string'; }).forEach(function (item, index) {
+            var node = element(options.select ? 'button' : 'article', 'opportunity-card');
+            if (options.select) {
+                node.type = 'button'; node.dataset.opportunityId = item.id || String(index);
+                node.disabled = typeof options.disabled === 'function' ? options.disabled(item) : !!options.disabled;
+                node.setAttribute('aria-pressed', String(!!item.id && options.selectedId === item.id));
+                node.addEventListener('click', function () { if (!node.disabled) options.select(item); });
+            }
+            node.append(element('strong', '', item.label), element('span', 'opportunity-intent', item.intent));
+            if (item.exclusiveGroup) {
+                if (!groups.has(item.exclusiveGroup)) groups.set(item.exclusiveGroup, groups.size + 1);
+                node.appendChild(element('small', 'opportunity-tradeoff', '取舍组 ' + groups.get(item.exclusiveGroup) + ' · 同组选一项'));
+            } else node.appendChild(element('small', 'opportunity-source', item.source === 'device' ? '设备里可做的事' : '眼前可以尝试'));
+            list.appendChild(node);
+        });
+        if (!list.children.length) root.appendChild(element('p', 'opportunity-note', '暂时没有新的建议，仍可按自己的意图行动。'));
+        else root.appendChild(list);
+        return root;
+    }
+    window.ReadableData = { render: render, text: text, rawText: rawText, raw: raw, label: label, thoughtText: thoughtText, thoughtCall: thoughtCall, opportunities: opportunities };
 })();

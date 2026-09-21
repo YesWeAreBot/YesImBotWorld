@@ -101,6 +101,15 @@ export default async function smokeLive({evaluate,wait,assert,navigate,page}) {
   await step({id:textId,action:'append',text:frame({content:'"arguments":{"id":"group-2"}}'})+'data: [DONE]\n\n'});await step({id:textId,action:'finish'});
   await wait("document.querySelector('.live-answer-text .readable-data')?.textContent.includes('group-2')");
   assert(await evaluate("!document.querySelector('.live-reading').hidden && !document.querySelector('.live-answer-text').textContent.includes('data:')"),'Text-protocol JSON is shown as fields rather than chunk envelopes');
+  const thoughtId=id+'_thought';
+  await step({id:thoughtId,action:'begin',source:'Bot'});await wait(`document.querySelector('[data-call-id="${thoughtId}"]')`);
+  await evaluate(`document.querySelector('[data-call-id="${thoughtId}"]').click()`);
+  await step({id:thoughtId,action:'append',text:frame({reasoning_content:'选择一段内心独白。',tool_calls:[{index:0,id:'inner_voice',type:'function',function:{name:'think',arguments:'{"thought":"等水烧开，我想'}}]})});
+  await wait("document.querySelector('.readable-thought .readable-prose')?.textContent==='等水烧开，我想'");
+  assert(await evaluate("document.querySelector('.live-reasoning h3').textContent==='模型推理' && document.querySelector('.readable-thought').textContent.includes('主观想法')"),'Character inner speech is distinct from model reasoning while streaming');
+  await step({id:thoughtId,action:'append',text:frame({tool_calls:[{index:0,function:{arguments:'先整理一下今天的计划。"}'}}]})+'data: [DONE]\n\n'});await step({id:thoughtId,action:'finish'});
+  await wait("document.querySelector('.readable-thought .readable-prose')?.textContent==='等水烧开，我想先整理一下今天的计划。'");
+  assert(await evaluate("!document.querySelector('.live-tool-arguments').textContent.includes('{') && document.querySelector('.readable-thought').textContent.includes('没有向外说出')"),'Completed thought remains readable subjective prose instead of action results or raw JSON');
   const cancelledId=id+'_cancelled';
   await step({id:cancelledId,action:'begin',source:'World'});await step({id:cancelledId,action:'cancel'});
   await wait("document.querySelector('[data-live-source=World]').dataset.state==='cancelled'");

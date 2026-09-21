@@ -30,11 +30,11 @@ async function main() {
     const app = { id: "notes", name: "记事本", description: "fixture", async open() { opens++; return { tools: [{ name: "read_note", description: "read fixture", inputSchema: { type: "object", properties: {} } }] }; }, async close() { order.push("close"); }, async call() {
       calls++; order.push("call-start"); if (block) { entered.resolve(); await finish.promise; } if (fail) throw new Error("fixture device disconnected"); order.push("call-finish"); return "visible fixture content";
     } };
-    const defs = BOT_TOOLS.filter(tool => ["open_app", "close_app", "pick_up_phone", "put_down_phone", "select_channel", "send", "check_msg", "observe_device", "observe", "check_status", "check_time"].includes(tool.name));
+    const defs = BOT_TOOLS.filter(tool => ["open_app", "close_app", "pick_up_phone", "put_down_phone", "select_channel", "send", "check_msg", "observe_device", "act", "think", "check_status", "check_time"].includes(tool.name));
     assert.deepEqual(signatureParams(defs.find(tool => tool.name === "observe_device")!.signature), [{ name: "device", required: true, schema: { type: "string", enum: ["phone", "computer"] } }]);
     const apps = new AppManager("chat", [app], new Set(defs.map(tool => tool.name)), logger);
     const messenger: any = { recentChannels: async () => ({ text: "cached channels" }), channelMessages: async () => ({ text: "cached messages" }), resolveKey: async () => ({ key: "onebot@fixture:channel", isPrivate: true }), putDownPhone: async () => "phone down", send: async () => { sends++; return "sent fixture message"; } };
-    const world: any = { observe: async () => ({ observationId: "fixture-observation", actorId: "bot", sourceEventIds: [], entities: [] }), resolveCheckTime: async () => {} };
+    const world: any = { adjudicateAct: async (_call: any, deliver: any, _signal: any, commit: any) => { assert.ok(commit()); deliver("你看向周围的环境。"); return true; }, observe: async () => ({ observationId: "fixture-observation", actorId: "bot", sourceEventIds: [], entities: [] }), resolveCheckTime: async () => {} };
     const computer: any = { isOpen: false, activeToolNames: () => [], activeToolDefs: () => [], view: () => null, hasTool: () => false };
     bot = new BotAgent(cfg, clock, files, context, world, messenger, apps, computer, null, phone, logger, defs, null, async () => { peeks++; return { text: "actual visible screen" }; });
     bot.running = true;
@@ -71,7 +71,7 @@ async function main() {
     assert.ok(declared.includes("read_note"), "explicit observation restores the actual visible app tools");
     assert.equal(peeks, 1, "Bot sees the actual device when it next looks, without a hidden-operation history");
     assert.ok(bot.mailbox.some((event: any) => /当前可见界面.*记事本/.test(event.content)));
-    for (const [name, args] of [["observe", { modality: "self" }], ["observe", { target: "self" }]] as const) {
+    for (const [name, args] of [["think", { thought: "我还想看完这篇笔记。" }], ["think", { thought: "刚才那个问题可以稍后再想。" }]] as const) {
       const id = await autonomous(name, args); await until(() => !bot.scheduler.isPending(id));
       assert.equal(bot.deviceAttention, "phone", `${name} must not invent looking away`);
     }
@@ -97,7 +97,7 @@ async function main() {
     assert.equal(peeks, priorPeeks, "observing a closed computer cannot connect or capture a screen");
     assert.ok(bot.mailbox.some((event: any) => /电脑当前已关闭/.test(event.content)));
     assert.equal(computer.isOpen, false); assert.equal(opens, 2);
-    const worldLook = await autonomous("observe"); await until(() => !bot.scheduler.isPending(worldLook));
+    const worldLook = await autonomous("act", { description: "看向周围的环境" }); await until(() => !bot.scheduler.isPending(worldLook));
     assert.equal(bot.deviceAttention, null, "explicitly observing surroundings changes the focus without guessing prose");
 
     // Bot operation -> human close -> stale Bot operation. Only individual effects hold the queue.

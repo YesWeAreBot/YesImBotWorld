@@ -22,6 +22,9 @@ import { GrowthLedger, type GrowthKind, type ReflectionOpportunity, type Reflect
 import { GrowthRuntime } from "./growth-runtime.js";
 import { RegulationRuntime, StaleRegulationDecision, type RegulationChoice } from "./regulation-runtime.js";
 import { ReceiptInbox } from "./receipts.js";
+import { DeliberationBudget, thoughtError } from "./deliberation.js";
+import { collectOpportunities, type ActionOpportunity } from "./opportunities.js";
+import { spillNarrativeText } from "./narrative-spill.js";
 import type { WorldObservation } from "../world/state.js";
 import { typingSlackTU } from "./typing.js";
 import { BOT_TOOLS, renderToolsText, toolLayer, type BotToolDef } from "./tools.js";
@@ -29,6 +32,7 @@ import type { AppToolDef } from "../apps/app.js";
 import { signatureParams } from "./nativeTools.js";
 import { sliceText } from "../text.js";
 import { detectDeviceRequest, DEVICE_TOOL_GUIDANCE } from "../world/device-boundary.js";
+import { SCENE_CHOICE_GUIDANCE, THOUGHT_RUNTIME_GUIDANCE } from "../prompts.js";
 
 /** 代理执行单个工具调用的回传结果（管理员「手动驾驶」Bot） */
 export interface ManualToolResult {
@@ -149,12 +153,12 @@ interface MailboxItem {
  * Bot-LLM：持续推理的 Agent。
  *
  * 主循环：排空事件邮箱（应用上下文修改）→ 生成一个工具调用 → 追加进流 →
- * 派发执行（不等待结果）→ 立即生成下一个。
+ * 派发执行 → 继续生成；工具可用性分别控制，无效调用重试采用可唤醒退避。
  *
  * 阻塞规则：上下文修改（事件注入、压缩）只发生在两次生成之间 ——
  * 事件先进 mailbox，在下一次生成开始前统一追加。
  *
- * wait() / rest() 是仅有的两个会暂停生成的工具。
+ * wait/rest 主动暂停生成；pending act 只依据 blockingAct 收起下一次 act，不暂停其他能力。
  */
 
 /** 延期发送意图：duration 明显超过打字时间的 send，不自动发出，到点询问 Bot 是否要发 */
@@ -191,8 +195,12 @@ export class BotAgent {
   private running = false;
   private loopPromise: Promise<void> | null = null;
   private abort: AbortController | null = null;
-  private waiting: { callId: string; kind?: "wait" | "rest"; startedTU?: number } | null = null;
+  private waiting: { callId: string; kind?: "wait" | "rest"; startedTU?: number; worldCalls?: string[] } | null = null;
   private wakeFn: (() => void) | null = null;
+  private deliberation: DeliberationBudget;
+  private awaitingToolRetry = false;
+  private thoughtGuidanceDelivered = false;
+  private opportunityStamp: string | undefined;
   private lastGenAt = 0;
   /**
    * 近期已发消息的签名滑动窗口（频道+内容+图片），用于拦截"近期反复说同一句"——
@@ -314,7 +322,8 @@ export class BotAgent {
     /** Passive pixels from the already-open desktop; called only while Bot attends it. */
     private peekDevice?: (kind: DeviceKind) => Promise<RichText | null>,
   ) {
-    this.toolDefs = tools ?? BOT_TOOLS;
+    this.toolDefs = (tools ?? BOT_TOOLS).filter(tool => tool.name !== "observe");
+    this.deliberation = new DeliberationBudget(context.stream);
     this.growth = new GrowthLedger(files.base);
     this.growthRuntime = new GrowthRuntime(this.growth, config.bot, clock, context, logger);
     this.regulation = new RegulationRuntime(files.base, config.bot, clock, context, logger);
@@ -374,7 +383,7 @@ export class BotAgent {
           }
         }
         for (const observation of precedingObservations) this.pushEvent(observation.source ?? "world", this.spillResult(observation));
-        this.pushEvent("tool", gated, { ref });
+        this.pushEvent("tool", gated, { ref, wake: !!ref && this.waiting?.worldCalls?.includes(ref) });
         for (const observation of followingObservations) {
           this.pushEvent(observation.source ?? "koishi", this.spillResult(observation));
         }
@@ -400,7 +409,7 @@ export class BotAgent {
    * 手机界面状态 / App 打开状态变化后：重算**允许集**并同步进后端（GBNF 语法 / 解析校验）。
    * 原生声明保留到压缩边界；新工具及参数变化通过追加事件呈现。
    */
-  private currentToolNames(excludeCallId?: string, includeBanned = false): string[] {
+  private currentToolNames(excludeCallId?: string, includeBanned = false, autonomous = true): string[] {
     const names = [...this.layerNames("core")];
     if (this.phoneUi.chatOpen) {
       names.push(...this.layerNames("chat"));
@@ -420,6 +429,9 @@ export class BotAgent {
     const location = this.crossing?.location();
     const meaningful = (name: string): boolean => {
       switch (name) {
+        case "think": return !autonomous || this.deliberation.canThink;
+        case "observe": return false; // Retired public tool; historical receipts remain readable.
+        case "act": return this.config.bot.blockingAct === false || !pending.some(task => task.name === "act");
         case "pick_up_phone": return this.phone.down;
         case "put_down_phone": return !this.phone.down;
         case "open_app": return !!this.apps;
@@ -467,6 +479,10 @@ export class BotAgent {
       if (removed.length || added.length || changed.length) {
         const lines = ["（当前能力发生变化，立即生效；之前的工具说明保留为历史记录，以本事件为准。"];
         if (removed.length) lines.push(`现在不可用：${removed.join("、")}。调用这些工具不会执行操作。`);
+        if (removed.some(name => name === "act" || name === "observe") && this.pendingWorldOperations()) {
+          lines.push("已有动作尚未返回，当前专注设置暂停新的 act；结果会自动交付，无需重复提交。仍可思考或处理独立设备操作，不必用 rest 代替。");
+        }
+        if (removed.includes("think") && !this.deliberation.canThink) lines.push("这一段内心活动暂告一段落；新的实际感知或操作结果到来后，可以继续想。无需改用其他工具重复记录同一想法。");
         if (added.length) lines.push(`现在新增可用：\n${renderToolsText(added)}`);
         if (changed.length) lines.push(`以下工具的参数或语义已更新：\n${renderToolsText(changed)}`);
         if (this.config.bot.nativeToolCalls && (added.length || changed.length)) lines.push('原生 function 声明会在整理记忆后更新；新能力或新参数尚未出现在声明中时，可在正文输出单个 {"name":"工具名","arguments":{},"duration":0} 调用。缺少原生声明不表示要用 act 代替设备工具。');
@@ -474,6 +490,7 @@ export class BotAgent {
       }
     }
     this.announcedToolDefs = next;
+    if (this.awaitingToolRetry && !this.pendingWorldOperations()) this.wakeFn?.();
   }
 
   /**
@@ -620,6 +637,8 @@ export class BotAgent {
     pendingTasks: number;
     /** 手动驾驶（管理员接管 Bot）是否暂停了自主生成 */
     paused: boolean;
+    awaitingToolRetry: boolean;
+    opportunities: ActionOpportunity[];
     /** 手机界面状态（WebUI「设备」页窥视手机用） */
     phoneUi: { chatOpen: boolean; channelKey: string | null; channelIsGroup: boolean; forwardDepth: number };
   } {
@@ -630,6 +649,8 @@ export class BotAgent {
       approxChars: this.context.approxChars(),
       pendingTasks: this.scheduler.pendingCount,
       paused: this.manualPaused,
+      awaitingToolRetry: this.awaitingToolRetry,
+      opportunities: this.actionOpportunities(),
       phoneUi: {
         chatOpen: this.phoneUi.chatOpen,
         channelKey: this.phoneUi.channelKey,
@@ -637,6 +658,31 @@ export class BotAgent {
         forwardDepth: this.phoneUi.forwardStack.length,
       },
     };
+  }
+
+  /** Suggestions use only delivered scenes and perceived capabilities, never hidden device state. */
+  actionOpportunities(mode?: "avatar" | "puppet"): ActionOpportunity[] {
+    const names = mode ? this.manualTools(mode) : [...(this.announcedToolDefs?.keys() ?? [])];
+    return collectOpportunities(this.context.stream, names);
+  }
+
+  private async announceOpportunities(opportunities: ActionOpportunity[]): Promise<void> {
+    const prefix = "（当前可考虑的行动机会；建议不是事实、命令或结果保证，可自由选择其他行动。";
+    const lines = opportunities.map((option, index) => `${index + 1}. [${option.source === "world" ? "世界" : "设备"}] ${option.label}：${option.intent}` +
+      (option.exclusiveGroup ? `〔取舍组 ${option.exclusiveGroup}，可能无法同时选择〕` : "") +
+      (option.call ? `\n   可用调用：${JSON.stringify(option.call)}` : ""));
+    const content = prefix + "旧建议不代表现在仍可用；未选择也不算已经行动或放弃承诺。）\n" +
+      (lines.length ? lines.join("\n") : "此前的建议已不再作为当前选择；仍可依照当前能力自由行动。");
+    const stamp = JSON.stringify([this.context.windowRevision, opportunities]);
+    if (stamp === this.opportunityStamp) return;
+    const prior = [...this.context.stream].reverse().find(entry => entry.kind === "event" && entry.event.source === "system" && entry.event.content.startsWith(prefix));
+    if ((!opportunities.length && !prior) || (prior?.kind === "event" && prior.event.content === content)) {
+      this.opportunityStamp = stamp; return;
+    }
+    const event: BotEvent = { id: this.context.nextEventId(), source: "system", originEventIds: [], worldTime: this.clock.now(), content };
+    await this.context.appendEvent(event);
+    this.opportunityStamp = stamp;
+    this.publishPerception(event);
   }
 
   // ---------- 事件注入（唯一入口） ----------
@@ -661,7 +707,7 @@ export class BotAgent {
     if ((opts.ref && this.stealthCalls.has(opts.ref)) || (this.deviceExecution.getStore()?.stealth && (source === "system" || source === "tool"))) return;
     const isWaitResult = this.waiting !== null && opts.ref === this.waiting.callId;
     // 唤醒规则：等待中的工具结果必定唤醒；wake 事件可以提前唤醒 wait（等待本来就是"直到有事发生"）。
-    // act 不再阻塞生成（blockingAct 只管住下一个 act），因此没有"专注做事顾不上别的"的暂停态。
+    // 工具不可用的重试退避不与角色 wait/rest 混为一谈。
     const shouldWake = this.waiting !== null && (isWaitResult || opts.wake === true || puppetResult);
 
     if (shouldWake && !isWaitResult) {
@@ -726,6 +772,8 @@ export class BotAgent {
       this.waiting = null;
       this.wakeFn?.();
     }
+    // Result waiting is a scheduler state, independent of the character's wait/rest timer.
+    if (this.awaitingToolRetry && source !== "system" && !rich.experience?.internalThought) this.wakeFn?.();
   }
 
   /** Text and ordered multimodal parts carry the same agency attribution, including after restart. */
@@ -835,10 +883,9 @@ export class BotAgent {
   setManualPaused(paused: boolean): void {
     if (this.manualPaused === paused) return;
     this.manualPaused = paused;
+    this.wakeFn?.();
     if (paused) this.generationAbort?.abort();
     this.logger.info("Bot-LLM 手动驾驶%s", paused ? "接管（暂停自主生成）" : "交还（恢复自主生成）");
-    // 交还/唤醒时若 runLoop 正停在暂停等待，立即唤醒推进
-    if (!paused) this.wakeFn?.();
   }
 
   /** 当前是否处于手动驾驶（自主生成已暂停） */
@@ -871,11 +918,11 @@ export class BotAgent {
 
   /** 身体受控不等于意识被替代；未知扩展工具按可能有副作用处理。 */
   private autonomousDuringPuppet(name: string): boolean {
-    return ["observe", "observe_device", "reflect", "recall_growth", "wait", "rest"].includes(name);
+    return ["think", "observe_device", "reflect", "recall_growth", "wait", "rest"].includes(name);
   }
 
   private puppetToolAllowed(name: string): boolean {
-    return !["reflect", "recall_growth", "wait", "rest"].includes(name);
+    return !["think", "reflect", "recall_growth", "wait", "rest"].includes(name);
   }
 
   async acquireResidentControl(mode: "avatar" | "puppet", sessionId: string): Promise<{ busy: boolean }> {
@@ -927,7 +974,7 @@ export class BotAgent {
     const task = this.scheduler.pending().find(task => task.id === id);
     if (!task || task.control?.sessionId !== sessionId) return { ok: false, status: "not_found", text: "此会话没有该待处理调用。" };
     const status = this.scheduler.cancel(id);
-    const text = status === "cancelled" ? "尚未提交的调用已取消。" : "调用已开始提交，无法撤销；请等待真实回执。";
+    const text = status === "cancelled" ? "已取消后续尚未提交的部分；此前已发生的结果保留。" : "调用已开始提交，无法撤销；请等待真实回执。";
     if (status === "cancelled") {
       this.finishPause(id);
       this.operationCalls.delete(id);
@@ -936,6 +983,7 @@ export class BotAgent {
       this.pushEvent("system", text, { ref: id });
       this.puppetCalls.delete(id);
       if (this.waiting?.callId === id) { this.waiting = null; this.wakeFn?.(); }
+      this.refreshToolGate();
     }
     return { ok: status === "cancelled", status, text, callId: id };
   }
@@ -948,7 +996,7 @@ export class BotAgent {
 
   /** 当前分层真正允许的工具与原始应用 schema；读取无副作用。 */
   manualTools(mode?: "avatar" | "puppet"): AppToolDef[] {
-    const allowed = new Set(this.currentToolNames());
+    const allowed = new Set(this.currentToolNames(undefined, false, false));
     return [...this.toolDefs, ...(this.apps?.activeToolDefs() ?? []), ...(this.computer?.activeToolDefs() ?? [])]
       .filter(def => allowed.has(def.name) && (mode !== "puppet" || this.puppetToolAllowed(def.name)))
       .map(def => {
@@ -997,10 +1045,11 @@ export class BotAgent {
     if (opts.control && (this.residentClosing || this.residentControl?.sessionId !== opts.control.sessionId || this.residentControl.mode !== opts.control.mode)) return { ok: false, text: "角色接管会话已改变，此调用没有执行。" };
     if (opts.control?.mode === "puppet" && !this.puppetToolAllowed(name)) return { ok: false, text: "身体操纵不能代替角色思考、反思或休息；请使用观察与身体/设备能力。" };
     if (!args || typeof args !== "object" || Array.isArray(args) || (opts.duration !== undefined && (!Number.isFinite(opts.duration) || opts.duration < 0))) return { ok: false, text: "工具参数必须为对象，duration 必须为有限非负数。" };
-    if (!this.currentToolNames().includes(name)) return { ok: false, text: `（${name} 此刻不可用，本次操作没有执行。请从当前能力列表重新选择。）` };
+    if (!this.currentToolNames(undefined, false, false).includes(name)) return { ok: false, text: `（${name} 此刻不可用，本次操作没有执行。请从当前能力列表重新选择。）` };
+    if (name === "think" && thoughtError(args.thought)) return { ok: false, text: thoughtError(args.thought)! };
     if (opts.stealth && (!this.classifyDevice(name) || name === "pick_up_phone" || name === "put_down_phone")) return { ok: false, text: "偷偷操作只能改变设备界面，不能代替角色拿起或放下手机。" };
     const issuedAt = this.clock.now();
-    let duration = opts.duration;
+    let duration = name === "think" ? 0 : opts.duration;
     // 与 finalize 一致：wait 以参数 n 为准（模型常输出 duration:0 + n:x 的组合）
     if (name === "wait" && !(duration && duration > 0)) {
       const n = Number(args.n ?? 0);
@@ -1119,6 +1168,10 @@ export class BotAgent {
           this.generationAbort = new AbortController();
           const signal = AbortSignal.any([this.abort!.signal, this.generationAbort.signal]);
           parsed = await this.backend.generate(this.context, this.wakeTimeLine, signal);
+          if (parsed.name === "think") {
+            const error = thoughtError(parsed.arguments.thought);
+            if (error) throw new ToolCallParseError(error);
+          }
           const available = [...this.toolDefs, ...this.perceivedAppDefs].filter(def => this.announcedToolDefs?.has(def.name));
           const gate = JSON.stringify([...this.announcedToolDefs ?? []]);
           const control = JSON.stringify(this.residentControl);
@@ -1143,8 +1196,9 @@ export class BotAgent {
             );
             // 「工具此刻不可用 / 未知工具」是可执行的明确原因（分层允许集造成）——必须原样透传给模型，
             // 让它知道该先 open_app 进聊天应用、select_channel 进频道，而不是吞成"恍惚"后原地重试同一个调用。
-            if (/(此刻不可用|未知工具)/.test(err.message)) {
+            if (/(此刻不可用|未知工具)/.test(err.message) || err.message.startsWith("think.thought")) {
               this.pushEvent("system", `（${err.message}）`);
+              await this.backoffInvalidToolRetry();
               continue;
             }
             const emphasis =
@@ -1259,6 +1313,15 @@ export class BotAgent {
   }
 
   private async drainMailboxUnlocked(): Promise<void> {
+    if (this.running && !this.thoughtGuidanceDelivered && this.toolDefs.some(def => def.name === "think")) {
+      if (!this.context.stream.some(entry => entry.kind === "event" && entry.event.source === "system" && entry.event.content === THOUGHT_RUNTIME_GUIDANCE + "\n\n" + SCENE_CHOICE_GUIDANCE)) {
+        const event: BotEvent = { id: this.context.nextEventId(), source: "system", worldTime: this.clock.now(),
+          content: THOUGHT_RUNTIME_GUIDANCE + "\n\n" + SCENE_CHOICE_GUIDANCE, originEventIds: [] };
+        await this.context.appendEvent(event);
+        this.publishPerception(event);
+      }
+      this.thoughtGuidanceDelivered = true;
+    }
     await this.regulation.restore();
     if (!this.growthRestored) {
       await this.growth.restorePerceptions(this.context.stream);
@@ -1272,6 +1335,8 @@ export class BotAgent {
       this.publishPerception(event);
       await this.growth.perceive(event, event.originEventIds ?? [event.id]);
       await this.regulation.perceive(event);
+      const origin = this.context.stream.find(entry => entry.kind === "tool_call" && entry.call.id === event.refToolCallId);
+      if (this.deliberation.perceive(event, origin?.kind === "tool_call" ? origin.call : undefined)) this.parseFailures = 0;
       debug.emit("bot.event", `[tool receipt] ${event.id}`, { ...event, recovered: true });
     });
     if (!this.mailbox.length) { await this.offerReflection(); return; }
@@ -1316,7 +1381,7 @@ export class BotAgent {
       const originCall = event.refToolCallId
         ? this.context.stream.find((entry) => entry.kind === "tool_call" && entry.call.id === event.refToolCallId)
         : undefined;
-      const derived = originCall?.kind === "tool_call" && ["reflect", "recall_growth", "recall"].includes(originCall.call.name);
+      const derived = originCall?.kind === "tool_call" && ["think", "reflect", "recall_growth", "recall"].includes(originCall.call.name);
       await this.growth.perceive(event, derived ? [] : event.originEventIds ?? [event.id]).catch((err) => {
         // Retry from the durable context at the next boundary, before it can be compressed away.
         this.growthRestored = false;
@@ -1324,6 +1389,7 @@ export class BotAgent {
         throw err;
       });
       await this.regulation.perceive(event);
+      if (this.deliberation.perceive(event, originCall?.kind === "tool_call" ? originCall.call : undefined)) this.parseFailures = 0;
       this.noteProgress(event);
       const resultLabel = event.refToolCallId
         ? `[${event.source} ← ${event.refToolCallId}] ${event.id}`
@@ -1345,8 +1411,10 @@ export class BotAgent {
     // Maintenance never edits the active request: only this serialized delivery boundary may
     // append its results. Avatar control defers private automatic changes until handback.
     if (this.running && !this.manualPaused) {
+      const opportunities = this.actionOpportunities();
+      await this.announceOpportunities(opportunities);
       for (const event of await this.regulation.drain()) this.publishPerception(event);
-      for (const event of [...await this.growthRuntime.drain(), ...await this.growthRuntime.remember()]) {
+      for (const event of [...await this.growthRuntime.drain(), ...await this.growthRuntime.remember(undefined, opportunities)]) {
         this.publishPerception(event);
         debug.emit("bot.event", `[growth] ${event.id}`, event);
       }
@@ -1395,15 +1463,72 @@ export class BotAgent {
     this.wakeFn = null;
   }
 
+  private pendingWorldOperations(): boolean {
+    return this.pendingWorldCalls().length > 0;
+  }
+
+  private pendingWorldCalls(): string[] {
+    return this.scheduler?.pending().filter(task => (task.name === "act" || task.name === "observe") &&
+      !this.stealthCalls.has(task.id)).map(task => task.id) ?? [];
+  }
+
   private async throttle(): Promise<void> {
     const wait = this.lastGenAt + this.config.bot.minIntervalMs - Date.now();
     if (wait > 0) await sleep(wait, this.abort?.signal);
     this.lastGenAt = Date.now();
   }
 
+  /** Invalid calls back off independently of act concurrency; fresh events can wake them. */
+  private async backoffInvalidToolRetry(): Promise<void> {
+    if (this.parseFailures < 2) return;
+    // Persist the correction first, and let any real input already queued reset failures.
+    await this.drainMailbox();
+    if (!this.running || this.manualPaused || this.parseFailures < 2) return;
+    const delay = Math.min(60_000, Math.max(1000, this.config.bot.retryDelayMs) * 2 ** Math.min(6, this.parseFailures - 2));
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    this.awaitingToolRetry = true;
+    try {
+      await new Promise<void>(resolve => {
+        this.wakeFn = resolve;
+        timer = setTimeout(resolve, delay);
+        if (!this.running || this.manualPaused || this.receiptsPending ||
+          this.mailbox.some(item => item.source !== "system" && !item.experience?.internalThought)) resolve();
+      });
+    } finally {
+      clearTimeout(timer);
+      this.wakeFn = null;
+      this.awaitingToolRetry = false;
+    }
+  }
+
+  /** The assistant call already contains the thought; never turn it into another perception. */
+  private dispatchThought(call: ToolCallRecord): void {
+    const error = thoughtError(call.arguments.thought);
+    if (error) { this.pushEvent("system", `（${error}）`, { ref: call.id, originEventIds: [] }); return; }
+    const thought = call.arguments.thought as string;
+    if (call.role === "agent") {
+      const repeated = this.deliberation.hasThought(thought);
+      this.deliberation.recordThought(thought);
+      if (repeated) {
+        this.pushEvent("system", "（这个想法刚刚已经记下，没有新的内容；先等实际进展，或做一件有意义的事。）", { ref: call.id, originEventIds: [] });
+        this.refreshToolGate();
+        return;
+      }
+    }
+    const content: RichText = { text: "（这段内心独白已记下。）", originEventIds: [],
+      experience: { internalThought: true, agency: call.role === "agent" || call.control?.mode === "avatar" ? "self" : "unknown", opportunity: false } };
+    const pending = this.externalToolResults.get(call.id);
+    if (pending) {
+      this.externalToolResults.delete(call.id);
+      pending.resolve({ ok: true, callId: call.id, text: content.text, content });
+    }
+    this.pushEvent("system", content, { ref: call.id });
+    this.refreshToolGate();
+  }
+
   private finalize(parsed: ParsedToolCall): ToolCallRecord {
     const issuedAt = this.clock.now();
-    let duration = parsed.duration;
+    let duration = parsed.name === "think" ? 0 : parsed.duration;
     // wait 的等待时长以参数 n 为准（模型常输出 duration: 0 + n: x 的组合）
     if (parsed.name === "wait" && !(duration && duration > 0)) {
       const n = Number(parsed.arguments.n ?? 0);
@@ -1452,13 +1577,12 @@ export class BotAgent {
     // A device changed off screen is discovered when the scheduled interaction turns
     // attention to it. Other stale capabilities are rejected before any side effect.
     const allowed = call.role === "agent" && this.classifyDevice(call.name)
-      ? this.perceivedToolNames.filter(name => !this.tempBannedTools.has(name)) : this.currentToolNames();
+      ? this.perceivedToolNames.filter(name => !this.tempBannedTools.has(name)) : this.currentToolNames(undefined, false, call.role === "agent");
     if (!allowed.includes(call.name)) {
       this.pushEvent("system", `（工具 ${call.name} 此刻不可用，这次调用没有执行。请依据最新能力变化事件和当前状态选择可用操作。）`, { ref: call.id });
       return;
     }
-    if ((call.role === "agent" || call.control) && (["act", "rest", "nap", "travel", "go_home"].includes(call.name) ||
-      (call.name === "observe" && call.arguments.target !== "self" && call.arguments.modality !== "self"))) {
+    if ((call.role === "agent" || call.control) && ["act", "rest", "nap", "travel", "go_home"].includes(call.name)) {
       this.attention = null;
       this.observingPlacedPhone = false;
     }
@@ -1483,14 +1607,14 @@ export class BotAgent {
       return;
     }
     switch (call.name) {
+      case "think":
+        return this.dispatchThought(call);
       case "wait":
         return this.dispatchWait(call);
       case "act":
         return this.dispatchAct(call);
       case "rest":
         return this.dispatchRest(call);
-      case "observe":
-        return this.dispatchLocal(call, async () => this.observe(call));
       case "observe_device": {
         const device = call.arguments.device;
         if (device !== "phone" && device !== "computer") {
@@ -2129,7 +2253,7 @@ export class BotAgent {
   }
 
   /**
-   * 调度类调用的启动确认：生成后立即以事件告知"已开始执行"，随后照常生成下一个调用。
+   * 调度类调用的受理确认；排队/期望时刻不能被解释为实际已开始或已完成。
    * 这从源头消除了"结果尚未进邮箱 → Bot 以为工具没反应 → 重复调用"的信息真空，
    * 且不引入任何等待延迟。带 duration 的调用额外附上编号（可 cancel）与预计完成时刻。
    */
@@ -2140,13 +2264,13 @@ export class BotAgent {
     if (call.expectedAt - call.issuedAt > 0) {
       this.pushEvent(
         "system",
-        `${call.id} ${describeToolCall(call)} 已开始，预计 T=${call.expectedAt.toFixed(1)} 完成。`,
+        `${call.id} ${describeToolCall(call)} 已受理，期望完成时刻 T=${call.expectedAt.toFixed(1)}；实际执行和结果交付可能仍需等待，不证明已经完成。`,
         { ref: call.id },
       );
     } else {
       this.pushEvent(
         "system",
-        `${call.id} ${describeToolCall(call)} 已开始执行，完成后结果会自动以事件形式送到你这里。`,
+        `${call.id} ${describeToolCall(call)} 已受理，正在等待执行或返回结果；完成后结果会自动送达，不必重复提交。`,
         { ref: call.id },
       );
     }
@@ -2165,7 +2289,7 @@ export class BotAgent {
     }
     if (this.gatePause(call)) return;
     const startedTU = this.startPause(call);
-    this.waiting = { callId: call.id, kind: "wait", startedTU };
+    this.waiting = { callId: call.id, kind: "wait", startedTU, worldCalls: this.pendingWorldCalls() };
 
     // Drain already committed passive perceptions only after the wait actually ends.
     // Interrupted waits must not trigger active observation or invent an elapsed interval.
@@ -2232,11 +2356,25 @@ export class BotAgent {
     let actionCompleted = false;
     this.schedule(call, {
       executeAt: "now",
+      delivery: "immediate",
       cancellation: "cooperative",
       resultOk: () => actionCompleted,
       run: async (task) => {
         const parts: string[] = [];
-        const ok = await this.world.adjudicateAct(call, (content) => parts.push(content), task.signal, task.beginCommit);
+        const ok = await this.world.adjudicateAct(call, async (content) => {
+          let ongoing = false;
+          try { ongoing = JSON.parse(content)?.action?.status === "pending"; } catch { /* preserve ordinary passive and final receipts below */ }
+          if (!ongoing) { parts.push(content); return; }
+          // A committed beginning is an experience now, not proof of the eventual outcome.
+          for (const text of parts.splice(0)) this.pushEvent("world", { text, originEventIds: observationOrigins(text) });
+          const rich = this.puppetReceipt(this.describeExperience({ text: content, originEventIds: observationOrigins(content),
+            experience: { worldPerception: true } }, call), call.id);
+          if (this.retired) await this.receipts.save(rich, this.clock.now(), call.id);
+          else this.pushEvent("tool", this.spillResult(rich, call.id + "-start"), { ref: call.id, wake: true });
+        }, task.signal, phase => {
+          if (task.cancelled() || (call.control && (this.residentControl?.sessionId !== call.control.sessionId || this.residentControl.mode !== call.control.mode))) return false;
+          return phase === "start" ? true : task.beginCommit();
+        });
         if (task.cancelled()) return null;
         const adjudicatedFailure = parts.some((part) => {
           try { return JSON.parse(part)?.action?.status === "failed"; } catch { return false; }
@@ -2549,7 +2687,8 @@ export class BotAgent {
   /**
    * 工具结果溢出治理（spill/prune，对应 dsh 的 tool-result-pruner + spill-policy）：
    * 纯文本结果超过 spillMinChars 时，裁成「头部 + 省略标记 + 尾部」，全文 fire-and-forget 落盘到
-   * <base>/spill/，模型上下文只保留裁剪预览。落盘失败静默降级为原样返回（不把成功的调用变成失败）。
+   * <base>/spill/，模型上下文只保留裁剪预览。世界回执在 JSON 字段内裁剪，保持事实与候选可分离。
+   * 落盘尽力而为，失败不把成功的调用变成失败。
    *
    * 注意：这里只裁剪 **模型可见** 的文本，原始结果仍由 scheduler 的结果语义保留；
    * 裁剪只发生在新回执进入上下文之前，不改写任何已发送的历史前缀。
@@ -2560,15 +2699,18 @@ export class BotAgent {
     if (typeof content !== "string" && (content.parts?.length || content.attachments?.length)) return content;
     const text = typeof content === "string" ? content : content.text;
     if (text.length <= threshold) return content;
+    const spillFile = this.files.spillPath(ref ? `${ref}.txt` : `result_${Date.now()}.txt`);
+    const worldReceipt = typeof content !== "string" &&
+      (content.experience?.worldPerception === true || (content as RichText & { source?: string }).source === "world");
+    const narrative = worldReceipt ? spillNarrativeText(text, threshold, spillFile) : undefined;
     // head/tail 各占约 45%，中间省略标记
     const headChars = Math.floor(threshold * 0.45);
     const tailChars = Math.floor(threshold * 0.45);
     const head = sliceText(text, 0, headChars);
     const tail = sliceText(text, text.length - tailChars);
     const omitted = text.length - headChars - tailChars;
-    const spillFile = this.files.spillPath(ref ? `${ref}.txt` : `result_${Date.now()}.txt`);
     const marker = `\n\n[... 中间 ${omitted} 字符已省略，完整结果见 ${spillFile} ...]\n\n`;
-    const preview = head + marker + tail;
+    const preview = narrative ?? head + marker + tail;
     // 落盘（异步、尽力而为）
     void this.files
       .atomicWrite(spillFile, text)
@@ -3007,7 +3149,7 @@ export class BotAgent {
     if (result === "cancelled") {
       this.finishPause(target);
       this.operationCalls.delete(target);
-      this.externalToolResults.get(target)?.resolve({ ok: false, callId: target, text: "（尚未提交的调用已取消，没有继续执行。）" });
+      this.externalToolResults.get(target)?.resolve({ ok: false, callId: target, text: "（已取消后续尚未提交的部分；此前已发生的结果保留。）" });
       this.externalToolResults.delete(target);
       this.puppetCalls.delete(target);
       this.stealthCalls.delete(target);
@@ -3023,19 +3165,8 @@ export class BotAgent {
           ? `（找不到进行中的 ${target}，它可能已经完成了。）`
           : `（${target} 已开始提交，不能保证撤销；它的真实结果仍会送达。）`;
     this.pushEvent("system", text, { ref: call.id });
+    this.refreshToolGate();
   }
-
-  /** Active attention complements passive world events and action results. */
-  private async observe(call: ToolCallRecord): Promise<RichText> {
-    const self = call.arguments.target === "self";
-    const target = !self && typeof call.arguments.target === "string" ? call.arguments.target : undefined;
-    const intent = typeof call.arguments.intent === "string" ? call.arguments.intent : undefined;
-    if (detectDeviceRequest([intent?.trim() || "查看", target].filter(Boolean).join(" "))) throw new Error(`观察未执行。${DEVICE_TOOL_GUIDANCE}`);
-    const modality = self ? "self" : typeof call.arguments.modality === "string" ? call.arguments.modality : undefined;
-    const observation: WorldObservation = await this.world.observe("bot", { ...(intent ? { intent } : {}), target, modality });
-    return { text: JSON.stringify(observation), originEventIds: observation.sourceEventIds, experience: { worldPerception: true, agency: "observed", opportunity: false } };
-  }
-
 
   /** 角色休息与记忆维护分别调度；通知始终可以打断角色休息。 */
   private dispatchRest(call: ToolCallRecord): void {
@@ -3053,7 +3184,7 @@ export class BotAgent {
     // expectedAt 只影响调度不进入上下文渲染，可安全修正（duration 可能写在 arguments 里）
     call.expectedAt = call.issuedAt + n;
     const startedTU = this.startPause(call);
-    this.waiting = { callId: call.id, kind: "rest", startedTU };
+    this.waiting = { callId: call.id, kind: "rest", startedTU, worldCalls: this.pendingWorldCalls() };
     this.schedule(call, {
       executeAt: "expected",
       run: async () => {
@@ -3210,7 +3341,7 @@ export function actBusyMessage(
   const pdesc = String(pendingActs[0]?.arguments.description ?? "").trim();
   const what = pdesc ? `「${truncate(pdesc, 60)}」` : "上一件事";
   const escalate = escalatingRepeatHint(repeatCount);
-  return `（你正在做${what}，它还在进行中，结果会自动以事件的形式送到你这里。${escalate}。）`;
+  return `（${what}的请求已受理，尚未返回结果；受理不证明身体动作已经开始。结果会自动送到你这里。${escalate}。）`;
 }
 
 /**
@@ -3223,7 +3354,7 @@ export function repeatingActMessage(sig: string, repeatCount: number, callId: st
   // 只在重复次数还少时提示 repeat 绕过口；一旦连续重复多次，就不再给绕过口（避免模型借此破防）
   const bypass = repeatCount < 4 ? "确实要同时再做一遍同样的事时，再在参数里加 repeat。" : "";
   return (
-    `（你已经在做${what}了（${callId}），它还在进行中，这次没有重复开始；` +
+    `（${what}的请求（${callId}）已受理，尚未返回结果，这次没有重复提交；` +
     `结果会自动以事件的形式送到你这里。${escalate}。${bypass}）`
   );
 }
@@ -3249,29 +3380,29 @@ function escalatingRepeatHint(repeatCount: number): string {
   }
   if (repeatCount >= 2) {
     return pickMeta([
-      `这是你第 ${repeatCount} 次重复发起同一动作——不必再重复，它已经在进行中了`,
-      `同一个动作你已经是第 ${repeatCount} 次发起了——它还在进行中，无需再补一次`,
-      `这动作你已重复到第 ${repeatCount} 次——停下吧，它正在进行，结果会自然来到`,
-      `你第 ${repeatCount} 次提起同一个动作了，它其实已经开始了，不用再提一次`,
-      `同一个动作你已经说了 ${repeatCount} 遍，它已经在推进，别再加了`,
-      `提醒：这是你第 ${repeatCount} 次发起同一件事，它早已开始，重复是多余的`,
-      `这动作你已经提到第 ${repeatCount} 次，它一次就到位了，收手吧`,
-      `同一个动作反复到第 ${repeatCount} 次，可以停了——它正在做，结果稍后到`,
-      `你已连续第 ${repeatCount} 次发起同一个动作，它已经在进行，无需重复提及`,
-      `同一个动作你提了 ${repeatCount} 次，其实第一次就已开始，后面的都是空动作`,
+      `这是你第 ${repeatCount} 次重复发起同一动作——原请求仍在等待结果，无需再提交`,
+      `同一个动作你已经是第 ${repeatCount} 次发起了——尚未取得结果，无需再补一次`,
+      `这动作你已重复到第 ${repeatCount} 次——请求已经受理，结果会自动送达`,
+      `你第 ${repeatCount} 次提起同一个动作了，原请求已受理，不用再提一次`,
+      `同一个动作你已经说了 ${repeatCount} 遍，请以原请求的实际回执为准`,
+      `提醒：这是你第 ${repeatCount} 次发起同一件事，已有请求，重复是多余的`,
+      `这动作你已经提到第 ${repeatCount} 次，只需要提交一次请求`,
+      `同一个动作反复到第 ${repeatCount} 次，可以停了——原请求的结果会自动送达`,
+      `你已连续第 ${repeatCount} 次发起同一个动作，它尚未返回，无需重复提及`,
+      `同一个动作你提了 ${repeatCount} 次，第一次请求已经受理，后面的没有再次执行`,
     ]);
   }
   return pickMeta([
-    "它已经在进行中了，结果会自动送达，不用再发起一次",
-    "这件事已经在推进了，结果会自己送过来，不必再重复",
-    "已经在做了，等结果到即可，无需再来一次",
-    "这个动作已经开始，剩下的就是等结果，别重复提交",
-    "它已经在路上了，你只需静静等结果，不必再说一遍",
-    "动作已经启动，结果会自然回来，重复提交是多余的",
-    "这件事已在推进，无须你再次发起，等它完成就好",
-    "它已经在执行了，等结果送达即可，不必重复",
-    "已经开始的事不用再提，结果会自动出现",
-    "这个动作就位了，接下来是等待，而不是再来一次",
+    "请求已受理，结果会自动送达，不用再发起一次",
+    "原请求还没有结果，不必再重复",
+    "已有请求尚未返回，无需再来一次",
+    "这个动作已经提交，尚需等待真实结果，别重复提交",
+    "不必再次发起，原请求的回执会自动送达",
+    "动作请求已受理，重复提交是多余的",
+    "这件事的请求已在处理队列中，无须你再次发起",
+    "是否执行完毕以最终回执为准，不必重复",
+    "已经受理的请求不用再提，结果会自动送达",
+    "此请求还没有结果，重复提交不会推进它",
   ]);
 }
 

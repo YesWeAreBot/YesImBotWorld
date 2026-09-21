@@ -27,9 +27,13 @@ const RECONNECT_MAX = 6;
 const RECONNECT_BASE_MS = 2000;
 
 interface PendingTask {
-  resolve: (r: { ok: boolean; content: string }) => void;
+  resolve: (r: { ok: boolean; content: string; parts?: string[] }) => void;
   timer: NodeJS.Timeout;
   cleanup?: () => void;
+  deliver: (content: string) => void;
+  delivery: Promise<void>;
+  nextIndex: number;
+  queuedParts: Map<number, string>;
 }
 
 export interface CrossingClientHooks {
@@ -193,14 +197,17 @@ export class CrossingClient implements RemoteWorldLink {
       void this.post("/crossing/cancel", { token, taskId }).catch(() => {});
     };
     options.signal?.addEventListener("abort", cancel, { once: true });
-    const resultP = new Promise<{ ok: boolean; content: string }>((resolve) => {
+    let task!: PendingTask;
+    const resultP = new Promise<{ ok: boolean; content: string; parts?: string[] }>((resolve) => {
       const timer = setTimeout(() => {
         options.signal?.removeEventListener("abort", cancel);
         cancel();
         this.pending.delete(taskId);
         resolve({ ok: false, content: "等待主世界结果超时，已请求取消尚未提交的行动；最终结果未知，请观察确认，勿自动重发。" });
       }, TASK_TIMEOUT_MS);
-      this.pending.set(taskId, { resolve, timer, cleanup: () => options.signal?.removeEventListener("abort", cancel) });
+      task = { resolve, timer, cleanup: () => options.signal?.removeEventListener("abort", cancel), deliver,
+        delivery: Promise.resolve(), nextIndex: 0, queuedParts: new Map() };
+      this.pending.set(taskId, task);
     });
     try {
       // 请求一旦发出就可能在远端提交；本地调度器必须从这里开始返回 too_late。
@@ -210,14 +217,14 @@ export class CrossingClient implements RemoteWorldLink {
         return false;
       }
       sent = true;
-      const r = await this.post("/crossing/task", { token, taskId, kind, payload });
+      const r = await this.post("/crossing/task", { token, taskId, kind, payload, progress: true });
       if (!r.ok) throw new Error(String(r.error ?? "任务被拒绝"));
     } catch (err) {
       const p = this.pending.get(taskId);
       // SSE 回执可能先于丢失的 HTTP 确认到达；保留已经明确的结果。
       if (!p) {
         const known = await resultP;
-        if (known.content.trim()) deliver(known.content);
+        await this.deliverTaskResult(task, known, kind);
         return known.ok;
       }
       if (p) {
@@ -228,12 +235,37 @@ export class CrossingClient implements RemoteWorldLink {
       }
       cancel();
       this.hooks.logger.warn("[穿越] 任务提交失败（%s）: %s", kind, err);
-      deliver("远程任务未获得确认，可能已被主世界接收；已请求取消未提交的行动，结果需观察确认，不会自动重放。" );
+      await task.delivery;
+      await deliver("远程任务未获得确认，可能已被主世界接收；已请求取消未提交的行动，结果需观察确认，不会自动重放。" );
       return false;
     }
     const result = await resultP;
-    if (result.content.trim()) deliver(result.content);
+    await this.deliverTaskResult(task, result, kind);
     return result.ok;
+  }
+
+  /** Queue complete receipts in host order, including replayed or temporarily missing indexes. */
+  private queueTaskPart(task: PendingTask, index: number, content: string): void {
+    if (!Number.isSafeInteger(index) || index < task.nextIndex || index < 0 || index > 10_000 || typeof content !== "string") return;
+    if (!task.queuedParts.has(index)) task.queuedParts.set(index, content);
+    while (task.queuedParts.has(task.nextIndex)) {
+      const part = task.queuedParts.get(task.nextIndex)!;
+      task.queuedParts.delete(task.nextIndex++);
+      task.delivery = task.delivery.then(async () => { if (part.trim()) await task.deliver(part); });
+      void task.delivery.catch(() => {}); // surfaced by the owning runTask, not an unhandled SSE rejection
+    }
+  }
+
+  private async deliverTaskResult(task: PendingTask, result: { content: string; parts?: string[] }, kind: CrossingTaskKind): Promise<void> {
+    if (Array.isArray(result.parts) && result.parts.every(part => typeof part === "string")) {
+      result.parts.forEach((part, index) => this.queueTaskPart(task, index, part));
+    } else {
+      const parts = ["act", "wait", "checkTime"].includes(kind) ? legacyWorldReceipts(result.content) : [result.content];
+      // Legacy hosts do not send progress. Local timeout/lost responses may follow
+      // actual progress, so append their honest uncertainty after the known stages.
+      for (const part of parts) this.queueTaskPart(task, task.nextIndex, part);
+    }
+    await task.delivery;
   }
 
   // ---------- SSE 事件循环 ----------
@@ -301,13 +333,16 @@ export class CrossingClient implements RemoteWorldLink {
       }
     } else if (msg.type === "status_update") {
       if (msg.content?.trim()) this.hooks.onEvent(`你在「${this.worldName}」经历的状态变化：${msg.content}`);
+    } else if (msg.type === "task_progress") {
+      const p = this.pending.get(msg.taskId);
+      if (p) this.queueTaskPart(p, msg.index, msg.content);
     } else if (msg.type === "task_result") {
       const p = this.pending.get(msg.taskId);
       if (p) {
         clearTimeout(p.timer);
         p.cleanup?.();
         this.pending.delete(msg.taskId);
-        p.resolve({ ok: !!msg.ok, content: String(msg.content ?? "") });
+        p.resolve({ ok: !!msg.ok, content: String(msg.content ?? ""), ...(Array.isArray(msg.parts) ? { parts: msg.parts } : {}) });
       }
     } else if (msg.type === "farewell") {
       return msg.reason || "主世界送别了你";
@@ -349,4 +384,19 @@ export class CrossingClient implements RemoteWorldLink {
     if (!res.ok && data.error === undefined) data.error = `HTTP ${res.status}`;
     return data;
   }
+}
+
+/** Old hosts joined complete JSON receipts with newlines. Never split general prose or arbitrary JSON. */
+function legacyWorldReceipts(content: string): string[] {
+  try { JSON.parse(content); return [content]; } catch { /* possibly old JSONL receipts */ }
+  const lines = content.split(/\r?\n/).filter(line => line.trim());
+  if (lines.length < 2) return [content];
+  try {
+    for (const line of lines) {
+      const value = JSON.parse(line), observation = value?.observation ?? value;
+      if (!observation || typeof observation.observationId !== "string" || typeof observation.actorId !== "string" || !Array.isArray(observation.sourceEventIds) ||
+        (observation.mode !== "narrative" && !Array.isArray(observation.entities))) return [content];
+    }
+    return lines;
+  } catch { return [content]; }
 }

@@ -68,6 +68,8 @@ export type RichTextPart = (
 
 /** Facts about an already delivered experience, never access to hidden controller intent. */
 export interface ExperienceMetadata {
+  /** Program-assigned receipt for a character's subjective thought, never external evidence or a completed behavior. */
+  internalThought?: boolean;
   /** Set by the world-tool dispatcher; model text and platform messages cannot assert this provenance. */
   worldPerception?: boolean;
   episodeId?: string;

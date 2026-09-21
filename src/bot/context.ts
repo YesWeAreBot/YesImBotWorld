@@ -693,6 +693,8 @@ function narrativeContextText(event: BotEvent, toolName?: string): string | unde
       if (Object.hasOwn(status, parsed.action.status)) sections.push(`行动结果：${status[parsed.action.status]}`);
     }
     sections.push(body);
+    const situation = observation.situation ?? observation.scene?.situation ?? parsed.scene?.situation;
+    if (typeof situation === "string" && situation.trim()) sections.push(`当前可知处境：${situation}`);
     return sections.join("\n\n");
   } catch { return undefined; }
 }

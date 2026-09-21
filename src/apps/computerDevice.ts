@@ -150,7 +150,8 @@ export class ComputerDevice {
       if (opening) openings.push(opening);
       for (const t of tools) {
         let exposed = t.name;
-        const occupied = new Set([...this.reserved, ...this.otherToolNames(), ...toolMap.keys()]);
+        // Keep app homonyms distinct from the retired tool in frozen historical declarations.
+        const occupied = new Set([...this.reserved, "observe", ...this.otherToolNames(), ...toolMap.keys()]);
         if (occupied.has(exposed)) exposed = `${app.id}.${t.name}`;
         if (occupied.has(exposed)) continue;
         toolMap.set(exposed, { app, tool: t.name });

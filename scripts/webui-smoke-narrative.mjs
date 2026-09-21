@@ -43,7 +43,6 @@ export default async function smokeNarrative({ evaluate, wait, assert, navigate,
       await run(()=>document.querySelector('[data-journey-arrive]').click());
       await wait(`!!document.querySelector('.journey-connection.connected')`);
       if(mode!=='cross')await wait(`!!document.querySelector('[data-cockpit-field="act:description"]')&&!document.querySelector('.cockpit-submit').disabled`);
-      await click('重新观察');
       await wait(`document.querySelector('.journey-state-body')?.textContent.includes('花园传来阿青')`);
       assert(await run(()=>!document.querySelector('.journey-entity')&&document.querySelector('.journey-state-summary').textContent.includes('所见所闻')),'A narrative observation is readable and actionable even with zero entities');
       await run(mode=>{
@@ -56,23 +55,30 @@ export default async function smokeNarrative({ evaluate, wait, assert, navigate,
       await wait(`document.querySelector('.journey-action-card[data-action-status="needs_input"]')?.textContent.includes('风铃轻轻响了一声')&&!document.querySelector('.journey-pending')`);
       assert(await run(()=>{const card=document.querySelector('.journey-action-card[data-action-status="needs_input"]');return card.querySelector('.journey-feed-scene').textContent.includes('店员等着你的回答')&&card.querySelector('.journey-action-state').textContent==='等你决定'&&!card.querySelector('.journey-feed-experience');}),'World-generated prose leads the result directly, without manufactured structural steps');
       if(mode==='puppet') assert(await run(()=>document.querySelector('.journey-feed-scene .journey-control-notice')?.textContent.includes('不由自主')),'Body-only control keeps the agency notice alongside natural prose');
-      if(mode==='cross') {
-        await run(()=>{const input=document.querySelector('.journey-action-input');input.value='看看菜单';input.dispatchEvent(new Event('input',{bubbles:true}));input.focus();input.dispatchEvent(new CompositionEvent('compositionstart',{bubbles:true}));window.__narrativeInput=input;document.querySelector('.journey-observe-intent').click();});
-        await wait(`document.querySelector('.journey-state-body').textContent.includes('米饭现在就有')`);
-        assert(await run(()=>window.__narrativeInput.isConnected&&document.activeElement===window.__narrativeInput&&window.__narrativeInput.value==='看看菜单'),'Intentful observation returns persistent scene details without replacing or refocusing the composing input');
-        await run(()=>{window.__narrativeInput.dispatchEvent(new CompositionEvent('compositionend',{bubbles:true}));window.__narrativeInput.blur();delete window.__narrativeInput;});
-      }
-      if(mode!=='cross') {
-        await run(()=>document.querySelector('[data-cockpit-tool="observe"]').click());
-        await wait(`!!document.querySelector('[data-cockpit-field="observe:intent"]')&&!document.querySelector('.cockpit-submit').disabled`);
-        assert(await run(()=>!!document.querySelector('.cockpit-primary-fields [data-cockpit-field="observe:intent"]')),'Resident observation intent is visible without opening optional parameters');
-        await run(()=>{const input=document.querySelector('[data-cockpit-field="observe:intent"]');input.value='仔细看看菜单';input.dispatchEvent(new Event('input',{bubbles:true}));input.closest('form').requestSubmit();});
-        await wait(`document.querySelector('.journey-state-body').textContent.includes('米饭现在就有')&&!document.querySelector('.journey-pending')`);
-      }
+      await run(mode=>{
+        const input=document.querySelector(mode==='cross'?'.journey-action-input':'[data-cockpit-field="act:description"]');
+        input.value='仔细看看菜单';input.dispatchEvent(new Event('input',{bubbles:true}));input.closest('form').requestSubmit();
+        input.value='我还想问问今天有没有汤';input.dispatchEvent(new Event('input',{bubbles:true}));input.focus();input.dispatchEvent(new CompositionEvent('compositionstart',{bubbles:true}));window.__narrativeInput=input;
+      },mode);
+      await wait(`document.querySelector('.journey-state-body').textContent.includes('米饭现在就有')&&!document.querySelector('.journey-pending')`);
+      assert(await run(()=>window.__narrativeInput.isConnected&&document.activeElement===window.__narrativeInput&&window.__narrativeInput.value==='我还想问问今天有没有汤'&&!document.querySelector('[data-cockpit-tool="observe"]')),'Active observation uses act, while incoming scene updates preserve the composing draft');
+      await run(()=>window.__narrativeInput.dispatchEvent(new CompositionEvent('compositionend',{bubbles:true})));
+      await wait(`Array.from(document.querySelectorAll('.journey-dock .opportunity-card')).some(node=>node.textContent.includes('选米饭套餐'))`);
+      await run(()=>{[...document.querySelectorAll('.journey-dock .opportunity-card')].find(node=>node.textContent.includes('选米饭套餐')).click();});
+      assert(await run(mode=>document.querySelector(mode==='cross'?'.journey-action-input':'[data-cockpit-field="act:description"]').value==='向店员点一份米饭套餐'&&!document.querySelector('.journey-pending')&&document.querySelector('.journey-dock .readable-opportunities').textContent.includes('取舍组'),mode),'Opportunity selection fills an editable intention and labels tradeoffs without executing it');
+      await run(async mode=>{
+        const input=document.querySelector(mode==='cross'?'.journey-action-input':'[data-cockpit-field="act:description"]');input.value='这份草稿请保留';input.dispatchEvent(new Event('input',{bubbles:true}));input.focus();window.__opportunityDraft=input;
+        const update=await api('POST','/api/preview/opportunities',{text:'店员暂时去厨房了。',situation:'柜台暂时无人。',opportunities:[]});window.__oldOpportunityScene=update.previousScene;
+      },mode);
+      await wait(`!document.querySelector('.journey-dock .opportunity-card')`);
+      assert(await run(()=>window.__opportunityDraft.isConnected&&document.activeElement===window.__opportunityDraft&&window.__opportunityDraft.value==='这份草稿请保留'&&document.querySelector('.journey-dock').textContent.includes('草稿仍然保留')),'A changed scene retires old suggestions without stealing focus or discarding an edited draft');
+      await run(async()=>{await api('POST','/api/preview/opportunities',{replayScene:window.__oldOpportunityScene});await new Promise(resolve=>setTimeout(resolve,150));});
+      assert(await run(()=>!document.querySelector('.journey-dock .opportunity-card')&&window.__opportunityDraft.value==='这份草稿请保留'),'A late scene replay cannot revive obsolete suggestions');
+      assert(await run(()=>![...document.querySelectorAll('.journey-feed-scene')].some(node=>node.textContent.includes('选米饭套餐')||node.textContent.includes('exclusiveGroup'))),'Suggested choices are never rendered as factual scene outcomes');
       assert(await run(()=>document.documentElement.scrollWidth<=innerWidth),'Natural scenes and operation dock fit a phone');
       await click(mode==='cross'?'离开世界':'归还控制并离场');
       await wait(`!!document.querySelector('.journey-identity')`);
     }
-    return ['natural world/actor/event prose without retired controls; full-width short and long events, reversible folds and refresh persistence','zero-entity act/observe in cross, puppet and avatar modes','direct narrative decision handoff, agency and stable IME inputs'];
+    return ['natural world/actor/event prose without retired controls; full-width short and long events, reversible folds and refresh persistence','zero-entity act and optional opportunities in cross, puppet and avatar modes','direct narrative decision handoff, agency and stable IME inputs'];
   } finally {await run(async()=>{await api('POST','/api/preview/narrative',{enabled:false});});}
 }

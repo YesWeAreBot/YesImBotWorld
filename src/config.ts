@@ -421,7 +421,7 @@ export const Config: Schema<Config> = Schema.intersect([
           "关闭模型思维链（对支持开关思考模式的模型生效，如 Qwen3 / DeepSeek V3.1+ / GLM 系）。" +
             "请求会附带 enable_thinking: false，以及 chat_template_kwargs 里的 " +
             "enable_thinking: false（Qwen/GLM 系模板）与 thinking: false（DeepSeek 系模板）。" +
-            "生成工具调用不需要深度思考，关闭可显著提速省钱。仅 chat 模式生效",
+            "关闭可减少原生推理开销，是否适合取决于模型与任务。仅 chat 模式生效；不关闭角色的 think 内心独白能力",
         ),
       stream: Schema.boolean()
         .default(true)

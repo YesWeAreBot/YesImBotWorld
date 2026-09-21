@@ -10,7 +10,7 @@ import type { ChatMessage, ChatResult } from "../src/llm/chat.js";
 import type { ToolCallRecord } from "../src/types.js";
 
 const response = (input: unknown): ChatResult => ({ content: "", toolCalls: [{ id: "resolution", type: "function", function: { name: "resolve_world", arguments: JSON.stringify(input) } }] });
-const good = (text: string, worldState?: string, outcome: { status: "completed" | "failed" | "needs_input"; reason?: string } = { status: "completed" }): ChatResult => response({ ...(worldState ? { worldState } : {}), perceptions: [{ actorId: "bot", text }], outcome });
+const good = (text: string, worldState?: string, outcome: { status: "completed" | "failed" | "needs_input" | "ongoing"; reason?: string } = { status: "completed" }): ChatResult => response({ ...(worldState ? { worldState } : {}), perceptions: [{ actorId: "bot", text }], outcome });
 const tick = () => new Promise<void>(resolve => setImmediate(resolve));
 async function eventually(condition: () => boolean): Promise<void> {
   for (let attempt = 0; attempt < 200; attempt++) { if (condition()) return; await new Promise(resolve => setTimeout(resolve, 5)); }
@@ -62,15 +62,16 @@ async function main(): Promise<void> {
     const first = runtime.act("bot", call("parallel-one", "先点一碗面", 105), text => receiptOne.push(text));
     const second = runtime.act("bot", call("parallel-two", "再付钱", 105), text => receiptTwo.push(text));
     await eventually(() => Object.values(store.snapshot().actions).filter(action => action.status === "pending").length === 2);
-    assert.equal(calls, beforeParallel, "neither future action infers or changes world prose before it is due");
+    await eventually(() => !!firstRelease);
+    assert.equal(calls, beforeParallel + 1, "the first action infers immediately, without first waiting for its duration estimate");
     assert.equal(store.snapshot().worldState, beforeIdle.worldState);
-    now = 105; await eventually(() => !!firstRelease);
     assert.equal(seen.length, 1); assert.equal(maxModels, 1);
     firstRelease!(good("店员记下一碗面的订单。", "ORDERED_FIRST：小澈已经点了一碗面，正在等付款。ADMIN_PRIVATE_SECRET 仍然存在。"));
     assert.deepEqual(await Promise.all([first, second]), [true, true]);
     assert.equal(calls, beforeParallel + 2); assert.equal(maxModels, 1); assert.match(store.snapshot().worldState, /ORDERED_SECOND/);
     assert.equal(JSON.parse(receiptOne[0]!).scene.actionId, "bot:parallel-one"); assert.equal(JSON.parse(receiptTwo[0]!).scene.actionId, "bot:parallel-two");
-    pass("distinct pending calls honor due time and serialize model adjudication against the latest committed prose");
+    assert.equal(now, 100, "short, actually completed actions do not wait for the estimate");
+    pass("distinct immediate actions serialize model adjudication against the latest committed prose without a duration pre-delay");
 
     let duplicateRelease: ((value: ChatResult) => void) | undefined;
     infer = () => new Promise(resolve => { duplicateRelease = resolve; });
@@ -117,16 +118,18 @@ async function main(): Promise<void> {
     pass("imported terminal receipts honestly report missing history without borrowing another action's scene, event identity or evidence");
 
     const delayedAbort = new AbortController(), delayRequest = call("delay-cancel", "稍后出门", 150), beforeDelay = calls;
-    let delayedDelivery = false;
-    const delayed = runtime.act("bot", delayRequest, () => { delayedDelivery = true; }, delayedAbort.signal);
+    const delayedReceipts: any[] = [];
+    infer = async () => good("你在门口开始等候，尚未离开。", undefined, { status: "ongoing" });
+    const delayed = runtime.act("bot", delayRequest, text => { delayedReceipts.push(JSON.parse(text)); }, delayedAbort.signal);
     const delayedRejected = assert.rejects(delayed);
-    await eventually(() => store.snapshot().actions["bot:delay-cancel"]?.status === "pending");
+    await eventually(() => delayedReceipts.length === 1);
     delayedAbort.abort(new Error("user cancelled delayed action")); await bounded(delayedRejected);
     await eventually(() => store.snapshot().actions["bot:delay-cancel"]?.status === "cancelled");
-    assert.equal(calls, beforeDelay); assert.equal(delayedDelivery, false); assert.equal(store.snapshot().actions["bot:delay-cancel"]!.status, "cancelled");
+    assert.equal(calls, beforeDelay + 1); assert.equal(delayedReceipts[0].action.status, "pending"); assert.equal(store.snapshot().actions["bot:delay-cancel"]!.status, "cancelled");
     const afterDelay = store.snapshot();
     now = 150; await tick(); await tick(); assert.deepEqual(store.snapshot(), afterDelay);
-    pass("cancellation during the duration wait records cancellation without inference or late delivery");
+    assert.equal(delayedReceipts.length, 1);
+    pass("cancellation after immediate ongoing feedback preserves the beginning without later completion inference or delivery");
 
     let lateRelease: ((value: ChatResult) => void) | undefined, inferenceSignal: AbortSignal | undefined;
     infer = (_messages, signal) => { inferenceSignal = signal; return new Promise(resolve => { lateRelease = resolve; }); };

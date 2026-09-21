@@ -249,10 +249,11 @@ async function breakLoop() {
   assert.equal(f.agent.forceRestCount, 0);
   const entered = deferred(), finish = deferred<any>(); let generations = 0;
   const f2 = await fixture({ breakLoop: true, breakLoopRemoveToolAt: 0, breakLoopForceRestAt: 1, repeatExclude: ["wait"] }, {
-    observe: async () => ({ observationId: "obs_1", actorId: "bot", worldSequence: 1, observedAt: 0, entities: [], sourceEventIds: ["origin_1"] }),
     compress: async () => { entered.resolve(); return finish.promise; },
   });
-  f2.agent.backend = { generate: async () => { generations++; return generations <= 3 ? { name: "observe", arguments: {} } : { name: "wait", arguments: { n: 3600 } }; }, setToolNames() {}, setToolDefs() {} };
+  f2.agent.backend = { generate: async () => { generations++; return generations <= 3 ? { name: "observe_device", arguments: { device: "phone" } } : { name: "wait", arguments: { n: 3600 } }; }, setToolNames() {}, setToolDefs() {} };
+  f2.agent.peekDevice = async () => ({ text: "手机上仍显示刚刚读到的同一条消息。", originEventIds: ["chat-message:first-read"],
+    experience: { agency: "observed", chat: { kind: "attention", channelKey: "onebot:visible:account" } } });
   f2.agent.start(); await entered.promise;
   assert.equal(generations, 3, "the first new observation is progress; repeating it must pause at the compression boundary");
   const late: BotEvent = { id: "ev_manual_late", source: "koishi", content: "压缩开始后收到的重要承诺", worldTime: 3 };
@@ -295,12 +296,8 @@ async function recoverInterruptedCompression() {
   assert.equal(await f.files.exists(`${f.files.base}/context-commit.json`), false);
 }
 async function observationProvenance() {
-  const received: any[] = [];
   const observation = { actorId: "visitor:authenticated-session", observationId: "obs_remote", sourceEventIds: ["original_speech"], entities: [], utterances: [], worldSequence: 1, observedAt: 0 };
-  const f = await fixture({}, { observe: async (_actor: string, args: any) => { received.push(args); return observation; } });
-  const result = await f.agent.observe(call("self", "observe", { target: "self" }));
-  assert.deepEqual(received[0], { target: undefined, modality: "self" });
-  assert.deepEqual(result.originEventIds, ["original_speech"]);
+  const f = await fixture();
   f.agent.pushEvent("world", JSON.stringify(observation));
   await f.agent.drainMailbox();
   const event = f.context.stream.find((e) => e.kind === "event") as any;

@@ -7,6 +7,7 @@ import { WorldKernel } from "./kernel.js";
 import { WorldBus, envelope, type BusEnvelope, type BusListener } from "./bus.js";
 import { assertJson, assertSafeKey, KernelError, type JsonValue, type WorldEntity, type WorldObservation, type WorldSnapshot } from "./state.js";
 import type { NarrativeActor, NarrativeAction, NarrativeCommit, NarrativeCommitResult, NarrativePerception, NarrativeSnapshot } from "./narrative-types.js";
+import { validNarrativePresentation } from "./narrative-types.js";
 
 interface StoreOptions {
   now?: () => number;
@@ -87,6 +88,9 @@ export class NarrativeStore {
       const perceptions: NarrativePerception[] = (commit.perceptions ?? []).map(perception => {
         const eventId = randomUUID();
         return { eventId, actorId: perception.actorId, text: perception.text, worldSequence: sequence, worldTime: effectiveAt,
+          ...(perception.situation !== undefined ? { situation: perception.situation } : {}),
+          ...(perception.opportunities !== undefined ? { opportunities: perception.opportunities } : {}),
+          ...(commit.actionPhase !== undefined ? { phase: commit.actionPhase } : {}),
           ...(commit.actionId ? { actionId: commit.actionId } : {}), sourceEventIds: [...new Set(perception.sourceEventIds === undefined ? [eventId] : perception.sourceEventIds)] };
       });
       const next = applyCommit(this.state, commit, sequence, effectiveAt, perceptions);
@@ -131,6 +135,8 @@ export class NarrativeStore {
           record.perceptions.forEach((perception, index) => {
             const draft = commit.perceptions![index]!;
             if (perception.actorId !== draft.actorId || perception.text !== draft.text || perception.worldSequence !== record.sequence ||
+              perception.situation !== draft.situation || JSON.stringify(perception.opportunities) !== JSON.stringify(draft.opportunities) ||
+              perception.phase !== commit.actionPhase ||
               perception.worldTime !== record.effectiveAt || perception.actionId !== commit.actionId || !perception.eventId ||
               !Array.isArray(perception.sourceEventIds) || perception.sourceEventIds.some(id => typeof id !== "string" || !id.trim())) throw new Error("感知记录无效");
           });
@@ -231,10 +237,12 @@ function copyCommit(input: NarrativeCommit): NarrativeCommit {
   if (input.expectedSequence !== undefined && (!Number.isSafeInteger(input.expectedSequence) || input.expectedSequence < 0)) throw new KernelError("INVALID_VERSION", "世界版本必须是非负整数。");
   if (input.worldState !== undefined && typeof input.worldState !== "string") throw new KernelError("INVALID_PROPOSAL", "世界状态必须是自然语言文本。");
   if (input.initialized !== undefined && typeof input.initialized !== "boolean") throw new KernelError("INVALID_PROPOSAL", "初始化状态必须为布尔值。");
+  if (input.actionPhase !== undefined && (!input.actionId || !["start", "finish"].includes(input.actionPhase))) throw new KernelError("INVALID_ACTION", "行动感知阶段需要有效动作编号和start/finish。");
   if (input.toolReceipt !== undefined) {
     const receipt = input.toolReceipt;
     if (!receipt || typeof receipt.actorId !== "string" || !receipt.actorId.trim() || typeof receipt.text !== "string" || !receipt.text.trim() ||
-        !["completed", "failed", "needs_input"].includes(receipt.status) || (receipt.reason !== undefined && typeof receipt.reason !== "string")) throw new KernelError("INVALID_TOOL_RECEIPT", "应用回执需要角色、实际输出和明确执行结果。");
+        !["completed", "failed", "needs_input"].includes(receipt.status) || (receipt.reason !== undefined && typeof receipt.reason !== "string") ||
+        "situation" in receipt || "opportunities" in receipt) throw new KernelError("INVALID_TOOL_RECEIPT", "应用回执需要角色、实际输出和明确执行结果，不能附加角色状态栏或剧情建议。");
   }
   for (const value of [input.actors, input.actions]) if (value !== undefined && (!value || typeof value !== "object" || Array.isArray(value))) throw new KernelError("INVALID_PROPOSAL", "角色与行动更新必须按标识寻址。");
   for (const [id, actor] of Object.entries(input.actors ?? {})) {
@@ -245,11 +253,14 @@ function copyCommit(input: NarrativeCommit): NarrativeCommit {
     assertSafeKey(id);
     if (!action || action.id !== id || typeof action.actorId !== "string" || !action.intent?.trim() || !["pending", "completed", "needs_input", "failed", "cancelled"].includes(action.status) ||
         typeof action.requestFingerprint !== "string" || !Number.isFinite(action.startedAt) || action.startedAt < 0 || !Number.isFinite(action.expectedEnd) || action.expectedEnd < action.startedAt ||
+        (action.phase !== undefined && (!(["accepted", "ongoing", "finished"] as string[]).includes(action.phase) || (action.status === "pending") !== (action.phase !== "finished"))) ||
         (action.finishedAt !== undefined && (!Number.isFinite(action.finishedAt) || action.finishedAt < action.startedAt))) throw new KernelError("INVALID_ACTION", "行动执行记录无效。");
   }
   if (input.perceptions !== undefined && !Array.isArray(input.perceptions)) throw new KernelError("INVALID_PROPOSAL", "感知必须是列表。");
   for (const perception of input.perceptions ?? []) if (!perception || typeof perception.actorId !== "string" || typeof perception.text !== "string" || !perception.text.trim() ||
-    (perception.sourceEventIds !== undefined && (!Array.isArray(perception.sourceEventIds) || perception.sourceEventIds.some(id => typeof id !== "string" || !id.trim())))) throw new KernelError("INVALID_PERCEPTION", "角色感知必须包含有效文本和来源。");
+    !validNarrativePresentation(perception) ||
+    (perception.sourceEventIds !== undefined && (!Array.isArray(perception.sourceEventIds) || perception.sourceEventIds.some(id => typeof id !== "string" || !id.trim())))) throw new KernelError("INVALID_PERCEPTION", "角色感知必须包含有效文本和来源；可选状态栏最多1200字，行动建议最多4条且须有有效标题和意图。");
+  if (["app_observe", "app_action"].includes(input.source) && input.perceptions?.some(p => p.situation !== undefined || p.opportunities !== undefined)) throw new KernelError("INVALID_PERCEPTION", "应用回执不能提供角色状态栏或剧情行动建议。");
   return clone(input);
 }
 function applyCommit(base: NarrativeSnapshot, commit: NarrativeCommit, sequence: number, effectiveAt: number, perceptions: NarrativePerception[]): NarrativeSnapshot {

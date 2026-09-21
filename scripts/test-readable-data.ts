@@ -108,6 +108,22 @@ async function main() {
   const encodedRecord = JSON.stringify(JSON.stringify({ name: 'observe', arguments: { target: '9007199254740993' } }));
   assert.ok(reader.text(encodedRecord).includes('目标（target）：9007199254740993'), 'Encoded objects still unfold');
   assert.ok(reader.text(JSON.stringify(JSON.stringify(['null', 'true']))).includes('1. null'), 'Encoded arrays still unfold');
+  const inner = '也许他只是忙。等手边的事做完，再问问他。\n<img src=x onerror=alert(1)>';
+  for (const thought of [{ name: 'think', arguments: { thought: inner } }, { id: 'native-think', type: 'function', function: { name: 'think', arguments: JSON.stringify({ thought: inner }) } }]) {
+    const view = reader.render(thought, { raw: false });
+    assert.equal(cls(view, 'readable-thought').length, 1);
+    assert.equal(cls(view, 'readable-prose')[0].textContent, inner, 'Inner speech is prose, not a field table');
+    assert.ok(view.textContent.includes('主观想法') && view.textContent.includes('不代表事情已经发生'));
+    assert.ok(!all(view).some(node => node.tagName === 'img'), 'Inner speech remains escaped text');
+  }
+  assert.equal(reader.thoughtText('{"thought":"先把\\"那件事\\"记住'), '先把"那件事"记住');
+  assert.equal(reader.thoughtText('{"thought":"先想想\\n再决定\\u4f'), '先想想\n再决定', 'An unfinished Unicode escape stays hidden until complete');
+  assert.equal(reader.thoughtText('{"thought":"先想想\\n再决定\\u4f60'), '先想想\n再决定你');
+  assert.equal(reader.thoughtText('{"thought":"等一下\\'), '等一下', 'A split escape does not display raw transport syntax');
+  assert.equal(reader.thoughtText('{"other":"thought"}'), null);
+  assert.equal(reader.thoughtCall('{"name":"think","arguments":{"thought":"等水烧开再'), '等水烧开再', 'Text-protocol inner speech also stays readable while streaming');
+  assert.equal(reader.thoughtCall('{"name":"act","arguments":{"thought":"test'), null);
+  assert.equal(cls(reader.render({ name: 'act', arguments: { thought: inner } }), 'readable-thought').length, 0, 'Only the explicit think tool is presented as inner speech');
   console.log('PASS readable data: safe text, nested JSON, lazy complete lists/text, raw fidelity, copy and refresh state');
 }
 main().catch(error => { console.error(error); process.exitCode = 1; });

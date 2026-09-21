@@ -26,7 +26,7 @@ async function fixture(dir: string) {
   const actions: any[] = [], schemas = { type: "object", properties: { data: { type: "array", items: { type: "number" } } }, required: ["data"] };
   let opened = 0, sent = 0, deviceCalls = 0;
   const app = { id: "fixture", name: "fixture", description: "local test app", open: async () => { opened++; return { tools: [{ name: "fixture_input", description: "local fixture input", inputSchema: schemas }] }; }, close: async () => {}, call: async () => { deviceCalls++; return "actual fixture device receipt"; } };
-  const defs = BOT_TOOLS.filter(tool => ["act", "observe", "observe_device", "check_status", "check_time", "reflect", "recall_growth", "recall", "wait", "rest", "cancel", "open_app", "close_app", "select_channel", "send", "pick_up_phone", "put_down_phone"].includes(tool.name));
+  const defs = BOT_TOOLS.filter(tool => ["act", "observe_device", "check_status", "check_time", "reflect", "recall_growth", "recall", "wait", "rest", "cancel", "open_app", "close_app", "select_channel", "send", "pick_up_phone", "put_down_phone"].includes(tool.name));
   const apps = new AppManager("chat", [app], new Set(defs.map(tool => tool.name)), logger);
   const observation = { observationId: "obs-fixture", actorId: "bot", entities: [], sourceEventIds: [] };
   const world: any = { residentBotName: "resident", observe: async () => observation, adjudicateAct: async (call: any, deliver: any, signal: AbortSignal, commit: () => boolean) => { signal.throwIfAborted(); if (!commit()) return false; actions.push(call); deliver(JSON.stringify({ action: { status: "completed" }, observation })); return true; } };
@@ -50,7 +50,8 @@ async function semantics(dir: string) {
     assert.ok(f.allowed().includes("reflect")); assert.ok(!f.allowed().includes("act"));
     let cockpit = await f.service.playerCockpit("puppet-token");
     assert.equal(cockpit.tools.some((tool: any) => tool.name === "reflect"), false, "human cannot rewrite puppet consciousness");
-    assert.deepEqual(cockpit.tools.find((tool: any) => tool.name === "observe").inputSchema.properties.modality.enum, ["all", "sight", "self"]);
+    assert.equal(cockpit.tools.some((tool: any) => tool.name === "observe"), false, "active observation belongs to act, not a public observer");
+    assert.ok(cockpit.tools.find((tool: any) => tool.name === "act").inputSchema.properties.description);
     const body = await f.service.botToolCall("act", { description: "raise hand", speech: "hello" }, 0, "puppet-token");
     assert.equal(body.ok, true); assert.ok(body.callId); assert.equal(f.actions.length, 1);
     assert.equal(f.context.stream.filter((entry: any) => entry.kind === "tool_call").length, 0, "puppet input cannot become a voluntary intent");
@@ -69,6 +70,8 @@ async function semantics(dir: string) {
     assert.equal((await f.service.botToolCall("act", { description: "stale" }, 0, "puppet-token")).ok, false);
 
     assert.equal((await f.enter("avatar", "avatar-token")).ok, true); assert.equal(f.bot.manualMode, true);
+    assert.equal((await f.service.botToolCall("act", { description: "仔细看看桌上的纸信" }, 0, "avatar-token")).ok, true);
+    assert.equal(f.actions.at(-1).arguments.description, "仔细看看桌上的纸信", "a resident actively observes through its real act dispatch path");
     assert.equal((await f.service.deviceToolCall("open_app", { name: "chat" }, 0, false, "stealth")).ok, true);
     await f.service.botToolCall("select_channel", { id: "onebot@fixture:target" }, 0, "avatar-token");
     cockpit = await f.service.playerCockpit("avatar-token");
@@ -111,7 +114,7 @@ async function lifecycles(dir: string) {
     assert.equal(f.service.cancelPlayerTool("control", liveTask.id).status, "too_late");
     let lostDone = false; const lost = f.bot.releaseResidentControl("control-public-id", true).then(() => { lostDone = true; });
     await tick(); assert.equal(lostDone, false); assert.equal(f.bot.manualMode, true);
-    assert.equal((await f.service.botToolCall("observe", {}, 0, "control")).ok, false);
+    assert.equal((await f.service.botToolCall("act", { description: "仔细看看周围" }, 0, "control")).ok, false);
     committedFinish.resolve(); assert.equal((await active).text, "committed fixture result"); await lost;
     assert.equal(f.bot.manualMode, false);
 
@@ -121,9 +124,9 @@ async function lifecycles(dir: string) {
     const writeStarted = gate(), writeDone = gate();
     const original = f.context.appendToolCall.bind(f.context);
     f.context.appendToolCall = async (call: any) => { writeStarted.resolve(); await writeDone.promise; await original(call); };
-    let observed = 0; f.world.observe = async () => { observed++; return {}; };
-    const beforeDispatch = f.service.botToolCall("observe", {}, 0, "next"); await writeStarted.promise;
-    assert.equal((await f.service.botToolCall("observe", {}, 0, "next")).ok, false, "one synchronous admission gate includes persistence");
+    let observed = 0; f.world.adjudicateAct = async () => { observed++; return true; };
+    const beforeDispatch = f.service.botToolCall("act", { description: "仔细看看周围" }, 0, "next"); await writeStarted.promise;
+    assert.equal((await f.service.botToolCall("act", { description: "仔细看看周围" }, 0, "next")).ok, false, "one synchronous admission gate includes persistence");
     const ended = f.bot.releaseResidentControl("next-public-id", true); await tick();
     writeDone.resolve(); assert.equal((await beforeDispatch).ok, false); await ended; assert.equal(observed, 0);
 

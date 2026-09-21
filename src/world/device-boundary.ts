@@ -12,7 +12,7 @@ export interface DeviceBoundaryViolation {
 
 export const DEVICE_TOOL_GUIDANCE = "消息、通知、软件界面及设备读写由专用工具提供实际结果。请用 observe_device 查看设备，按当前工具用 open_app、select_channel/read_channel 读取真实聊天，用 send 等工具发送。act 只能裁定身体与物理环境；混合请求尚未执行，不能把消息内容、已读或发送成功当作世界行动结果。";
 
-export const WORLD_DEVICE_AUTHORITY = "代码限定的事实归属：普通任务只裁定物理世界。真实聊天平台在现实或虚构世界中都由外部服务独占；本次没有提供其消息原文、收发回执或设备运行状态。不得新建、续写、转述或确认平台消息、通知、未读/已读、聊天对象、发信结果、应用页面和开关状态，也不得依据旧世界叙述中的这类内容继续创作。初始化、演化、观察、离场和所有状态字段同样受限。手机等物品的位置、外观及身体拿放可裁定，软件与消息须由设备工具提供。只有明确的内部app_observe/app_action可按读写协议处理虚构软件，仍无真实平台权限。既有虚构文件原文仅供相应内部应用读取，普通裁定只能原样保留，不能作为普通角色感知。缺少设备事实时省略它们，不猜测有或没有。创世也不要描述屏幕亮暗、熄屏、锁定、电量或是否有通知：暗屏不是安全替代说法，仍在断言未知设备状态。可写“手机平放在床头柜上，机身留有握持余温”，不要加“屏幕暗着”。";
+export const WORLD_DEVICE_AUTHORITY = "代码限定的事实归属：普通任务只裁定物理世界。真实聊天平台在现实或虚构世界中都由外部服务独占；本次没有提供其消息原文、收发回执或设备运行状态。不得新建、续写、转述或确认平台消息、通知、未读/已读、聊天对象、发信结果、应用页面和开关状态，也不得依据旧世界叙述中的这类内容继续创作。初始化、演化、观察、离场和所有状态字段同样受限。手机等物品的位置、外观及身体拿放可裁定，软件与消息须由设备工具提供。“刷手机”“玩手机”“翻消息”和拿起手机后“随便刷点什么”同样是设备操作，不能作为物理行动建议，也不能写成已经划屏浏览了多久的经历；行动建议的标题、意图和分组文字都遵守此边界。只有明确的内部app_observe/app_action可按读写协议处理虚构软件，仍无真实平台权限。既有虚构文件原文仅供相应内部应用读取，普通裁定只能原样保留，不能作为普通角色感知。缺少设备事实时省略它们，不猜测有或没有。创世也不要描述屏幕亮暗、熄屏、锁定、电量或是否有通知：暗屏不是安全替代说法，仍在断言未知设备状态。可写“手机平放在床头柜上，机身留有握持余温”，不要加“屏幕暗着”。";
 
 const platform = /(?:\b(?:qq|wechat|weixin|telegram|discord|slack|whatsapp|messenger|email|e-mail|sms|imessage)\b|微信|钉钉|飞书|私聊|群聊|私信|短信|电子邮件|聊天(?:记录|窗口|界面|列表|频道|软件|应用|平台)|社交平台)/i;
 const digital = /(?:手机|电脑|平板|屏幕|显示器|终端|浏览器|软件|应用|网页|网站|网络|互联网|邮箱|收件箱|通知栏|状态栏|\b(?:phone|computer|screen|desktop|terminal|browser|app|inbox|online)\b)/i;
@@ -21,6 +21,17 @@ const readWrite = /(?:查看|看一眼|看看|看下|阅读|读取|读一读|翻
 const paper = /(?:纸质|纸上|纸条|纸张|信纸|书信|纸信|信封|手写信|信使|口信|告示牌|公告栏|公告牌|黑板|布告|菜单|书本|书页|书上|书中|目录页|当面|面对面|\b(?:paper|handwritten|envelope|face.to.face)\b)/i;
 const physicalDetail = /(?:背面|外壳|壳上|划痕|裂纹|裂痕|重量|材质|温度|烫不烫|\b(?:back cover|scratch|weight)\b)/i;
 const softwareTarget = /(?:屏幕|界面|浏览器|网页|网站|网址|软件|应用|程序|终端|命令|文件(?!柜|袋|盒|架|箱)|目录|服务器|Docker|联网|网络连接|天气预报|实时天气|\b(?:screen|desktop|browser|website|url|app|program|terminal|command|file|folder|directory|server|docker|forecast)\b)/i;
+const casualDeviceUse = /(?:刷|玩|翻)(?:了|着|过)?(?:一会儿?|会儿?|一阵子?|一下|几下|两下|一?点(?:儿)?|一些|几(?:条|个)|两(?:条|个)|一(?:条|个)|[零一二两三四五六七八九十百几数半\d]+(?:[～~—–-][零一二两三四五六七八九十百几数半\d]+)?(?:秒钟?|分钟|个?小时))?(?:(?:手机|平板|电脑)(?!(?:的|上(?:的)?)?(?:壳|模型|背面|外壳|划痕|裂纹|裂痕|重量|材质|温度))|微信|QQ|朋友圈|微博|抖音|小红书|B站|短视频|视频|信息流|聊天记录|消息|通知|私信|邮件|网页|软件|应用)|(?:滑屏|划屏)|(?:滑动|划动|滑过|划过|滑着|划着|划拉).{0,8}(?:屏幕|触屏|触摸屏)|(?:屏幕|触屏|触摸屏).{0,14}(?:滑动|划动|滑了|划了|滑着|划着|划拉|来回滑|来回划)/i;
+// A preceding clause can supply the device: “拿起手机，随便刷点什么”. Require
+// an unspecified object or a complete duration, so “刷牙/刷点油漆/翻纸书” stay physical.
+const contextualBrowsing = /(?:刷|翻|玩)(?:了|着|过)?(?:点(?:儿)?什么|(?:一?点|一些)(?:内容|东西)|一会儿?|一阵子?|一下|几下|两下|[零一二两三四五六七八九十百几数半\d]+(?:[～~—–-][零一二两三四五六七八九十百几数半\d]+)?(?:秒钟?|分钟|个?小时))(?=$|[\s的啊吧呢了着]|就|后|再|到|直至|直到|才)/;
+
+function casualDeviceKind(text: string, deviceContext: boolean): DeviceBoundaryViolation["kind"] | null {
+  const use = casualDeviceUse.exec(text);
+  if (use && !physicalDetail.test(use[0])) return platform.test(use[0]) || message.test(use[0]) ? "chat" : "software";
+  if (deviceContext && contextualBrowsing.test(text) && !paper.test(text) && !/(?:刷牙|刷墙|刷漆|刷鞋|油漆|涂料|洗刷)/.test(text)) return "software";
+  return null;
+}
 
 function normalized(text: string): string { return text.normalize("NFKC").replace(/[\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]/g, ""); }
 function clauses(text: string): string[] {
@@ -39,15 +50,18 @@ function violation(kind: DeviceBoundaryViolation["kind"], text: string): DeviceB
 
 /** Call on the user's tool intent/target, not on arbitrary file contents or quoted history. */
 export function detectDeviceRequest(input: string): DeviceBoundaryViolation | null {
-  for (const part of clauses(input)) { const found = requestClause(part); if (found) return found; }
+  const deviceContext = digital.test(normalized(input)) || platform.test(normalized(input));
+  for (const part of clauses(input)) { const found = requestClause(part, deviceContext); if (found) return found; }
   return null;
 }
-function requestClause(input: string): DeviceBoundaryViolation | null {
+function requestClause(input: string, deviceContext: boolean): DeviceBoundaryViolation | null {
   const text = normalized(input);
   if (!text.trim()) return null;
   const transport = /(?:查看|看看|读取|阅读|翻看|发送|发|回|回复).{0,45}(?:消息|私信|短信|邮件)/i.exec(text);
   if (transport && !paper.test(transport[0])) return violation("chat", input);
   const explicitDigital = platform.test(text) || digital.test(text);
+  const casual = casualDeviceKind(text, deviceContext);
+  if (casual) return violation(casual, input);
   if (paper.test(text) && !explicitDigital) return null;
   if (/\b(?:read_channel|select_channel|open_app|observe_device|send_voice|send_file|run_command|open_url)\b/i.test(text)) return violation("software", input);
   if ((platform.test(text) || message.test(text) || (digital.test(text) && /信息/.test(text))) && readWrite.test(text)) return violation("chat", input);
@@ -64,13 +78,16 @@ function requestClause(input: string): DeviceBoundaryViolation | null {
 
 /** Explicit output claims. virtualApp authorizes simulated software, never platform chat. */
 export function detectDeviceClaim(input: string, options: { virtualApp?: boolean } = {}): DeviceBoundaryViolation | null {
-  for (const part of clauses(input)) { const found = claimClause(part, options); if (found) return found; }
+  const deviceContext = digital.test(normalized(input)) || platform.test(normalized(input));
+  for (const part of clauses(input)) { const found = claimClause(part, options, deviceContext); if (found) return found; }
   return null;
 }
-function claimClause(input: string, options: { virtualApp?: boolean }): DeviceBoundaryViolation | null {
+function claimClause(input: string, options: { virtualApp?: boolean }, deviceContext: boolean): DeviceBoundaryViolation | null {
   const text = normalized(input);
   const transport = /(?:收到|接到|发来|发出|发送|回复|读到|看完).{0,45}(?:消息|私信|短信|邮件)/i.exec(text);
   if (transport && !paper.test(transport[0])) return violation("chat", input);
+  const casual = casualDeviceKind(text, deviceContext);
+  if (casual && (casual === "chat" || !options.virtualApp)) return violation(casual, input);
   // Physical correspondence and face-to-face dialogue remain ordinary world content.
   if (paper.test(text) && !platform.test(text) && !digital.test(text)) return null;
   if (platform.test(text) && (message.test(text) || readWrite.test(text) || /(?:发来|收到|说|写|显示|亮|弹|登入|登录|在线|离线|[「“"：:]|\b(?:received|sent|says|display|logged)\b)/i.test(text))) return violation("chat", input);

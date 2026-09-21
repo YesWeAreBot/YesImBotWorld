@@ -17,7 +17,7 @@ async function until(test:()=>boolean, label:string) { for(let i=0;i<500;i++){if
 function gate<T>() { let resolve!: (value:T)=>void; const promise=new Promise<T>(done=>{resolve=done;});return {promise,resolve}; }
 function stopped(signal:AbortSignal):Promise<never> { return new Promise((_,reject)=>{if(signal.aborted)reject(signal.reason);else signal.addEventListener("abort",()=>reject(signal.reason),{once:true});}); }
 const proposed:ParsedToolCall={name:"act",arguments:{description:"马上出门散步"}};
-const alternative:ParsedToolCall={name:"observe",arguments:{target:"self",intent:"先确认自己的处境"}};
+const alternative:ParsedToolCall={name:"observe_device",arguments:{device:"phone"}};
 function decision(input:RegulationModelInput, replacement?:ParsedToolCall):RegulationModelResult {
   return {appraisals:[],evidenceIds:input.events.map(event=>event.id),appraisalExplanations:[],candidateForecasts:[],candidates:[
     {id:"proposed",call:input.proposed,contextKey:"准备决定接下来如何行动",expectedEffects:{},cost:replacement?1:0,risk:replacement?1:0},
@@ -41,7 +41,8 @@ async function fixture(enabled=true) {
     adjudicateAct:async(call:ToolCallRecord,deliver:(text:string)=>void,_signal:AbortSignal,commit:()=>boolean)=>{assert.ok(commit());actions++;performed.push(structuredClone(call));trace.push("world.act");deliver(JSON.stringify({action:{id:call.id,intent:call.arguments.description,status:"completed"},scene:{eventId:"world-scene-"+actions,actorId:"bot",sourceEventIds:["actual-action-"+actions],text:"你沿着小路走了一会儿。"}}));return true;},
     compress:async()=>{compressions++;return {historySummary:"曾在门口考虑下一步。",memoryDigest:"保留与家人的约定。"};},
   } as any;
-  const agent=new BotAgent(cfg,clock,files,context,world,{} as any,null,null,null,{down:false},logger,BOT_TOOLS.filter(tool=>["act","observe","wait","rest"].includes(tool.name))) as any;
+  const agent=new BotAgent(cfg,clock,files,context,world,{} as any,null,null,null,{down:false},logger,BOT_TOOLS.filter(tool=>["act","observe_device","wait","rest"].includes(tool.name))) as any;
+  agent.peekDevice=async()=>{observations++;trace.push("device.observe");return {text:"手机当前停留在桌面。",originEventIds:["actual-device-observation-"+observations]};};
   agents.push(agent);
   assert.ok(agent.regulation,"the actual agent owns the regulation runtime");
   return {base,files,context,cfg,clock,agent,trace,performed,setTime:(value:number)=>{time=value;},get observations(){return observations;},get actions(){return actions;},get compressions(){return compressions;}};
@@ -71,8 +72,8 @@ async function oneChosenCall() {
   await until(()=>f.context.stream.some(entry=>entry.kind==="event"&&entry.event.source==="tool"),"chosen action receipt delivery");
   await f.agent.stop();
   assert.equal(evaluations,1);assert.equal(f.observations,1);assert.equal(f.actions,0);
-  assert.equal(calls(f).length,1);assert.equal(calls(f)[0]!.name,"observe");assert.deepEqual(calls(f)[0]!.arguments,alternative.arguments);
-  assert.ok(f.trace.indexOf("bind:committed")<f.trace.indexOf("call:append")&&f.trace.indexOf("call:append")<f.trace.indexOf("world.observe"));
+  assert.equal(calls(f).length,1);assert.equal(calls(f)[0]!.name,"observe_device");assert.deepEqual(calls(f)[0]!.arguments,alternative.arguments);
+  assert.ok(f.trace.indexOf("bind:committed")<f.trace.indexOf("call:append")&&f.trace.indexOf("call:append")<f.trace.indexOf("device.observe"));
   assert.ok(perceived.some(event=>event.source==="tool"&&event.refToolCallId===calls(f)[0]!.id),"real result is returned to the regulation perception path");
   const rows=await journal(f);
   assert.equal(rows.filter(row=>row.type==="decision").length,1);assert.equal(rows.find(row=>row.type==="decision").selectedId,"alternative-1");
@@ -117,7 +118,7 @@ async function controlFences() {
   const puppet=await fixture();await puppet.agent.acquireResidentControl("puppet","isolated-body-controller");oneGeneration(puppet,alternative);let allowed:string[]=[];
   puppet.agent.regulation.model.evaluate=async(value:RegulationModelInput)=>{allowed=value.tools.map(tool=>tool.name);return decision(value);};
   puppet.agent.start();await until(()=>puppet.context.stream.some(entry=>entry.kind==="event"&&entry.event.source==="tool"),"conscious observation while body is controlled");await puppet.agent.stop();
-  assert.ok(allowed.includes("observe"));assert.ok(!allowed.includes("act"),"the evaluator cannot propose autonomous body actions while puppet control holds the body");assert.equal(puppet.observations,1);assert.equal(puppet.actions,0);
+  assert.ok(allowed.includes("observe_device"));assert.ok(!allowed.includes("act"),"the evaluator cannot propose autonomous body actions while puppet control holds the body");assert.equal(puppet.observations,1);assert.equal(puppet.actions,0);
   console.log("PASS regulation Agent: manual replacement pauses private generation, late generation/evaluation cannot act, and puppet capabilities remain filtered");
 }
 

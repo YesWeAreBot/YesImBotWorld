@@ -9,6 +9,7 @@ import type { BotEvent, ParsedToolCall, StreamEntry, ToolCallRecord } from "../t
 import type { BotContext } from "./context.js";
 import type { NamedToolDef } from "./nativeTools.js";
 import { projectObservedMessages } from "./perception-fragments.js";
+import { narrativeFactText } from "./narrative-facts.js";
 import { RegulationModel, type RegulationModelOptions, type RegulationModelResult } from "./regulation-model.js";
 import { advanceState, applyAppraisal, createState, describeRegulation, learnOutcome, scoreCandidates, MODULATORS,
   type Appraisal, type AppraisalEffect, type LearningRecord, type ObservedOutcome, type OutcomePrediction,
@@ -180,15 +181,15 @@ export class RegulationRuntime {
     this.restored = true;
   }
   async perceive(event: BotEvent): Promise<void> {
-    if (!this.cfg.regulation?.enabled) return;
+    if (!this.cfg.regulation?.enabled || !eligible(event, this.context.stream)) return;
     await this.journal.ready();
     if (!this.journal.state) throw Error("内在调节尚未初始化感知边界");
-    if (this.journal.seen.has(event.id) || !eligible(event, this.context.stream)) return;
+    if (this.journal.seen.has(event.id)) return;
     const canonical = this.context.stream.find(entry => entry.kind === "event" && entry.event.id === event.id);
     if (!canonical || canonical.kind !== "event") throw Error("内在调节不能读取尚未交付的事件");
     // Keep ordered media identity and its delivered summary, without copying local files/base64.
     const value = canonical.event;
-    const text = value.contextText ?? (value.parts?.length ? richPartsText(value.parts) : value.content);
+    const text = value.contextText ?? (value.parts?.length ? richPartsText(value.parts) : narrativeFactText(value));
     const fragments = projectObservedMessages(value.id, this.context.stream);
     await this.journal.append({ type: "evidence", event: { id: value.id, source: value.source, worldTime: value.worldTime,
       content: text, contextText: text, refToolCallId: value.refToolCallId, originEventIds: value.originEventIds,
@@ -219,6 +220,7 @@ export class RegulationRuntime {
   }
   /** Persist the expectation before the actual call enters history or touches an external system. */
   async bind(choice: RegulationChoice, call: ToolCallRecord): Promise<void> {
+    if (call.name === "think" || choice.call.name === "think") return;
     if (!choice.prediction) return;
     if (call.role !== "agent" || call.control) throw Error("接管行动不能绑定自主选择的期待");
     if (actionSignature(choice.call) !== actionSignature(choice.prediction.call) || actionSignature(call) !== actionSignature(choice.prediction.call)) {
@@ -233,6 +235,8 @@ export class RegulationRuntime {
     signal?: AbortSignal, current: () => boolean = () => true): Promise<RegulationChoice> {
     signal?.throwIfAborted();
     if (!current()) throw new StaleRegulationDecision("控制权或能力已改变，本次旧候选未执行");
+    // Subjective character prose is retained locally, never appraised as a new action or stimulus.
+    if (proposed.name === "think") return { call: proposed };
     if (!this.cfg.regulation?.enabled || this.realNow() < this.nextAttemptAt) return { call: proposed };
     await this.restore();
     const epoch = this.epoch, signature = this.contextSignature(), optionsSignature = JSON.stringify(this.cfg.regulation);
@@ -262,7 +266,7 @@ export class RegulationRuntime {
       const recent = [...pending].sort((a, b) => b.worldTime - a.worldTime).slice(0, 6);
       const recentIds = new Set(recent.map(event => event.id));
       const events = pending.length <= 8 ? pending : [...recent.reverse(), ...pending.filter(event => !recentIds.has(event.id)).slice(0, 2)];
-      result = await this.model.evaluate({ events, state, proposed, tools, at: this.clock.now(), secondsPerTU: this.unit(),
+      result = await this.model.evaluate({ events, state, proposed, tools: tools.filter(tool => tool.name !== "think"), at: this.clock.now(), secondsPerTU: this.unit(),
         validationFeedback: this.journal.validationFeedback,
         pendingExpectations: [...pendingExpectations.values()].filter(item => item.roots.some(root => responseRoots.has(root))) }, combined);
       guard();
@@ -403,9 +407,9 @@ function learnTimedOutcome(state: RegulationState, comparison: Comparison, at: n
 }
 
 function eligible(event: BotEvent, stream: StreamEntry[]): boolean {
-  if (event.source === "system" || event.originEventIds?.length === 0) return false;
+  if (event.source === "system" || event.experience?.internalThought === true || event.originEventIds?.length === 0) return false;
   const call = event.refToolCallId && stream.find(entry => entry.kind === "tool_call" && entry.call.id === event.refToolCallId);
-  return !call || call.kind !== "tool_call" || !["reflect", "recall_growth", "recall"].includes(call.call.name);
+  return !call || call.kind !== "tool_call" || !["think", "reflect", "recall_growth", "recall"].includes(call.call.name);
 }
 function configured(cfg: BotModelConfig): RegulationOptions {
   return createState(0, { learningRate: cfg.regulation?.learningRate ?? .3, physiologyEnabled: cfg.regulation?.sexualResponseEnabled === true,

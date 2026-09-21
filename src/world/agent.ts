@@ -52,7 +52,7 @@ export interface VisitorRef {
  */
 export interface RemoteWorldLink {
   worldName: string;
-  adjudicateAct(call: ToolCallRecord, deliver: (content: string) => void, signal?: AbortSignal, beforeCommit?: () => boolean): Promise<boolean>;
+  adjudicateAct(call: ToolCallRecord, deliver: (content: string) => void | Promise<void>, signal?: AbortSignal, beforeCommit?: () => boolean): Promise<boolean>;
   observe?(args?: { intent?: string; target?: string; modality?: string }): Promise<WorldObservation>;
   observeVirtualApp?(task: string): Promise<RichText>;
   executeVirtualApp?(task: string, signal?: AbortSignal): Promise<RichText>;
@@ -160,7 +160,7 @@ export class WorldAgent {
   }
   private visitorId(v: VisitorRef): string { return "visitor:" + (v.id ?? v.name); }
   /** Read already committed perceptions; passive delivery must never invoke observe or the model. */
-  private async publishActor(actorId: string, deliver: (content: string) => void, receipt?: string): Promise<void> {
+  private async publishActor(actorId: string, deliver: (content: string) => void | Promise<void>, receipt?: string): Promise<void> {
     const signal = this.maintenanceAbort.signal; signal.throwIfAborted();
     const prior = this.deliveryTails.get(actorId) ?? Promise.resolve();
     const run = prior.catch(() => {}).then(async () => {
@@ -182,7 +182,7 @@ export class WorldAgent {
         // acknowledgement remain intact. A simultaneous heartbeat must not publish it early.
         const ownedByAction = observation.scene?.actionId && this.pendingReceiptActions.get(observation.scene.actionId) === actorId;
         if (ownedByAction && !wasObserved && !isReceipt) { waitingForReceipt = true; continue; }
-        if (isReceipt || (!wasObserved && !ownedByAction)) deliver(isReceipt ? receipt! : JSON.stringify(observation));
+        if (isReceipt || (!wasObserved && !ownedByAction)) await deliver(isReceipt ? receipt! : JSON.stringify(observation));
         if (isReceipt) receiptDelivered = true;
         if (waitingForReceipt) deliveredAhead.add(observation.observationId);
         else this.perceptionCursors.set(actorId, observation.worldSequence);
@@ -190,7 +190,7 @@ export class WorldAgent {
       // A retried action still needs its execution acknowledgement even when the underlying
       // perception was already delivered. Stable source IDs prevent it becoming new evidence.
       if (receipt && !receiptDelivered) {
-        deliver(receipt);
+        await deliver(receipt);
         if (receiptObservation?.actorId === actorId && receiptObservation.worldSequence > (this.perceptionCursors.get(actorId) ?? 0)) deliveredAhead.add(receiptObservation.observationId);
       }
     });
@@ -397,17 +397,19 @@ export class WorldAgent {
 
   // ---------- 对外任务 ----------
 
-  /** 裁定 Bot 的 act 动作。产出的事件通过 deliver 交付（由调度器压到期望完成时刻） */
-  async adjudicateAct(call: ToolCallRecord, deliver: (content: string) => void, signal?: AbortSignal, beforeCommit?: () => boolean): Promise<boolean> {
+  /** Deliver each committed action stage promptly; future completion stays on the world clock. */
+  async adjudicateAct(call: ToolCallRecord, deliver: (content: string) => void | Promise<void>, signal?: AbortSignal, beforeCommit?: (phase: "start" | "finish") => boolean): Promise<boolean> {
     const lifetime = this.maintenanceAbort.signal; lifetime.throwIfAborted();
-    if (this.remote) return this.remote.adjudicateAct(call, deliver, signal, beforeCommit);
+    if (this.remote) return this.remote.adjudicateAct(call, deliver, signal, beforeCommit ? () => beforeCommit("finish") : undefined);
     const actionId = `bot:${call.id}`;
     this.pendingReceiptActions.set(actionId, "bot");
     try {
-      const receipts: string[] = [];
-      const ok = await this.runtime.act("bot", call, content => receipts.push(content), signal, beforeCommit);
+      const ok = await this.runtime.act("bot", call, async content => {
+        lifetime.throwIfAborted();
+        await this.publishActor("bot", deliver, content);
+        await this.publishAll("bot");
+      }, signal, beforeCommit);
       lifetime.throwIfAborted();
-      for (const receipt of receipts) await this.publishActor("bot", deliver, receipt);
       await this.publishAll("bot");
       return ok;
     } catch (error) {
@@ -433,7 +435,7 @@ export class WorldAgent {
   async tingle(deliver: (content: string) => void): Promise<number | null> {
     const lifetime = this.maintenanceAbort.signal; lifetime.throwIfAborted();
     if (this.remote && !(this.visitorsProvider?.().length)) { this.notePresenceChange(); return null; }
-    await this.runtime.evolve("世界心跳：按距离当前状态时刻的实际经过时间，结算自然过程及 NPC 的自主行动。承接正在进行的工作、交谈、等待和角色行动造成的影响，以自然语言写明真正发生的经过，分别向在场角色提供他们实际能感知的新动静。常驻角色及玩家的主动选择由他们自己决定。没有合理变化时保持安静，不强制制造冲突或奇遇，也不要重播旧场景。");
+    await this.runtime.evolve("世界心跳：按距离当前状态时刻的实际经过时间，结算自然过程及 NPC 的自主行动。承接正在进行的工作、交谈、等待和角色行动造成的影响，以自然语言写明真正发生的经过，分别向在场角色提供他们实际能感知的新动静。常驻角色及玩家的主动选择由他们自己决定。没有合理变化时保持安静，不强制制造冲突或奇遇，也不要重播旧场景。", { heartbeat: true });
     lifetime.throwIfAborted();
     await this.publishAll(undefined, deliver); return null;
   }
@@ -525,10 +527,12 @@ export class WorldAgent {
     const callId = taskId ?? randomUUID(), actionId = `${actorId}:${callId}`;
     this.pendingReceiptActions.set(actionId, actorId);
     try {
-      const receipts: string[] = [];
-      const ok = await this.runtime.act(actorId, { id: callId, name: 'act', role: 'world', arguments: { description: desc, ...options }, duration, issuedAt: at, expectedAt: at + duration }, content => receipts.push(content), signal);
+      const ok = await this.runtime.act(actorId, { id: callId, name: 'act', role: 'world', arguments: { description: desc, ...options }, duration, issuedAt: at, expectedAt: at + duration }, async content => {
+        lifetime.throwIfAborted();
+        await this.publishActor(actorId, deliver, content);
+        await this.publishAll(actorId);
+      }, signal);
       lifetime.throwIfAborted();
-      for (const receipt of receipts) await this.publishActor(actorId, deliver, receipt);
       await this.publishAll(actorId);
       return ok;
     } catch (error) {

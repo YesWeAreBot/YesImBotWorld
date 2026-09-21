@@ -5,6 +5,7 @@ import type { BotEvent, ExperienceMetadata, StreamEntry } from "../types.js";
 import { richPartsText } from "../media/presentation.js";
 import { appendJsonLine } from "../jsonl.js";
 import { projectObservedMessages } from "./perception-fragments.js";
+import { narrativeFactText } from "./narrative-facts.js";
 import { actionContains, chatEvidence, deriveGrowthScope, growthMatchesScope, growthNeedsReview, matchingBehavior, stateBasis, type GrowthMessageEvidence, type GrowthScope } from "./growth-grounding.js";
 
 export type GrowthKind = "relationship" | "commitment" | "preference" | "state" | "habit" | "trait";
@@ -293,7 +294,7 @@ export class GrowthLedger {
   }
 
   private acceptEvidence(evidence: PerceivedEvidence): void {
-    if (this.evidence.has(evidence.eventId)) return;
+    if (evidence.experience?.internalThought === true || this.evidence.has(evidence.eventId)) return;
     const fresh = evidence.rootEventIds.filter(id => !this.roots.has(id));
     this.evidence.set(evidence.eventId, evidence);
     evidence.rootEventIds.forEach(id => this.roots.add(id));
@@ -319,7 +320,7 @@ export class GrowthLedger {
   }
 
   private async perceiveUnlocked(event: BotEvent, rootEventIds: string[], metadata?: ExperienceMetadata): Promise<void> {
-    if (event.source === "system" || this.evidence.has(event.id)) return;
+    if (event.source === "system" || event.experience?.internalThought === true || metadata?.internalThought === true || this.evidence.has(event.id)) return;
     const roots = [...new Set(rootEventIds.filter((id) => typeof id === "string" && id.trim()))];
     if (!roots.length) return; // derived memory/tool output cannot manufacture a fresh experience
     // `event` is the delivered receipt passed by the append boundary; projection validates
@@ -329,7 +330,7 @@ export class GrowthLedger {
       ? [{ text: part.content, rootEventIds: part.originEventIds!, chat: part.experience.chat }] : []);
     const evidence: PerceivedEvidence = {
       eventId: event.id, actorId: this.actorId, source: event.source,
-      observedAt: event.worldTime, text: event.parts?.length ? richPartsText(event.parts) : event.content, rootEventIds: roots,
+      observedAt: event.worldTime, text: event.parts?.length ? richPartsText(event.parts) : narrativeFactText(event), rootEventIds: roots,
       ...(metadata ? { experience: normalizeMetadata(metadata) } : {}),
       ...(messages?.length ? { messages } : {}),
     };
@@ -341,7 +342,7 @@ export class GrowthLedger {
   async restorePerceptions(entries: readonly StreamEntry[]): Promise<void> {
     return this.serial(async () => {
       const derivedCalls = new Set(entries.flatMap(entry => entry.kind === "tool_call" &&
-        ["reflect", "recall_growth", "recall"].includes(entry.call.name) ? [entry.call.id] : []));
+        ["think", "reflect", "recall_growth", "recall"].includes(entry.call.name) ? [entry.call.id] : []));
       for (const entry of entries) {
         if (entry.kind !== "event") continue;
         const event = entry.event;
@@ -904,7 +905,7 @@ export class GrowthLedger {
       // Previously supportive evidence can establish continuity; the current choice still needs fresh evidence.
       const supportingIds = new Set([...prior.filter(r => r.relation === "support" || r.relation === "revise").flatMap(r => r.evidenceIds), ...evidenceIds]);
       const voluntary = [...supportingIds].map(id => this.evidence.get(id)).filter((e): e is PerceivedEvidence => !!e &&
-        e.experience?.agency === "self" &&
+        e.experience?.internalThought !== true && e.experience?.agency === "self" &&
         e.experience.outcome === "completed" && e.experience.opportunity === true && !!e.experience.episodeId);
       const choices = independentChoices(voluntary);
       const minimum = input.kind === "habit" ? 3 : 6;
@@ -1048,7 +1049,7 @@ function snapshotId(snapshot: Omit<GrowthReviewSnapshot, "id">): string {
 
 /** The same program-verified admission rule used by habit/trait validation, for model evidence hints. */
 export function independentGrowthChoices(evidence: PerceivedEvidence[]): PerceivedEvidence[] {
-  return independentChoices(evidence.filter(item => item.experience?.agency === "self" && item.experience.outcome === "completed" &&
+  return independentChoices(evidence.filter(item => item.experience?.internalThought !== true && item.experience?.agency === "self" && item.experience.outcome === "completed" &&
     item.experience.opportunity === true && !!item.experience.episodeId));
 }
 

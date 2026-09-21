@@ -46,7 +46,7 @@ export default async function smokeCockpit({ evaluate, wait, assert, navigate, p
       await run(()=>window.dispatchEvent(new CustomEvent('studio:overview',{detail:{}})));
       assert(await run(mode=>document.querySelector('[data-takeover-mode="'+mode+'"]').getAttribute('aria-pressed')==='true'&&!document.querySelector('[data-journey-arrive]').disabled,mode), 'Running-state events restore entry without changing the selected mode; unknown status does not imply a stopped world');
       await click('接管 小澈');
-      await wait(`!!document.querySelector('.journey-connection.connected') && !!document.querySelector('[data-cockpit-tool="observe"]')`);
+      await wait(`!!document.querySelector('.journey-connection.connected') && !!document.querySelector('[data-cockpit-tool="act"]')`);
       assert(await run(mode=>window.__cockpitSmoke.calls.filter(c=>c.path==='/api/player/arrive').at(-1).body.mode === mode, mode), 'Selected consciousness mode reaches the server');
       assert.equal(await run(()=>!!document.querySelector('[data-cockpit-tool="recall_growth"]')), mode === 'avatar', 'Puppet cannot replace the character’s thoughts');
       assert(await run(()=>document.documentElement.scrollWidth <= innerWidth), 'Cockpit fits the viewport');
@@ -84,9 +84,11 @@ export default async function smokeCockpit({ evaluate, wait, assert, navigate, p
       assert(await run(()=>{const n=window.__cockpitSmoke.imeNode;return n.isConnected&&document.activeElement===n&&n.value==='正在用输入法编辑的意图'&&n.selectionStart===2&&n.selectionEnd===5&&window.__cockpitSmoke.extraFocus===0;}), 'Polling/catalog changes preserve the exact composing DOM node, selection and focus without reopening IME');
       await run(()=>{const n=window.__cockpitSmoke.imeNode;n.dispatchEvent(new CompositionEvent('compositionend',{bubbles:true}));document.removeEventListener('focusin',window.__cockpitSmoke.onFocus);n.blur();});
       assert(await run(()=>!document.querySelector('.cockpit-schema').open), 'Advanced JSON starts collapsed');
-      await click('重新观察');
+      await click('想仔细看看');
+      assert(await run(()=>document.querySelector('[data-cockpit-field="act:description"]').value.includes('仔细看看周围')), 'Looking closer prepares an act intent instead of invoking a removed observer');
+      await run(()=>document.querySelector('.cockpit-form').requestSubmit());
       await wait(`document.querySelectorAll('.journey-entity').length > 1 && !document.querySelector('.journey-pending')`);
-      assert(await run(()=>window.__cockpitSmoke.calls.some(c=>c.path==='/api/player/tool' && c.body.name==='observe' && c.body.token==='preview-player')), 'Resident observation uses the actual manual Bot tool path with session authorization');
+      assert(await run(()=>window.__cockpitSmoke.calls.some(c=>c.path==='/api/player/tool' && c.body.name==='act' && c.body.arguments.description==='仔细看看周围，确认眼前的情况。' && c.body.token==='preview-player')), 'Active observation uses the authorized act path');
       // The schema form must pass typed values and convert world seconds to TU.
       await choose('act');
       await run(()=>{
@@ -156,6 +158,29 @@ export default async function smokeCockpit({ evaluate, wait, assert, navigate, p
     }
     // Exercise canonical media selection with two distinguishable images. This
     // presentation-only component records arguments; it never calls a Bot tool.
+    await run(()=>{
+      const data={synced:true,unitWorldSeconds:2,tools:[{name:'act',inputSchema:{type:'object',properties:{description:{type:'string'}},required:['description']}},{name:'send',requiresSendConfirmation:true,inputSchema:{type:'object',properties:{id:{type:'string'},msg:{type:'string'}},required:['id','msg']}}],deviceSession:{chat:{channels:[{key:'fixture:friend',name:'已知朋友'}]}},opportunities:[{id:'message-choice',label:'联系朋友',intent:'询问朋友周末的安排',source:'device',sourceEventId:'known-channel',call:{name:'send',arguments:{id:'fixture:friend',msg:'周末有空吗？'}}}]};
+      window.__cockpitSmoke.opportunityCalls=[];
+      const panel=WorldCockpit.mount(data,{}, {call:(name,args)=>window.__cockpitSmoke.opportunityCalls.push({name,args})});panel.dataset.cockpitTest='1';document.querySelector('main').appendChild(panel);
+      panel.update(structuredClone(data));panel.querySelector('.opportunity-card').click();
+      panel.querySelector('.cockpit-form').requestSubmit();window.__cockpitSmoke.opportunityPanel=panel;window.__cockpitSmoke.opportunityData=data;
+    });
+    assert(await run(()=>window.__cockpitSmoke.opportunityCalls.length===0&&document.querySelector('[data-cockpit-field="send:msg"]').value==='周末有空吗？'&&document.querySelector('[data-cockpit-test] .journey-error').textContent.includes('确认')),'A refreshed device suggestion fills the actual tool form but never bypasses send confirmation');
+    await run(()=>{
+      const panel=window.__cockpitSmoke.opportunityPanel,input=panel.querySelector('[data-cockpit-field="send:msg"]');input.value='我自己编辑的邀请';input.dispatchEvent(new Event('input',{bubbles:true}));input.focus();window.__cockpitSmoke.suggestionDraft=input;
+      const data=structuredClone(window.__cockpitSmoke.opportunityData);data.opportunities=[];panel.update(data);
+    });
+    assert(await run(()=>window.__cockpitSmoke.suggestionDraft.isConnected&&document.activeElement===window.__cockpitSmoke.suggestionDraft&&window.__cockpitSmoke.suggestionDraft.value==='我自己编辑的邀请'&&!document.querySelector('[data-cockpit-test] .opportunity-card')),'Retiring device suggestions preserves the exact freeform draft and focus');
+    await run(()=>{const panel=window.__cockpitSmoke.opportunityPanel;panel.querySelector('[data-cockpit-confirm-send]').checked=true;panel.querySelector('.cockpit-form').requestSubmit();});
+    assert(await run(()=>window.__cockpitSmoke.opportunityCalls.length===1&&window.__cockpitSmoke.opportunityCalls[0].args.msg==='我自己编辑的邀请'),'Only an explicit confirmed submission executes the edited message');
+    await run(()=>document.querySelector('[data-cockpit-test]').remove());
+    await run(()=>{
+      const data={synced:true,unitWorldSeconds:2,tools:[{name:'think',inputSchema:{type:'object',properties:{thought:{type:'string'}},required:['thought']}}]};
+      const panel=WorldCockpit.mount(data,{}, {call:(name,args,duration)=>window.__cockpitSmoke.thoughtSubmission={name,args,duration}});panel.dataset.cockpitTest='1';document.querySelector('main').appendChild(panel);
+      const input=panel.querySelector('[data-cockpit-field="think:thought"]');input.value='等手边的事做完，再去散步。';input.dispatchEvent(new Event('input',{bubbles:true}));input.focus();window.__cockpitSmoke.thoughtInput=input;panel.update(data);panel.querySelector('.cockpit-form').requestSubmit();
+    });
+    assert(await run(()=>{const panel=document.querySelector('[data-cockpit-test]'),s=window.__cockpitSmoke.thoughtSubmission;return s.name==='think'&&s.args.thought==='等手边的事做完，再去散步。'&&s.duration===0&&document.activeElement===window.__cockpitSmoke.thoughtInput&&!panel.querySelector('[data-cockpit-field="duration"]')&&panel.querySelector('.cockpit-submit').textContent==='留下这段想法'&&panel.querySelector('.cockpit-tool-list').textContent.includes('意识与记忆');}),'Inner speech has a persistent prose input with no action duration or physical-action label');
+    await run(()=>document.querySelector('[data-cockpit-test]').remove());
     await run(()=>{
       const data={synced:true,unitWorldSeconds:2,tools:[{name:'view_media',inputSchema:{type:'object',properties:{media:{type:'array',items:{type:'string'}}},required:['media']}}],choices:{mediaCache:[{value:'media:1',text:'窗边的茶杯',preview:'/api/media/file?id=1'}],galleryMedia:[{value:'gallery:照片/清晨.png',text:'清晨的阳光',preview:'/api/media/file?id=2'}]}};
       const panel=WorldCockpit.mount(data,{}, {call:(name,args)=>window.__cockpitSmoke.mediaSubmission={name,args}});panel.dataset.cockpitTest='1';document.querySelector('main').appendChild(panel);

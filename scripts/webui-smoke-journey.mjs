@@ -67,7 +67,6 @@ export async function smokeJourney({ evaluate, wait, assert, navigate }) {
     });
     await click('以这个角色入场');
     await wait(`!!document.querySelector('.journey-connection.connected')`);
-    await click('重新观察');
     await wait(`document.querySelectorAll('.journey-entity').length > 1`);
     assert(await run(() => !!document.querySelector('.journey-entity-self') &&
       document.querySelector('[data-cockpit-field="action:target"]')?.tagName === 'INPUT'),
@@ -78,7 +77,7 @@ export async function smokeJourney({ evaluate, wait, assert, navigate }) {
       const input=document.querySelector('.journey-action-input'); window.__journeySmoke.imeNode=input; input.focus(); input.value='尚在编写';input.dispatchEvent(new Event('input',{bubbles:true}));input.dispatchEvent(new CompositionEvent('compositionstart',{bubbles:true}));
       const arrive=window.__journeySmoke.calls.find(c=>c.path==='/api/player/arrive');
       const token=(await arrive.promise).token;
-      await api('POST','/api/player/task',{token,taskId:'observe_ime_test',kind:'observe',payload:{}});
+      await api('POST','/api/player/task',{token,taskId:'perception_ime_test',kind:'act',payload:{desc:'留意窗边的动静'}});
     });
     await run(()=>new Promise(resolve=>setTimeout(resolve,300)));
     assert(await run(()=>window.__journeySmoke.imeNode===document.querySelector('.journey-action-input')&&document.activeElement===window.__journeySmoke.imeNode&&window.__journeySmoke.imeNode.value==='尚在编写'), 'Crossing SSE updates preserve the actual composing input node.');
@@ -101,7 +100,7 @@ export async function smokeJourney({ evaluate, wait, assert, navigate }) {
     await click('提交这次行动');
     await wait(`!document.querySelector('.journey-pending') && !!document.querySelector('.journey-feed-result')`);
     assert(await run(() => {
-      const call = window.__journeySmoke.calls.find(c => c.path === '/api/player/task' && c.body.kind === 'act');
+      const call = window.__journeySmoke.calls.find(c => c.path === '/api/player/task' && c.body.kind === 'act' && c.body.payload.desc === '检查眼前的物件');
       return call?.body.payload.desc === '检查眼前的物件' &&
         call.body.payload.speech === '我想仔细看看。' &&
         call.body.payload.durationWorldSeconds === 3 &&

@@ -20,7 +20,7 @@ export function messagesOf(evidence: PerceivedEvidence): GrowthMessageEvidence[]
 
 /** A displayed list, notification or successful send does not establish a current attention state. */
 export function stateBasis(evidence: PerceivedEvidence): boolean {
-  if (evidence.experience?.outcome === "failed") return false;
+  if (evidence.experience?.internalThought === true || evidence.experience?.outcome === "failed") return false;
   return evidence.source === "world" || evidence.experience?.worldPerception === true || evidence.experience?.chat?.kind === "attention";
 }
 

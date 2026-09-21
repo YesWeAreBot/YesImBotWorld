@@ -145,15 +145,24 @@ async function remoteDesktop() {
 async function namespaceAndLifecycle() {
   const schema = { type: "object", properties: { command: { type: "string" } } };
   let actual = "";
-  const component: any = { id: "terminal", name: "terminal", description: "fixture", open: async () => ({ tools: [{ name: "run_command", description: "fixture", inputSchema: schema }] }), call: async (tool: string) => { actual = tool; return "result"; }, close: async () => {} };
+  const component: any = { id: "terminal", name: "terminal", description: "fixture", open: async () => ({ tools: [
+    { name: "run_command", description: "fixture", inputSchema: schema },
+    { name: "observe", description: "inspect the application", inputSchema: { type: "object", properties: {} } },
+  ] }), call: async (tool: string) => { actual = tool; return "result"; }, close: async () => {} };
   const phone = new AppManager("chat", [component], new Set(), logger, () => ["run_command"]);
   await phone.open(component);
   assert.equal(phone.activeToolNames()[0], "terminal.run_command");
   await phone.call("terminal.run_command", {}); assert.equal(actual, "run_command");
+  assert.ok(phone.activeToolNames().includes("terminal.observe"), "retired public observe must not shadow an app tool");
+  assert.ok(!phone.activeToolNames().includes("observe"));
+  await phone.call("terminal.observe", {}); assert.equal(actual, "observe");
   const desktop = new ComputerDevice(component, null, null, { ensureReady: async () => ({ ok: true }) } as never, { readMeta: async () => ({ realWorld: true }) } as never, {} as never, { mode: "docker" } as never, new Set(), logger, () => ["run_command"]);
   await desktop.open();
   assert.equal(desktop.activeToolNames()[0], "terminal.run_command");
   assert.deepEqual(desktop.activeToolDefs()[0]!.inputSchema, schema);
+  assert.ok(desktop.activeToolNames().includes("terminal.observe"), "desktop homonyms must also avoid frozen legacy declarations");
+  assert.ok(!desktop.activeToolNames().includes("observe"));
+  await desktop.call("terminal.observe", {}); assert.equal(actual, "observe");
   await desktop.close(); await phone.closeAll();
   const done = gate(), entered = gate(); let calls = 0;
   const service: any = Object.create(WorldService.prototype);

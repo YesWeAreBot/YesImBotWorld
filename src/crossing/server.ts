@@ -62,6 +62,8 @@ interface SessionTask {
   abort: AbortController;
   promise?: Promise<void>;
   result?: Extract<CrossingSseMsg, { type: "task_result" }>;
+  progress?: boolean;
+  parts?: string[];
 }
 
 export interface CrossingServerHost {
@@ -496,6 +498,11 @@ export class CrossingServer {
     }
     // 补发离线期间暂存的消息
     for (const msg of session.outbox.splice(0)) res.write(sseFrame(msg));
+    // An in-flight operation may have committed feedback just before the previous
+    // socket disappeared. Replaying stable indexes does not re-execute the action.
+    for (const [taskId, task] of session.tasks) if (task.progress && !task.result) {
+      for (const [index, content] of (task.parts ?? []).entries()) res.write(sseFrame({ type: "task_progress", taskId, index, content }));
+    }
     this.attachPerceptions(session);
     req.on("close", () => {
       if (session.res === res) {
@@ -537,14 +544,15 @@ export class CrossingServer {
     }
     // 保留已完成 id，防止迟到重试重复执行。满额后要求建立新会话，而非丢掉去重记录。
     if (session.tasks.size + session.cancelledTaskIds.size >= 4096) return void sendJSON(res, 429, { error: "会话任务记录已满，请离开后重新进入" });
-    const task: SessionTask = { fingerprint, abort: new AbortController() };
+    const task: SessionTask = { fingerprint, abort: new AbortController(), progress: body.progress === true, parts: [] };
     session.tasks.set(taskId, task);
     session.pendingTasks++;
     sendJSON(res, 200, { ok: true, ...this.timeUnits() });
     task.promise = this.runTask(session, taskId, kind, payload, task)
       .catch((err) => {
         this.host.logger.warn("[穿越] 访客「%s」任务 %s 失败: %s", session.name, kind, err);
-        task.result = { type: "task_result", taskId, ok: false, content: task.abort.signal.aborted ? "取消请求已处理；已提交的变更不会回滚，请重新观察确认状态。" : "主世界任务失败。" };
+        const content = task.abort.signal.aborted ? "取消请求已处理；已提交的变更不会回滚，请重新观察确认状态。" : "主世界任务失败。";
+        task.result = { type: "task_result", taskId, ok: false, content, parts: [...(task.parts ?? []), content] };
         if (!session.closed) this.push(session, task.result);
       })
       .finally(() => { session.pendingTasks--; });
@@ -587,10 +595,12 @@ export class CrossingServer {
     task.abort.signal.throwIfAborted();
     if (session.closed) throw new Error("访客已离开");
     const clip = (s: unknown) => String(s ?? "").slice(0, CROSSING_LIMITS.maxTaskChars);
-    const parts: string[] = [];
+    const parts = task.parts ?? (task.parts = []);
     const deliver = (content: string) => {
+      const index = parts.length;
       parts.push(content);
       if (session.live && !session.closed) this.pushEvent(session, content);
+      else if (task.progress && !session.closed) this.push(session, { type: "task_progress", taskId, index, content });
     };
     let ok = false;
     if (session.residentControl) throw new Error("常驻角色的能力与观察请通过已授权的驾驶舱工具调用");
@@ -621,7 +631,9 @@ export class CrossingServer {
       parts.push(await this.host.world.visitorQuery(session, clip(payload.task)));
       ok = true;
     }
-    task.result = { type: "task_result", taskId, ok, content: parts.join("\n") };
+    // Older visitors still receive a parseable final acknowledgement. New visitors
+    // receive every complete envelope through progress/parts, never JSON glued to JSON.
+    task.result = { type: "task_result", taskId, ok, content: parts.at(-1) ?? "", parts: [...parts] };
     if (!session.closed) this.push(session, task.result);
   }
 

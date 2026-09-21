@@ -28,12 +28,23 @@ async function fixture(virtual = false) {
 async function main(): Promise<void> {
   for (const text of ["拿起手机，查看Touch Night发来的消息", "拿起手机查看屏幕", "查看QQ消息", "看看他发了什么", "打开聊天应用回复朋友", "read the messages on my phone", "运行终端命令", "查看手机屏幕", "解锁手机"]) assert.ok(detectDeviceRequest(text), text);
   for (const text of ["当面向店员点头，然后给Touch Night发一条消息", "读完纸信并给Touch Night发一条消息", "当面点头然后查看Touch Night的消息", "查看\nQQ聊天记录"]) assert.ok(detectDeviceRequest(text), text);
+  const casualRequests = ["拿起床头柜上的手机，随便刷点什么", "拿起手机，随手翻点东西", "刷手机", "玩一会儿手机", "翻翻消息", "读完纸信后翻消息", "刷了几分钟短视频", "刷点视频", "拿起手机，随便玩一会儿", "用拇指划动手机屏幕"];
+  for (const text of casualRequests) assert.ok(detectDeviceRequest(text), text);
   for (const text of ["拿起手机", "把手机放回口袋", "查看手机背面的划痕", "读信使送来的纸信", "面对面回复店员：谢谢", "看看纸上的消息", "查看公告栏的通知", "查看周围环境信息", "观察窗外的天色"]) assert.equal(detectDeviceRequest(text), null, text);
   for (const text of ["查看桌面上摆着的花瓶", "打开文件柜，取出合同", "打开容器，取出里面的水果"]) assert.equal(detectDeviceRequest(text), null, text);
+  for (const text of ["放下手机，刷牙", "手机放在桌上，给木板刷点油漆", "手机在一旁，翻一下纸书", "翻过手机的背面看看划痕", "把手机放回床头柜", "刷洗杯子"])
+    assert.equal(detectDeviceRequest(text), null, text);
   for (const text of [bad, "你收到一条来自朋友的新消息。", "手机震动，亮起一个未读红点。", "屏幕停留在聊天列表。", "浏览器页面显示了最新新闻。", "note.txt 已写入成功。", "The message from Alex says hello."]) assert.ok(detectDeviceClaim(text), text);
   for (const text of ["手机放在桌上。", "你拿起手机，检查背面的一道划痕。", "店员面对面说：“面好了。”", "你在餐厅和店员聊天。", "你展开纸信，信纸上写着一则消息。", "窗外正在下雨。"]) assert.equal(detectDeviceClaim(text), null, text);
   for (const text of ["你当面向店员点头，并收到一条Touch Night发来的消息：“我马上到了。”", "你放下纸信然后收到Touch Night发来的消息。", "当面点头并收到一条新消息。"]) assert.ok(detectDeviceClaim(text), text);
   for (const text of ["木质桌面上的台灯亮着", "木质桌面上摊着一本打开的书", "文件柜已经打开，里面放着几份合同。"]) assert.equal(detectDeviceClaim(text), null, text);
+  const casualClaims = ["你拿起床头柜上的手机，拇指在屏幕上划了六七分钟。", "你随手刷了六七分钟手机。", "手机握在手里，刷了一会儿就放下了。", "你玩了一会儿手机。", "你翻了几下消息。", "你拇指划屏刷了6–7分钟。"];
+  for (const text of casualClaims) assert.ok(detectDeviceClaim(text), text);
+  for (const text of ["你放下手机，刷了两分钟牙。", "手机在桌上，你给木板刷点油漆。", "手机在一旁，你翻了一会儿纸书。", "你把手机放回床头柜。", "你翻过手机的背面，机身有一道划痕。"])
+    assert.equal(detectDeviceClaim(text), null, text);
+  assert.ok(detectDeviceClaim("你翻了几下消息。", { virtualApp: true }), "virtual software never grants permission to fabricate platform messages");
+  assert.equal(detectDeviceClaim("你刷了几分钟短视频。", { virtualApp: true }), null, "authorized simulated app tasks keep their software scope");
+  assert.equal(projectWorldDeviceContext("屋内安静。\n\n" + casualClaims[0]), "屋内安静。", "old imaginary browsing is not replayed as physical-world evidence");
 
   const physicalPhone = "手机平放在床头柜上，机身还残留一点握持余温。";
   const darkPhone = "手机平放在床头柜上，屏幕暗着，机身还残留一点握持余温。";
@@ -90,16 +101,42 @@ async function main(): Promise<void> {
     } finally { await f.close(); }
   }
 
+  // A casual device suggestion cannot become an accepted genesis option through
+  // either its visible label, executable intent, or otherwise innocuous group text.
+  for (const field of ["label", "intent", "exclusiveGroup"] as const) {
+    const f = await fixture();
+    try {
+      f.infer(async () => resolution({ ...initial(), perceptions: [{ actorId: "bot", text: "手机放在床头柜上。",
+        opportunities: [{ label: "在屋里活动", intent: "走到窗边", [field]: casualRequests[0] }] }] }));
+      await assert.rejects(f.runtime.ensure(), /WORLD_DEVICE_BOUNDARY/);
+      assert.equal((await f.runtime.store()).snapshot().initialized, false);
+      assert.equal(f.calls(), 3);
+    } finally { await f.close(); }
+  }
+
   const f = await fixture();
   try {
     await f.runtime.ensure(); const store = await f.runtime.store(), original = store.snapshot();
     const beforePreflight = f.calls(), beforeJournal = await fs.readFile(f.files.narrativeJournal, "utf8");
     await assert.rejects(f.runtime.act("bot", call("chat", "拿起手机，查看Touch Night发来的消息"), () => { throw Error("must not deliver"); }), /专用工具/);
+    for (const [index, description] of casualRequests.entries()) {
+      await assert.rejects(f.runtime.act("bot", call(`casual-${index}`, description), () => { throw Error("must not deliver"); }), /专用工具/);
+    }
     await assert.rejects(f.runtime.observe("bot", { intent: "查看QQ消息" }), /专用工具/);
     await assert.rejects(f.runtime.observe("bot", { intent: "查看", target: "QQ聊天记录" }), /专用工具/);
     await assert.rejects(f.runtime.observe("bot", { target: "QQ聊天记录" }), /专用工具/);
     await assert.rejects(f.runtime.act("bot", { ...call("target-chat", "查看"), arguments: { description: "查看", target: "QQ聊天记录" } }, () => { throw Error("must not deliver"); }), /专用工具/);
     assert.equal(f.calls(), beforePreflight); assert.equal(await fs.readFile(f.files.narrativeJournal, "utf8"), beforeJournal);
+
+    for (const field of ["worldState", "actorStates", "perceptions"] as const) {
+      const before = store.snapshot();
+      f.infer(async () => resolution({ perceptions: [{ actorId: "bot", text: field === "perceptions" ? casualClaims[0] : "窗边一切如旧。" }],
+        ...(field === "worldState" ? { worldState: casualClaims[0] } : {}), ...(field === "actorStates" ? { actorStates: [{ actorId: "bot", state: casualClaims[0] }] } : {}),
+        outcome: { status: "completed" } }));
+      await assert.rejects(f.runtime.act("bot", call(`casual-output-${field}`, "走到窗边"), () => { throw Error("must not deliver"); }), /WORLD_DEVICE_BOUNDARY/);
+      assert.equal(store.snapshot().worldState, before.worldState); assert.equal(store.snapshot().actors.bot!.state, before.actors.bot!.state);
+      assert.ok(!store.readPerceptions("bot").some(p => p.text.includes("划了六七分钟")));
+    }
 
     for (const kind of ["evolve", "observe", "action"] as const) for (const field of ["worldState", "actorStates", "perceptions"] as const) {
       const before = store.snapshot(), count = f.calls();

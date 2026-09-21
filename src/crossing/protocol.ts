@@ -62,7 +62,10 @@ export interface CrossingPerceptionEvent {
 export type CrossingSseMsg =
   | ({ type: "hello"; worldName: string; timeLine: string; visitorId?: string } & Partial<CrossingTimeUnits>)
   | CrossingPerceptionEvent
-  | { type: "task_result"; taskId: string; ok: boolean; content: string }
+  /** Ordered committed feedback while the action remains pending; index is stable on replay. */
+  | { type: "task_progress"; taskId: string; index: number; content: string }
+  /** parts retains complete envelopes, allowing reconnects to recover missing progress in order. */
+  | { type: "task_result"; taskId: string; ok: boolean; content: string; parts?: string[] }
   /** 主世界对访客的状态描述，只作为体验事件；不可覆盖访客自己的持久人设。 */
   | { type: "status_update"; content: string }
   | { type: "farewell"; reason: string };

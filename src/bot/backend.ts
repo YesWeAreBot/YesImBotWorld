@@ -37,6 +37,8 @@ export class ChatBackend implements BotBackend {
     this.toolNames = [...toolNames];
     this.toolDefs = structuredClone(toolDefs);
     for (const name of [...toolNames, ...toolDefs.map(def => def.name)]) this.knownToolNames.add(name);
+    // Parse a retained historical declaration only to report its replacement; never execute it.
+    this.knownToolNames.add("observe");
     this.maxTokens = cfg.maxTokens;
     this.baseURL = cfg.baseURL;
     this.useNativeTools = cfg.nativeToolCalls;
@@ -151,6 +153,7 @@ export class ChatBackend implements BotBackend {
   }
 
   private assertAvailable(name: string): void {
+    if (name === "observe") throw new ToolCallParseError("工具 observe 此刻不可用，主动观察已合并到 act(description)，日常感知与行动结果自动送达。本次没有执行操作；请依据最新能力说明表达具体意图。");
     if (this.toolNames.includes(name)) return;
     const description = this.knownToolNames.has(name) ? `工具 ${name} 此刻不可用` : `未知工具 ${JSON.stringify(name)}`;
     throw new ToolCallParseError(`${description}。本次没有执行操作；请以最近的能力变化事件和当前工具说明为准，不要因旧声明仍存在就重复调用。`);

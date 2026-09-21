@@ -7,6 +7,24 @@
 .readable-original-key { padding: 0; background: none; font-size: 10px; font-weight: 400; color: var(--fg-dim); overflow-wrap: anywhere; }
 .readable-long-text { min-width: 0; }
 .readable-data .readable-prose, .readable-data .readable-source, .readable-raw .readable-source { margin: 0; padding: 0; white-space: pre-wrap; overflow-wrap: anywhere; word-break: normal; background: none; border: 0; border-radius: 0; color: inherit; max-height: none; font: inherit; text-align: left; }
+.readable-thought { min-width:0; padding:14px 16px; border-inline-start:3px solid var(--accent); border-radius:0 10px 10px 0; background:color-mix(in srgb,var(--accent) 6%,var(--surface)); }
+.readable-thought-label { display:block; margin-bottom:9px; font-size:12px; color:var(--accent); }
+.readable-thought-note { display:block; margin-top:10px; color:var(--fg-dim); line-height:1.7; }
+.readable-opportunities { min-width:0; max-width:100%; margin:12px 0; }
+.opportunity-heading { font-size:12px; font-weight:650; color:var(--fg); }
+.opportunity-note { margin:5px 0 9px; font-size:11px; line-height:1.6; color:var(--fg-dim); }
+.opportunity-list { display:flex; gap:8px; max-width:100%; min-width:0; overflow-x:auto; overscroll-behavior-x:contain; scroll-snap-type:x proximity; padding:2px 0 7px; }
+.opportunity-card { flex:0 0 min(230px,75%); min-width:0; display:flex; flex-direction:column; align-items:flex-start; gap:5px; padding:10px 12px; border:1px solid var(--line); border-radius:10px; background:var(--surface); color:var(--fg); font:inherit; text-align:left; white-space:normal; overflow-wrap:anywhere; scroll-snap-align:start; }
+button.opportunity-card { cursor:pointer; min-height:76px; height:auto; }
+button.opportunity-card:hover,button.opportunity-card[aria-pressed=true] { border-color:var(--accent); background:color-mix(in srgb,var(--accent) 7%,var(--surface)); }
+button.opportunity-card:disabled { opacity:.55; cursor:default; }
+.opportunity-card strong { font-size:12px; }
+.opportunity-intent { font-size:11px; line-height:1.6; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
+article.opportunity-card .opportunity-intent { display:block; overflow:visible; }
+.opportunity-tradeoff,.opportunity-source { font-size:10px; color:var(--fg-dim); }
+.cockpit-situation { margin:0 0 8px; padding:8px 10px; border-radius:8px; background:var(--panel2); font-size:12px; line-height:1.7; white-space:pre-wrap; overflow-wrap:anywhere; }
+.cockpit-suggestions .readable-opportunities { margin:0 0 10px; }
+.opportunity-draft-note { color:var(--fg-dim); font-size:11px; line-height:1.6; margin:5px 0; }
 .readable-scalar { overflow-wrap: anywhere; }
 .readable-boolean { color: var(--accent); }
 .readable-number { color: var(--accent2); font-variant-numeric: tabular-nums; }

@@ -12,7 +12,7 @@ var InnerRegulation = (function () {
         if (!call) return '行动内容未记录';
         var args = call.arguments || call.args || {};
         if (typeof args === 'string') { try { args = JSON.parse(args); } catch (_) { args = {}; } }
-        var label = { act: '行动', send: '发送消息', wait: '等待', rest: '休息', observe: '观察', read_channel: '阅读会话', check_msg: '查看消息', open_app: '打开应用', close_app: '关闭应用', reflect: '整理认识', check_time: '查看时间' }[call.name] || call.name || '行动';
+        var label = { think: '内心独白', act: '行动', send: '发送消息', wait: '等待', rest: '休息', observe: '观察', read_channel: '阅读会话', check_msg: '查看消息', open_app: '打开应用', close_app: '关闭应用', reflect: '整理认识', check_time: '查看时间' }[call.name] || call.name || '行动';
         var text = args.description || args.msg || args.intent || args.app || (Number.isFinite(args.n) ? args.n + ' TU' : Number.isFinite(args.duration) ? args.duration + ' TU' : '');
         return label + (text ? '：' + text : '');
     }

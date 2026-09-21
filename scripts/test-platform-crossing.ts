@@ -345,5 +345,62 @@ async function quietLifecycleProtocol() {
   console.log("PASS: 暂停以确定性登记清理访客；只恢复明确取消的旧离场，持久化错误仍阻断重置");
 }
 
-async function main() { await hostProtocol(); await clientProtocol(); await lifecycleProtocol(); await quietLifecycleProtocol(); }
+async function stagedProtocol() {
+  const finish = gate(), consumeStart = gate();
+  const messages: CrossingSseMsg[] = [], receipts: string[] = [];
+  let calls = 0, settled = false;
+  const envelope = (id: string, stage: "start" | "finish") => JSON.stringify({ observation: { ...observation("visitor:remote"), mode: "narrative", observationId: id,
+    narrative: stage === "start" ? "你开始缓缓浇水。" : "你浇完水，放下水壶。", scene: { eventId: id, actorId: "visitor:remote", text: "实际阶段感知", phase: stage } },
+    action: { id: "visitor:remote:staged", status: stage === "start" ? "pending" : "completed", phase: stage === "start" ? "ongoing" : "finished" } });
+  const beginning = envelope("started", "start"), completion = envelope("finished", "finish");
+  const client = new CrossingClient({ name: "host", url: "http://unused.invalid", inviteCode: "fixture" } as never, { name: "visitor", persona: "persona" }, { logger: logger as never, onEvent() {}, onLost() {} });
+  const internal = client as any;
+  const server = new CrossingServer({ cfg: config.crossing, logger, ready: () => true, clock: () => null, notifyHostBot() {}, world: {
+    residentBotName: "resident", wakeDormant: async () => {}, visitorArrive: async () => true,
+    visitorAct: async (_session: any, desc: string, _duration: number, deliver: (s: string) => void, signal: AbortSignal) => {
+      calls++; await deliver(beginning);
+      if (desc === "cancel") await new Promise<void>((_resolve, reject) => signal.addEventListener("abort", () => reject(new Error("cancelled")), { once: true }));
+      await finish.promise; signal.throwIfAborted(); await deliver(completion); return true;
+    }, visitorLeave: async () => true, disconnectVisitor: async () => {}, cancelPending() {}, notePresenceChange() {}, setVisitorsProvider() {},
+  } } as never);
+  (server as any).push = (_session: any, message: CrossingSseMsg) => { messages.push(message); internal.receiveMessage(message); };
+  const connected = server.arrivePlayer("remote", "persona"); assert.ok(connected.ok); if (!connected.ok) return;
+  const session = (server as any).sessions.get(connected.token); session.live = false; await session.ready;
+  internal.active = true; internal.token = connected.token;
+  internal.post = async (endpoint: string, body: any) => {
+    const req: any = Readable.from([Buffer.from(JSON.stringify(body))]); req.url = endpoint; req.method = "POST";
+    let text = "";
+    await (server as any).handle(req, { writeHead() {}, end(data: unknown) { text = String(data); } });
+    return JSON.parse(text);
+  };
+  const call: ToolCallRecord = { id: "staged", name: "act", role: "agent", issuedAt: 0, expectedAt: 300, duration: 300, arguments: { description: "water" } };
+  try {
+    const work = client.adjudicateAct(call, async text => { receipts.push(text); if (text === beginning) await consumeStart.promise; }).then(result => { settled = true; return result; });
+    await until(() => receipts.length === 1); assert.equal(receipts[0], beginning); assert.equal(settled, false);
+    const first = messages.find(message => message.type === "task_progress")!; internal.receiveMessage(first); internal.receiveMessage(first);
+    finish.resolve(); await until(() => messages.some(message => message.type === "task_result" && message.taskId === call.id));
+    await tick(); assert.deepEqual(receipts, [beginning], "the completion cannot overtake an asynchronous beginning delivery"); assert.equal(settled, false);
+    consumeStart.resolve(); assert.equal(await work, true); assert.deepEqual(receipts, [beginning, completion]); assert.equal(calls, 1);
+    const result = messages.find(message => message.type === "task_result" && message.taskId === call.id)!;
+    assert.ok(result.type === "task_result"); assert.equal(JSON.parse(result.content).action.status, "completed"); assert.deepEqual(result.parts, receipts);
+    const cancelReceipts: string[] = [], abort = new AbortController();
+    const cancelled = client.adjudicateAct({ ...call, id: "cancel-stage", arguments: { description: "cancel" } }, text => { cancelReceipts.push(text); }, abort.signal);
+    await until(() => cancelReceipts.length === 1); abort.abort(); assert.equal(await cancelled, false);
+    assert.equal(cancelReceipts[0], beginning); assert.equal(cancelReceipts.length, 2); assert.match(cancelReceipts[1]!, /已提交的变更不会回滚/);
+    assert.equal(calls, 2, "cancel does not replay the already started remote operation");
+
+    const legacyBodies = [beginning + "\n" + completion, "第一段自然文字\n第二段自然文字", beginning + "\n不是JSON的后续文字"];
+    for (const [index, body] of legacyBodies.entries()) {
+      internal.post = async (_endpoint: string, request: any) => { internal.receiveMessage({ type: "task_result", taskId: request.taskId, ok: true, content: body }); return { ok: true }; };
+      const output: string[] = [];
+      assert.equal(await client.adjudicateAct({ ...call, id: `legacy-${index}` }, async text => { await tick(); output.push(text); }), true);
+      assert.deepEqual(output, index === 0 ? [beginning, completion] : [body], "only fully validated world receipt JSONL is split");
+    }
+    internal.post = async (_endpoint: string, request: any) => { internal.receiveMessage({ type: "task_result", taskId: request.taskId, ok: true, content: legacyBodies[0] }); return { ok: true }; };
+    assert.equal(await client.query("literal text"), legacyBodies[0], "query content must not be reinterpreted as action envelopes");
+    console.log("PASS: 远程阶段即刻交付、按序await、重复去重、最终完整回执、取消保留已发生开始，以及旧host JSONL兼容");
+  } finally { finish.resolve(); consumeStart.resolve(); await client.leave(); await server.stop(); }
+}
+
+async function main() { await hostProtocol(); await clientProtocol(); await stagedProtocol(); await lifecycleProtocol(); await quietLifecycleProtocol(); }
 main().catch((error) => { console.error(error); process.exitCode = 1; });

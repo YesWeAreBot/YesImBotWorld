@@ -346,7 +346,8 @@ var Studio = (function () {
             character.appendChild(section('常驻角色', 'RESIDENT'));
             character.appendChild(el('div', { cls: 'studio-bot-card' }, [botAvatar(o.botIdentity), el('div', null, [el('h3', { text: bot?.name || RESIDENT_BOT_NAME || '常驻 Bot' }), el('span', { cls: 'studio-badge', text: o.bot?.paused ? '手动接管中' : o.bot?.running ? '正在自主行动' : o.initialized ? '等待下一刻' : '尚未初始化' })])]));
             character.appendChild(ReadableData.render(bot?.state || (snapshot ? '当前还没有角色处境记录。' : '进入世界后，可以从角色视角了解此刻的处境。'), { raw: false, textLimit: 800, state: actorReadState }));
-            character.appendChild(row('当前状态', o.bot?.waiting || (running[0]?.intent) || '暂无进行中的意图'));
+            character.appendChild(row('当前状态', o.bot?.awaitingToolRetry ? '正在调整生成节奏 · 新消息可唤醒' : o.bot?.waiting || (running[0]?.intent) || '暂无进行中的意图'));
+            if (o.bot?.opportunities?.length) character.appendChild(ReadableData.opportunities(o.bot.opportunities));
             if (can('growth'))
                 character.appendChild(button('查看角色成长', 'growth', function () { navigate('growth'); }));
             right.appendChild(character);

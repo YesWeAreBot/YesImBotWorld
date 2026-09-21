@@ -32,13 +32,13 @@ async function main() {
     const world: any = {
       async adjudicateAct(call: ToolCallRecord, deliver: (content: string) => void, _signal: AbortSignal, beginCommit: () => boolean) {
         calls.push({ kind: "act", input: call }); assert.ok(beginCommit());
-        const text = call.arguments.speech ? `你当面对店员说：“${call.arguments.speech}”店员停下手中的工作，朝你点头。` : "你拿起桌上的手机，机身有一点凉。";
+        const text = String(call.arguments.description).includes("纸信") ? "纸信上的字迹清晰，落款是一朵手绘的小花。" : call.arguments.speech ? `你当面对店员说：“${call.arguments.speech}”店员停下手中的工作，朝你点头。` : "你拿起桌上的手机，机身有一点凉。";
         deliver(JSON.stringify({ action: { id: "bot:" + call.id, intent: call.arguments.description, status: "completed" }, observation: observation("physical:" + call.id, text) }));
         return true;
       },
       async observe(actor: string, input: unknown) { assert.equal(actor, "bot"); calls.push({ kind: "observe", input }); return observation("physical-observe:" + calls.length, "纸信上的字迹清晰，落款是一朵手绘的小花。"); },
     };
-    const tools = BOT_TOOLS.filter(tool => ["act", "observe"].includes(tool.name));
+    const tools = BOT_TOOLS.filter(tool => ["act"].includes(tool.name));
     bot = new BotAgent(cfg, clock, files, context, world, {} as any, null, null, null, { down: false }, logger, tools);
     bot.running = true; bot.backend = { setToolNames() {}, setToolDefs() {} }; bot.refreshToolGate();
     async function dispatch(name: string, args: Record<string, unknown>) {
@@ -50,10 +50,14 @@ async function main() {
     }
     for (const [name, args] of [
       ["act", { description: "拿起手机，查看Touch Night发来的消息", target: "手机" }],
-      ["observe", { intent: "查看Touch Night发来的私信", target: "手机" }],
+      ["act", { description: "查看Touch Night发来的私信", target: "手机" }],
       ["act", { description: "给Touch Night发一条消息，问他在不在" }],
-      ["observe", { intent: "查看", target: "QQ聊天记录" }],
-      ["observe", { target: "QQ聊天记录" }],
+      ["act", { description: "查看QQ聊天记录", target: "QQ聊天记录" }],
+      ["act", { description: "阅读QQ聊天记录" }],
+      ["act", { description: "拿起床头柜上的手机，随便刷点什么" }],
+      ["act", { description: "玩一会儿手机" }],
+      ["act", { description: "翻翻消息" }],
+      ["act", { description: "随便刷点什么", target: "手机" }],
     ] as const) {
       const before = calls.length, denied = await dispatch(name, args);
       assert.equal(calls.length, before, `${name} must reject explicit device I/O before invoking World`);
@@ -75,9 +79,13 @@ async function main() {
     const conversation = await dispatch("act", { description: "当面向店员点一碗面", speech: "请给我一碗面，谢谢。" });
     assert.equal(calls.length, 2); assert.equal(conversation.result.experience?.outcome, "completed");
     assert.match(conversation.result.contextText ?? "", /请给我一碗面，谢谢/);
-    const paper = await dispatch("observe", { intent: "查看纸信上的文字", target: "纸信" });
-    assert.equal(calls.length, 3); assert.equal(calls[2]!.kind, "observe"); assert.match(paper.result.contextText ?? "", /纸信/);
-    assert.ok(paper.result.contextText?.includes(WORLD_PERCEPTION_SCOPE), "ordinary observation carries the same domain boundary");
+    const paper = await dispatch("act", { description: "查看纸信上的文字", target: "纸信" });
+    assert.equal(calls.length, 3); assert.equal(calls[2]!.kind, "act"); assert.match(paper.result.contextText ?? "", /纸信/);
+    assert.ok(paper.result.contextText?.includes(WORLD_PERCEPTION_SCOPE), "an active physical observation carries the same domain boundary");
+    const retired = await dispatch("observe", { intent: "查看纸信上的文字" });
+    assert.equal(calls.length, 3, "the retired public observer never invokes World");
+    assert.match(retired.result.content, /observe.*此刻不可用/);
+    assert.ok(!BOT_TOOLS.some(tool => tool.name === "observe"));
     assert.deepEqual((await context.toChatMessages("T101")).slice(0, prefix.length), prefix, "boundary failures and new world projections only append to the provider history");
     const replay = new BotContext(files); await replay.load();
     assert.deepEqual(await replay.toChatMessages("T999"), await context.toChatMessages("T101"), "reload keeps the same frozen provider rendering");

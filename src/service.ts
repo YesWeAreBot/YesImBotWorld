@@ -1018,6 +1018,7 @@ export class WorldService extends Service<Config> {
         const device = this.deviceToolDefs().find(candidate => candidate.name === tool.name);
         return { ...tool, ...(device ? { device: device.device, effect: device.effect } : {}), requiresSendConfirmation: device?.effect === "send" };
       }), pending: bot.pendingManualCalls(),
+      opportunities: bot.actionOpportunities(session.mode),
       time: { unitWorldSeconds: this.clock?.unitWorldSeconds ?? 1, unitRealSeconds: this.clock?.unitRealSeconds ?? 1 },
       choices: {
         subject_id: [...new Set(evidence.flatMap(item => item.experience?.subjectIds ?? []))].map(id => ({ id, label: `已感知的身份 · ${id}` })),

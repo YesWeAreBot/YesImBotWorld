@@ -26,6 +26,10 @@
             actors.forEach(function (entry) {
                 var actor = entry[1], card = el('article', { cls: 'world-narrative-actor' + (entry[0] === selectedActor ? ' selected' : ''), 'data-world-actor': entry[0], tabindex: -1 }, [el('h3', { text: actor.name || entry[0] })]);
                 card.appendChild(ReadableData.render(actor.state || '尚无处境记录。', { raw: false, textLimit: 1600, state: readState('actor:' + entry[0]) }));
+                var latest = [...(data.events || [])].reverse().find(function (event) { return event.actorId === entry[0] && event.topic === 'world.perception'; });
+                var scene = latest && latest.payload;
+                if (scene?.situation) card.appendChild(el('p', { cls: 'cockpit-situation', text: scene.situation }));
+                if (scene?.opportunities?.length) card.appendChild(ReadableData.opportunities(scene.opportunities));
                 list.appendChild(card);
             });
             if (actors.length) { actorPanel.appendChild(list); page.appendChild(actorPanel); }

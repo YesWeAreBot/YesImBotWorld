@@ -23,6 +23,8 @@ export interface TaskControl {
 
 export interface ScheduleOptions {
   executeAt: "now" | "expected";
+  /** World stages already observe their own clock; don't delay an available scene a second time. */
+  delivery?: "immediate";
   /** Serialize actual side effects, without owning the device during receipt delays. */
   serialKey?: string;
   beforeStart?: () => void;
@@ -110,7 +112,7 @@ export class Scheduler {
       }
       if (task.abort.signal.aborted) return;
       task.committed = true;
-      if (opts.executeAt === "now") { task.pendingDelivery = () => deliver(result, ok); atExpected(task.pendingDelivery); }
+      if (opts.executeAt === "now" && opts.delivery !== "immediate") { task.pendingDelivery = () => deliver(result, ok); atExpected(task.pendingDelivery); }
       else deliver(result, ok);
     };
     const run = () => {

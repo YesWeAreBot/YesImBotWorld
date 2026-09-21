@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
 import { Config } from "../src/config.js";
-import { Prompts, BOT_PROMPT_DEFAULTS, WORLD_PROMPT_DEFAULTS } from "../src/prompts.js";
+import { Prompts, BOT_PROMPT_DEFAULTS, WORLD_PROMPT_DEFAULTS, THOUGHT_RUNTIME_GUIDANCE } from "../src/prompts.js";
 import { WorldFiles } from "../src/files.js";
 import { WorldAgent } from "../src/world/agent.js";
 import { ChatBackend } from "../src/bot/backend.js";
@@ -78,24 +78,26 @@ async function main() {
     assert.equal(prompts.bot.constitutionHead, BOT_PROMPT_DEFAULTS.constitutionHead);
 
     for (const nativeToolCalls of [false, true]) {
-      const backend: any = new ChatBackend({ ...cfg.bot, nativeToolCalls }, ["observe"], [{ name: "observe", signature: "observe()", description: "观察" }]);
+      const backend: any = new ChatBackend({ ...cfg.bot, nativeToolCalls }, ["check_time"], [{ name: "check_time", signature: "check_time()", description: "查看时间" }]);
       let count = 0;
       backend.client = { complete: async (messages: any[], options: any) => {
         count++;
         const system = messages[0].content;
         if (nativeToolCalls) {
-          assert.equal(options.tools[0].function.name, "observe");
+          assert.equal(options.tools[0].function.name, "check_time");
           assert.match(system, /已有原生声明的能力使用 function calling/);
           assert.match(system, /尚未包含在固定原生声明中.*完整正文 JSON/);
         }
         else { assert.equal(options.tools, undefined); assert.match(system, /本次使用正文 JSON 协议/); }
-        return { content: '{"name":"observe","arguments":{},"duration":0}', toolCalls: [] };
+        return { content: '{"name":"check_time","arguments":{},"duration":0}', toolCalls: [] };
       } };
       const protocolFiles = new WorldFiles(path.join(dir, `protocol-${nativeToolCalls}`)); await protocolFiles.ensure();
       const context = new BotContext(protocolFiles, "", prompts); await context.load();
-      assert.equal((await backend.generate(context, "T=10")).name, "observe"); assert.equal(count, 1);
-      backend.client = { complete: async () => ({ content: "", toolCalls: [1, 2].map(i => ({ id: String(i), function: { name: "observe", arguments: "{}" } })) }) };
+      assert.equal((await backend.generate(context, "T=10")).name, "check_time"); assert.equal(count, 1);
+      backend.client = { complete: async () => ({ content: "", toolCalls: [1, 2].map(i => ({ id: String(i), function: { name: "check_time", arguments: "{}" } })) }) };
       await assert.rejects(backend.generate(context, "T=10"), /多个调用均未执行/);
+      backend.client = { complete: async () => ({ content: '{"name":"observe","arguments":{"intent":"看看菜单"}}', toolCalls: [] }) };
+      await assert.rejects(backend.generate(context, "T=10"), /工具 observe 此刻不可用.*合并到 act/, "old observer calls explain the current active-observation path");
     }
     const queries: string[] = [], actions: string[] = [];
     const appWorld = { query: async () => { throw new Error("Virtual apps must read established device content, not only the last perception"); }, observeVirtualApp: async (task: string) => { queries.push(task); return { text: "<html><title>未知</title><body>不可用</body></html>", originEventIds: ["fixture"] }; }, executeAppAction: async (task: string) => { actions.push(task); return { text: "未执行", originEventIds: ["fixture"] }; } } as any;
@@ -121,6 +123,19 @@ async function main() {
     const tools = toNativeToolDefs(availableTools({ tts: false, ops: cfg.platformOps, ignoreSendDuration: true } as any));
     assert.match(tools.find(t => t.function.name === "send")!.function.description!, /忽略发送耗时/);
     assert.ok(!JSON.stringify(tools).includes("省略表示瞬间完成"));
+    const focusedTools = toNativeToolDefs(availableTools({ tts: false, ops: cfg.platformOps, blockingAct: true, waitConfirm: true, disableWait: true } as any));
+    const restDescription = focusedTools.find(t => t.function.name === "rest")!.function.description!;
+    const actDescription = focusedTools.find(t => t.function.name === "act")!.function.description!;
+    assert.match(restDescription, /不是等待其他操作结果的必经步骤/);
+    assert.doesNotMatch(restDescription, /等待已有操作/);
+    assert.match(actDescription, /受理不证明已经开始/);
+    assert.doesNotMatch(actDescription, /手头的事照常推进/);
+    assert.match(THOUGHT_RUNTIME_GUIDANCE, /牵挂.*打算/);
+    assert.match(THOUGHT_RUNTIME_GUIDANCE, /不为填满等待时间而编造独白/);
+    assert.match(THOUGHT_RUNTIME_GUIDANCE, /不强制每次行动前都思考/);
+    assert.match(WORLD_PROMPT_DEFAULTS.narrativeSystem, /actionPhase=start.*expectedEnd仍在未来.*ongoing/);
+    assert.match(WORLD_PROMPT_DEFAULTS.narrativeSystem, /actionPhase=finish.*不能再次ongoing/);
+    assert.doesNotMatch(BOT_PROMPT_DEFAULTS.outputFormatNative + BOT_PROMPT_DEFAULTS.outputFormatText, /act\s*在?到期后裁定/);
     console.log("PASS prompts: live runtime overrides, real defaults/reset API, save failure isolation, legacy backup, read-only app boundaries and exact action arguments");
   } finally { await world?.runtime.shutdown(); await fs.rm(dir, { recursive: true, force: true }); }
 }

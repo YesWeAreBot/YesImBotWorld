@@ -20,15 +20,15 @@ var CallReader = (function () {
         if (node._readingValue === value && !node._deferredStructure) return;
         var selection = window.getSelection(), held = selection && !selection.isCollapsed && node.contains(selection.anchorNode);
         if (held && node.dataset.structured) { node._deferredStructure = true; return; }
-        var structure = parsed(value);
-        if (structure !== null && !held) {
-            node.replaceChildren(renderData(structure, 2, attachments));
+        var structure = parsed(value), thought = ReadableData.thoughtCall(value);
+        if ((structure !== null || thought !== null) && !held) {
+            node.replaceChildren(renderData(thought !== null ? { name: 'think', arguments: { thought: thought } } : structure, 2, attachments));
             node.dataset.structured = 'true';
         } else {
             if (node.dataset.structured) { node.replaceChildren(); delete node.dataset.structured; }
             appendText(node, typeof value === 'string' ? value : plain(value));
         }
-        node._deferredStructure = structure !== null && !!held;
+        node._deferredStructure = (structure !== null || thought !== null) && !!held;
         node._readingValue = value;
     }
     function contentParts(value, attachments) {
@@ -100,7 +100,7 @@ var CallReader = (function () {
                 var nodes = choices.get(choice.index);
                 if (!nodes) {
                     var card = el('article', { cls: 'live-answer', 'data-choice-index': choice.index }), heading = title('模型返回'), reasoning = el('section', { cls: 'live-reasoning', hidden: true }), reasoningText = el('div', { cls: 'live-prose live-reasoning-text' }), content = el('section', { cls: 'live-content', hidden: true }), contentText = el('div', { cls: 'live-prose live-answer-text' }), tools = el('div', { cls: 'live-tool-calls' }), finish = el('div', { cls: 'live-finish' });
-                    reasoning.append(title('思考'), reasoningText); content.append(title('正文'), contentText); card.append(heading, reasoning, content, tools, finish); output.appendChild(card);
+                    reasoning.append(title('模型推理'), reasoningText); content.append(title('正文'), contentText); card.append(heading, reasoning, content, tools, finish); output.appendChild(card);
                     nodes = { card: card, heading: heading, reasoning: reasoning, reasoningText: reasoningText, content: content, contentText: contentText, tools: tools, toolNodes: new Map(), finish: finish }; choices.set(choice.index, nodes);
                 }
                 nodes.heading.textContent = messages.length > 1 ? '候选回答 ' + (choice.index + 1) : '模型返回';
@@ -114,9 +114,10 @@ var CallReader = (function () {
                         var element = el('section', { cls: 'live-tool-call' }), name = el('h3'), ref = el('small'), args = el('div', { cls: 'live-tool-arguments live-prose' });
                         element.append(name, ref, args); nodes.tools.appendChild(element); item = { element: element, name: name, ref: ref, args: args }; nodes.toolNodes.set(id, item);
                     }
-                    item.name.textContent = '调用工具 · ' + (call.name || '名称正在生成');
+                    item.name.textContent = call.name === 'think' ? '角色的内心独白' : '调用工具 · ' + (call.name || '名称正在生成');
                     item.ref.textContent = call.id || ''; item.ref.hidden = !call.id;
-                    setValue(item.args, call.arguments || '参数正在生成…', attachments);
+                    var thought = call.name === 'think' ? ReadableData.thoughtText(call.arguments) : null;
+                    setValue(item.args, thought !== null ? JSON.stringify({ name: 'think', arguments: { thought: thought } }) : call.arguments || '参数正在生成…', attachments);
                 });
                 nodes.toolNodes.forEach(function (item, id) { if (!toolIds.has(id)) { item.element.remove(); nodes.toolNodes.delete(id); } });
                 nodes.finish.textContent = choice.finishReason ? '结束原因 · ' + ({ stop: '正常结束', tool_calls: '交给工具执行', function_call: '交给工具执行', length: '达到生成长度限制', content_filter: '内容过滤' }[choice.finishReason] || choice.finishReason) : options.active ? '正在生成…' : '';
@@ -141,7 +142,7 @@ var CallReader = (function () {
                     meta.appendChild(data(decoded.metadata)); footer.appendChild(meta);
                 }
             }
-            copy = function () { return messages.map(function (choice) { return (choice.reasoning ? '思考\n' + choice.reasoning + '\n\n' : '') + (choice.content ? '正文\n' + plain(choice.content) : '') + (choice.toolCalls || []).map(function (call) { return '\n\n调用工具 · ' + call.name + '\n' + plain(call.arguments); }).join(''); }).join('\n\n') + (decoded.error ? '\n错误\n' + plain(decoded.error) : '') + (decoded.unparsed ? '\n未解析内容\n' + decoded.unparsed : '') + (decoded.warnings?.length ? '\n' + decoded.warnings.join('\n') : ''); };
+            copy = function () { return messages.map(function (choice) { return (choice.reasoning ? '模型推理\n' + choice.reasoning + '\n\n' : '') + (choice.content ? '正文\n' + plain(choice.content) : '') + (choice.toolCalls || []).map(function (call) { var thought = call.name === 'think' ? ReadableData.thoughtText(call.arguments) : null; return thought !== null ? '\n\n内心独白 · 主观想法\n' + thought : '\n\n调用工具 · ' + call.name + '\n' + plain(call.arguments); }).join(''); }).join('\n\n') + (decoded.error ? '\n错误\n' + plain(decoded.error) : '') + (decoded.unparsed ? '\n未解析内容\n' + decoded.unparsed : '') + (decoded.warnings?.length ? '\n' + decoded.warnings.join('\n') : ''); };
         }
         return { request: request, response: response, clear: function () { clear(''); }, text: function () { return typeof copy === 'function' ? copy() : copy; } };
     }
