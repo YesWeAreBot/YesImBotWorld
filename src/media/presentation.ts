@@ -13,20 +13,35 @@ export function parseMediaId(value: string): number | null {
   return Number.isSafeInteger(id) ? id : null;
 }
 
-export function mediaPart(ref: MediaRef, metadata: { name?: string; summary?: string; sticker?: boolean } = {}): MediaPart {
-  const part: MediaPart = { kind: "media", ref, ...metadata, marker: "" };
+export function mediaPart(ref: MediaRef, metadata: {
+  name?: string; summary?: string; sticker?: boolean; expressionSummary?: string; galleryNote?: string;
+} = {}): MediaPart {
+  const part: MediaPart = {
+    kind: "media", ref, ...metadata, marker: "",
+    presentation: ref.type === "image" && metadata.sticker === true ? "expression-v1" : "media-v1",
+  };
   part.marker = mediaText(part);
   return part;
 }
 
 /** Each name/summary and its actual content occupy the same media block. */
 export function mediaOpen(part: MediaPart): string {
+  const sticker = part.ref.type === "image" && part.sticker === true;
+  const open = `<media ref="${mediaRefText(part.ref)}" type="${part.ref.type}"${sticker ? ' usage="sticker"' : ""}${part.name ? ` name="${escape(part.name)}"` : ""}>\n`;
+  const note = part.presentation && part.galleryNote
+    ? `收藏备注（你自己的选用线索，不是原图识别或发送者意图）：${escape(part.galleryNote)}\n` : "";
+  if (part.presentation === "expression-v1" && sticker) {
+    return open + "会话表情包（像 emoji 一样的表意符号；画面仅帮助辨认，不是独立话题）\n" +
+      (part.expressionSummary
+        ? `字面文字与可能用途（识别可能有误，不代表发送者真实情绪或意图）：${escape(part.expressionSummary)}\n`
+        : "未缓存用途提示；如有原图，可结合字面字幕与前后文理解；实际发送意图仍需语境判断，也可以不接话。\n") + note;
+  }
   // Read descriptions from persisted pre-0.3 events without exposing the old #N/attachment protocol.
+  // No discriminator means exactly the historical rendering, including its wording. It may be
+  // recomputed after a restart, so upgrades must not rewrite this frozen model prefix.
   const legacySummary = part.marker.match(/^\[(?:图片|视频|音频|语音)#\d+[:：]([\s\S]*)\]$/)?.[1]?.trim();
   const summary = part.summary ?? legacySummary;
-  const sticker = part.ref.type === "image" && part.sticker === true;
-  return `<media ref="${mediaRefText(part.ref)}" type="${part.ref.type}"${sticker ? ' usage="sticker"' : ""}${part.name ? ` name="${escape(part.name)}"` : ""}>\n` +
-    `${sticker ? "表情包（按表情使用）" : LABEL[part.ref.type]}${summary ? `；文字摘要（可能有误）：${escape(summary)}` : "；暂无文字摘要"}\n`;
+  return open + `${sticker ? "表情包（按表情使用）" : LABEL[part.ref.type]}${summary ? `；文字摘要（可能有误）：${escape(summary)}` : "；暂无文字摘要"}\n` + note;
 }
 
 export function mediaText(part: MediaPart, reason = "此处仅保留媒体身份与文字摘要，未展开原始媒体"): string {

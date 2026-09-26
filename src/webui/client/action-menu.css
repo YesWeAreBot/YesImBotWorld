@@ -1,0 +1,46 @@
+.world-action-menu { min-width:0; max-width:100%; margin:0 0 22px; padding:24px; border:1px solid var(--line); border-radius:18px; background:var(--surface); }
+.world-action-menu [hidden] { display:none!important; }
+.action-menu-head { display:flex; align-items:center; gap:14px; margin-bottom:18px; min-width:0; }
+.action-menu-head>div { min-width:0; flex:1; }
+.action-menu-head h2 { margin:0; font-size:22px; }
+.action-menu-head .journey-section-kicker { margin-bottom:6px; font-size:9px; }
+.action-menu-art { flex:none; width:62px; height:62px; color:var(--accent); }
+.action-menu-art svg { width:100%; height:100%; }
+.action-menu-free { flex:none; font-size:11px; }
+.action-menu-scene { font-size:15px; line-height:1.95; overflow-wrap:anywhere; }
+.action-menu-scene .readable-data { margin:0; }
+.action-menu-scene .readable-prose { font-size:15px; line-height:1.95; }
+.action-menu-situation { margin:14px 0; padding:10px 13px; border-left:2px solid var(--accent); background:var(--panel2); color:var(--fg-dim); font-size:12px; line-height:1.7; white-space:pre-wrap; overflow-wrap:anywhere; }
+.action-menu-hint,.action-menu-empty,.action-menu-status { font-size:12px; line-height:1.7; color:var(--fg-dim); margin:14px 0 10px; }
+.world-action-list { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; min-width:0; }
+.action-choice-card { min-width:0; border:1px solid var(--line); border-radius:12px; overflow:hidden; background:var(--surface); }
+.action-choice-card.selected,.action-choice-card:focus-within { border-color:var(--accent); }
+.action-choice { display:flex; align-items:flex-start; justify-content:flex-start; gap:12px; width:100%; padding:15px; border:0; border-radius:0; height:auto; min-height:100px; background:transparent; text-align:left; white-space:normal; color:var(--fg); cursor:pointer; font:inherit; }
+.action-choice:hover:not(:disabled) { background:color-mix(in srgb,var(--accent) 6%,var(--surface)); }
+.action-choice:focus-visible,.action-choice-edit:focus-visible { outline:2px solid var(--accent); outline-offset:-3px; }
+.action-choice:disabled,.action-choice-edit:disabled { cursor:default; opacity:.55; }
+.action-choice-number { flex:none; color:var(--accent); font:12px var(--mono); padding-top:3px; }
+.action-choice-copy { display:flex; flex-direction:column; align-items:flex-start; gap:7px; min-width:0; overflow-wrap:anywhere; }
+.action-choice-copy strong { font-size:14px; font-weight:650; line-height:1.5; }
+.action-choice-intent { color:var(--fg-dim); font-size:12px; line-height:1.7; }
+.action-choice-hint { color:var(--accent); font-size:11px; }
+.action-choice-footer { display:flex; justify-content:space-between; gap:8px; align-items:center; min-height:42px; padding:0 12px 0 15px; background:var(--panel2); color:var(--fg-dim); font-size:10px; }
+.action-choice-footer>span { min-width:0; overflow-wrap:anywhere; }
+.action-choice-edit { flex:none; min-height:44px; padding:8px; border:0; background:transparent; color:var(--fg); font-size:11px; cursor:pointer; }
+.action-menu-status { margin-bottom:0; padding-top:8px; border-top:1px solid var(--line); }
+.is-working .action-menu-status::before { content:''; display:inline-block; width:6px; height:6px; margin-right:8px; border-radius:50%; background:var(--accent); animation:journey-pulse 1.6s ease-in-out infinite; }
+.journey-choice-draft { grid-column:1/-1; padding:9px 11px; background:var(--panel2); border-radius:9px; font-size:12px; line-height:1.65; }
+.journey-choice-draft p { margin:0 0 6px; }
+.journey-choice-draft button { font-size:11px; min-height:40px; margin-right:6px; }
+@media(max-width:700px) {
+  .world-action-menu { padding:16px; margin-bottom:16px; border-radius:14px; }
+  .action-menu-head { gap:10px; flex-wrap:wrap; margin-bottom:13px; }
+  .action-menu-art { width:44px; height:44px; }
+  .action-menu-head h2 { font-size:19px; }
+  .action-menu-free { padding:8px 10px; }
+  .world-action-list { grid-template-columns:1fr; gap:9px; }
+  .action-choice { min-height:80px; padding:13px; }
+  .action-choice-intent { font-size:12px; }
+  .action-menu-scene .readable-prose { font-size:14px; }
+}
+@media(prefers-reduced-motion:reduce) { .is-working .action-menu-status::before { animation:none; } }

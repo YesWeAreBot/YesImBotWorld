@@ -103,8 +103,13 @@ export class MediaRenderer {
     const row = await this.store.get(id);
     if (!row) return { kind: "text", text: `（${TYPE_LABEL[type]} media:${id} 已丢失，无法查看或发送。）` };
 
-    const caption = await this.captioner.describe(row.ref);
-    const part = mediaPart(row.ref, { summary: caption ?? undefined, ...((sticker ?? row.sticker) ? { sticker: true } : {}) });
+    // Asset history cannot establish the communicative role of this occurrence. Old placeholders
+    // without a usage flag stay neutral even if this file later arrived as a platform expression.
+    const asExpression = row.ref.type === "image" && sticker === true;
+    const caption = await this.captioner.describe(row.ref, { sticker: asExpression });
+    const part = mediaPart(row.ref, asExpression
+      ? { sticker: true, expressionSummary: caption ?? undefined }
+      : { summary: caption ?? undefined });
 
     if (this.nativeSupport(row.ref) && attachments.length < this.maxAttachments) {
       attachments.push(row.ref);

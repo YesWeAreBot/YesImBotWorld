@@ -100,7 +100,7 @@ async function main() {
   a.getGuildMember = async (guild, user) => { lookupStarted(); await release; return originalLookup(guild, user); };
   const pendingNotice = gateway.handle(incoming({ channelId: "slow", guildId: "slow", messageId: "phone-down-race", elements: h.parse("这段正文不可泄露") }));
   await started; phone.down = true; releaseLookup(); await pendingNotice;
-  assert.equal(notifications.at(-1)!.text, "放在一边的手机震了一下。");
+  assert.equal(notifications.at(-1)!.text, "手机震了一下。");
   assert.equal(notifications.at(-1)!.parts, undefined); assert.equal(notifications.at(-1)!.attachments, undefined);
   assert.doesNotMatch(JSON.stringify(notifications.at(-1)), /这段正文|该群名片|slow|peer/);
   assert.ok(notifications.at(-1)!.originEventIds!.every(id => id.startsWith("chat-notice:")));

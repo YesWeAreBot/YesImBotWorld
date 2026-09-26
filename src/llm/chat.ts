@@ -72,6 +72,8 @@ export interface ChatUsage {
 }
 
 export interface ChatCompleteOptions {
+  /** 累计正文快照（流式及非流式）；观察界面不参与请求或历史。 */
+  onDelta?: (content: string) => void;
   tools?: ChatToolDef[];
   /** Require a specific tool for callers whose result must be a validated proposal. */
   toolChoice?: { type: "function"; function: { name: string } };
@@ -185,6 +187,7 @@ export class ChatClient {
       );
       this.recordUsage(usage);
       callStore.update(callId, { status: "completed", usage, preview: message.content || JSON.stringify(message.tool_calls ?? []) });
+      opts.onDelta?.(message.content ?? "");
       return { content: message.content ?? "", toolCalls: message.tool_calls ?? [] };
     }
 
@@ -195,6 +198,7 @@ export class ChatClient {
     let usage: ChatUsage | null = null;
     try {
       const result = await readChatCompletionStream(res, (progress) => {
+        opts.onDelta?.(progress.content);
         const labelNow = `${label}·流式 ${Date.now() - startedAt}ms`;
         const detail = {
           callId,
@@ -217,6 +221,7 @@ export class ChatClient {
         else debug.update(streamId, { label: labelNow, detail });
       }, (text) => callStore.append(callId, text));
       content = result.content;
+      opts.onDelta?.(content);
       toolCalls = result.toolCalls;
       usage = result.usage;
     } catch (err) {

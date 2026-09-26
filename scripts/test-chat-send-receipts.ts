@@ -94,14 +94,14 @@ async function agentReceipts(base: string) {
   const perform = async (call: ToolCallRecord) => { await context.appendToolCall(call); bot.dispatchSend(call); await bot.scheduler.whenIdle(); await bot.drainMailbox(); return context.stream.filter((entry: any) => entry.kind === "event" && entry.event.refToolCallId === call.id).map((entry: any) => entry.event.content).join("\n"); };
   try {
     const over = "长".repeat(21);
-    assert.match(await perform(make(over)), /本次尚未提交到聊天平台/); assert.equal(f.submitted.length, 0); assert.deepEqual(bot.recentSendSigs, []);
+    assert.match(await perform(make(over)), /正文过长，本次未发送.*confirm_long: true/); assert.equal(f.submitted.length, 0); assert.deepEqual(bot.recentSendSigs, []);
     assert.match(await perform(make(over, { confirm_long: true })), /消息已发送/); assert.equal(f.submitted.length, 1);
     const prefix = await context.toChatMessages("固定起点");
-    assert.match(await perform(make(over)), /本次尚未提交到聊天平台/); assert.equal(f.submitted.length, 1);
+    assert.match(await perform(make(over)), /正文过长，本次未发送/); assert.equal(f.submitted.length, 1);
     const after = await context.toChatMessages("固定起点"); assert.deepEqual(after.slice(0, prefix.length), prefix, "send guards only append, never alter old success receipts");
-    assert.match(await perform(make(over, { confirm_long: true, id: "test@self:room" })), /已经向这个频道发出过相同内容/);
+    assert.match(await perform(make(over, { confirm_long: true, id: "test@self:room" })), /相同内容已发送，本次未重发/);
     assert.equal(f.submitted.length, 1, "channel aliases cannot bypass repetition checks");
-    assert.match(await perform(make(over, { confirm_long: true, reply_to: "another-message", at_sender: false })), /已经向这个频道发出过相同内容/);
+    assert.match(await perform(make(over, { confirm_long: true, reply_to: "another-message", at_sender: false })), /相同内容已发送，本次未重发/);
     assert.equal(f.submitted.length, 1, "changing only the quote target or automatic mention cannot bypass repetition checks");
 
     f.cfg.messaging.coldChannelMsgs = 1;
@@ -138,7 +138,7 @@ async function agentReceipts(base: string) {
     const original = f.platform.sendMessage; f.platform.sendMessage = async () => [];
     const unresolved = await perform(make("没有平台回执")); assert.match(unresolved, /送达状态未知/);
     f.platform.sendMessage = original;
-    assert.match(await perform(make("没有平台回执")), /上次发送没有取得完整确认/); assert.equal(f.submitted.length, 4);
+    assert.match(await perform(make("没有平台回执")), /上次发送结果未知，可能已送达；本次未重发/); assert.equal(f.submitted.length, 4);
     f.cfg.platformOps.reply = true;
     f.messenger.store.findByMessageId = async () => null;
     assert.match(await perform(make(over, { confirm_long: true, reply_to: "another-message", at_sender: false, resend: true })), /消息已发送/);

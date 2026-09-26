@@ -20,7 +20,7 @@ export function messagesOf(evidence: PerceivedEvidence): GrowthMessageEvidence[]
 
 /** A displayed list, notification or successful send does not establish a current attention state. */
 export function stateBasis(evidence: PerceivedEvidence): boolean {
-  if (evidence.experience?.internalThought === true || evidence.experience?.outcome === "failed") return false;
+  if (evidence.experience?.internalThought === true || evidence.experience?.outcome === "failed" || evidence.experience?.historicalWorld === true) return false;
   return evidence.source === "world" || evidence.experience?.worldPerception === true || evidence.experience?.chat?.kind === "attention";
 }
 
@@ -36,7 +36,7 @@ export function deriveGrowthScope(kind: GrowthKind, evidence: PerceivedEvidence[
   }
   if (kind === "state") {
     const qualified = evidence.filter(stateBasis);
-    if (!qualified.length) throw new Error("临时状态需要实际身体处境或已经呈现的当前注意界面；通知、频道列表、拿起手机及送达回执不证明注意意图或身体状态");
+    if (!qualified.length) throw new Error("临时状态需要实际身体处境或已经呈现的当前注意界面；先前世界的历史回执不证明当前处境，通知、频道列表、拿起手机及送达回执不证明注意意图或身体状态");
     const attention = qualified.filter(item => item.experience?.chat?.kind === "attention");
     if (attention.length) {
       const channels = [...new Set(attention.map(item => item.experience!.chat!.channelKey))];

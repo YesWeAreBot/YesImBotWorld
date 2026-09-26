@@ -41,7 +41,7 @@ async function fixture(base: string) {
   } };
   await world.runtime.ensure();
   const context = new BotContext(files); await context.load();
-  const defs = BOT_TOOLS.filter(tool => ["act", "observe", "open_app", "close_app", "wait", "cancel", "reflect", "recall_growth"].includes(tool.name));
+  const defs = BOT_TOOLS.filter(tool => ["act", "observe", "pick_up_phone", "open_app", "close_app", "wait", "cancel", "reflect", "recall_growth"].includes(tool.name));
   const apps = new AppManager("chat", [{ id: "fixture", name: "fixture", description: "local fixture",
     async open() { return { tools: [{ name: "try_save", description: "fixture save", inputSchema: { type: "object", properties: {} } }] }; },
     async close() {}, async call() { return "保存失败，文件没有修改。"; } }], new Set(defs.map(tool => tool.name)), logger);
@@ -54,7 +54,7 @@ async function fixture(base: string) {
   async function delivered(callId: string): Promise<BotEvent> {
     await bot.scheduler.whenIdle(); await bot.drainMailbox();
     const entry = [...context.stream].reverse().find(item => item.kind === "event" && item.event.refToolCallId === callId && item.event.source === "tool");
-    assert.ok(entry?.kind === "event", `tool receipt for ${callId}`); return entry.event;
+    assert.ok(entry?.kind === "event", `tool receipt for ${callId}: ${JSON.stringify(context.stream.filter(item => item.kind === "tool_call" ? item.call.id === callId : item.event.refToolCallId === callId))}`); return entry.event;
   }
   return { files, cfg, clock, world, context, bot, apps, autonomous, delivered,
     advance: (at: number) => { time = at; }, outcome: (next: typeof status) => { status = next; } };
@@ -118,6 +118,8 @@ async function main() {
     assert.equal((await f.bot.injectExternalToolCall("open_app", { name: "fixture" }, { stealth: true })).ok, true);
     await f.bot.drainMailbox();
     assert.equal((await f.bot.growth.stats()).perceivedEvents, beforeStealth, "an unattended hidden operation is not a character experience");
+    const pickup = await f.autonomous("pick_up_phone"); await f.delivered(pickup.id);
+    assert.equal(f.bot.phone.down, false, "an autonomous app interaction requires the actual phone to be held");
     const open = await f.autonomous("open_app", { name: "fixture" }); await f.delivered(open.id);
     const save = await f.autonomous("try_save"); const saveReceipt = await f.delivered(save.id);
     assert.match(saveReceipt.content, /保存失败/);

@@ -106,7 +106,7 @@ async function structuredMigration(root: string): Promise<void> {
       const body = JSON.parse([...messages].reverse().find(message => message.role === "user")!.content as string);
       assert.equal(body.timeAuthority.tu, 124); assert.equal(body.stateAsOf.tu, 123); assert.equal(body.elapsedWorldSeconds, 1);
       assert.equal(body.stateAheadOfClock, undefined);
-      return result({ worldState: body.worldState + "\n现在店员告知今日面食需要等十分钟。", actorStates: [{ actorId: "bot", state: "你仍在柜台前，得知面食要等十分钟。" }], perceptions: [{ actorId: "bot", text: "店员补充道：“面要等十分钟，你可以先看看其他的。”" }] });
+      return result({ worldState: body.worldState + "\n现在店员告知今日面食需要等十分钟。", externalChanges: [{ id: "clerk", description: "店员补充说明今日面食的等待时间。" }], perceptions: [{ actorId: "bot", text: "店员补充道：“面要等十分钟，你可以先看看其他的。”", changeIds: ["clerk"] }] });
     });
     await aligned.runtime.evolve("店员继续说明等待时间。"); assert.equal(f.requests(), 2);
     const committed = (await aligned.runtime.store()).snapshot(), perception = await aligned.runtime.peek(); await aligned.runtime.shutdown();
@@ -114,7 +114,7 @@ async function structuredMigration(root: string): Promise<void> {
     f.setInfer(async () => { throw Error("Restart must reuse current persisted prose"); });
     const restarted = f.create(125); await restarted.runtime.ensure();
     assert.deepEqual((await restarted.runtime.store()).snapshot(), committed); assert.deepEqual(await restarted.runtime.peek(), perception);
-    assert.match(await restarted.files.readWorldStatus(), /现在店员告知今日面食需要等十分钟/); assert.match(await restarted.files.readBotStatus(), /十分钟/);
+    assert.match(await restarted.files.readWorldStatus(), /现在店员告知今日面食需要等十分钟/); assert.equal(await restarted.files.readBotStatus(), snapshot.actors.bot!.state, "hearing an NPC does not grant heartbeat permission to rewrite actor state");
     assert.equal(f.requests(), 2, "restart cannot regenerate or remigrate the world");
     assert.equal(await fs.readFile(f.files.worldJournal, "utf8"), originalJournal); await assertBackup(f);
     console.log("PASS v0.3 runtime migration preserves private facts, dialogue, old action idempotency, interrupted failures, visitor absence and latest prose across restart");

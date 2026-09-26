@@ -12,7 +12,7 @@ import { toNativeToolDefs } from "../src/bot/nativeTools.js";
 import { projectObservedMessages } from "../src/bot/perception-fragments.js";
 import type { BotEvent, ToolCallRecord } from "../src/types.js";
 
-const logger = { info() {}, warn() {}, error() {} } as any;
+const logger = { info() {}, warn() {}, error() {}, debug() {} } as any;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const deferred = <T = void>() => { let resolve!: (value: T) => void; const promise = new Promise<T>((r) => { resolve = r; }); return { promise, resolve }; };
 const until = async (fn: () => boolean) => { for (let i = 0; i < 500 && !fn(); i++) await sleep(2); assert.ok(fn(), "condition timed out"); };
@@ -55,7 +55,7 @@ async function truthfulRestReceipts() {
   f.agent.pushEvent("koishi", { text: "手机振动了一下。", originEventIds: ["chat-notice:unseen"],
     experience: { agency: "observed", situation: "手机通知", subjectIds: [] } }, { wake: true });
   const interruption = f.agent.mailbox.find((item: any) => item.refToolCallId === rest.id);
-  assert.match(interruption.content, /实际经过 7\.5 TU/);
+  assert.match(interruption.content, /计时中断.*经过 7\.5 TU/);
   assert.match(interruption.content, /来源的频道、发送者和内容尚未确认/);
   assert.doesNotMatch(interruption.content, /睡|醒|迷迷糊糊|睁开/);
   assert.deepEqual(interruption.originEventIds, []);
@@ -68,7 +68,7 @@ async function truthfulRestReceipts() {
   completed.agent.dispatchRest(call("rest_completed", "rest", { duration: 0.005 }));
   await until(() => completed.agent.mailbox.some((item: any) => item.refToolCallId === "rest_completed"));
   const result = completed.agent.mailbox.find((item: any) => item.refToolCallId === "rest_completed");
-  assert.match(result.content, /休息计时到期，实际经过/);
+  assert.match(result.content, /休息计时结束，经过 \d+\.\d TU/);
   assert.doesNotMatch(result.content, /睡醒|从浅睡|恢复了体力/);
   assert.deepEqual(result.originEventIds, []);
   assert.equal(completed.agent.waiting, null);
@@ -133,8 +133,7 @@ async function sharedPauseBudget() {
   f.agent.dispatchRest(pause("blocked", "rest", true));
   assert.equal(f.agent.waiting, null, "habitually adding confirm cannot bypass a first refusal");
   const refused = f.agent.mailbox.find((item: any) => item.refToolCallId === "blocked");
-  assert.match(refused.content, /60\.0 TU（60%）/);
-  assert.match(refused.content, /不要用 rest 反复空等消息/);
+  assert.equal(refused.content, "等待额度已耗尽", "budget feedback is concise; actual charged duration is asserted separately");
   assert.doesNotMatch(refused.content, /hidden-control|外部意图/, "budget feedback may list only the character's own submitted tasks");
   assert.equal(f.agent.compressionRequested, null, "a refused rest cannot erase repetition by requesting compaction");
   f.agent.dispatchWait(pause("switch_tool", "wait", true));

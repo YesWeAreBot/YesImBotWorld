@@ -76,7 +76,6 @@ async function page(visitor: boolean) {
     window: { addEventListener: (event: string, listener: () => void) => { events[event] = listener; }, removeEventListener() {} },
     setInterval() {}, clearInterval() {}, isVisitor: () => visitor,
     api: async (_method: string, url: string) => { assert.equal(url, "/api/bot/growth/status"); requests++; return status; },
-    InnerRegulation: { mount: () => ({ refresh() {}, dispose() {} }) },
     Studio: {
       register: (name: string, mount: (holder: Element) => () => void) => { routes[name] = mount; },
       title: () => el("header"), fetchGrowth: async () => rows,

@@ -1,4 +1,5 @@
 import { promises as fs } from "node:fs";
+import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { h, Universal, type Bot, type Context } from "koishi";
@@ -28,17 +29,18 @@ import type { OwnSendTracker } from "./ownsends.js";
 import type { RequestStore } from "./requests.js";
 import { channelKey as makeChannelKey, parseChannelKey } from "./channels.js";
 import { chatMessageEvidence, chatSubjectId, evidenceHash, conversationKind, conversationLabel, describeConversation, type ConversationContext } from "./conversation.js";
-import { normalizeMsgId } from "./markers.js";
+import { quoteTag, resolveOutgoingQuote, storedQuoteContent } from "./quotes.js";
 import { executeSelfCommand } from "./self-commands.js";
 import { formatMessageTime, MESSAGE_ORDER_GUIDANCE, messageSequence } from "./message-order.js";
 import { firstName, formatMessageSender, messageAccountRelation } from "./identity.js";
+import { sendPlatformMessage } from "./platform-media.js";
 
 /** Explicit stable references retain interleaved text/media order without ordinal placeholders. */
 const INLINE_MEDIA = /<media\s+ref=(["'])(media:[1-9]\d*|gallery:[^"'<>]+)\1\s*\/>/g;
 
 /**
- * 「表情包」分类图片的表情标记：OneBot image 段的 sub_type=1 表示表情（QQ 按表情包渲染，
- * 对方无法"保存为图片"），summary 为聊天列表/引用中的预览文案，与 QQ 客户端发表情的行为一致。
+ * OneBot/NapCat 的图片表情标记。h() 会将 sub_type 转为 subType，发送时必须
+ * 经 sendPlatformMessage 在 session.transform() 之后恢复协议字段；summary 仅为预览文案。
  */
 const STICKER_ATTRS = { sub_type: 1, summary: "[动画表情]" } as const;
 
@@ -55,12 +57,25 @@ const MIME_BY_EXT: Record<string, string> = {
 };
 
 type MessageTarget = { bot: Bot; platform: string; channelId: string; isDirect: boolean };
+export interface DiscoveryOptions { cursor?: string; limit?: number; preview?: boolean }
+type DiscoveryKind = "group" | "friend";
+interface DiscoveryEntry { key: string; platform: string; channelId: string; selfId: string; name: string; details?: string }
+interface DiscoveryCatalog {
+  id: string; at: number; entries: DiscoveryEntry[]; notes: string[];
+  sources: { bot: Bot; next?: string; done: boolean }[];
+}
+const DISCOVERY_TTL = 5 * 60_000;
+const DISCOVERY_HISTORY_LIMIT = 2;
 
 const blockedSend = (text: string): MessageSendReceipt => ({ status: "blocked", text, messageIds: [] });
 
 /** MessengerApi 的 Koishi 实现：查看/发送消息、图片、文件、语音，浏览收藏夹 */
 export class KoishiMessenger implements MessengerApi {
   private sendQueues = new Map<string, Promise<void>>();
+  private historyLoads = new Map<string, Promise<string>>();
+  private historyAttempts = new Map<string, { at: number; note: string; limit: number }>();
+  private discoveryCatalogs = new Map<DiscoveryKind, DiscoveryCatalog>();
+  private discoveryTail: Promise<void> = Promise.resolve();
   constructor(
     private ctx: Context,
     private store: MessageStore,
@@ -78,6 +93,8 @@ export class KoishiMessenger implements MessengerApi {
     private names: ChannelNameResolver,
     /** 世界时钟的惰性访问器（禁言剩余时长按历法模式渲染；未就绪时为 null） */
     private clockInfo: () => { syncRealTime: boolean; unitRealSeconds: number } | null,
+    /** On-demand history imports join the same stop/reset barrier as startup recovery. */
+    private historyLifecycle?: { signal: AbortSignal; track(task: Promise<unknown>): void },
   ) {}
 
   /**
@@ -137,7 +154,16 @@ export class KoishiMessenger implements MessengerApi {
 
   async recentChannels(n: number): Promise<RichText> {
     const channels = await this.store.recentChannels(n);
-    if (!channels.length) return { text: "你翻了翻手机，最近没有任何频道有消息。", originEventIds: [] };
+    if (!channels.length) {
+      const discovery = [this.ops.listGroups ? "list_groups 查看已加入的群" : "", this.ops.listFriends ? "list_friends 查看好友" : ""].filter(Boolean);
+      const hint = discovery.length ? `可用 ${discovery.join("、")}，再 select_channel 主动点开。` : "如果已经知道某个频道的完整 id，可以用 select_channel 主动点开。";
+      const heading = "本地最近没有已保存的频道消息；这不表示平台上没有聊天。" + hint;
+      const discovered = this.ops.listGroups ? await this.listGroups({ limit: Math.min(5, Math.max(1, n)) })
+        : this.ops.listFriends ? await this.listFriends({ limit: Math.min(5, Math.max(1, n)) }) : undefined;
+      return discovered ? { ...discovered, text: heading + "\n" + discovered.text,
+        parts: [{ kind: "text", text: heading + "\n" }, ...(discovered.parts ?? [{ kind: "text", text: discovered.text }])] }
+        : { text: heading, originEventIds: [] };
+    }
     const lines = await Promise.all(
       channels.map(async ({ key, latest }) => {
         const time = formatMessageTime(latest);
@@ -145,26 +171,39 @@ export class KoishiMessenger implements MessengerApi {
         const who = formatMessageSender(latest, identity);
         // 预览只做轻量替换，不触发解释器
         const kind = conversationKind(latest.isDirect, latest.channelId, latest.guildId);
-        return `- ${await this.names.display(key)}（${kind === "direct" ? "私聊" : kind === "group" ? "群聊" : "会话类型未知"}）\n${identity.text}\n${this.notify.channelStatusText(key)}\n[${time}] ${who}: ${truncate(stripPlaceholders(latest.content), 80)}`;
+        return `- ${await this.names.display(key)}（${kind === "direct" ? "私聊" : kind === "group" ? "群聊" : "会话类型未知"}）\n${identity.text}\n${this.notify.channelStatusText(key)}\n[${time}] ${who}: ${truncate(stripPlaceholders(storedQuoteContent(latest)), 80)}`;
       }),
     );
     return {
-      text: `你翻了翻手机，最近活跃的频道：\n${lines.join("\n")}`,
+      text: `你翻了翻手机，最近活跃的频道：\n${lines.join("\n")}` +
+        ([this.ops.listGroups ? "list_groups" : "", this.ops.listFriends ? "list_friends" : ""].filter(Boolean).length
+          ? `\n这只是本地最近列表；可用 ${[this.ops.listGroups ? "list_groups" : "", this.ops.listFriends ? "list_friends" : ""].filter(Boolean).join(" / ")} 按页发现其他会话和有限历史预览。` : ""),
       originEventIds: [...new Set(channels.flatMap(({ key, latest }) => chatMessageEvidence(latest, parseChannelKey(key).selfId).originEventIds ?? []))],
       experience: { agency: "observed", situation: "聊天频道列表" },
     };
   }
 
   async channelMessages(id: string, n: number, opts?: { intro?: "open" | "read" | "echo" }): Promise<RichText> {
+    this.historyLifecycle?.signal.throwIfAborted();
     const resolved = await this.resolveChannel(id);
+    this.historyLifecycle?.signal.throwIfAborted();
     if ("error" in resolved) return { text: resolved.error, originEventIds: [] };
     const { platform, channelId, selfId } = resolved;
     // 打开频道 = 开始关注：一段时间内该频道的新消息会直接呈现内容
     await this.focus.focus(makeChannelKey(platform, channelId, selfId));
     const display = await this.names.display(makeChannelKey(platform, channelId, selfId));
-    const rows = await this.store.channelMessages(platform, channelId, n, selfId);
+    let rows = await this.store.channelMessages(platform, channelId, n, selfId);
+    let historyNote = "";
+    // A small discovery preview must not keep an explicitly opened conversation
+    // stuck at three messages. Read at most one requested page when local history
+    // is shorter than requested; sending readback never fetches platform history.
+    if (rows.length < n && opts?.intro !== "echo") {
+      historyNote = await this.loadEmptyChannelHistory(platform, channelId, selfId, resolved.isDirect, n);
+      this.historyLifecycle?.signal.throwIfAborted();
+      rows = await this.store.channelMessages(platform, channelId, n, selfId);
+    }
     const identity = await this.names.identity(makeChannelKey(platform, channelId, selfId), { isDirect: resolved.isDirect, guildId: rows.at(-1)?.guildId });
-    if (!rows.length) return { text: `频道 ${display} 里还没有任何消息记录。\n${identity.text}\n${this.notify.channelStatusText(makeChannelKey(platform, channelId, selfId))}`, originEventIds: [], experience: { agency: "observed", situation: "聊天频道", chat: { channelKey: makeChannelKey(platform, channelId, selfId), kind: "attention" } } };
+    if (!rows.length) return { text: `频道 ${display} 暂无本地可读记录，不代表该会话没有发生过聊天。${historyNote ? "\n" + historyNote : ""}\n${identity.text}\n${this.notify.channelStatusText(makeChannelKey(platform, channelId, selfId))}`, originEventIds: [], experience: { agency: "observed", situation: "聊天频道", chat: { channelKey: makeChannelKey(platform, channelId, selfId), kind: "attention" } } };
 
     const attachments: MediaRef[] = [];
     const lines: string[] = [];
@@ -176,7 +215,7 @@ export class KoishiMessenger implements MessengerApi {
       const row = rows[idx]!;
       const messagePartsStart = parts.length;
       const who = formatMessageSender(row, identity);
-      const rendered = await this.renderer.render(row.content);
+      const rendered = await this.renderer.render(storedQuoteContent(row));
       if (rendered.attachments) attachments.push(...rendered.attachments);
       const msgTag = this.showMsgId && row.messageId ? ` (msg:${row.messageId})` : "";
       const address = conversationLabel(row.conversation, selfId);
@@ -223,7 +262,11 @@ export class KoishiMessenger implements MessengerApi {
         : `你打开了 ${display} 的聊天记录（最近 ${rows.length} 条）`;
     const channelKind = conversationKind(resolved.isDirect, channelId);
     const channelNote = channelKind === "group" ? "群聊 · 这是多人对话，关注或收到通知只表示看见，不表示每条都在找你。" : "私聊";
-    const heading = `${intro}（${channelNote}）。这是此刻可见记录的快照。${MESSAGE_ORDER_GUIDANCE}同一频道、同一记录编号或 msg 编号再次出现是回读，不是发送者又说了一遍。更早看过的内容仍属于你的经历，不因这次只显示最近几条而作废。\n${identity.text}\n${this.notify.channelStatusText(makeChannelKey(platform, channelId, selfId))}\n发送者、时间和对话指向是界面标注；“消息正文”内是各条发送者的原文，不要把昵称标头当成自己要发送的内容。\n`;
+    // Reading a slice never clears messages outside that slice, including later live arrivals.
+    await this.notify.markSeen?.(makeChannelKey(platform, channelId, selfId), rows).catch(error => {
+      this.ctx.logger("yesimbot-world").warn("消息已读取，但未读状态保存失败：%s", error);
+    });
+    const heading = `${intro}（${channelNote}）。这是此刻可见记录的快照。${MESSAGE_ORDER_GUIDANCE}同一频道、同一记录编号或 msg 编号再次出现是回读，不是发送者又说了一遍。更早看过的内容仍属于你的经历，不因这次只显示最近几条而作废。${historyNote ? "\n" + historyNote : ""}\n${identity.text}\n${this.notify.channelStatusText(makeChannelKey(platform, channelId, selfId))}\n发送者、时间和对话指向是界面标注；“消息正文”内是各条发送者的原文，不要把昵称标头当成自己要发送的内容。\n`;
     return {
       text: `${heading}${lines.join("\n")}${tail}`,
       originEventIds: [...new Set(rows.flatMap(row => chatMessageEvidence(row, selfId).originEventIds ?? []))],
@@ -239,9 +282,9 @@ export class KoishiMessenger implements MessengerApi {
 
   /**
    * 浏览收藏夹。
-   * - 不带分类：总览（各分类的条目数），未整理有存货时提醒 Bot 找空整理；
+   * - 不带分类：总览（各分类的条目数），不把未整理内容变成待办任务；
    * - 带分类：列出该分类的条目（编号、名字、描述），Bot-LLM 原生识图时附上前几张原图。
-   * 描述优先用 Bot 自己写下的（gallery_save / gallery_move 时记录），没有则退回解释器摘要。
+   * 图像解释与收藏备注分别呈现，备注不能冒充原图识别或原发送者意图。
    */
   async gallery(category?: string): Promise<RichText> {
     await this.galleryStore.sweepRoot();
@@ -250,21 +293,16 @@ export class KoishiMessenger implements MessengerApi {
       const counts = await this.galleryStore.counts();
       const total = counts.reduce((s, c) => s + c.count, 0);
       if (!total) {
-        return { text: "你的收藏夹空空如也。（看到喜欢的图可以用 gallery_save 分类存进来）" };
+        return { text: "你的收藏夹目前是空的。媒体缓存中的内容仍可直接选用，无需先收藏。" };
       }
       const lines = counts.map(({ category: c, count }) => {
         const note = c === UNSORTED_CATEGORY && count > 0 ? "（尚未归类的导入内容）" : "";
         return `- ${c}：${count} 项${note}`;
       });
-      const unsorted = counts.find((c) => c.category === UNSORTED_CATEGORY)?.count ?? 0;
-      const tip =
-        unsorted > 0
-          ? `\n（「未整理」里有 ${unsorted} 项：有空时打开看看，view_media 看清内容后用 gallery_move 归类并写好描述。）`
-          : "";
       return {
         text:
           `你翻了翻自己的收藏夹：\n${lines.join("\n")}\n` +
-          `（用 category 参数打开某一类查看具体内容，如 check_gallery 的 category: "表情包"）${tip}`,
+          `（可用 category 查看一类的内容与选用线索，如「表情包」。按自己想表达的态度或接话方式选择；未整理不是待办事项。）`,
       };
     }
 
@@ -293,17 +331,19 @@ export class KoishiMessenger implements MessengerApi {
         continue;
       }
       const meta = await this.galleryStore.findMeta(cat, name, row.sha256);
-      const summary = meta?.description || await this.captioner.describe(row.ref) || undefined;
-      const part = mediaPart(row.ref, { name: `gallery:${cat}/${name}`, summary, ...(cat === STICKER_CATEGORY ? { sticker: true } : {}) });
+      // Explicit gallery categories retain the same usage semantics as resolveMediaRef.
+      const sticker = row.ref.type === "image" && cat === STICKER_CATEGORY;
+      const summary = sticker || !meta?.description ? await this.captioner.describe(row.ref, { sticker }) : null;
+      const part = mediaPart(row.ref, { name: `gallery:${cat}/${name}`,
+        ...(sticker ? { sticker: true, expressionSummary: summary || undefined } : { summary: summary || undefined }),
+        galleryNote: meta?.description || undefined });
       if (this.renderer.canAttach(row.ref) && attachments.length < this.renderer.maxAttach) {
         attachments.push(row.ref); parts.push(part);
       } else parts.push({ kind: "text", text: mediaText(part) });
       parts.push({ kind: "text", text: "\n" });
     }
     if (names.length > 50) parts.push({ kind: "text", text: `（还有 ${names.length - 50} 项未显示）\n` });
-    parts.push({ kind: "text", text: cat === UNSORTED_CATEGORY
-      ? "（这些是尚未归类的导入内容：先 view_media 看清内容，再用 gallery_move 移到合适的分类并写好描述。）"
-      : "（发出前确认具体媒体内容；用 media:N 或完整 gallery:分类/文件名选择同一个媒体，不凭展示顺序猜编号。）" });
+    parts.push({ kind: "text", text: "（表情包可作为自己的表态或接话，不需要点评画面。可能用途与收藏备注不代表原发送者的真实意图。显式 gallery:分类/文件名保留该分类的发送用途；media:N 只标识资源，相同字节不等于相同用途，不要把图库引用自动换成编号。不凭展示顺序猜编号；收藏和整理均不是发送前置步骤。）" });
     return { text: richPartsText(parts), attachments: attachments.length ? attachments : undefined, parts };
   }
 
@@ -316,24 +356,28 @@ export class KoishiMessenger implements MessengerApi {
     if (!rows.length) return "（媒体缓存是空的，你还没在聊天里见过任何媒体。）";
     const lines: string[] = [];
     for (const row of rows) {
-      const label = LABEL[row.type as MediaType] ?? row.type;
-      let summary = row.summary;
-      if (!summary && row.type === "image") {
+      const meta = row.type === "image" ? await this.galleryStore.findBySha(row.sha256) : null;
+      const sticker = row.type === "image" && (row.sticker === true || meta?.category === STICKER_CATEGORY);
+      const label = sticker ? "表情包" : LABEL[row.type as MediaType] ?? row.type;
+      // A scene-description cache is not a sticker's conversational-use interpretation.
+      let summary = sticker ? "" : row.summary;
+      if (row.type === "image" && (sticker || !summary)) {
         const full = await this.media.get(row.id);
-        if (full) summary = (await this.captioner.describe(full.ref)) ?? "";
+        if (full) summary = (await this.captioner.describe(full.ref, { sticker })) ?? "";
       }
       lines.push(
         `- ${label} media:${row.id} ${formatSize(row.size)} ${formatTime(row.createdAt)}` +
-          (summary ? `：${truncate(summary, 100)}` : "（无内容摘要）"),
+          (summary ? `：${sticker ? "可能表意（非原发送者意图）" : "内容摘要（可能有误）"}：${truncate(summary, 160)}` : sticker ? "（暂无可靠的表意线索）" : "（无内容摘要）") +
+          (meta?.description ? `\n  你的收藏备注（非原图识别）：${truncate(meta.description, 160)}` : ""),
       );
     }
     return (
       `你翻看了最近的媒体缓存（最新在前，缓存只读）：\n${lines.join("\n")}\n` +
-      `（想留下的用 gallery_save 存进收藏夹——记得选好分类、写清描述）`
+      `（表情包按你想表达的态度或接话方式选用；可能用途不是原发送者的真实意图。缓存媒体可直接使用，无需先收藏，也无需点评或解说画面。）`
     );
   }
 
-  /** 把缓存里的媒体存进收藏夹：必须选定分类并由 Bot 亲自写下描述（日后挑图全靠它） */
+  /** 显式收藏并记录自己的选用备注；此操作不发送消息。 */
   async gallerySave(mediaId: string, category: string, description: string, name?: string): Promise<string> {
     const id = parseMediaId(mediaId);
     if (id === null) return `（无法理解的媒体引用："${mediaId}"。请使用 check_media 展示的 media:N。）`;
@@ -345,7 +389,7 @@ export class KoishiMessenger implements MessengerApi {
       return `（category 必须是这几类之一：${MAIN_CATEGORIES.join(" / ")}。「${UNSORTED_CATEGORY}」用于暂存导入内容，主动收藏时请选定分类。）`;
     }
     const desc = description.trim();
-    if (!desc) return "（description 不能为空：用你自己的话写清这是什么、什么梗/情绪、适合什么场合发。）";
+    if (!desc) return "（description 不能为空：留一条供自己今后选用的备注；表情包可记表达用途、适用或易误读语境，不推断原发送者意图。这条备注不会发给聊天对象。）";
 
     const ext = path.extname(row.file) || "";
     let filename: string;
@@ -365,7 +409,7 @@ export class KoishiMessenger implements MessengerApi {
     await fs.copyFile(row.ref.file, dest);
     await this.galleryStore.upsertMeta(cat, filename, row.sha256, desc);
     const label = LABEL[row.type as MediaType] ?? row.type;
-    return `你把${label} media:${row.id} 存进了收藏夹 ${cat}/${filename}，并记下：${truncate(desc, 100)}`;
+    return `你把${label} media:${row.id} 存进了收藏夹 ${cat}/${filename}。你的选用备注：${truncate(desc, 100)}\n仅已收藏，没有发送消息。`;
   }
 
   /** 整理收藏夹：把文件移到某个分类（主要用于「未整理」的归类），可顺带写描述 */
@@ -376,27 +420,18 @@ export class KoishiMessenger implements MessengerApi {
     if (!cat || cat === UNSORTED_CATEGORY) {
       return `（category 必须是这几类之一：${MAIN_CATEGORIES.join(" / ")}。）`;
     }
-    if (entry.category === cat) return `（"${entry.name}" 本来就在「${cat}」里。）`;
-
     const desc = description?.trim();
-    if (!desc) {
-      // 没带新描述：必须已有 Bot 写下的描述，否则要求先看图再写
-      const sha = await this.galleryStore.hashFile(entry.file).catch(() => undefined);
-      const meta = entry.category
-        ? await this.galleryStore.findMeta(entry.category, entry.name, sha)
-        : null;
-      if (!meta?.description) {
-        return (
-          `（"${entry.name}" 还没有描述。先用 view_media 看清它的内容，` +
-          `再带上 description 参数（这是什么、什么梗/情绪、适合什么场合发）一起移动。）`
-        );
-      }
+    if (entry.category === cat) {
+      if (!desc) return `（"${entry.name}" 本来就在「${cat}」里。）`;
+      await this.galleryStore.upsertMeta(cat, entry.name, await this.galleryStore.hashFile(entry.file), desc);
+      return `分类仍为「${cat}」。你的选用备注已更新：${truncate(desc, 100)}\n没有发送消息。`;
     }
     const moved = await this.galleryStore.move(entry, cat, desc || undefined);
     return (
       `你把 ${entry.category ? `${entry.category}/` : ""}${entry.name} 移进了「${cat}」` +
       `${moved.name !== entry.name ? `（重名，改叫 ${moved.name}）` : ""}` +
-      `${desc ? `，并记下：${truncate(desc, 100)}` : "。"}`
+      `${desc ? `。你的选用备注：${truncate(desc, 100)}` : "。"}` +
+      "\n仅已调整收藏分类，没有发送消息。"
     );
   }
 
@@ -409,7 +444,7 @@ export class KoishiMessenger implements MessengerApi {
   }
 
   /**
-   * 细看媒体（发图前确认内容用）：
+   * 按需细看媒体（现有线索不足时再确认）：
    * - Bot-LLM 原生支持该模态 → 附原始媒体（直接看）；
    * - 否则 → 用解释器产出比常规摘要更完整的详述。
    * 同时带出收藏夹里已记下的描述（如果有）。
@@ -433,20 +468,22 @@ export class KoishiMessenger implements MessengerApi {
         ? await this.galleryStore.findMeta(resolved.gallery.category, resolved.gallery.name, row?.sha256)
         : row ? await this.galleryStore.findBySha(row.sha256) : null;
       const native = this.renderer.canAttach(ref) && attachments.length < this.renderer.maxAttach;
-      const summary = native ? await this.captioner.describe(ref) : await this.captioner.describeDetailed(ref);
-      const description = [summary, meta?.description ? `收藏时记下的描述：${meta.description}` : ""].filter(Boolean).join("\n");
+      const summary = native ? await this.captioner.describe(ref, { sticker: resolved.sticker }) : await this.captioner.describeDetailed(ref, { sticker: resolved.sticker });
       const name = resolved.gallery ?? meta;
-      const part = mediaPart(ref, { name: name ? `gallery:${name.category}/${name.name}` : undefined, summary: description || undefined, ...(resolved.sticker ? { sticker: true } : {}) });
+      const part = mediaPart(ref, { name: name ? `gallery:${name.category}/${name.name}` : undefined,
+        ...(resolved.sticker ? { sticker: true, expressionSummary: summary || undefined } : { summary: summary || undefined }),
+        galleryNote: meta?.description || undefined });
       if (native) { attachments.push(ref); parts.push(part); }
-      else parts.push({ kind: "text", text: mediaText(part, description ? "当前通过文字描述了解内容，未展开原始媒体" : "当前无法查看内容") });
+      else parts.push({ kind: "text", text: mediaText(part, summary || meta?.description ? "当前只有文字线索，未展开原始媒体；收藏备注不等于识别结果" : "当前无法查看内容") });
       parts.push({ kind: "text", text: "\n" });
     }
+    parts.push({ kind: "text", text: "（选用图库内容时，保留已确认的 gallery:分类/文件名以保留分类用途；media:N 标识的是资源，不保证与图库分类的发送用途相同。查看和选中均不等于已发送。）" });
     return { text: richPartsText(parts), attachments: attachments.length ? attachments : undefined, parts };
   }
 
   /**
    * 选图：解析一串媒体引用（media:N / gallery:分类/文件）为具体的 MediaRef + sticker，
-   * 供 agent 的 pick_media 工具「选定并插入输入框」用。每项返回判别联合：解析成功或失败。
+   * 供 agent 的 pick_media 工具确认真实引用；不插入草稿也不发送。每项返回解析结果。
    */
   async resolveMediaRefs(
     refs: string[],
@@ -489,16 +526,14 @@ export class KoishiMessenger implements MessengerApi {
   }
 
   private async sendResolved(target: MessageTarget, id: string, msg: string, media: (string | number)[], replyTo: string | undefined, atSender: boolean, insist: boolean): Promise<MessageSendReceipt> {
+    const quote = resolveOutgoingQuote(msg, replyTo);
+    if (quote.error !== undefined) return blockedSend(`消息没有发出：${quote.error}`);
+    msg = quote.msg; replyTo = quote.replyTo;
     if (/<img\b|\[(?:图片|视频|音频|语音)#\d+/i.test(msg)) {
       return blockedSend('（消息没有发出：旧媒体占位格式已停用。请先 view_media 确认内容，再在原位置填写 <media ref="media:12"/>，或在 media 参数里给出明确引用。）');
     }
     if (/<media\b/i.test(msg.replace(INLINE_MEDIA, ""))) return blockedSend('（消息没有发出：媒体标签格式无效。请使用 <media ref="media:12"/>；摘要或名称不能代替媒体引用。）');
     if (media.length > 9) return blockedSend("（消息没有发出：media 参数最多包含 9 个媒体，请分开选择。）");
-    if (replyTo !== undefined) {
-      const normalized = normalizeMsgId(replyTo);
-      if (!normalized) return blockedSend("（消息没有发出：reply_to 必须是完整消息 ID 或 msg:ID / (msg:ID)，不能使用 media:N、gallery:路径或说明文字。）");
-      replyTo = normalized;
-    }
 
     // 冷频道刷屏拦截：最近 N 条消息全是自己发的（无人回应）时，继续发送需要 insist 确认。
     // 在实际发出时刻检查（而非生成时刻）——打字期间对方回复了就不拦。
@@ -550,29 +585,13 @@ export class KoishiMessenger implements MessengerApi {
       }
     };
 
-    // A copied quote and reply_to use the same message-ID namespace and validation.
-    let quoteFromTag: string | undefined;
-    let quoteError = false;
-    msg = msg
-      .replace(/<quote\s+([^<>]*?)\/?>(?:<\/quote>)?/g, (_whole, attrsRaw: string) => {
-        const attrs = parseTagAttrs(attrsRaw);
-        const normalized = normalizeMsgId(attrs.id);
-        if (!normalized || (quoteFromTag && quoteFromTag !== normalized)) quoteError = true;
-        else quoteFromTag = normalized;
-        return "";
-      })
-      .trimStart();
-    if (quoteError || /<quote\b/i.test(msg) || (replyTo && quoteFromTag && replyTo !== quoteFromTag)) {
-      return blockedSend("（消息没有发出：引用标签必须指定同一条消息的完整 ID，且须与 reply_to 一致；media:N、gallery:路径和多个不同引用不能代替消息 ID。）");
-    }
-    replyTo ??= quoteFromTag;
     if (replyTo && !this.ops.reply) return blockedSend("（消息没有发出：当前未启用引用回复能力；若要发送普通消息，请移除 reply_to 和引用标签后重新决定。）");
 
     // 引用回复：模拟 QQ 客户端行为——群聊里引用时自动在开头 @ 原发送人 + 空格，
     // Bot 可用 at_sender: false 去掉（如同真人手动删掉自动加上的 @）。
     // 私聊没有 @ 的概念，强制不附加 at（QQ 私聊无法渲染 at，只会留下一个孤零零的空格）。
     if (replyTo) {
-      add(h("quote", { id: replyTo }), `[引用 msg:${replyTo}] `);
+      add(h("quote", { id: replyTo }), quoteTag({ id: replyTo }));
       if (target.isDirect) atSender = false;
       if (atSender) {
         const quoted = await this.store.findByMessageId(target.platform, target.channelId, replyTo, target.bot.selfId);
@@ -651,7 +670,7 @@ export class KoishiMessenger implements MessengerApi {
       const batch = batches[bi]!;
       let ids: string[];
       try {
-        ids = await this.runOwnSend(channelKey, () => target.bot.sendMessage(target.channelId, batch.elements));
+        ids = await this.runOwnSend(channelKey, () => sendPlatformMessage(this.ctx, target.bot, target.channelId, batch.elements));
       } catch (err) {
         const mute = await this.muteHint(target);
         const text = `${bi > 0 ? `（消息已部分发出：前 ${bi} 批已由平台确认${sentMsgIds.length ? `（msg:${sentMsgIds.join("、")}）` : ""}。` : "（"}` +
@@ -666,7 +685,7 @@ export class KoishiMessenger implements MessengerApi {
       sentMsgIds.push(...ids.filter(Boolean));
       confirmedAt = new Date();
       // Platform success is irreversible. A local record failure must never claim it did not send.
-      try { await this.storeSelf(target, batch.stored, ids[0], confirmedAt); }
+      try { await this.storeSelf(target, batch.stored, ids[0], confirmedAt, describeConversation(batch.elements, target.isDirect ? "direct" : "group", isStickerElement)); }
       catch { receiptProblems.push(`第 ${bi + 1} 批已由平台确认发送，但本地聊天记录保存失败`); }
     }
     try { await this.focus.focus(channelKey); }
@@ -696,9 +715,8 @@ export class KoishiMessenger implements MessengerApi {
   /**
    * 媒体引用 → 消息元素（图片 / 视频）。
    * sticker = true 的图片标记为平台表情：OneBot 适配器会把元素上的额外属性原样并入
-   * image 段的 data，NapCat 端据此以 sub_type=1（表情）发送——QQ 会按表情包尺寸渲染，
-   * 且别人无法将其"保存为图片"，与真人发的表情包行为一致（发普通大图反而容易暴露是 Bot）。
-   * 其他平台的适配器会忽略这两个未知属性，不受影响。
+   * image 段的 data。sendPlatformMessage 恢复 sub_type 后，NapCat 据此发送图片表情。
+   * 其他平台是否支持这些扩展属性取决于其适配器，不能仅凭此标记保证原生表情发送。
    */
   private async mediaElement(ref: MediaRef, sticker = false): Promise<h> {
     const data = await this.media.readFile(ref);
@@ -746,7 +764,7 @@ export class KoishiMessenger implements MessengerApi {
     let msgIds: string[] = [];
     const channelKey = makeChannelKey(target.platform, target.channelId, target.bot.selfId);
     try {
-      msgIds = await this.runOwnSend(channelKey, () => target.bot.sendMessage(target.channelId, element));
+      msgIds = await this.runOwnSend(channelKey, () => sendPlatformMessage(this.ctx, target.bot, target.channelId, element));
     } catch (err) {
       const mute = await this.muteHint(target);
       return `（文件发送没有取得确认：${sendFailText(err)}。${mute ? `${mute}。` : ""}可能已送达，请先查看记录，不要直接重发。）`;
@@ -1033,7 +1051,8 @@ export class KoishiMessenger implements MessengerApi {
           break;
         }
         case "reply":
-          out += "[引用了一条消息]";
+        case "quote":
+          out += quoteTag({ id: d.id == null ? undefined : String(d.id) });
           break;
         case "json":
         case "xml":
@@ -1249,22 +1268,7 @@ export class KoishiMessenger implements MessengerApi {
   // ---------- 群相关（OneBot） ----------
 
   /** 查看自己加入的群列表 */
-  async listGroups(): Promise<string> {
-    const bot = this.findOnebot();
-    if (!bot) return "（没有唯一可确定的在线 OneBot 账号（多账号的全局资料操作需先明确账号）。）";
-    let data: Record<string, unknown>[];
-    try {
-      data = ((await callOnebot(bot, "get_group_list", {})) ?? []) as Record<string, unknown>[];
-    } catch (err) {
-      return `（查看群列表失败：${(err as Error).message ?? err}）`;
-    }
-    if (!Array.isArray(data) || !data.length) return "（你没有加入任何群。）";
-    const lines = data
-      .slice(0, 100)
-      .map((g) => `- ${g.group_name ?? "（未命名）"}（onebot:${g.group_id}，${g.member_count ?? "?"}/${g.max_member_count ?? "?"} 人）`);
-    const more = data.length > 100 ? `\n（其余 ${data.length - 100} 个群未显示）` : "";
-    return `你翻了翻自己加入的群（共 ${data.length} 个）：\n${lines.join("\n")}${more}`;
-  }
+  async listGroups(options: DiscoveryOptions = {}): Promise<RichText> { return this.discover("group", options); }
 
   /** 查看某个群的信息 */
   async groupInfo(id: string): Promise<string> {
@@ -1673,31 +1677,131 @@ export class KoishiMessenger implements MessengerApi {
   }
 
   /** 查看好友列表 */
-  async listFriends(): Promise<string> {
-    const lines: string[] = [];
-    for (const bot of this.ctx.bots) {
-      try {
-        let next: string | undefined;
-        do {
-          const page = await bot.getFriendList(next);
-          for (const friend of page.data) {
-            // 兼容两种返回形态：Universal.User 本体（onebot 等适配器）或 { user: {...} } 包装
-            const user = (friend.user ?? friend) as { id?: string; name?: string; nick?: string };
-            const uid = user.id;
-            if (!uid) continue;
-            const name = friend.nick || user.nick || user.name || uid;
-            lines.push(`- ${name}（${makeChannelKey(bot.platform ?? "unknown", `private:${uid}`, bot.selfId)}）`);
+  async listFriends(options: DiscoveryOptions = {}): Promise<RichText> { return this.discover("friend", options); }
+
+  /** Discovery is a bounded read, not a new-message source or an account-wide history sync. */
+  private discover(kind: DiscoveryKind, options: DiscoveryOptions): Promise<RichText> {
+    const task = this.discoveryTail.then(() => this.discoverPage(kind, options));
+    this.discoveryTail = task.then(() => {}, () => {});
+    this.historyLifecycle?.track(task);
+    return task;
+  }
+
+  private async discoverPage(kind: DiscoveryKind, options: DiscoveryOptions): Promise<RichText> {
+    this.historyLifecycle?.signal.throwIfAborted();
+    const limit = options.limit ?? 5;
+    if (!Number.isInteger(limit) || limit < 1 || limit > 10) throw new Error("limit 须为 1—10 的整数，默认 5");
+    if (options.preview !== undefined && typeof options.preview !== "boolean") throw new Error("preview 须为布尔值");
+    if (options.cursor !== undefined && (typeof options.cursor !== "string" || !options.cursor)) throw new Error("cursor 须使用上页返回的游标；第一页请省略");
+    const tool = kind === "group" ? "list_groups" : "list_friends", label = kind === "group" ? "群" : "好友";
+    let catalog = this.discoveryCatalogs.get(kind), offset = 0;
+    if (options.cursor !== undefined) {
+      const match = /^([^:]+):(\d+)$/.exec(options.cursor);
+      if (!catalog || !match || match[1] !== catalog.id || Date.now() - catalog.at > DISCOVERY_TTL || Number(match[2]) > catalog.entries.length)
+        return { text: `这页${label}列表的游标已失效，请不带 cursor 重新调用 ${tool}；没有继续拉取其他历史。`, originEventIds: [] };
+      offset = Number(match[2]);
+    } else if (!catalog || Date.now() - catalog.at > DISCOVERY_TTL) {
+      catalog = { id: randomUUID(), at: Date.now(), entries: [], notes: [], sources: [] };
+      if (kind === "group") {
+        const bot = this.findOnebot();
+        if (!bot) return { text: "没有唯一可确定的在线 OneBot 账号，无法读取群目录；这不表示你没有群。", originEventIds: [] };
+        try {
+          const data = await this.discoveryRead(() => callOnebot(bot, "get_group_list", {}));
+          if (!Array.isArray(data)) throw new Error("平台没有返回可读的群列表");
+          const known = new Set<string>();
+          for (const item of data) {
+            if (!item || item.group_id == null) continue;
+            const channelId = String(item.group_id), key = makeChannelKey("onebot", channelId, bot.selfId);
+            if (known.has(key)) continue; known.add(key);
+            catalog.entries.push({ key, platform: "onebot", channelId, selfId: bot.selfId,
+              name: String(item.group_name ?? "未命名群"), details: `${item.member_count ?? "?"}/${item.max_member_count ?? "?"} 人` });
           }
-          next = page.next;
-        } while (next && lines.length < 500);
-      } catch {
-        /* 平台不支持好友列表 */
+        } catch (error) {
+          this.historyLifecycle?.signal.throwIfAborted();
+          return { text: `查看群列表失败：${String((error as Error).message ?? error).slice(0, 240)}；不能据此判断群或消息为空。`, originEventIds: [] };
+        }
+      } else {
+        const seen = new Set<string>();
+        catalog.sources = this.ctx.bots.filter(bot => {
+          const key = `${bot.platform}:${bot.selfId}`;
+          if (!bot.isActive || seen.has(key)) return false; seen.add(key); return true;
+        }).map(bot => ({ bot, done: false }));
+        if (!catalog.sources.length) return { text: "没有在线账号可读取好友目录；这不表示没有好友或私聊。", originEventIds: [] };
+      }
+      this.historyLifecycle?.signal.throwIfAborted();
+      this.discoveryCatalogs.set(kind, catalog);
+    }
+    // One upstream friend page per explicit discovery call. Never automatically
+    // walk all platform cursors or open every contact's conversation.
+    if (kind === "friend" && offset >= catalog.entries.length) {
+      const source = catalog.sources.find(source => !source.done);
+      if (source) {
+        try {
+          const page = await this.discoveryRead(() => source.bot.getFriendList(source.next));
+          if (!page || !Array.isArray(page.data)) throw new Error("平台没有返回可读的好友列表");
+          const keys = new Set(catalog.entries.map(entry => entry.key));
+          for (const friend of page.data) {
+            const user = (friend.user ?? friend) as { id?: string; name?: string; nick?: string };
+            if (!user?.id) continue;
+            const platform = source.bot.platform ?? "unknown", channelId = `private:${user.id}`, selfId = source.bot.selfId;
+            const key = makeChannelKey(platform, channelId, selfId);
+            if (keys.has(key)) continue; keys.add(key);
+            catalog.entries.push({ key, platform, channelId, selfId, name: String(friend.nick || user.nick || user.name || user.id) });
+          }
+          source.done = !page.next || page.next === source.next;
+          source.next = page.next;
+        } catch (error) {
+          this.historyLifecycle?.signal.throwIfAborted();
+          catalog.notes.push(`${source.bot.platform}@${source.bot.selfId} 的好友目录暂不可读取（${String((error as Error).message ?? error).slice(0, 180)}）；不能当作空列表。`);
+          source.done = true;
+        }
       }
     }
-    if (!lines.length) return "（拿不到好友列表：当前平台不支持，或者你还没有好友。）";
-    const shown = lines.slice(0, 200);
-    const more = lines.length > shown.length ? `\n（其余 ${lines.length - shown.length} 人未显示）` : "";
-    return `你翻了翻好友列表（共 ${lines.length} 人）：\n${shown.join("\n")}${more}`;
+    this.historyLifecycle?.signal.throwIfAborted();
+    const entries = catalog.entries.slice(offset, offset + limit);
+    const hasMore = offset + entries.length < catalog.entries.length || catalog.sources.some(source => !source.done);
+    const cards = await Promise.all(entries.map(async entry => ({ entry, rows: options.preview === false ? [] : await this.store.channelMessages(entry.platform, entry.channelId, 2, entry.selfId), note: "" })));
+    this.historyLifecycle?.signal.throwIfAborted();
+    if (options.preview !== false && this.messaging.offlineHistory) {
+      const candidates = cards.filter(card => card.entry.platform === "onebot" &&
+        (!this.historyAttempts.has(card.entry.key) || Date.now() - this.historyAttempts.get(card.entry.key)!.at >= DISCOVERY_TTL) &&
+        (!card.rows.length || Date.now() - new Date(card.rows.at(-1)!.observedAt ?? card.rows.at(-1)!.timestamp).getTime() >= DISCOVERY_TTL))
+        .sort((a, b) => Number(!!a.rows.length) - Number(!!b.rows.length)).slice(0, DISCOVERY_HISTORY_LIMIT);
+      await Promise.all(candidates.map(async card => {
+        card.note = await this.loadEmptyChannelHistory(card.entry.platform, card.entry.channelId, card.entry.selfId, kind === "friend", 3, DISCOVERY_TTL);
+        this.historyLifecycle?.signal.throwIfAborted();
+        card.rows = await this.store.channelMessages(card.entry.platform, card.entry.channelId, 2, card.entry.selfId);
+      }));
+    }
+    this.historyLifecycle?.signal.throwIfAborted();
+    const parts: RichTextPart[] = [{ kind: "text", text: `${label}发现列表${entries.length ? `（本页第 ${offset + 1}—${offset + entries.length} 项）` : "（本页没有可显示条目）"}。${options.preview === false ? "本次只读目录，不补拉聊天。" : `只展示真实记录的有限预览；每页最多补拉 ${DISCOVERY_HISTORY_LIMIT} 个会话、每个最近3条，短时间不重复拉取。${this.messaging.offlineHistory ? "" : "历史补拉已关闭，只读本地。"}本地未同步不表示没有消息。历史预览不是新通知，也不表示有人正在找你；同一记录编号是回读。媒体仅显示类型，尚未展开看图。`}\n` }];
+    const roots = new Set<string>();
+    for (const card of cards) {
+      const { entry, rows } = card;
+      parts.push({ kind: "text", text: `\n- ${entry.name}（${entry.key}${entry.details ? `，${entry.details}` : ""}）\n${this.notify.channelStatusText(entry.key)}\n` });
+      if (options.preview === false) continue;
+      if (!rows.length) { parts.push({ kind: "text", text: (card.note || (this.messaging.offlineHistory ? "暂无本地可读片段，本页未拉取或平台没有返回可读记录；不是会话没有历史。" : "暂无本地可读片段，历史补拉已关闭。")) + "\n" }); continue; }
+      const identity = await this.names.identity(entry.key, { isDirect: kind === "friend", guildId: rows.at(-1)?.guildId });
+      this.historyLifecycle?.signal.throwIfAborted();
+      parts.push({ kind: "text", text: identity.text + "\n" });
+      for (const row of rows) {
+        const evidence = chatMessageEvidence(row, entry.selfId);
+        evidence.originEventIds?.forEach(root => roots.add(root));
+        parts.push({ kind: "text", text: `〔记录 #${row.id}${row.messageId ? ` · msg:${row.messageId}` : ""} · ${formatMessageTime(row)}〕\n发送者：${formatMessageSender(row, identity)}；${conversationLabel(row.conversation, entry.selfId)}\n正文片段：${truncate(stripPlaceholders(storedQuoteContent(row)), 160)}\n〔片段结束；完整图文请 select_channel〕\n`,
+          observedMessage: { originEventIds: evidence.originEventIds!, experience: evidence.experience! } });
+      }
+      if (card.note) parts.push({ kind: "text", text: card.note + "\n" });
+    }
+    if (catalog.notes.length) parts.push({ kind: "text", text: catalog.notes.join("\n") + "\n" });
+    if (hasMore) parts.push({ kind: "text", text: `下一页：${tool}(${JSON.stringify({ cursor: `${catalog.id}:${offset + entries.length}`, limit, ...(options.preview === false ? { preview: false } : {}) })})。仅在想继续浏览时翻页，不必穷尽列表。` });
+    else parts.push({ kind: "text", text: `本次目录已到末页。可用 select_channel(id) 选择感兴趣的会话；没有必要为了填满列表重复查询。` });
+    return { text: richPartsText(parts), parts, originEventIds: [...roots], experience: { agency: "observed", situation: "聊天发现列表" } };
+  }
+
+  private discoveryRead<T>(run: () => Promise<T>): Promise<T> {
+    const timeout = AbortSignal.timeout(15_000);
+    const signal = this.historyLifecycle ? AbortSignal.any([timeout, this.historyLifecycle.signal]) : timeout;
+    return abortableHistory(run, signal).then(result => { signal.throwIfAborted(); return result; });
   }
 
   /** 放下手机：清除全部频道关注，恢复为一般通知策略 */
@@ -1711,6 +1815,46 @@ export class KoishiMessenger implements MessengerApi {
   }
 
   // ---------- 离线历史补拉 ----------
+
+  private async loadEmptyChannelHistory(platform: string, channelId: string, accountId: string | undefined, isDirect: boolean, limit: number, cooldownMs = 30_000): Promise<string> {
+    this.historyLifecycle?.signal.throwIfAborted();
+    if (!this.messaging.offlineHistory) return "历史补拉已关闭；这里只显示本地记录，平台是否有更早消息未知。";
+    if (platform !== "onebot") return "当前平台没有接入按需历史读取；这里只显示本地记录。";
+    const key = makeChannelKey(platform, channelId, accountId);
+    while (this.historyLoads.has(key)) {
+      const ongoing = this.historyLoads.get(key)!;
+      const note = await ongoing;
+      this.historyLifecycle?.signal.throwIfAborted();
+      if ((this.historyAttempts.get(key)?.limit ?? 0) >= limit) return note;
+      // The prior caller's finally normally removes this before continuation;
+      // remove only that same settled promise if this waiter resumed first.
+      if (this.historyLoads.get(key) === ongoing) this.historyLoads.delete(key);
+    }
+    const previous = this.historyAttempts.get(key);
+    if (previous && previous.limit >= limit && Date.now() - previous.at < cooldownMs) return "最近一次查询结果：" + previous.note + "（刚刚查询过，稍后可再次刷新。）";
+    const work = (async () => {
+      const timeout = AbortSignal.timeout(15_000);
+      const signal = this.historyLifecycle ? AbortSignal.any([timeout, this.historyLifecycle.signal]) : timeout;
+      let note: string;
+      try {
+        const count = await this.syncGroupHistory(platform, channelId, accountId, signal, { limit: Math.max(1, Math.min(200, Math.floor(limit) || 10)), isDirect });
+        signal.throwIfAborted();
+        note = count > 0 ? `本次按需补入 ${count} 条平台历史记录；这是回读，不是这些人现在又发来消息，也不是全部聊天历史。`
+          : "平台此次未返回新增的可读历史记录，不能据此断言这个会话从未有消息。";
+      } catch (error) {
+        this.historyLifecycle?.signal.throwIfAborted();
+        note = timeout.aborted ? "平台历史读取超时，仍可查看已保存的本地记录；这不表示会话没有消息。"
+          : `平台历史暂时不可读取（${String((error as Error).message ?? error).slice(0, 240)}），仍可查看已保存的本地记录；这不表示会话没有消息。`;
+      }
+      this.historyAttempts.set(key, { at: Date.now(), note, limit });
+      if (this.historyAttempts.size > 200) this.historyAttempts.delete(this.historyAttempts.keys().next().value!);
+      return note;
+    })();
+    this.historyLoads.set(key, work);
+    this.historyLifecycle?.track(work);
+    try { return await work; }
+    finally { if (this.historyLoads.get(key) === work) this.historyLoads.delete(key); }
+  }
 
   /**
    * 插件离线期间错过的群消息补拉（OneBot 扩展接口 get_group_msg_history）。
@@ -1759,23 +1903,32 @@ export class KoishiMessenger implements MessengerApi {
   }
 
   /** Bounded overlap by platform IDs/sequence, never by the host clock. */
-  private async syncGroupHistory(platform: string, channelId: string, accountId?: string, signal?: AbortSignal): Promise<number> {
+  private async syncGroupHistory(platform: string, channelId: string, accountId?: string, signal?: AbortSignal, requested?: { limit: number; isDirect: boolean }): Promise<number> {
     signal?.throwIfAborted();
     const bot = accountId
       ? this.ctx.bots.find((b) => b.platform === platform && b.selfId === accountId && b.isActive)
       : this.findOnebot();
-    if (!bot) return 0;
+    if (!bot) {
+      if (requested) throw new Error("该账号当前未连接，不能读取平台历史");
+      return 0;
+    }
     const fence = this.store.captureLive();
     const prior = await this.store.channelMessages(platform, channelId, 500, bot.selfId);
     signal?.throwIfAborted();
-    if (!prior.length) return 0;
+    if (!prior.length && !requested) return 0;
     const known = new Map(prior.filter(row => row.messageId).map(row => [row.messageId, row]));
-    const params: Record<string, unknown> = { group_id: toIdValue(channelId), count: 50 };
+    const isDirect = requested?.isDirect === true;
+    const pageSize = requested?.limit ?? 50;
+    const params: Record<string, unknown> = isDirect
+      ? { user_id: toIdValue(channelId.replace(/^private:/, "")), message_seq: 0, count: pageSize }
+      : { group_id: toIdValue(channelId), count: pageSize };
     const collected = new Map<string, Record<string, unknown>>();
-    for (let page = 0; page < 4; page++) {
-      const data = ((await abortableHistory(() => callOnebot(bot, "get_group_msg_history", params), signal)) ?? {}) as { messages?: unknown[]; next_seq?: number | string };
+    for (let page = 0; page < (requested ? 1 : 4); page++) {
+      const data = ((await abortableHistory(() => callOnebot(bot, isDirect ? "get_friend_msg_history" : "get_group_msg_history", params), signal)) ?? {}) as { messages?: unknown[]; next_seq?: number | string };
       signal?.throwIfAborted();
-      const messages = (Array.isArray(data.messages) ? data.messages : []) as Record<string, unknown>[];
+      if (requested && !Array.isArray(data.messages)) throw new Error("平台未返回历史消息列表，可能不支持该接口");
+      const messages = (Array.isArray(data.messages) ? data.messages.slice(0, pageSize) : [])
+        .filter((item): item is Record<string, unknown> => !!item && typeof item === "object");
       if (!messages.length) break;
       let minSeq: bigint | undefined;
       let overlap = false;
@@ -1787,7 +1940,7 @@ export class KoishiMessenger implements MessengerApi {
         if (known.has(id)) overlap = true;
         collected.set(id, raw);
       }
-      if (overlap || messages.length < 50) break;
+      if (overlap || messages.length < pageSize) break;
       const nextSeq = messageSequence(data.next_seq) ?? minSeq?.toString();
       if (!nextSeq || (params.message_seq != null && BigInt(nextSeq) >= BigInt(String(params.message_seq)))) break;
       params.message_seq = nextSeq;
@@ -1817,18 +1970,19 @@ export class KoishiMessenger implements MessengerApi {
       if (Array.isArray(body)) {
         content = await this.serializeRawSegments(body as Record<string, unknown>[], signal);
         signal?.throwIfAborted();
-        conversation = rawGroupConversation(body as Record<string, unknown>[]);
-      } else if (typeof body === "string") content = body;
+        conversation = rawGroupConversation(body as Record<string, unknown>[], isDirect ? "direct" : "group");
+      } else if (typeof body === "string") content = escapeMediaStorageText(body);
       if (!content.trim()) continue;
       if (conversation?.reply?.messageId) {
-        const original = await this.store.findByMessageId(platform, channelId, conversation.reply.messageId, bot.selfId);
+        const original = rows.find(row => row.messageId === conversation!.reply!.messageId)
+          ?? await this.store.findByMessageId(platform, channelId, conversation.reply.messageId, bot.selfId);
         signal?.throwIfAborted();
         if (original?.userId) conversation.reply.userId = original.userId;
       }
       rows.push({ platform, channelId, selfId: bot.selfId, guildId: "", userId: senderId,
         username: firstName(sender.card, sender.nickname), content, timestamp: new Date(timeMs),
         platformSequence: messageSequence(raw.message_seq), self, senderOrigin: "unknown", senderOwned: self ? true : null,
-        messageId: msgId, isDirect: false, conversation });
+        messageId: msgId, isDirect, conversation });
     }
     signal?.throwIfAborted();
     // Unlike platform/media reads, an import already admitted must finish before
@@ -1936,7 +2090,7 @@ export class KoishiMessenger implements MessengerApi {
   /**
    * 解析媒体引用：media:N 或 gallery:分类/文件名；裸数字仅为界面输入便利，禁止末尾数字猜测。
    * sticker：图片是否属于收藏夹「表情包」分类（发送时应作为平台表情而非普通图片呈现）——
-   * 收藏夹引用直接看分类；裸媒体编号按 sha256 反查收藏记录（同一张图无论怎么引用都一致）。
+   * 收藏夹引用直接看分类；裸媒体编号按 sha256 反查收藏记录和入站标记，资源相同不代表用途相同。
    */
   private async resolveMediaRef(
     refText: string,
@@ -1996,6 +2150,7 @@ export class KoishiMessenger implements MessengerApi {
     content: string,
     messageId?: string,
     timestamp = new Date(),
+    conversation?: ConversationContext,
   ): Promise<void> {
     const ticket = this.store.captureReceipt(target.platform, target.channelId, target.bot.selfId, messageId ?? "", timestamp);
     const identity = await this.names.identity(makeChannelKey(target.platform, target.channelId, target.bot.selfId), { isDirect: target.isDirect });
@@ -2014,6 +2169,7 @@ export class KoishiMessenger implements MessengerApi {
       senderOwned: true,
       messageId: messageId ?? "",
       isDirect: target.isDirect,
+      ...(conversation ? { conversation } : {}),
     }, ticket);
   }
 
@@ -2294,7 +2450,7 @@ function stripPlaceholders(text: string): string {
 }
 
 /** Offline OneBot history carries structured segments too; preserve the same evidence as live sessions. */
-export function rawGroupConversation(segments: Record<string, unknown>[]): ConversationContext {
+export function rawGroupConversation(segments: Record<string, unknown>[], kind: "group" | "direct" = "group"): ConversationContext {
   const elements = segments.map(segment => {
     const data = (segment.data && typeof segment.data === "object" ? segment.data : {}) as Record<string, unknown>;
     switch (segment.type) {
@@ -2312,7 +2468,7 @@ export function rawGroupConversation(segments: Record<string, unknown>[]): Conve
       default: return h("unknown", {});
     }
   });
-  return describeConversation(elements, "group", isStickerElement);
+  return describeConversation(elements, kind, isStickerElement);
 }
 
 function truncate(text: string, max: number): string {

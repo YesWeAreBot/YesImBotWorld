@@ -109,7 +109,8 @@ async function main(): Promise<void> {
     assert.deepEqual(recordedReceipt.observation.sourceEventIds, []); assert.equal(recordedReceipt.observation.scene, undefined); assert.equal(recordedReceipt.scene, undefined);
     assert.match(recordedReceipt.observation.narrative, /整理书桌.*已经完成/); assert.match(recordedReceipt.observation.narrative, /没有保存当时的感知经过/);
     assert.match(recordedReceipt.observation.narrative, /没有重新执行/); assert.doesNotMatch(recordedReceipt.observation.narrative, /零钱/);
-    await store.commit({ idempotencyKey: "another-perception", source: "evolve", perceptions: [{ actorId: "bot", text: "另一个事件：门口传来敲门声。" }] });
+    await store.commit({ idempotencyKey: "another-perception", source: "evolve", worldState: store.snapshot().worldState + "门外有人敲门。", perceptions: [{ actorId: "bot", text: "另一个事件：门口传来敲门声。" }],
+      evolution: { changes: [{ id: "knock", description: "门外有人敲门。" }], actorEffects: [], perceptionSources: [{ actorId: "bot", changeIds: ["knock"] }] } });
     const actualEvent = await runtime.peek();
     assert.equal(await runtime.act("bot", recordedCall, text => { recordedReceipt = JSON.parse(text); }), true);
     assert.equal(recordedReceipt.observation.observationId, "action-record:bot:imported-terminal", "record-only receipt identity stays stable when newer events arrive");

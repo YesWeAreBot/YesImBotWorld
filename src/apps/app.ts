@@ -36,11 +36,17 @@ export interface WorldApp {
   /** Known transport state only; reading this never connects or probes a remote service. */
   readonly connected?: boolean;
   /** 打开应用：建立连接并列出可用工具；opening 为实际界面状态说明（不得替角色编造移动、姿态或心理，可选） */
-  open(): Promise<{ tools: AppRawTool[]; opening?: string }>;
+  open(): Promise<{ tools: AppRawTool[]; opening?: string | RichText }>;
   /** 调用应用的一个工具，返回呈现给 Bot 的结果（可带原生附件，如浏览器点开的图片） */
-  call(tool: string, args: Record<string, unknown>): Promise<string | RichText>;
-  /** 关闭应用（断开连接/释放资源） */
+  call(tool: string, args: Record<string, unknown>, context?: { operator?: boolean }): Promise<string | RichText>;
+  /** 关闭前台界面；后台任务可继续，直到世界停止。 */
   close(): Promise<void>;
+  /** 仅读取缓存的设备界面，不触发网络请求或模型生成。 */
+  viewState?(): unknown;
+  /** 仅读取当前已缓存的可见内容；与某次操作的确认回执区分。 */
+  peekScreen?(): RichText | null;
+  /** 世界停止：取消并等待后台任务，释放连接。 */
+  dispose?(): Promise<void>;
 }
 
 /** 从 JSON Schema 渲染工具参数签名：`name(city: string, days?: number)` */

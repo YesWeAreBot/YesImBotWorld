@@ -7,7 +7,8 @@ import { WorldKernel } from "./kernel.js";
 import { WorldBus, envelope, type BusEnvelope, type BusListener } from "./bus.js";
 import { assertJson, assertSafeKey, KernelError, type JsonValue, type WorldEntity, type WorldObservation, type WorldSnapshot } from "./state.js";
 import type { NarrativeActor, NarrativeAction, NarrativeCommit, NarrativeCommitResult, NarrativePerception, NarrativeSnapshot } from "./narrative-types.js";
-import { validNarrativePresentation } from "./narrative-types.js";
+import { validNarrativeEvolution, validNarrativePresentation } from "./narrative-types.js";
+import { validPhonePhysicalState } from "../phone-state.js";
 
 interface StoreOptions {
   now?: () => number;
@@ -67,11 +68,39 @@ export class NarrativeStore {
     return clone(this.records.filter(record => record.sequence > sinceSequence).flatMap(record => record.perceptions)
       .filter(perception => perception.actorId === actorId && (actionId === undefined || perception.actionId === actionId)));
   }
+  /** Bounded, chronological window of actual external changes; never infer causes from legacy prose. */
+  readRecentEvolution(limit = 3, maxChars = 6000): { sequence: number; worldTime: number; changes: { id: string; description: string }[] }[] {
+    const count = Number.isFinite(limit) ? Math.max(0, Math.floor(limit)) : 3;
+    const budget = Number.isFinite(maxChars) ? Math.max(0, Math.floor(maxChars)) : 6000;
+    const recent: { sequence: number; worldTime: number; changes: { id: string; description: string }[] }[] = [];
+    let chars = 2; // JSON array brackets; later rows also need a comma.
+    for (let index = this.records.length - 1; index >= 0 && recent.length < count; index--) {
+      const record = this.records[index]!, changes = record.commit.evolution?.changes;
+      if (!changes?.length) continue;
+      const row = { sequence: record.sequence, worldTime: record.effectiveAt, changes: changes.map(({ id, description }) => ({ id, description })) };
+      const size = JSON.stringify(row).length + (recent.length ? 1 : 0);
+      // Do not skip a large recent event and present older ones as if no gap existed.
+      if (chars + size > budget) break;
+      recent.push(row); chars += size;
+    }
+    return recent.reverse();
+  }
+  /** Last committed evolution, including legacy records without external-cause metadata. */
+  lastEvolutionAt(): number | undefined {
+    for (let index = this.records.length - 1; index >= 0; index--) {
+      const record = this.records[index]!;
+      if (record.commit.source === "evolve") return record.effectiveAt;
+    }
+    return undefined;
+  }
   /** Complete committed records only, so a concurrent archive can never copy a half-written append. */
   exportJournal(): Promise<string> {
     return this.enqueue(async () => this.records.map(record => JSON.stringify(record) + "\n").join(""));
   }
   commit(input: NarrativeCommit, options: CommitOptions = {}): Promise<NarrativeCommitResult> {
+    // Historical journals predate external-cause metadata; replay remains permissive.
+    // Fresh writers cannot use that compatibility path to bypass evolve authority.
+    if (input?.source === "evolve" && input.evolution === undefined) throw new KernelError("INVALID_EVOLUTION", "新的世界演化事务必须包含本轮外部变化及evolution来源；无变化时不要提交。");
     const commit = copyCommit(input);
     return this.enqueue(async () => {
       checkCancellation(options);
@@ -97,6 +126,7 @@ export class NarrativeStore {
       const events: BusEnvelope[] = [envelope({ kind: "event", topic: "world.committed", source: commit.source, sequence, effectiveAt, priority: 3,
         ...(commit.actorId ? { actorId: commit.actorId } : {}), ...(commit.actionId ? { correlationId: commit.actionId } : {}),
         payload: { changedActorIds: Object.keys(commit.actors ?? {}), actionIds: Object.keys(commit.actions ?? {}),
+          ...(commit.phoneState !== undefined ? { phoneStateChanged: JSON.stringify(commit.phoneState) !== JSON.stringify(this.state.phoneState) } : {}),
           perceptibleChanges: Object.fromEntries(perceptions.map(item => [item.actorId, [item.actorId]])) } }),
         ...perceptions.map(perception => ({ ...envelope({ kind: "observation", topic: "world.perception", source: commit.source,
           actorId: perception.actorId, sequence, effectiveAt, priority: 2, causationId: transactionId,
@@ -236,6 +266,9 @@ function copyCommit(input: NarrativeCommit): NarrativeCommit {
   if (!input || typeof input.idempotencyKey !== "string" || !input.idempotencyKey.trim() || input.idempotencyKey.length > 256 || typeof input.source !== "string" || !input.source.trim()) throw new KernelError("INVALID_PROPOSAL", "世界更新需要有效请求标识和来源。");
   if (input.expectedSequence !== undefined && (!Number.isSafeInteger(input.expectedSequence) || input.expectedSequence < 0)) throw new KernelError("INVALID_VERSION", "世界版本必须是非负整数。");
   if (input.worldState !== undefined && typeof input.worldState !== "string") throw new KernelError("INVALID_PROPOSAL", "世界状态必须是自然语言文本。");
+  if (input.phoneState !== undefined && (!validPhonePhysicalState(input.phoneState)
+    || !["initialize", "action", "observe", "evolve", "administrator"].includes(input.source)
+    || input.actorId !== undefined && input.actorId !== "bot")) throw new KernelError("INVALID_PHONE_STATE", "手机物理状态必须完整且有效，仅常驻角色的物理世界裁定或管理员可更新；访客和应用任务不能修改。");
   if (input.initialized !== undefined && typeof input.initialized !== "boolean") throw new KernelError("INVALID_PROPOSAL", "初始化状态必须为布尔值。");
   if (input.actionPhase !== undefined && (!input.actionId || !["start", "finish"].includes(input.actionPhase))) throw new KernelError("INVALID_ACTION", "行动感知阶段需要有效动作编号和start/finish。");
   if (input.toolReceipt !== undefined) {
@@ -261,21 +294,36 @@ function copyCommit(input: NarrativeCommit): NarrativeCommit {
     !validNarrativePresentation(perception) ||
     (perception.sourceEventIds !== undefined && (!Array.isArray(perception.sourceEventIds) || perception.sourceEventIds.some(id => typeof id !== "string" || !id.trim())))) throw new KernelError("INVALID_PERCEPTION", "角色感知必须包含有效文本和来源；可选状态栏最多1200字，行动建议最多4条且须有有效标题和意图。");
   if (["app_observe", "app_action"].includes(input.source) && input.perceptions?.some(p => p.situation !== undefined || p.opportunities !== undefined)) throw new KernelError("INVALID_PERCEPTION", "应用回执不能提供角色状态栏或剧情行动建议。");
+  if (input.evolution !== undefined) {
+    if (input.source !== "evolve" || input.actionId !== undefined || input.actionPhase !== undefined || input.actions !== undefined || input.initialized !== undefined || input.toolReceipt !== undefined || !validNarrativeEvolution(input.evolution)) throw new KernelError("INVALID_EVOLUTION", "外部演化需要本轮外部变化及有效来源，不能结算角色行动。");
+    const effects = new Set(input.evolution.actorEffects.map(effect => effect.actorId));
+    const recipients = new Set(input.evolution.perceptionSources.map(source => source.actorId));
+    if (Object.keys(input.actors ?? {}).length !== effects.size || Object.keys(input.actors ?? {}).some(id => !effects.has(id)) ||
+      (input.perceptions ?? []).length !== recipients.size || (input.perceptions ?? []).some(perception => !recipients.has(perception.actorId)) ||
+      (input.phoneState !== undefined) !== (input.evolution.phoneChangeIds !== undefined) || !input.worldState?.trim()) throw new KernelError("INVALID_EVOLUTION", "角色影响、感知和手机物理变化须分别引用本轮外部原因，并同笔保存世界经过。");
+  }
   return clone(input);
 }
 function applyCommit(base: NarrativeSnapshot, commit: NarrativeCommit, sequence: number, effectiveAt: number, perceptions: NarrativePerception[]): NarrativeSnapshot {
   if (commit.expectedSequence !== undefined && commit.expectedSequence !== base.sequence) throw new KernelError("VERSION_CONFLICT", `世界已更新：预期版本 ${commit.expectedSequence}，当前版本 ${base.sequence}。`);
+  if (commit.evolution) for (const [id, actor] of Object.entries(commit.actors ?? {})) {
+    const previous = base.actors[id];
+    if (!previous?.present || JSON.stringify({ ...actor, state: previous.state }) !== JSON.stringify(previous)) throw new KernelError("INVALID_EVOLUTION", "外部身体影响只能更新既有在场角色的客观状态，不能改写身份、在场登记或感知记录。");
+  }
   if (!Number.isFinite(effectiveAt) || effectiveAt < base.effectiveAt || sequence !== base.sequence + 1) throw new KernelError("INVALID_TIME", "世界更新顺序或时间无效。");
   const next = clone(base);
   next.sequence = sequence; next.effectiveAt = effectiveAt;
-  const proseChanged = (commit.worldState !== undefined && commit.worldState !== base.worldState) || Object.entries(commit.actors ?? {}).some(([id, actor]) => {
+  const proseChanged = (commit.worldState !== undefined && commit.worldState !== base.worldState)
+    || (commit.phoneState !== undefined && JSON.stringify(commit.phoneState) !== JSON.stringify(base.phoneState)) || Object.entries(commit.actors ?? {}).some(([id, actor]) => {
     const previous = Object.hasOwn(base.actors, id) ? base.actors[id] : undefined;
     return !previous || previous.state !== actor.state || previous.present !== actor.present;
   });
   if (proseChanged) { next.stateUpdatedAt = effectiveAt; next.stateSequence = sequence; }
   if (commit.initialized !== undefined) next.initialized = commit.initialized;
   if (commit.worldState !== undefined) next.worldState = commit.worldState;
+  if (commit.phoneState !== undefined) next.phoneState = clone(commit.phoneState);
   for (const [id, actor] of Object.entries(commit.actors ?? {})) next.actors[id] = clone(actor);
+  if (commit.phoneState !== undefined && !next.actors.bot?.present) throw new KernelError("INVALID_PHONE_STATE", "常驻角色不在本世界时不能裁定其手机物理状态。");
   if (commit.toolReceipt && !Object.hasOwn(next.actors, commit.toolReceipt.actorId)) throw new KernelError("MISSING_ACTOR", "应用操作角色不存在。");
   for (const [id, action] of Object.entries(commit.actions ?? {})) {
     if (!Object.hasOwn(next.actors, action.actorId)) throw new KernelError("MISSING_ACTOR", "行动角色不存在。");

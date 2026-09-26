@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { createRequire, Module } from 'node:module';
 import { createDeviceFixture } from './webui-preview-devices.mjs';
 import { createLiveFixture } from './webui-preview-live.mjs';
-import { createRegulationFixture } from './webui-preview-regulation.mjs';
+import { renderWebUISource } from './webui-source.mjs';
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 process.env.NODE_PATH = join(root, 'node_modules');
 Module._initPaths();
@@ -15,11 +15,13 @@ const require = createRequire(import.meta.url);
 const { build } = require(require.resolve('esbuild', { paths: [dirname(require.resolve('pkgroll/package.json'))] }));
 const temporary = await mkdtemp(join(tmpdir(), 'world-studio-preview-'));
 const configModule = join(temporary, 'config.cjs');
-await build({ stdin: { contents: 'export { Config } from "./src/config.ts"; export { introspect } from "./src/webui/schema.ts"; export { WebCommandRunner } from "./src/webui/commands.ts";', resolveDir: root, loader: 'ts' }, outfile: configModule, bundle: true, platform: 'node', format: 'cjs', packages: 'external', alias: { koishi: require.resolve('koishi') }, logLevel: 'warning' });
-const { Config, introspect, WebCommandRunner } = require(configModule);
+await build({ stdin: { contents: 'export { Config } from "./src/config.ts"; export { introspect } from "./src/webui/schema.ts"; export { WebCommandRunner } from "./src/webui/commands.ts"; export { deviceAppCatalog } from "./src/webui/app-catalog.ts"; export { collectOpportunities } from "./src/bot/opportunities.ts"; export { resolveHumanChoice } from "./src/bot/choice.ts";', resolveDir: root, loader: 'ts' }, outfile: configModule, bundle: true, platform: 'node', format: 'cjs', packages: 'external', alias: { koishi: require.resolve('koishi') }, logLevel: 'warning' });
+const { Config, introspect, WebCommandRunner, deviceAppCatalog, collectOpportunities, resolveHumanChoice } = require(configModule);
 let config = Config({ autoStart: false });
-const fixture = createDeviceFixture();
-const regulation = createRegulationFixture();
+let phoneShell = '', shellDesign = 0;
+config.apps.chatAppName = '消息';
+config.world.model = 'preview-world-model';
+const fixture = createDeviceFixture({config:()=>config,running:()=>running,catalog:deviceAppCatalog});
 const modelListRequests = [];
 const debugStreams = new Set();
 const liveFixture = createLiveFixture(entry => {for(const res of debugStreams)res.write('data: '+JSON.stringify({channel:'debug',entry,update:true})+'\n\n');});
@@ -100,7 +102,31 @@ function cockpitTools() {
  return [tool('act','尝试身体动作',{description:{type:'string'},speech:{type:'string'},target:{type:'string'}},['description']),tool('observe_device','只读查看设备画面',{device:{type:'string',enum:['phone','computer']}},['device']),...(player?.mode==='avatar'?[tool('recall_growth','回顾自己的认识',{keyword:{type:'string'}}),tool('wait','等待指定 TU',{n:{type:'number'}},['n']),tool('rest','休息指定 TU',{duration:{type:'number'}})]:[]),...fixture.session().tools.map(t=>({...t,requiresSendConfirmation:t.effect==='send'}))];
 }
 function observation(intent) { if(narrativeMode&&(intent||!player?.observation))return narrativeObservation(intent);if(player?.observation)return structuredClone(player.observation);return { observationId:'obs_preview',actorId:player?.takeover?'bot':'player_fixture',worldSequence:28,observedAt:at,sourceEventIds:['event_12'],entities:[{observedId:'seen_self',kind:'actor',name:player?.takeover?'小澈':profile.name,revision:1,self:true,attributes:{posture:'站在窗边'}},{observedId:'seen_studio',kind:'place',name:'窗边工作室',revision:3,self:false,attributes:{light:'soft'}},{observedId:'seen_cup',kind:'object',name:'温热的茶',revision:3,self:false,locationObservedId:'seen_studio',attributes:{temperature:52}}],utterances:[]}; }
-function playerEvent(value){for(const res of streams)res.write((value.eventId?'id: '+value.eventId+'\n':'')+'data: '+JSON.stringify(value)+'\n\n');}
+function playerMenu(obs=player?.observation) {
+ if(!obs)return [];
+ const id=obs.observationId||obs.scene?.eventId;
+ return collectOpportunities([{kind:'event',event:{id,source:'world',worldTime:obs.observedAt||0,content:JSON.stringify(obs)}}],['act'])
+  .filter(item=>item.sourceEventId!==player?.consumedScene);
+}
+function playerEnvelope(value) {
+ try{
+  const raw=JSON.parse(value.content),obs=raw.observation||raw;
+  if(obs.scene||obs.mode==='narrative'){
+   const sequence=obs.worldSequence??obs.scene?.worldSequence;
+   if(player&&sequence<(player.menuSequence??-Infinity))return {...value,worldSequence:sequence};
+   const opportunities=playerMenu(obs),stamp=JSON.stringify([obs.observationId||obs.scene?.eventId,opportunities]);
+   if(player&&stamp!==player.menuStamp){player.menuStamp=stamp;player.menuRevision=(player.menuRevision||0)+1;player.menuSequence=sequence;}
+   return {...value,eventId:value.eventId||obs.observationId||obs.scene.eventId,worldSequence:sequence,opportunities,opportunityRevision:player?.menuRevision||0};
+  }
+ }catch{/* Natural text and externally controlled receipts are not parsed as JSON. */}
+ return value;
+}
+function playerEvent(value){value=playerEnvelope(value);for(const res of streams)res.write((value.eventId?'id: '+value.eventId+'\n':'')+'data: '+JSON.stringify(value)+'\n\n');}
+function consumeChoice(sourceEventId){
+ player.consumedScene=sourceEventId;player.menuRevision=(player.menuRevision||0)+1;
+ player.menuStamp=JSON.stringify([player.observation?.observationId||player.observation?.scene?.eventId,[]]);
+ if(!player.takeover)playerEvent({type:'opportunities',opportunities:[],opportunityRevision:player.menuRevision,worldSequence:player.menuSequence});
+}
 // A deterministic action/scene pair exercises the same append-only UI protocol
 // without calling an LLM. The scene is released separately by the smoke test.
 function storyReceipt(callId, intent, speech) {
@@ -124,15 +150,16 @@ const server=http.createServer(async(req,res)=>{
  const json=(value,status=200)=>{res.writeHead(status,{'content-type':'application/json; charset=utf-8','cache-control':'no-store'});res.end(JSON.stringify(value));};
  try{
   if(path==='/'){
-   const source=await readFile(join(root,'src/webui/page.ts'),'utf8');let page=JSON.parse(source.slice(source.indexOf('export const PAGE_HTML = ')+24).trim().replace(/;$/,''));
+   let page;
    if(process.env.STUDIO_PREVIEW_SOURCE==='1'){
-    page=await readFile(join(root,'src/webui/index.html'),'utf8');
-    for(const match of page.matchAll(/\/\* @include ([a-zA-Z0-9_./-]+) \*\//g)){const file=resolve(root,'src/webui',match[1]);if(!file.startsWith(join(root,'src/webui/client')+'/'))throw Error('Invalid preview include');page=page.replace(match[0],await readFile(file,'utf8'));}
+    page=renderWebUISource(root);
+   }else{
+    const source=await readFile(join(root,'src/webui/page.ts'),'utf8');page=JSON.parse(source.slice(source.indexOf('export const PAGE_HTML = ')+24).trim().replace(/;$/,''));
    }
-   res.writeHead(200,{'content-type':'text/html; charset=utf-8','cache-control':'no-store'});res.end(page.replace('</body>','<div style="position:fixed;bottom:6px;left:12px;z-index:65;padding:3px 8px;border-radius:5px;background:#fff2d4;color:#896428;font:9px sans-serif;pointer-events:none">开发预览 · 全部为本地样本数据</div></body>'));return;
+   res.writeHead(200,{'content-type':'text/html; charset=utf-8','cache-control':'no-store'});res.end(page.replace(/<\/body>\s*<\/html>\s*$/i,'<div style="position:fixed;bottom:6px;left:12px;z-index:65;padding:3px 8px;border-radius:5px;background:#fff2d4;color:#896428;font:9px sans-serif;pointer-events:none">开发预览 · 全部为本地样本数据</div></body></html>'));return;
   }
   if(path==='/api/events'){res.writeHead(200,{'content-type':'text/event-stream','cache-control':'no-cache'});debugStreams.add(res);res.write('data: '+JSON.stringify({channel:'hello',snapshot:45})+'\n\n');const timer=setInterval(()=>res.write(': keepalive\n\n'),15000);req.on('close',()=>{debugStreams.delete(res);clearInterval(timer);});return;}
-  if(path==='/api/player/events'){res.writeHead(200,{'content-type':'text/event-stream','cache-control':'no-cache'});streams.add(res);res.write('data: '+JSON.stringify({type:'hello',worldName:'林间小屋',unitWorldSeconds:1,timeLine:'09:41 · 初秋的清晨'})+'\n\n');res.write('data: '+JSON.stringify({type:'event',eventId:'initial-'+(player?.token||'preview'),content:JSON.stringify(observation())})+'\n\n');const timer=setInterval(()=>res.write(': keepalive\n\n'),15000);req.on('close',()=>{streams.delete(res);clearInterval(timer);});return;}
+  if(path==='/api/player/events'){res.writeHead(200,{'content-type':'text/event-stream','cache-control':'no-cache'});streams.add(res);const initial=playerEnvelope({type:'event',eventId:'initial-'+(player?.token||'preview'),content:JSON.stringify(observation())});res.write('data: '+JSON.stringify({type:'hello',worldName:'林间小屋',unitWorldSeconds:1,timeLine:'09:41 · 初秋的清晨',opportunities:playerMenu(),opportunityRevision:player?.menuRevision||0,worldSequence:player?.menuSequence})+'\n\n');res.write('data: '+JSON.stringify(initial)+'\n\n');const timer=setInterval(()=>res.write(': keepalive\n\n'),15000);req.on('close',()=>{streams.delete(res);clearInterval(timer);});return;}
   let body={};if(!['GET','HEAD'].includes(req.method)){const chunks=[];let size=0;for await(const chunk of req){size+=chunk.length;if(size>1000000)throw Error('body too large');chunks.push(chunk);}const raw=Buffer.concat(chunks).toString('utf8');if(raw)body=JSON.parse(raw);}
   if(path==='/api/health')return json({ok:true,preview:true});
   if(path==='/api/commands'){if(req.method==='GET')return json(commandFixture.catalog());if(req.method==='POST'){try{const run=commandFixture.start(body);return json({instanceId:commandFixture.instanceId,run},run.status==='running'?202:200);}catch(error){return json({error:error.message},error.status||400);}}}
@@ -144,14 +171,22 @@ const server=http.createServer(async(req,res)=>{
   if(path==='/api/preview/narrative'){narrativeMode=body.enabled!==false;if(player)delete player.observation;return json({ok:true,mode:narrativeMode?'narrative':'structured'});}
   if(path==='/api/bot/growth')return json({growth});
   if(path==='/api/bot/growth/status')return json({pending:9,deferred:14,reviews:2,rejected:1,failures:2,lastOutcome:'failed',lastFailure:{at:4240,realAt:1789375200000,reason:'成长整理等待或生成超时'},recentFailures:[{at:4240,realAt:1789375200000,reason:'成长整理等待或生成超时'},{at:4239,realAt:1789375000000,reason:'整理响应未包含完整的 changes 数组'}],recent:[{at:4238,records:[],sampledEventIds:['observed_1','observed_2'],rejected:[{index:0,reason:'习惯提案缺少跨情境的自主完成证据。'}]}],backlogs:[{cursor:10,throughCursor:24,reason:'较早经历保留在历史补审队列，先处理近期经历。'}]});
-  if(path==='/api/regulation')return json(regulation);
   if(path==='/api/debug')return json({entries:debugEntries,snapshot:45});
   if(path==='/api/calls')return json(liveFixture.list());
   if(path.startsWith('/api/calls/')){const detail=liveFixture.detail(path.slice('/api/calls/'.length),Number(url.searchParams.get('after') || 0),url.searchParams.get('request')!=='0');return detail?json(detail):json({error:'调用已不可用'},404);}
   if(path==='/api/preview/calls/step' && req.method==='POST')return json(liveFixture.step(body));
   if(path==='/api/usage')return json({summary,entries:usageEntries,snapshot:70});
-  if(path==='/api/state')return json({initialized:true,botDef:'小澈，住在林间小屋，喜欢阅读、植物与安静的午后。她会根据自己的经历，慢慢形成判断。',worldDef:'一间光线柔和的工作室，窗外是一座小花园。周围的事物遵循稳定的空间与物理规则。',botStatus:'开发预览：只读的角色状态投影。',worldStatus:'开发预览：小澈在窗边的工作室。',meta:{botName:'小澈',realWorld:false},news:[],facts:[],phoneShell:''});
+  if(path==='/api/state')return json({initialized:true,botDef:'小澈，住在林间小屋，喜欢阅读、植物与安静的午后。她会根据自己的经历，慢慢形成判断。',worldDef:'一间光线柔和的工作室，窗外是一座小花园。周围的事物遵循稳定的空间与物理规则。',botStatus:'开发预览：只读的角色状态投影。',worldStatus:'开发预览：小澈在窗边的工作室。',meta:{botName:'小澈',realWorld:false},news:[],facts:[],phoneShell});
+  if(path==='/api/state/phone-shell' && req.method==='GET')return json({content:phoneShell});
+  if(path==='/api/state/phone-shell' && req.method==='PUT'){phoneShell=String(body.content||'');return json({ok:true});}
+  if(path==='/api/state/phone-shell/generate' && req.method==='POST'){
+    await new Promise(resolve=>setTimeout(resolve,250));
+    const color=++shellDesign%2?'#204c47':'#283b67';
+    phoneShell='<!doctype html><html><head><style>html,body{margin:0;width:100vw;height:100vh;overflow:hidden}body{display:flex;flex-direction:column;background:'+color+';color:white;font:16px sans-serif}header,footer{padding:12px}.screen{flex:1;min-height:0;width:100%;object-fit:cover;object-position:top}</style></head><body><header>{{time}} · 开发样本 '+shellDesign+'<br>{{url}}</header><img class="screen" src="{{screen}}"><footer>本地外观预览 · 未调用模型</footer></body></html>';
+    return json({ok:true,content:phoneShell,phone:{width:800,height:1280}});
+  }
   if(path==='/api/device/session')return json(fixture.session());
+  if(path==='/api/preview/device/phone-calls')return json({calls:fixture.phoneCalls()});
   if(path==='/api/device/control')return player?.takeover?json({error:'请从角色驾驶舱归还控制。'},409):json(fixture.control(body));
   if(path==='/api/device/tool')return json(await fixture.tool(body));
   if(path==='/api/devices')return json(fixture.session().devices);
@@ -161,6 +196,16 @@ const server=http.createServer(async(req,res)=>{
   if(path==='/api/player/arrive'){if(!running)return json({error:'世界尚未运行，暂时无法进入或接管角色。请先在总览页启动世界。',code:'world_not_running'},409);player={token:'preview-player',mode:body.mode,takeover:['avatar','puppet'].includes(body.mode)};if(body.name)profile={name:body.name,persona:body.persona||''};const control=player.takeover?fixture.resident(player.mode):undefined;return json({ok:true,control,token:player.token,worldName:'林间小屋',timeLine:'09:41 · 初秋的清晨',botName:'小澈',takeover:player.takeover,isAdmin:true});}
   if(path==='/api/player/task'){
    if(receipts.has(body.taskId)){setTimeout(()=>playerEvent(receipts.get(body.taskId)),40);return json({ok:true,accepted:true,taskId:body.taskId});}
+   if(body.kind==='choose'){
+    if(!player||body.token!==player.token)return json({error:'需要角色会话。'},403);
+    try{
+     if(Object.keys(body.payload||{}).some(key=>!['selection','text','durationWorldSeconds'].includes(key)))throw Error('选择不能覆盖动作或目标。');
+     const chosen=resolveHumanChoice(body.payload?.selection,playerMenu(),body.payload?.text,body.payload?.durationWorldSeconds);
+     if(chosen.call.name!=='act')throw Error('独立角色只能选择世界行动。');
+     consumeChoice(chosen.selection.sourceEventId);
+     body={...body,kind:'act',payload:{desc:chosen.call.arguments.description,speech:chosen.call.arguments.speech,durationWorldSeconds:chosen.call.duration??0}};
+    }catch(error){return json({ok:false,error:error.message,text:error.message,code:/已过期|已变化|不再可用/.test(error.message)?'STALE_SELECTION':'SELECTION_REJECTED'},409);}
+   }
    const result={type:'task_result',taskId:body.taskId,ok:true,content:JSON.stringify(narrativeMode?narrativeReceipt(body.taskId,body.payload?.desc):body.payload?.desc==='去吃饭'?storyReceipt(body.taskId,body.payload.desc,body.payload.speech):{observation:observation(),action:{id:body.taskId,intent:body.payload?.desc,status:'completed'}})};receipts.set(body.taskId,result);setTimeout(()=>playerEvent(result),150);return json({ok:true,accepted:true,taskId:body.taskId});
   }
   if(path==='/api/preview/player/connection')return json({connected:streams.size});
@@ -179,9 +224,18 @@ const server=http.createServer(async(req,res)=>{
    }else return json({error:'未知样本阶段'},400);
    return json({ok:true,actionId:entry.actionId,worldSequence:storySequence});
   }
-  if(path==='/api/player/cockpit')return player?.takeover&&url.searchParams.get('ctoken')===player.token?json({mode:player.mode,running:true,control:fixture.session().control,tools:cockpitTools(),opportunities:(player.observation?.scene?.opportunities||[]).map((item,index)=>({...item,id:player.observation.scene.eventId+':'+index,source:'world',sourceEventId:player.observation.scene.eventId})),situation:player.observation?.scene?.situation||'',pending:[...cockpitCalls.values()].map(c=>c.call),time:{unitWorldSeconds:2,unitRealSeconds:1}}):json({error:'接管会话不存在。'},403);
+  if(path==='/api/player/cockpit')return player?.takeover&&url.searchParams.get('ctoken')===player.token?json({mode:player.mode,running:true,control:fixture.session().control,tools:cockpitTools(),opportunities:playerMenu(),situation:player.observation?.scene?.situation||'',pending:[...cockpitCalls.values()].map(c=>c.call),time:{unitWorldSeconds:2,unitRealSeconds:1}}):json({error:'接管会话不存在。'},403);
   if(path==='/api/player/tool'){
    if(!player?.takeover||body.token!==player.token)return json({error:'需要接管会话。'},403);
+   if(Object.hasOwn(body,'selection')){
+    try{
+     if(Object.keys(body).some(key=>!['token','selection','text','duration','confirmSend'].includes(key)))throw Error('选择不能覆盖工具或目标。');
+     if(cockpitCalls.size)throw Error('此前操作正在完成，请等待真实回执。');
+     const chosen=resolveHumanChoice(body.selection,playerMenu(),body.text,body.duration);
+     consumeChoice(chosen.selection.sourceEventId);
+     body={token:body.token,name:chosen.call.name,arguments:chosen.call.arguments,duration:chosen.call.duration??0,confirmSend:body.confirmSend};
+    }catch(error){return json({ok:false,error:error.message,text:error.message,code:/已过期|已变化|不再可用/.test(error.message)?'STALE_SELECTION':'SELECTION_REJECTED'},409);}
+   }
    const tool=cockpitTools().find(t=>t.name===body.name);if(!tool)return json({ok:false,text:'当前能力不可用。'});
    if(tool.requiresSendConfirmation&&!body.confirmSend)return json({ok:false,text:'请确认发送。'});
    const id='fixture_call_'+Date.now(),call={id,name:body.name,committed:false};

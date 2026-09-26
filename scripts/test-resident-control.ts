@@ -137,6 +137,61 @@ async function lifecycles(dir: string) {
   } finally { await f.bot.stop(); }
 }
 
+async function choices(dir: string) {
+  for (const mode of ["avatar", "puppet"] as const) {
+    const f = await fixture(path.join(dir, mode));
+    try {
+      await f.enter(mode, "human");
+      const scene = async (id: string, intent: string) => {
+        f.bot.pushEvent("world", JSON.stringify({ scene: { eventId: id, actorId: "bot", worldSequence: id === "first" ? 1 : 2, text: "门边有一条小路。", opportunities: [{ label: "走到河边", intent }] } }));
+        await f.bot.drainMailbox();
+      };
+      await scene("first", "沿着小路走到河边");
+      const old = f.bot.actionOpportunities(mode)[0]; assert.ok(old);
+      await scene("second", "走上山坡");
+      const stale = await f.service.botChooseCall({ opportunityId: old.id, sourceEventId: old.sourceEventId }, undefined, 0, "human");
+      assert.equal(stale.ok, false); assert.equal(stale.admissionRejected, true); assert.equal(stale.code, "STALE_SELECTION");
+      assert.equal(f.actions.length, 0, "stale identity cannot silently choose a new first option");
+      const current = f.bot.actionOpportunities(mode)[0], reference = { opportunityId: current.id, sourceEventId: current.sourceEventId };
+      assert.equal((await f.service.botChooseCall({ ...reference, target: "forged" }, undefined, 0, "human")).ok, false);
+      const result = await f.service.botChooseCall(reference, "我去看看。", 0, "human");
+      assert.equal(result.ok, true); assert.equal(f.actions.length, 1);
+      assert.equal(f.actions[0].arguments.description, "走上山坡"); assert.equal(f.actions[0].arguments.speech, "我去看看。");
+      assert.equal(f.actions[0].control.mode, mode); assert.equal(f.actions[0].selection.opportunityId, current.id);
+      assert.equal((await f.service.botChooseCall(reference, undefined, 0, "human")).ok, false, "body mode also retires a consumed scene before receipt delivery");
+      assert.equal(f.actions.length, 1);
+
+      await f.bot.drainMailbox();
+      await f.service.botToolCall("open_app", { name: "chat" }, 0, "human");
+      await f.service.botToolCall("select_channel", { id: "onebot@fixture:target" }, 0, "human");
+      await f.bot.drainMailbox();
+      f.bot.pushEvent("koishi", { text: "朋友：今天去哪里了？", experience: { chat: { kind: "message", channelKey: "onebot@fixture:target", senderOwn: false } } });
+      await f.bot.drainMailbox();
+      const reply = f.bot.actionOpportunities(mode).find((item: any) => item.replyTo); assert.ok(reply);
+      const replyRef = { opportunityId: reply.id, sourceEventId: reply.sourceEventId };
+      assert.equal((await f.service.botChooseCall(replyRef, undefined, 0, "human", true)).ok, false, "a reply never invents words");
+      assert.equal((await f.service.botChooseCall(replyRef, "去河边看了看。", 0, "human")).ok, false, "a suggested reply still requires explicit send confirmation");
+      assert.equal(f.counts().sent, 0);
+      assert.equal((await f.service.botChooseCall(replyRef, "去河边看了看。", 0, "human", true)).ok, true);
+      assert.equal(f.counts().sent, 1);
+      if (mode === "avatar") {
+        await f.bot.drainMailbox(); await scene("third", "观察树下的脚印");
+        const candidate = f.bot.actionOpportunities(mode)[0]; assert.ok(candidate);
+        const append = f.context.appendToolCall.bind(f.context);
+        f.context.appendToolCall = async (call: any) => { await append(call); await scene("fourth", "向店员问路"); };
+        const raced = await f.service.botChooseCall({ opportunityId: candidate.id, sourceEventId: candidate.sourceEventId }, undefined, 0, "human");
+        assert.equal(raced.ok, false); assert.equal(f.actions.length, 1, "scene changing during durable append must not execute the stale selection");
+        assert.ok(raced.callId); assert.equal(raced.admissionRejected, true); assert.equal(raced.code, "STALE_SELECTION");
+        f.context.appendToolCall = append;
+        const latest = f.bot.actionOpportunities(mode)[0], execute = f.service.botToolCall;
+        f.service.botToolCall = async () => { throw new Error("transport failed after execution began"); };
+        await assert.rejects(f.service.botChooseCall({ opportunityId: latest.id, sourceEventId: latest.sourceEventId }, undefined, 0, "human"), /transport failed/, "execution exceptions must not become definite admission rejections");
+        f.service.botToolCall = execute;
+      }
+    } finally { await f.bot.stop(); }
+  }
+}
+
 async function httpAndCrossing(dir: string) {
   const cfg = Config({ autoStart: false }); cfg.webui.token = "fixture-admin";
   let called = 0, consumed = 0; const released: string[] = [];
@@ -154,6 +209,30 @@ async function httpAndCrossing(dir: string) {
   assert.equal((await post("/api/player/tool", { token: "control", name: "act", duration: "NaN" })).status, 400);
   assert.equal((await post("/api/player/tool", { token: "control", name: "act", duration: -1 })).status, 400);
   assert.equal((await post("/api/player/tool", { token: "control", name: "observe", arguments: {} })).status, 200); assert.equal(called, 1);
+  let selected = 0;
+  server.host.botChooseCall = async (reference: any, text: unknown, duration: unknown, token: string, confirm: boolean) => {
+    selected++; assert.equal(reference.opportunityId, "option"); assert.equal(text, "真人正文"); assert.equal(duration, 2); assert.equal(token, "control"); assert.equal(confirm, true);
+    return { ok: false, callId: "attempted-send", text: "发送结果未知，未重发。" };
+  };
+  const selectedBody = { token: "control", selection: { opportunityId: "option", sourceEventId: "scene" }, text: "真人正文", duration: 2, confirmSend: true };
+  assert.equal((await post("/api/player/tool", { ...selectedBody, name: "send", arguments: { id: "forged" } })).status, 400); assert.equal(selected, 0);
+  const unknownResult = await post("/api/player/tool", selectedBody);
+  assert.equal(unknownResult.status, 200); assert.equal(unknownResult.body.code, "OPERATION_RESULT", "an attempted send is not represented as a safe-to-retry rejection");
+  for (const text of ["建议已过期", "选项已变化", "不再可用"]) {
+    for (const ok of [true, false]) {
+      server.host.botChooseCall = async () => ({ ok, callId: "actual-receipt", text: `实际执行结果：${text}` });
+      const actualReceipt = await post("/api/player/tool", selectedBody);
+      assert.equal(actualReceipt.status, 200, "real receipt prose never determines whether an operation was admitted");
+      assert.equal(actualReceipt.body.admissionRejected, undefined);
+      if (!ok) assert.equal(actualReceipt.body.code, "OPERATION_RESULT");
+    }
+  }
+  server.host.botChooseCall = async () => ({ ok: false, text: "重新选择当前建议", admissionRejected: true, code: "STALE_SELECTION", callId: "reserved-not-dispatched" });
+  const staleResult = await post("/api/player/tool", selectedBody);
+  assert.equal(staleResult.status, 409); assert.equal(staleResult.body.code, "STALE_SELECTION");
+  server.host.botChooseCall = async () => ({ ok: false, text: "请先明确确认发送" });
+  const unadmitted = await post("/api/player/tool", selectedBody);
+  assert.equal(unadmitted.status, 409); assert.equal(unadmitted.body.code, "SELECTION_REJECTED");
   assert.equal((await post("/api/player/task", { token: "control", kind: "observe", payload: {} })).status, 400);
   assert.equal((await post("/api/player/tool/cancel", { token: "control", callId: "tc_1" })).body.status, "too_late");
   await cross.disconnectVisitors("fixture disconnect"); assert.deepEqual(released, [resident.id]); assert.equal(cross.residentSession(arrival.token), null);
@@ -220,7 +299,7 @@ async function admission(dir: string) {
 
 async function main() {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "yesimbot-resident-"));
-  try { await semantics(path.join(dir, "semantics")); await lifecycles(path.join(dir, "lifecycle")); await httpAndCrossing(path.join(dir, "webui")); await admission(path.join(dir, "admission")); console.log("PASS resident control: puppet agency, avatar inheritance, device ownership, complete tool schemas, session authorization, cancellation/commit and lifecycle fences"); }
+  try { await semantics(path.join(dir, "semantics")); await lifecycles(path.join(dir, "lifecycle")); await choices(path.join(dir, "choices")); await httpAndCrossing(path.join(dir, "webui")); await admission(path.join(dir, "admission")); console.log("PASS resident control: puppet agency, avatar inheritance, device ownership, complete tool schemas, session authorization, cancellation/commit and lifecycle fences, identity-bound human choices and confirmed own-text replies"); }
   finally { await fs.rm(dir, { recursive: true, force: true }); }
 }
 main().catch(error => { console.error(error); process.exitCode = 1; });

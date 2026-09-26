@@ -7,6 +7,8 @@ export type DeliverFn = (content: string | RichText, refToolCallId?: string, out
 interface ScheduledTask {
   call: ToolCallRecord;
   abort: AbortController;
+  settled: Promise<void>;
+  settle: () => void;
   committed: boolean;
   delivered: boolean;
   retired?: boolean;
@@ -23,7 +25,7 @@ export interface TaskControl {
 
 export interface ScheduleOptions {
   executeAt: "now" | "expected";
-  /** World stages already observe their own clock; don't delay an available scene a second time. */
+  /** Deliver completed scenes/UI results immediately instead of delaying them to the estimate. */
   delivery?: "immediate";
   /** Serialize actual side effects, without owning the device during receipt delays. */
   serialKey?: string;
@@ -57,6 +59,11 @@ export class Scheduler {
     return this.tasks.size ? new Promise(resolve => this.idleWaiters.add(resolve)) : Promise.resolve();
   }
 
+  /** Wait for one receipt/cancellation, without owning or draining its serial queue. */
+  whenSettled(id: string): Promise<void> {
+    return this.tasks.get(id)?.settled ?? Promise.resolve();
+  }
+
   pending(): { id: string; name: string; issuedAt: number; expectedAt: number; committed: boolean; control?: ToolCallRecord["control"] }[] {
     return [...this.tasks.values()].map(({ call, committed }) => ({ id: call.id, name: call.name, issuedAt: call.issuedAt, expectedAt: call.expectedAt, committed, ...(call.control ? { control: call.control } : {}) }));
   }
@@ -66,8 +73,10 @@ export class Scheduler {
 
   schedule(call: ToolCallRecord, opts: ScheduleOptions): void {
     if (this.tasks.has(call.id)) throw new Error(`工具调用编号重复：${call.id}`);
+    let settle!: () => void;
+    const settled = new Promise<void>(resolve => { settle = resolve; });
     const task: ScheduledTask = {
-      call, abort: new AbortController(), committed: false, delivered: false,
+      call, abort: new AbortController(), settled, settle, committed: false, delivered: false,
     };
     this.tasks.set(call.id, task);
     const control: TaskControl = {
@@ -84,7 +93,8 @@ export class Scheduler {
       task.delivered = true;
       this.tasks.delete(call.id);
       this.notifyIdle();
-      if (result !== null) this.deliver(result, call.id, { ok });
+      try { if (result !== null) this.deliver(result, call.id, { ok }); }
+      finally { task.settle(); }
     };
     const atExpected = (fn: () => void) => {
       if (task.retired && task.committed) { fn(); return; }
@@ -108,7 +118,7 @@ export class Scheduler {
         if (task.abort.signal.aborted) return;
         this.logger.warn("工具 %s (%s) 执行失败: %s", call.name, call.id, err);
         ok = false;
-        result = `（${describeToolCall(call)} 执行失败（调用 ${call.id}）：${(err as Error).message ?? err}）`;
+        result = `${describeToolCall(call)}失败：${(err as Error).message ?? err}`;
       }
       if (task.abort.signal.aborted) return;
       task.committed = true;
@@ -136,6 +146,7 @@ export class Scheduler {
     if (task.timer) clearTimeout(task.timer);
     this.tasks.delete(id);
     this.notifyIdle();
+    task.settle();
     return "cancelled";
   }
 
@@ -165,6 +176,7 @@ export class Scheduler {
       task.abort.abort();
       if (task.timer) clearTimeout(task.timer);
       this.tasks.delete(id);
+      task.settle();
     }
     this.notifyIdle();
   }

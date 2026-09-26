@@ -666,6 +666,11 @@
 .journey-live-status { min-width:0; }
 .journey-live-status .live-compact { margin:0; }
 .journey-live-status .live-lane-preview { max-height:125px; }
+.journey-live-panel { margin:0 0 20px; min-width:0; }
+.journey-live-panel>summary { cursor:pointer; color:var(--fg-dim); font-size:12px; min-height:44px; padding:12px 0; }
+.journey-live-panel[open]>summary { margin-bottom:4px; }
+.journey-choice-speech { grid-column:1/-1; min-width:0; }
+.journey-choice-speech>.journey-field { margin:0; }
 .journey-stream-layout { display:grid; grid-template-columns:minmax(0,1.4fr) minmax(0,1fr); align-items:start; gap:20px; }
 .journey-stream-layout>* { min-width:0; }
 .journey-stream-layout .journey-history { margin:0; padding:20px; }

@@ -15,6 +15,12 @@ const initial = () => ({ botName: "小澈", worldState: "清晨的房间很安�
 const call = (id: string, description: string): ToolCallRecord => ({ id, name: "act", role: "agent", arguments: { description }, issuedAt: 10, expectedAt: 10 });
 const clock = { now: () => 10, realMsUntil: () => 0, syncRealTime: true } as unknown as WorldClock;
 const bad = "手机的 QQ 聊天窗口显示 Touch Night 发来的消息：“碧姬梗和论文英文名”。你已回复成功。";
+const worldTask = (messages: ChatMessage[]) => {
+  const task = messages.filter(message => message.role === "user").map(message => JSON.parse(String(message.content)))
+    .find(value => typeof value.kind === "string" && Object.hasOwn(value, "worldState"));
+  assert.ok(task, "world input remains in the initial task; retry users only carry diagnostics");
+  return task;
+};
 
 async function fixture(virtual = false) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "world-device-boundary-"));
@@ -30,6 +36,13 @@ async function main(): Promise<void> {
   for (const text of ["当面向店员点头，然后给Touch Night发一条消息", "读完纸信并给Touch Night发一条消息", "当面点头然后查看Touch Night的消息", "查看\nQQ聊天记录"]) assert.ok(detectDeviceRequest(text), text);
   const casualRequests = ["拿起床头柜上的手机，随便刷点什么", "拿起手机，随手翻点东西", "刷手机", "玩一会儿手机", "翻翻消息", "读完纸信后翻消息", "刷了几分钟短视频", "刷点视频", "拿起手机，随便玩一会儿", "用拇指划动手机屏幕"];
   for (const text of casualRequests) assert.ok(detectDeviceRequest(text), text);
+  const phoneAlarmRequests = ["伸手摸一下床头柜上的手机确认明早六点五十的闹钟已设好", "拿起手机，确认明早六点五十的闹钟已设好", "核对手机闹钟是否开启", "确认闹钟已设好\n手机", "把手机的计时器设为五分钟", "确认手机里的闹钟和独立闹钟都已设好", "check the phone alarm"];
+  for (const text of phoneAlarmRequests) assert.equal(detectDeviceRequest(text)?.kind, "software", text);
+  const physicalClocks = ["确认床头柜上的机械闹钟已设好", "放下手机，检查独立的电子闹钟是否已设好", "手机放在桌上，拧动实体闹钟的发条", "手机在口袋里，检查闹钟的外壳", "把独立闹钟放回床头柜"];
+  for (const text of physicalClocks) {
+    assert.equal(detectDeviceRequest(text), null, text);
+    assert.equal(detectDeviceClaim(text), null, text);
+  }
   for (const text of ["拿起手机", "把手机放回口袋", "查看手机背面的划痕", "读信使送来的纸信", "面对面回复店员：谢谢", "看看纸上的消息", "查看公告栏的通知", "查看周围环境信息", "观察窗外的天色"]) assert.equal(detectDeviceRequest(text), null, text);
   for (const text of ["查看桌面上摆着的花瓶", "打开文件柜，取出合同", "打开容器，取出里面的水果"]) assert.equal(detectDeviceRequest(text), null, text);
   for (const text of ["放下手机，刷牙", "手机放在桌上，给木板刷点油漆", "手机在一旁，翻一下纸书", "翻过手机的背面看看划痕", "把手机放回床头柜", "刷洗杯子"])
@@ -40,6 +53,11 @@ async function main(): Promise<void> {
   for (const text of ["木质桌面上的台灯亮着", "木质桌面上摊着一本打开的书", "文件柜已经打开，里面放着几份合同。"]) assert.equal(detectDeviceClaim(text), null, text);
   const casualClaims = ["你拿起床头柜上的手机，拇指在屏幕上划了六七分钟。", "你随手刷了六七分钟手机。", "手机握在手里，刷了一会儿就放下了。", "你玩了一会儿手机。", "你翻了几下消息。", "你拇指划屏刷了6–7分钟。"];
   for (const text of casualClaims) assert.ok(detectDeviceClaim(text), text);
+  const phoneAlarmClaim = "你摸了一下床头柜上的手机，确认明早六点五十的闹钟已设好。";
+  for (const text of [phoneAlarmClaim, "手机上的闹钟是六点五十。", "手机里的闹钟：06:50，已开启。"])
+    assert.equal(detectDeviceClaim(text)?.kind, "software", text);
+  assert.equal(projectWorldDeviceContext("屋内安静。\n\n" + phoneAlarmClaim), "屋内安静。", "old imaginary alarm checks are not physical-world evidence");
+  assert.equal(detectDeviceClaim("手机的闹钟已设为六点五十。", { virtualApp: true }), null, "authorized virtual app operations retain their separate scope");
   for (const text of ["你放下手机，刷了两分钟牙。", "手机在桌上，你给木板刷点油漆。", "手机在一旁，你翻了一会儿纸书。", "你把手机放回床头柜。", "你翻过手机的背面，机身有一道划痕。"])
     assert.equal(detectDeviceClaim(text), null, text);
   assert.ok(detectDeviceClaim("你翻了几下消息。", { virtualApp: true }), "virtual software never grants permission to fabricate platform messages");
@@ -67,7 +85,8 @@ async function main(): Promise<void> {
       const value = initial();
       if (++attempts === 1) value.worldState = darkPhone;
       else {
-        const feedback = messages.filter(m => m.role === "tool").map(m => String(m.content)).join("\n");
+        const feedback = messages.filter(m => m.role === "user").map(m => JSON.parse(String(m.content)))
+          .filter(value => value.committed === false && typeof value.error === "string").map(value => value.error).join("\n");
         assert.match(feedback, /屏幕暗着/);
         assert.match(feedback, /删除这部分子句/);
         value.worldState = physicalPhone;
@@ -119,7 +138,7 @@ async function main(): Promise<void> {
     await f.runtime.ensure(); const store = await f.runtime.store(), original = store.snapshot();
     const beforePreflight = f.calls(), beforeJournal = await fs.readFile(f.files.narrativeJournal, "utf8");
     await assert.rejects(f.runtime.act("bot", call("chat", "拿起手机，查看Touch Night发来的消息"), () => { throw Error("must not deliver"); }), /专用工具/);
-    for (const [index, description] of casualRequests.entries()) {
+    for (const [index, description] of [...casualRequests, ...phoneAlarmRequests].entries()) {
       await assert.rejects(f.runtime.act("bot", call(`casual-${index}`, description), () => { throw Error("must not deliver"); }), /专用工具/);
     }
     await assert.rejects(f.runtime.observe("bot", { intent: "查看QQ消息" }), /专用工具/);
@@ -151,12 +170,12 @@ async function main(): Promise<void> {
     }
     let attempts = 0;
     f.infer(async messages => {
-      const body = JSON.parse([...messages].reverse().find(m => m.role === "user")!.content as string);
+      const body = worldTask(messages);
       assert.equal(body.deviceAuthority.platformChat, "external_tools_only");
       if (!attempts++) return resolution({ perceptions: [{ actorId: "bot", text: bad }] });
-      return resolution({ worldState: original.worldState + "\n\n窗户敞开了一条缝。", perceptions: [{ actorId: "bot", text: "窗边吹来一阵风。" }] });
+      return resolution({ worldState: original.worldState + "\n\n窗户被风吹开了一条缝。", externalChanges: [{ id: "wind", description: "风把窗户吹开了一条缝。" }], perceptions: [{ actorId: "bot", text: "窗边吹来一阵风。", changeIds: ["wind"] }] });
     });
-    await f.runtime.evolve("一阵风吹过。"); assert.equal(attempts, 2); assert.match(store.snapshot().worldState, /窗户敞开/);
+    await f.runtime.evolve("一阵风吹过。"); assert.equal(attempts, 2); assert.match(store.snapshot().worldState, /窗户被风吹开/);
     f.infer(async () => resolution({ perceptions: [{ actorId: "bot", text: "你拿起桌上的手机，外壳温凉。" }], outcome: { status: "completed" } }));
     assert.equal(await f.runtime.act("bot", call("physical-phone", "拿起手机"), () => {}), true);
     const speech = "QQ上的消息必须先读原文。";
@@ -173,7 +192,7 @@ async function main(): Promise<void> {
     assert.doesNotMatch(JSON.stringify(await f.runtime.peek()), /碧姬|英文名/);
     assert.ok(!(await f.runtime.perceptionsSince("bot")).some(p => p.narrative.includes("碧姬")));
     f.infer(async messages => {
-      const body = JSON.parse([...messages].reverse().find(m => m.role === "user")!.content as string);
+      const body = worldTask(messages);
       assert.doesNotMatch(JSON.stringify(body), /碧姬|英文名/); assert.match(body.worldState, /屋内依然安静/);
       return resolution({ perceptions: [] });
     });
@@ -194,10 +213,10 @@ async function main(): Promise<void> {
     assert.match(projectWorldDeviceContext(world, { virtualApp: true }), /必须保留的任意文件正文/);
     assert.ok(projectWorldDeviceContext(world, { virtualApp: true }).endsWith(file), "the first file heading and all subsequent arbitrary file bodies are retained byte-for-byte");
     virtual.infer(async messages => {
-      const body = JSON.parse([...messages].reverse().find(m => m.role === "user")!.content as string);
+      const body = worldTask(messages);
       assert.doesNotMatch(body.worldState, /note\.txt|second\.txt|必须保留|伪造尾部/);
       assert.match(body.retainedDeviceRecords, /程序原样保留/);
-      return resolution({ worldState: "阳光照着书桌。\n\n浏览器页面显示既有公告。", perceptions: [{ actorId: "bot", text: "阳光照着桌面。" }] });
+      return resolution({ worldState: "阳光照着书桌。\n\n浏览器页面显示既有公告。", externalChanges: [{ id: "sun", description: "太阳升高，阳光照进书房。" }], perceptions: [{ actorId: "bot", text: "阳光照着桌面。", changeIds: ["sun"] }] });
     });
     await virtual.runtime.evolve("天光渐亮。"); assert.match(store.snapshot().worldState, /必须保留的任意文件正文/);
     assert.ok(store.snapshot().worldState.endsWith(file));
@@ -206,7 +225,7 @@ async function main(): Promise<void> {
     virtual.infer(async () => resolution({ perceptions: [{ actorId: "bot", text: bad }] }));
     await assert.rejects(virtual.runtime.observeVirtualApp("bot", "查看浏览器现有网页"), /WORLD_DEVICE_BOUNDARY/);
     virtual.infer(async messages => {
-      const body = JSON.parse([...messages].reverse().find(m => m.role === "user")!.content as string);
+      const body = worldTask(messages);
       assert.ok(body.worldState.endsWith(file), "authorized app reads retain the archived bytes, without treating them as an ordinary scene");
       return resolution({ perceptions: [{ actorId: "bot", text: "示例字符串：收到一条消息。\n必须保留的任意文件正文。" }] });
     });

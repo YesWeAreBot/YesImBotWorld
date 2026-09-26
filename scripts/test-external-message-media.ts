@@ -49,10 +49,13 @@ async function main() {
     const original = deliveries.at(-1)!;
     assert.ok(Array.isArray(original.content.parts), "external images must preserve ordered RichText rather than only send-reference strings");
     const parts = original.content.parts;
-    assert.deepEqual(parts.filter((part: any) => part.kind === "media").map((part: any) => [part.ref.id, !!part.sticker, part.summary]), [[1, true, "summary-1"], [2, false, "summary-2"]]);
+    assert.deepEqual(parts.filter((part: any) => part.kind === "media").map((part: any) => [part.ref.id, !!part.sticker, part.sticker ? part.expressionSummary : part.summary]), [[1, true, "summary-1"], [2, false, "summary-2"]]);
     assert.deepEqual(original.content.attachments.map((ref: any) => ref.id), [1, 2]);
     assert.equal(original.sendArgs.msg, '先看：<media ref="media:1"/>再看：<media ref="media:2"/>');
     assert.doesNotMatch(original.sendArgs.msg, /media id=|summary-|usage=/);
+    assert.match(original.content.text, /聊天记录 #1.*附有表情包×1、图片×1.*表情与文字共同表意/);
+    assert.deepEqual(rows.at(-1).conversation.mediaCounts, { sticker: 1, image: 1 });
+
 
     // The actual simulation method must preserve legal send arguments separately
     // from the actual rich media perceived in its successful tool result.
@@ -75,6 +78,32 @@ async function main() {
     assert.ok(wire.includes("今晚值班的大王"), "the observed group nickname reaches the actual multimodal model request");
     assert.match(wire, /media:1.*usage=.*sticker.*summary-1.*AQ==.*再看.*media:2.*summary-2.*Ag==/s);
     assert.doesNotMatch(wire, /media id=/);
+
+    // The same asset can participate in different acts of expression. Its first
+    // recorded use must not redefine later ordinary images or erase real repetition.
+    await emit("ordinary-reuse", [h("img", { src: "fixture:1", sub_type: 0, file: "same-cat.gif" })]);
+    const reusedOrdinary = deliveries.at(-1)!;
+    assert.match(reusedOrdinary.content.text, /仅含图片×1/);
+    assert.doesNotMatch(reusedOrdinary.content.text, /usage="sticker"/);
+    assert.equal(reusedOrdinary.content.parts.find((p: any) => p.kind === "media").ref.id, 1);
+    await emit("sticker-again", [h("img", { src: "fixture:1", sub_type: 1 }), h("img", { src: "fixture:1", sub_type: 1 })]);
+    const repeat = deliveries.at(-1)!;
+    assert.match(repeat.content.text, /仅含表情包×2.*未附文字/);
+    assert.notDeepEqual(repeat.content.originEventIds, original.content.originEventIds);
+    assert.equal(repeat.sendArgs.msg, '<media ref="media:1"/><media ref="media:1"/>', "account simulation preserves actual outgoing multiplicity, without adding narrative");
+    const count = deliveries.length;
+    await emit("sticker-again", [h("img", { src: "fixture:1", sub_type: 1 })]);
+    assert.equal(deliveries.length, count, "another echo of the same platform id is not another expressive act");
+    const frozen = await context.toChatMessages("T=2");
+    for (const [index, entry] of [reusedOrdinary, repeat].entries()) await context.appendEvent({ id: "reuse-" + index, source: "koishi", worldTime: 2 + index, content: entry.content.text, parts: entry.content.parts, attachments: entry.content.attachments, originEventIds: entry.content.originEventIds });
+    const appended = await context.toChatMessages("T=3");
+    assert.deepEqual(appended.slice(0, frozen.length), frozen, "new uses never rewrite a previously delivered media description or frozen provider prefix");
+    const ordinaryWire = JSON.stringify(appended.at(-2));
+    const repeatWire = JSON.stringify(appended.at(-1));
+    assert.match(ordinaryWire, /仅含图片×1/);
+    assert.doesNotMatch(ordinaryWire, /usage=\\"sticker\\"/);
+    assert.match(repeatWire, /表情包×2/);
+    assert.equal((repeatWire.match(/usage=\\"sticker\\"/g) ?? []).length, 2, "both new occurrences remain individually represented even when native image bytes are reused");
 
     // Silent and phone-down events only store the originals. No caption, native
     // attachment or media contents should cross into the event-delivery payload.

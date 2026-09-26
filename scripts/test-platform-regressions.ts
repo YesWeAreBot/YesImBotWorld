@@ -36,10 +36,16 @@ async function permissions(root: string) {
     await fs.writeFile(path.join(dir, "World_Status.md"), "VISIBLE-WORLD");
     await fs.writeFile(path.join(dir, "world-state.json"), "PRIVATE-RAW-WORLD");
   }
+  const heartbeat = { phase: "failed", mode: "auto", intervalTU: 120, nextAtTU: 540, consecutiveFailures: 2, quietStreak: 0,
+    error: "PRIVATE-HEARTBEAT-FAILURE", lastOutcome: { status: "failed", finishedAtTU: 420, reason: "PRIVATE-HEARTBEAT-FAILURE", elapsedMs: 300000 } };
   const host = {
     config: { ...cfg, webui: { ...cfg.webui, token: "test-admin" }, crossing: { ...cfg.crossing, invites: [{ code: "TEST-INVITE", enabled: true, name: "fixture" }] } },
     webuiDir: path.join(root, "webui"),
-    files: { base: root, archiveDir: archive },
+    files: { base: root, archiveDir: archive, readNews: async () => [], readFacts: async () => [] },
+    baseDir: root, version: "offline-fixture", gallery: { counts: async () => [] },
+    getClock: () => null, botStatus: () => null, isInitialized: async () => true,
+    worldRunning: () => true, worldQueue: () => 0, heartbeatStatus: () => structuredClone(heartbeat),
+    appOpen: () => null, computerOn: () => null, phoneDown: () => true, focusChannels: () => [],
     crossingInfo: () => ({ location: null, visitors: [], worlds: [], serverEnabled: true }),
     getStructuredWorld: async () => ({ privateWorld: "PRIVATE-RAW-WORLD" }),
     getGrowth: async () => ({ skills: [], relationships: [] }),
@@ -75,7 +81,15 @@ async function permissions(root: string) {
   assert.equal((await get("/api/world/state", "admin")).status, 200);
   assert.ok((await get("/api/crossing", "admin")).body.includes("TEST-INVITE"));
   assert.equal((await get("/api/data/file?name=pinned.json", "admin")).status, 200);
-  console.log("PASS: viewer/operator 文件权限、邀请码保密、结构化状态管理员限制、成长 notes 授权");
+  const adminOverview = await get("/api/overview", "admin");
+  assert.equal(adminOverview.status, 200); assert.deepEqual(adminOverview.json.heartbeat, heartbeat, "admin overview exposes the actual scheduler outcome and retry snapshot");
+  for (const role of ["viewer", "operator", "player"]) {
+    const overview = await get("/api/overview", role);
+    assert.equal(overview.status, 200);
+    assert.ok(!Object.hasOwn(overview.json, "heartbeat"), role + " overview omits internal heartbeat state");
+    assert.ok(!overview.body.includes("PRIVATE-HEARTBEAT-FAILURE"), role + " overview cannot leak internal scheduler diagnostics");
+  }
+  console.log("PASS: viewer/operator 文件权限、邀请码保密、结构化状态管理员限制、成长 notes 授权、心跳总览仅管理员可见");
 }
 
 function shellIsolation() {

@@ -7,9 +7,14 @@
         chat: '<path d="M26 20c3-2 4-5 3-8C27 4 11 3 5 9c-5 5-1 13 6 14l-2 5 8-4h3"/><path d="M10 14h.1M16 14h.1M22 14h.1"/>',
         weather: '<circle cx="12" cy="11" r="6"/><path d="M12 1v2M2 11H0M4 3l2 2M20 3l-2 2M22 10h3"/><path d="M11 27h14a5 5 0 0 0 0-10 7 7 0 0 0-13-2 6 6 0 0 0-1 12Z"/>',
         browser: '<circle cx="16" cy="16" r="13"/><path d="m21 10-3 9-8 3 3-9 8-3Z"/>',
+        clock: '<circle cx="16" cy="17" r="11"/><path d="M16 9v8l5 3M5 5l4-3m14 0 4 3M8 27l-2 3m18-3 2 3"/>',
+        camera: '<rect x="3" y="8" width="26" height="20" rx="5"/><path d="m10 8 2-4h8l2 4"/><circle cx="16" cy="18" r="6"/><path d="M24 12h1"/>',
+        assistant: '<path d="M7 24l-3 5v-9a12 12 0 1 1 7 8"/><path d="m16 8 2 6 6 2-6 2-2 6-2-6-6-2 6-2Z"/>',
         notes: '<rect x="6" y="3" width="23" height="26" rx="3"/><path d="M3 8h6M3 15h6M3 22h6M14 10h9M14 16h9M14 22h5"/>',
         news: '<path d="M6 6h23v21a2 2 0 0 1-2 2H6a3 3 0 0 1-3-3V11h3V6Z"/><path d="M6 11v15M11 11h13M11 16h5v6h-5zM21 16h3M21 21h3"/>',
         mcp: '<rect x="7" y="7" width="18" height="18" rx="4"/><path d="M12 2v5M20 2v5M12 25v5M20 25v5M2 12h5M2 20h5M25 12h5M25 20h5M12 16h8M16 12v8"/>',
+        bell: '<path d="M7 22V13a9 9 0 0 1 18 0v9l3 3H4l3-3ZM12 28a4 4 0 0 0 8 0"/>',
+        settings: '<path d="m13 3 6 0 1 4 3 2 4-1 3 5-3 3v3l3 3-3 5-4-1-3 2-1 3h-6l-1-3-3-2-4 1-3-5 3-3v-3l-3-3 3-5 4 1 3-2 1-4Z"/><circle cx="16" cy="17" r="5"/>',
         arrow: '<path d="m19 7-9 9 9 9"/>',
         refresh: '<path d="M27 11a12 12 0 1 0 1 10M27 3v8h-8"/>',
         send: '<path d="m3 4 26 12L3 28l5-12-5-12ZM8 16h21"/>',
@@ -33,7 +38,7 @@
     function appKind(app) { var id = (app && app.id || '').toLowerCase(); if (app && app.kind === 'chat')
         id = 'chat'; if (['chat', 'koishi', 'qq', 'wechat', 'messages'].indexOf(id) >= 0)
         return 'chat'; if (id === 'newsfeed')
-        return 'news'; return ['weather', 'browser', 'notes', 'news'].indexOf(id) >= 0 ? id : 'mcp'; }
+        return 'news'; return ['weather', 'browser', 'notes', 'news', 'clock', 'assistant', 'camera', 'settings'].indexOf(id) >= 0 ? id : 'mcp'; }
     function safeUrl(url) { try {
         var parsed = new URL(url, location.href);
         return ['http:', 'https:'].indexOf(parsed.protocol) >= 0 ? parsed.href : null;
@@ -42,11 +47,12 @@
         return null;
     } }
     Studio.register('devices', function (container) {
-        var live = true, synced = false, session = null, tab = 'phone', selected = null, busy = 0, refreshing = false, polling = null, generation = 0, operationMode = 'stealth';
+        var live = true, synced = false, session = null, tab = 'phone', selected = null, catalogView = false, busy = 0, refreshing = false, polling = null, generation = 0, operationMode = 'stealth';
         var results = {}, drafts = {}, noteList = null, noteDraft = null, repaintNotes = null, reloadNotes = null, screenUrl = null, screenAbort = null, screenTimer = null, screenBusy = false, screenGeneration = 0, clickTimer = null, clickPoint = null, appViewStamp = '', computerViewStamp = '';
         var screenWidth = 0, screenHeight = 0, pointer = null, remoteReady = false, terminalEntries = [], history = [], historyIndex = 0, remoteQueue = Promise.resolve(), remotePending = 0, inputEpoch = 0;
         var root = el('section', { cls: 'device-studio' }), header = el('div', { cls: 'device-heading' }), control = el('div', { cls: 'device-control' }), workspace = el('div', { cls: 'device-workspace' }), status = el('div', { cls: 'device-live-status', 'aria-live': 'polite' });
-        var phoneBody = null, appBody = null, remoteImage = null, remoteStatus = null, terminalLog = null, viewKey = '', lastChat = '';
+        var appPanel = null, phoneBody = null, appBody = null, remoteImage = null, remoteStatus = null, terminalLog = null, viewKey = '', lastChat = '';
+        var notificationsOpen = false, lastNotifications = '', chatNotifyView = null;
         container.appendChild(root);
         header.appendChild(el('div', {}, [el('span', { cls: 'device-eyebrow', text: 'DEVICE STUDIO' }), el('h1', { text: '设备' }), el('p', { text: '拿起手机，或在电脑前坐一会儿。' })]));
         var switches = el('div', { cls: 'device-switch', 'role': 'tablist', 'aria-label': '设备切换' });
@@ -56,8 +62,12 @@
         root.append(header, control, status, workspace);
         function computerMode() { var computer = session && session.devices && session.devices.computer || {}; return computer.effectiveMode || computer.mode || 'off'; }
         function residentMode() { return session && session.control && session.control.residentMode; }
+        function appCatalog() { return session && session.appCatalog || (session && session.apps || []).map(function(app){return Object.assign({status:'ready',configurable:['camera','assistant','clock','browser'].includes(app.id)},app);}); }
+        function catalogEntry(id) { return appCatalog().find(function(app){return app.id===id;}); }
+        function statusLabel(app) { return {ready:'已就绪',disabled:'未启用',unconfigured:'待配置',stopped:'待启动'}[app.status] || '已就绪'; }
+        function settingsButton(app, label) { return el('button',{type:'button',cls:'phone-app-config-button','data-app-config':app.id,text:label || '设置',onclick:function(){window.StudioPhoneAppSettings?.open(app.id,function(){if(live)refresh(true);});}}); }
         function controlled() { return !!(synced && session && session.running && session.control && !isVisitor() && (residentMode() ? !session.control.busy : operationMode === 'stealth' || session.control.paused && !session.control.busy)); }
-        function toolDef(name, device) { device = device || (['mouse', 'keyboard', 'screen', 'run_command', 'open_computer', 'close_computer'].includes(name) ? 'computer' : 'phone'); var tools = (session && session.tools || []).filter(function (t) { return t.device === device; }); return tools.find(function (t) { return t.name === name; }) || tools.find(function (t) { return t.name.endsWith('.' + name); }); }
+        function toolDef(name, device) { device = device || (['mouse', 'keyboard', 'screen', 'run_command', 'open_computer', 'close_computer'].includes(name) ? 'computer' : 'phone'); var tools = (session && session.tools || []).filter(function (t) { return t.device === device; }); return tools.find(function(t){return selected && t.name === selected.id + '.' + name;}) || tools.find(function (t) { return t.name === name; }) || tools.find(function (t) { return t.name.endsWith('.' + name); }); }
         function available(name, device) { return !(!residentMode() && operationMode === 'stealth' && ['pick_up_phone', 'put_down_phone', 'pick_media'].includes(name)) && !!toolDef(name, device); }
         function report(err) { if (!live)
             return; status.textContent = err && err.message || String(err); status.classList.add('device-status-error'); toast(status.textContent, 'err'); }
@@ -81,6 +91,11 @@
             if (!session)
                 return;
             var c = session.control || {}, paused = !!c.paused, waiting = !!c.busy;
+            if (!session.running && !isVisitor()) {
+                control.appendChild(el('div',{cls:'device-control-copy'},[el('span',{cls:'device-presence'}),el('div',{},[el('strong',{text:'世界尚未运行'}),el('p',{text:'可以浏览应用说明、启用应用和配置模型。启动世界后再操作角色的设备。'})])]));
+                control.appendChild(button('返回世界总览',function(){Studio.navigate('overview');},'device-button'));
+                updateControls();return;
+            }
             if (residentMode() && !isVisitor()) {
                 var puppet = residentMode() === 'puppet';
                 control.appendChild(el('div', { cls: 'device-control-copy' }, [el('span', { cls: 'device-presence device-presence-human' }), el('div', {}, [el('strong', { text: puppet ? '角色身体接管中 · Bot 保留意识' : '完全入替中 · 你正在使用自己的设备' }), el('p', { text: waiting ? '此前的操作正在完成，请等待真实回执。' : puppet ? '设备操作随身体控制：Bot 能体验到自己并未决定的操作。结束接管请返回角色驾驶舱。' : '这里的操作会成为角色自己的意图和经历。结束入替请返回角色驾驶舱。' })])]));
@@ -161,7 +176,11 @@
                 computerViewStamp = computerStamp;
                 var active = (session.apps || []).find(function (a) { return a.active; });
                 // Keep the desktop visible until the user opens an app, then follow shared focus.
-                if (selected && (!active || active.id !== selected.id)) {
+                if (selected && catalogView) {
+                    selected = catalogEntry(selected.id) || selected;
+                } else if (selected && catalogEntry(selected.id) && catalogEntry(selected.id).status !== 'ready') {
+                    selected = catalogEntry(selected.id);catalogView = true;generation++;viewKey = '';
+                } else if (selected && (!active || active.id !== selected.id)) {
                     selected = active || null;
                     generation++;
                     viewKey = '';
@@ -259,17 +278,21 @@
             if (!live || !session)
                 return;
             updateControls();
-            var d = session.devices, key = tab === 'phone' ? 'phone:' + (selected ? selected.id : 'home') + ':' + d.phone.down : 'computer:' + computerMode() + ':' + d.computer.on + ':' + !!(d.computer.docker && d.computer.docker.running);
+            var d = session.devices, key = tab === 'phone' ? 'phone:' + (selected ? selected.id : 'home') + ':' + d.phone.down + ':notifications:' + notificationsOpen : 'computer:' + computerMode() + ':' + d.computer.on + ':' + !!(d.computer.docker && d.computer.docker.running);
+            if (tab === 'phone' && (!selected || catalogView)) key += ':catalog:' + JSON.stringify(appCatalog()) + ':' + catalogView;
             if (tab === 'phone' && selected && appKind(selected) === 'mcp')
                 key += ':' + JSON.stringify(session.tools || []);
             if (key !== viewKey) {
                 viewKey = key;
                 stopScreen();
+                appPanel?.dispose?.(); appPanel=null;
                 workspace.replaceChildren();
                 appBody = null;
                 remoteImage = null;
                 terminalLog = null;
                 lastChat = '';
+                chatNotifyView = null;
+                lastNotifications = '';
                 if (tab === 'phone')
                     renderPhone();
                 else
@@ -278,9 +301,13 @@
             if (tab === 'phone') {
                 var hint = root.querySelector('.phone-device-label');
                 if (hint)
-                    hint.textContent = d.phone.down ? '手机已放下' : d.phone.appOpen ? '当前应用 · ' + d.phone.appOpen : '手机待机';
-                if (selected && appKind(selected) === 'chat')
+                    hint.textContent = d.phone.physical && !d.phone.physical.reachable ? '手机暂不可拿取' : d.phone.physical && !d.phone.physical.usable ? '手机无法正常使用' : d.phone.down ? '手机已放下' : d.phone.appOpen ? '当前应用 · ' + d.phone.appOpen : '手机待机';
+                var description = root.querySelector('.phone-physical-description');
+                if (description) description.textContent = d.phone.description || '';
+                if (notificationsOpen) updateNotifications();
+                else if (selected && !catalogView && appKind(selected) === 'chat')
                     updateChat();
+                updateNotificationBadges();
             }
             else if (computerMode() === 'remote_desktop') {
                 var online = !!(d.computer.on && d.computer.remote && d.computer.remote.connected);
@@ -298,73 +325,85 @@
                 }
             }
             updateControls();
+            appPanel?.update();
         }
         function phoneAction(label, name, args, cls, svg) { return toolButton(label, name, args, null, cls, svg); }
         function renderPhone() {
             var scene = el('div', { cls: 'phone-scene' }), phone = el('div', { cls: 'phone-frame' }), rail = el('aside', { cls: 'device-side-note' });
-            var top = el('div', { cls: 'phone-statusbar' }, [el('span', { cls: 'phone-device-label', text: '手机' }), el('span', { cls: 'phone-camera', 'aria-hidden': 'true' }), el('span', { text: '●', 'aria-hidden': 'true' })]);
+            var notices = button('通知中心', function () { notificationsOpen = !notificationsOpen; viewKey = ''; render(); }, 'phone-notification-button', 'bell');
+            notices.appendChild(el('span', { cls: 'phone-unread-badge', 'data-notify-badge': 'notifications', hidden: true }));
+            var top = el('div', { cls: 'phone-statusbar' }, [el('span', { cls: 'phone-device-label', text: '手机' }), el('span', { cls: 'phone-camera', 'aria-hidden': 'true' }), notices]);
             phoneBody = el('div', { cls: 'phone-display' });
             phone.append(top, phoneBody);
-            var home = button('返回桌面', async function () { selected = null; generation++; viewKey = ''; render(); }, 'phone-home-button');
+            var home = button('返回桌面', async function () { selected = null; catalogView = false; notificationsOpen = false; generation++; viewKey = ''; render(); }, 'phone-home-button');
             home.appendChild(el('span', { cls: 'phone-home-line', 'aria-hidden': 'true' }));
             phone.append(home);
             scene.append(phone);
             workspace.append(scene, rail);
-            rail.append(el('span', { cls: 'device-eyebrow', text: 'THE POCKET WORLD' }), el('h2', { text: selected ? selected.name : '一方小小的日常' }), el('p', { text: selected ? selected.description || '与 Bot 共用的真实应用。' : '手机桌面展示已安装的应用。每一次点击，都会发生在这台设备上。' }));
+            rail.append(el('span', { cls: 'device-eyebrow', text: 'THE POCKET WORLD' }), el('h2', { text: selected ? selected.name : '一方小小的日常' }), el('p', { text: selected ? selected.description || '与 Bot 共用的真实应用。' : '轻点已就绪的应用，使用与角色共享的设备。尚未启用的应用也可以在这里了解和设置。' }));
             var physical = el('div', { cls: 'device-facts' });
             physical.append(el('span', { text: '设备状态' }), el('strong', { text: session.devices.phone.down ? '已放下' : '已拿起' }));
             rail.append(physical);
+            rail.append(el('p', { cls: 'phone-physical-description', text: session.devices.phone.description || '' }));
             if (residentMode() || operationMode === 'takeover') rail.append(phoneAction(session.devices.phone.down ? '拿起手机' : '放下手机', session.devices.phone.down ? 'pick_up_phone' : 'put_down_phone', {}, 'device-button device-button-soft', 'phone'));
             if (session.devices.phone.appOpen || session.devices.phone.chatOpen)
                 rail.append(phoneAction('关闭当前应用', 'close_app', {}, 'device-button', 'close'));
+            if (notificationsOpen) {
+                phoneBody.className = 'phone-display app-notifications';
+                phoneBody.append(el('div', { cls: 'app-navigation' }, [button('返回', function () { notificationsOpen = false; viewKey = ''; render(); }, 'app-back', 'arrow'), el('strong', { text: '通知中心' })]));
+                appBody = el('div', { cls: 'app-body phone-notifications' }); phoneBody.append(appBody); updateNotifications(); return;
+            }
             if (!selected) {
                 renderDesktop();
                 return;
             }
             var kind = appKind(selected);
             phoneBody.className = 'phone-display app-' + kind;
-            var nav = el('div', { cls: 'app-navigation' }, [button('桌面', function () { selected = null; generation++; viewKey = ''; render(); }, 'app-back', 'arrow'), el('strong', { text: selected.name }), el('span', { cls: 'app-navigation-mark', 'aria-hidden': 'true', text: '•' })]);
+            var entry = catalogEntry(selected.id) || selected;
+            var nav = el('div', { cls: 'app-navigation' }, [button('桌面', function () { selected = null; catalogView = false; generation++; viewKey = ''; render(); }, 'app-back', 'arrow'), el('strong', { text: entry.name }), entry.configurable && !isVisitor() ? settingsButton(entry) : el('span', { cls: 'app-navigation-mark', 'aria-hidden': 'true', text: '•' })]);
             appBody = el('div', { cls: 'app-body' });
             phoneBody.append(nav, appBody);
-            ({ chat: renderChat, weather: renderWeather, browser: renderBrowser, notes: renderNotes, news: renderNews, mcp: renderMcp }[kind])();
+            if (catalogView) { renderAppInformation(entry); return; }
+            ({ chat: renderChat, weather: renderWeather, browser: renderBrowser, clock: renderPhonePanel, assistant: renderPhonePanel, camera: renderPhonePanel, settings: renderPhonePanel, notes: renderNotes, news: renderNews, mcp: renderMcp }[kind])();
         }
         function renderDesktop() {
             phoneBody.className = 'phone-display phone-desktop';
             phoneBody.appendChild(el('div', { cls: 'phone-wallpaper', 'aria-hidden': 'true', html: '<svg viewBox="0 0 400 660" preserveAspectRatio="xMidYMid slice"><path fill="#e4eadb" d="M0 0h400v660H0z"/><circle fill="#f5d6b8" cx="324" cy="132" r="112"/><path fill="#9ab394" d="M-90 432C23 166 232 281 258 422S413 714 451 719H-90Z"/><path fill="#416852" d="M0 528c87-183 233-225 424-199v331H0Z"/><path d="M64 530c86-145 168-178 312-168" stroke="#c6d4b3" stroke-width="2" fill="none"/></svg>' }));
-            phoneBody.appendChild(el('div', { cls: 'phone-desktop-title' }, [el('span', { text: '随身世界' }), el('h2', { text: '你好，生活。' }), el('p', { text: session.apps.length ? '所有应用都在这里。' : '尚无可用应用。' })]));
+            phoneBody.appendChild(el('div', { cls: 'phone-desktop-title' }, [el('span', { text: '随身世界' }), el('h2', { text: '你好，生活。' }), el('p', { text: appCatalog().length ? '应用与设置，都在这里。' : '尚无可用应用。' })]));
             var grid = el('div', { cls: 'phone-app-grid' });
-            (session.apps || []).forEach(function (app) {
-                var kind = appKind(app), b = button(app.name, async function () {
-                    if (!controlled()) {
-                        toast('接管设备后即可打开应用', 'err');
-                        return;
-                    }
-                    var token = ++generation;
-                    try {
-                        var response = await perform('open_app', { name: app.id });
-                        if (!live || token !== generation)
-                            return;
-                        selected = app;
-                        results[app.id] = response;
-                        viewKey = '';
-                        render();
-                    }
-                    catch (err) {
-                        report(err);
-                    }
-                }, 'phone-app-tile');
+            appCatalog().forEach(function (app) {
+                var kind = appKind(app), b = button(app.name, function () { openCatalogApp(app); }, 'phone-app-tile');
+                b.dataset.phoneApp=app.id;b.dataset.appStatus=app.status || 'ready';
                 b.replaceChildren(el('span', { cls: 'phone-app-icon phone-app-icon-' + kind }, [glyph(kind)]), el('span', { cls: 'phone-app-name', text: app.name }));
+                if (kind === 'chat') b.appendChild(el('span', { cls: 'phone-unread-badge phone-app-unread', 'data-notify-badge': 'unread', hidden: true }));
                 if (app.active)
                     b.appendChild(el('span', { cls: 'phone-app-active', title: '当前打开', 'aria-label': '当前打开' }));
-                mutation(b, 'open_app');
+                if(app.status && app.status!=='ready')b.appendChild(el('span',{cls:'phone-app-status',text:statusLabel(app)}));
                 grid.appendChild(b);
             });
             phoneBody.append(grid);
             if (isVisitor())
                 phoneBody.appendChild(el('p', { cls: 'phone-desktop-notice', text: '应用交互仅向管理员开放。' }));
-            else if (!session.apps.length)
-                phoneBody.appendChild(el('p', { cls: 'phone-desktop-notice', text: session.running ? '没有已安装的应用。' : '启动世界后可查看应用。' }));
+            else if (!session.running)
+                phoneBody.appendChild(el('p', { cls: 'phone-desktop-notice', text: '世界尚未运行，仍可查看应用说明和修改设置。' }));
             phoneBody.appendChild(el('div', { cls: 'phone-desktop-footer', text: session.devices.phone.down ? '手机已放下' : '轻点应用，继续日常' }));
+        }
+        async function openCatalogApp(app) {
+            if(app.status && app.status!=='ready' || !controlled() || !available('open_app') || busy) {
+                selected=app;catalogView=true;generation++;viewKey='';render();return;
+            }
+            var token=++generation;
+            try { var response=await perform('open_app',{name:app.kind==='chat'?app.name:app.id});if(!live || token!==generation)return;selected=catalogEntry(app.id)||app;catalogView=false;results[app.id]=response;viewKey='';render(); }
+            catch(error){report(error);}
+        }
+        function renderAppInformation(app) {
+            var kind=appKind(app), card=el('section',{cls:'phone-app-unavailable'}), actions=el('div',{cls:'phone-app-unavailable-actions'});
+            card.append(el('span',{cls:'phone-app-icon phone-app-icon-'+kind},[glyph(kind)]),el('h2',{text:app.name}),el('span',{cls:'phone-app-status',text:statusLabel(app)}),el('p',{text:app.description||'手机应用'}));
+            card.appendChild(el('p',{text:app.status==='ready' ? '应用已经就绪。操作设备需要世界运行并取得操作权限；查看设置不影响角色正在使用的应用。' : app.reason || '启动世界后可使用此应用。'}));
+            if(app.configurable && !isVisitor()){var setup=settingsButton(app,'应用设置');setup.className='phone-app-primary';actions.append(setup);}
+            if(app.status==='ready')actions.append(mutation(button('打开应用',function(){openCatalogApp(app);},'phone-app-action'),'open_app'));
+            if(app.status==='stopped')actions.append(button('返回世界总览',function(){Studio.navigate('overview');},'phone-app-action'));
+            card.append(actions);appBody.append(card);
         }
         function appOutput(id) { var output = el('div', { cls: 'app-output', 'aria-live': 'polite' }); if (results[id])
             showResult(output, results[id]); return output; }
@@ -410,9 +449,11 @@
             if (!appBody)
                 return;
             var chat = session.chat || {}, channels = chat.channels || [], messages = chat.messages || [];
-            var hash = JSON.stringify([chat.channelKey, channels, messages]);
-            if (hash === lastChat)
+            var hash = JSON.stringify([chat.channelKey, channels, messages, session.notifications]);
+            if (hash === lastChat) {
+                chatNotifyView?.update();
                 return;
+            }
             lastChat = hash;
             var list = appBody.querySelector('.app-chat-channels'), stream = appBody.querySelector('.app-chat-messages'), title = appBody.querySelector('.app-chat-title');
             if (!list || !stream)
@@ -429,15 +470,35 @@
                     report(err);
                 } }, 'app-chat-channel' + (channel.key === chat.channelKey ? ' app-chat-channel-active' : ''));
                 b.replaceChildren(el('span', { cls: 'app-avatar', text: name.slice(0, 1) }), el('span', { cls: 'app-chat-channel-copy' }, [el('strong', { text: name }), el('small', { text: channel.latest ? textOf(channel.latest.content) : channel.platform || '' })]));
+                var reading = notificationChannel(channel.key);
+                if (reading && reading.unread) b.appendChild(el('span', { cls: 'phone-unread-badge', text: badgeCount(reading.unread), 'aria-label': reading.unread + ' 条未读' }));
+                if (reading && (!reading.enabled || reading.muted)) b.appendChild(el('span', { cls: 'app-channel-muted', text: '静', title: reading.muted ? '此会话免打扰至 '+(reading.mutedUntilText || '设定时刻') : '此会话免打扰' }));
                 mutation(b, 'select_channel');
                 list.appendChild(b);
             });
             if (!channels.length)
                 list.appendChild(el('p', { cls: 'app-subtle', text: '还没有会话' }));
             var current = channels.find(function (c) { return c.key === chat.channelKey; });
-            title.replaceChildren(el('strong', { text: current ? (current.name || current.title || current.channelId || current.key) : chat.channelKey || '选择一个会话' }));
-            if (chat.channelKey)
+            var titleKey=JSON.stringify([chat.channelKey,current && (current.name||current.title||current.channelId||current.key)]);
+            if (title.dataset.channelTitle !== titleKey) {
+                title.dataset.channelTitle=titleKey;
+                title.replaceChildren(el('strong', { text: current ? (current.name || current.title || current.channelId || current.key) : chat.channelKey || '选择一个会话' }));
+                chatNotifyView=null;
+                if (chat.channelKey) {
                 title.appendChild(toolButton('更多消息', 'read_channel', { n: 80 }, function () { lastChat = ''; updateChat(); }, 'app-text-button'));
+                title.appendChild(toolButton('标为已读', 'phone_notifications', { action: 'read', id: chat.channelKey }, null, 'app-text-button'));
+                var channelKey=chat.channelKey,notify=el('details',{cls:'app-channel-notify'}),summary=el('summary',{text:'会话通知'}),copy=el('p',{cls:'phone-app-hint'});
+                var toggle=toolButton('','channel_notify',function(){var row=notificationChannel(channelKey)||{};return {id:channelKey,allow:!(row.allowed ?? row.enabled ?? true)};},null,'phone-app-action');
+                notify.append(summary,copy,toggle);title.append(notify);
+                var mute=StudioPhoneApps.mountMuteControls(notify,{label:'当前会话',getState:function(){return session.notifications;},available:function(){return controlled()&&!busy&&available('channel_notify');},run:function(seconds){return perform('channel_notify',{id:channelKey,mute_seconds:seconds});},report:report});
+                chatNotifyView={update:function(){var row=notificationChannel(channelKey)||{},allowed=row.allowed ?? row.enabled ?? true;
+                    summary.textContent='会话通知 · '+(row.muted?'限时免打扰':allowed?'已开启':'已关闭');
+                    toggle.textContent=allowed?'关闭会话通知':'开启会话通知';toggle.setAttribute('aria-label',toggle.textContent);
+                    copy.textContent=row.muted?'免打扰至 '+(row.mutedUntilText || '设定时刻')+(allowed?'':' · 长期通知仍关闭'):allowed?'当前会话允许通知；手机和应用的通知设置仍会生效。':'当前会话长期免打扰；新消息仍保留未读角标。';mute.update();
+                }};
+                }
+            }
+            chatNotifyView?.update();
             var wasBottom = stream.scrollHeight - stream.scrollTop - stream.clientHeight < 60;
             stream.replaceChildren();
             if (!chat.channelKey)
@@ -457,6 +518,47 @@
                 }
             }
             updateControls();
+        }
+        function badgeCount(count) { return count > 99 ? '99+' : String(count); }
+        function notificationChannel(key) { return (session.notifications && session.notifications.channels || []).find(function (row) { return row.key === key; }); }
+        function updateNotificationBadges() {
+            var state = session.notifications || {};
+            root.querySelectorAll('[data-notify-badge]').forEach(function (node) {
+                var count = node.dataset.notifyBadge === 'unread' ? state.unread || 0 : state.count || 0;
+                node.hidden = !count; node.textContent = count ? badgeCount(count) : ''; node.setAttribute('aria-label', count + ' 条' + (node.dataset.notifyBadge === 'unread' ? '未读消息' : '通知'));
+            });
+        }
+        function updateNotifications() {
+            if (!appBody || !notificationsOpen) return;
+            var state = session.notifications || { mode: 'vibrate', unread: 0, count: 0, channels: [] };
+            var stamp = JSON.stringify(state); if (stamp === lastNotifications) return; lastNotifications = stamp;
+            appBody.replaceChildren();
+            appBody.append(el('div', { cls: 'phone-notification-summary' }, [glyph('bell'), el('div', {}, [el('h2', { text: state.count + ' 条通知' }), el('p', { text: state.unread + ' 条未读消息 · 清除通知不会标为已读' })])]));
+            var settingsApp=catalogEntry('settings');
+            if(settingsApp) appBody.append(mutation(button('通知设置',function(){notificationsOpen=false;openCatalogApp(settingsApp);},'app-text-button','settings'),'open_app'));
+            var actions = el('div', { cls: 'phone-notification-actions' }, [toolButton('清除全部通知', 'phone_notifications', { action: 'clear' }, null, 'app-text-button'), toolButton('全部标为已读', 'phone_notifications', { action: 'read' }, null, 'app-text-button')]);
+            appBody.append(actions);
+            var rows = state.channels.filter(function (row) { return row.unread; }).slice().sort(function (a, b) { return Number(!!b.notifications) - Number(!!a.notifications) || String(b.latest && b.latest.timestamp || '').localeCompare(String(a.latest && a.latest.timestamp || '')); });
+            if (!rows.length) appBody.append(empty('暂时没有未读消息', '新的通知和会话未读会显示在这里。', 'bell'));
+            var group = '';
+            rows.forEach(function (row) {
+                var nextGroup = row.notifications ? '通知' : '未读会话 · 通知已清除或未开启';
+                if (nextGroup !== group) { group = nextGroup; appBody.append(el('h3', { cls: 'phone-notification-group', text: group })); }
+                var channel = (session.chat && session.chat.channels || []).find(function (entry) { return entry.key === row.key; });
+                var name = channel && (channel.name || channel.title || channel.channelId) || row.key;
+                var card = el('article', { cls: 'phone-notification-card' + (row.notifications ? '' : ' phone-notification-dismissed') }, [el('div', { cls: 'phone-notification-card-title' }, [el('strong', { text: name }), el('span', { cls: 'phone-unread-badge', text: badgeCount(row.unread) })]), el('small', { text: [row.enabled ? '' : '长期免打扰', row.muted ? '免打扰至 '+(row.mutedUntilText || '设定时刻') : '', row.notifications ? row.notifications + ' 条通知' : '通知已清除或未开启', timeLabel(row.latest && row.latest.timestamp)].filter(Boolean).join(' · ') }), el('p', { text: row.latest ? row.latest.sender + '：' + row.latest.preview : '' })]);
+                var open = mutation(button('打开会话', function () { openNotificationChannel(row.key).catch(report); }, 'app-text-button'), available('select_channel') ? 'select_channel' : 'open_app');
+                card.append(el('div', { cls: 'phone-notification-actions' }, [open, toolButton('标为已读', 'phone_notifications', { action: 'read', id: row.key }, null, 'app-text-button'), row.notifications ? toolButton('清除通知', 'phone_notifications', { action: 'clear', id: row.key }, null, 'app-text-button') : null]));
+                appBody.append(card);
+            });
+            updateControls();
+        }
+        async function openNotificationChannel(key) {
+            var chatApp = (session.apps || []).find(function (app) { return app.kind === 'chat'; });
+            if (!chatApp) throw new Error('当前没有可用的聊天应用。');
+            if (!available('select_channel')) await perform('open_app', { name: chatApp.name });
+            await perform('select_channel', { id: key });
+            notificationsOpen = false; selected = chatApp; catalogView = false; lastChat = ''; viewKey = ''; render();
         }
         function renderWeather() {
             var id = selected.id, output = el('div', { cls: 'app-weather-data', 'aria-live': 'polite' }), city = field('输入城市或地区', drafts.weatherCity, { 'aria-label': '城市或地区' });
@@ -484,26 +586,24 @@
             var original = el('details', { cls: 'app-source' }, [el('summary', { text: '完整天气结果' }), el('pre', { text: text })]);
             output.appendChild(original);
         }
-        function renderBrowser() {
-            var address = field('搜索或输入网址', drafts.browserAddress, { 'aria-label': '搜索或网址' }), output = appOutput(selected.id);
-            address.addEventListener('input', function () { drafts.browserAddress = address.value; });
-            var form = appForm(function () { var value = address.value.trim(); if (!value)
-                return; return appTool(/^https?:\/\//i.test(value) ? 'open_url' : 'search', /^https?:\/\//i.test(value) ? { url: value } : { query: value }, output); });
-            form.classList.add('app-browser-address');
-            form.append(glyph('browser'), address, mutation(el('button', { type: 'submit', cls: 'app-icon-button', text: '前往' })));
-            var toolbar = el('div', { cls: 'app-browser-tools' }, [toolButton('后退', 'go_back', {}, function (r) { showResult(output, r); }, 'app-text-button', 'arrow'), toolButton('下一屏', 'scroll_down', {}, function (r) { showResult(output, r); }, 'app-text-button'), toolButton('截图', 'screenshot', {}, function (r) { showResult(output, r); }, 'app-text-button')]);
-            var link = field('链接编号', '', { type: 'number', min: '1', 'aria-label': '页面链接编号' }), open = appForm(function () { return appTool('open_link', { n: Number(link.value) }, output); });
-            open.classList.add('app-browser-link');
-            open.append(link, mutation(el('button', { type: 'submit', cls: 'app-text-button', text: '打开链接' }), 'open_link'));
-            appBody.append(form, toolbar, el('div', { cls: 'app-browser-page' }, [results[selected.id] ? null : empty('从一个问题出发', '输入网址，或搜索你关心的事。页面内容来自真实浏览器。', 'browser'), output]), open);
+        function panelOptions() {
+            var id=selected.id;
+            return {name:selected.name,getState:function(){return session?.appView?.id===id?session.appView.state:null;},
+                run:function(name,args){if(selected?.id!==id) return Promise.reject(new Error('应用已切换')); return appTool(name,args);},
+                available:function(name){return controlled() && !busy && selected?.id===id && available(name);},
+                mediaUrl:function(id){return withToken('/api/media/file?id='+encodeURIComponent(id));}, report:report};
         }
+        function renderPhonePanel() { appPanel=StudioPhoneApps.mount(appKind(selected),appBody,panelOptions()); }
+        function renderBrowser() { appPanel=StudioBrowserPanel.mount(appBody,panelOptions()); }
         function renderNotes() {
             var heading = el('div', { cls: 'app-notes-heading' }, [el('span', { cls: 'app-kicker', text: '随手记，也认真记' }), el('h2', { text: '我的笔记' })]);
             var list = el('div', { cls: 'app-note-list' }), editor = el('div', { cls: 'app-note-editor' }), order=noteSortOrder();
             var add = mutation(button('新笔记', function () { noteDraft = { original: null, title: '', content: '' }; editNote(editor, true); }, 'app-notes-add', 'plus'), 'write_note');
             var sorting=noteSortSelect(function(value){order=value; listNotes();}), hint=el('p',{cls:'note-sort-hint'});
             heading.append(add);
-            appBody.append(heading, el('div',{cls:'app-note-sort'},[sorting,hint]), list, editor);
+            var templates=el('div',{cls:'phone-note-templates'});
+            [['剪贴板','剪贴板','来源：\n\n'],['作业本','练习草稿','题目：\n\n思路：\n\n演算：\n'],['账本','账本','| 时间 | 项目 | 收入 | 支出 |\n| --- | --- | --- | --- |\n'],['待办','待办','- [ ] 第一件事\n']].forEach(function(item){templates.appendChild(mutation(button(item[0],function(){noteDraft={original:null,title:item[1],content:item[2]};editNote(editor,true);},'app-text-button'),'write_note'));});
+            appBody.append(heading, templates, el('div',{cls:'app-note-sort'},[sorting,hint]), list, editor);
             function listNotes() {
                 if (!live || !list.isConnected)
                     return;
@@ -531,6 +631,17 @@
             title.addEventListener('input', function () { draft.title = title.value; });
             content.addEventListener('input', function () { draft.content = content.value; });
             var times=noteTimes(draft.metadata, 'app-note-times');
+            var preview=el('div',{cls:'app-note-preview',role:'region','aria-label':'笔记 Markdown 预览'});
+            var read=button('预览',function(){setMode('read');},'app-note-mode'), edit=button('编辑',function(){setMode('edit');},'app-note-mode');
+            var modes=el('div',{cls:'app-note-modes',role:'group','aria-label':'笔记显示方式'},[read,edit]);
+            function setMode(mode) {
+                draft.mode=mode;
+                var reading=mode==='read';
+                content.hidden=reading; preview.hidden=!reading; title.readOnly=reading;
+                read.setAttribute('aria-pressed',String(reading)); edit.setAttribute('aria-pressed',String(!reading));
+                // Switch visibility without replacing the textarea or its selection/draft.
+                if(reading) StudioMarkdown.render(preview,draft.content || '还没有正文。');
+            }
             var result = el('div', { cls: 'app-note-result', 'aria-live': 'polite' }), save = mutation(button('保存笔记', async function () {
                 if (!draft.title.trim() || !draft.content.trim()) {
                     toast('请填写标题和正文', 'err');
@@ -580,7 +691,8 @@
                 } }, 'app-text-button app-delete'), 'delete_note');
                 row.prepend(del);
             }
-            editor.append(title, times, content, row, result);
+            editor.append(title, times, modes, preview, content, row, result);
+            setMode(draft.mode || (draft.original ? 'read' : 'edit'));
             if(focusNew) title.focus();
         }
         function renderNews() {
@@ -976,6 +1088,6 @@
         refresh(true);
         polling = setInterval(function () { if (!document.hidden && !busy && !remotePending)
             refresh(false); }, 5000);
-        return function () { live = false; generation++; clearInterval(polling); window.removeEventListener('studio:refresh',onNotesChanged); stopScreen(); root.remove(); };
+        return function () { live = false; appPanel?.dispose?.(); generation++; clearInterval(polling); window.removeEventListener('studio:refresh',onNotesChanged); stopScreen(); root.remove(); };
     });
 })();

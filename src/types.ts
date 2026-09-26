@@ -19,11 +19,17 @@ export interface ParsedToolCall {
 
 /** 进入 Tool Call 流的完整工具调用记录 */
 export interface ToolCallRecord extends ParsedToolCall {
+  /** A real interface step inserted to carry out this requested operation. */
+  navigationFor?: string;
   id: string;
   /** 此调用由谁触发（agent = Bot-LLM 自己生成，system = 运行时强制，如强制 rest） */
   role: ToolCallRole;
   /** 管理员审计来源；不作为角色额外的心理或世界事实注入。 */
   control?: { mode: "avatar" | "puppet"; sessionId: string };
+  /** A menu choice resolved to this ordinary tool; not evidence of its completion. */
+  selection?: { index: number; opportunityId: string; sourceEventId: string; label: string };
+  /** Program-owned world identity when a physical operation was issued. Never model-supplied. */
+  worldEpoch?: string;
   /** 生成时刻（Time Unit） */
   issuedAt: number;
   /** 期望完成时刻 = issuedAt + (duration ?? 0) */
@@ -60,7 +66,15 @@ export interface PickFailure {
 /** RichText 的一个有序分段：文本段 或 原生媒体段（图文混排按此顺序铺开） */
 export type RichTextPart = (
   | { kind: "text"; text: string }
-  | { kind: "media"; ref: MediaRef; name?: string; summary?: string; sticker?: boolean; marker: string }
+  | {
+    kind: "media"; ref: MediaRef; name?: string; summary?: string; sticker?: boolean; marker: string;
+    /** Persisted rendering version: missing means preserve the historical text verbatim. */
+    presentation?: "media-v1" | "expression-v1";
+    /** Usage-specific recognition, never the sender's asserted intent or an ordinary image caption. */
+    expressionSummary?: string;
+    /** The character's personal selection note, distinct from media recognition. */
+    galleryNote?: string;
+  }
 ) & {
   /** Program-assigned message ownership; renderers never infer this from message-body delimiters. */
   observedMessage?: { originEventIds: string[]; experience: ExperienceMetadata };
@@ -72,6 +86,12 @@ export interface ExperienceMetadata {
   internalThought?: boolean;
   /** Set by the world-tool dispatcher; model text and platform messages cannot assert this provenance. */
   worldPerception?: boolean;
+  /** Program-confirmed routing transition, delivered before the destination's first perception. */
+  worldTransition?: { epoch: string };
+  /** Physical result's original world identity, retained even if routing changes during execution. */
+  worldEpoch?: string;
+  /** A true result from an earlier world; never the current scene or a new local action opportunity. */
+  historicalWorld?: boolean;
   episodeId?: string;
   agency?: "self" | "imposed" | "observed" | "unknown";
   action?: string;
@@ -95,6 +115,8 @@ export interface ExperienceMetadata {
 /** 带附件的富文本（附件 = Bot-LLM 原生支持的模态，以 content part 注入） */
 export interface RichText {
   text: string;
+  /** Program-authored model presentation only; raw text remains the receipt. Empty text omits boilerplate. */
+  contextHint?: { text: string };
   /** Separate already committed perceptions; preserve their order without merging action agency or roots. */
   precedingObservations?: (RichText & { source?: "world" | "koishi" })[];
   followingObservations?: (RichText & { source?: "world" | "koishi" })[];
@@ -123,10 +145,32 @@ export interface RichText {
  */
 export interface PhoneStatus {
   down: boolean;
+  /** Committed physical-world facts. Absent in legacy saves; see phone-state.ts defaults. */
+  physical?: PhonePhysicalState;
+}
+
+/** Physical reach and sensory range, never platform messages, software or connection state. */
+export interface PhonePhysicalState {
+  /** Can the character reach and handle the phone without another world action? */
+  reachable: boolean;
+  /** World-authoritative location; null means not established, not "beside the character". */
+  location: string | null;
+  /** Physical device functions can operate; damage or lack of power can make this false. */
+  usable: boolean;
+  /** Its physical notification cues can reach the character in the current circumstances. */
+  perceptible: boolean;
 }
 
 export interface BotEvent {
   id: string;
+  /** Durable chat turn delimiter only; never an operation result or experience. */
+  generationCue?: true;
+  /** One-time progress notice for a call still pending at a generation boundary. */
+  toolProgress?: "pending";
+  /** Append-time presentation hint; BotContext freezes it then discards this input field. */
+  contextHint?: { text: string };
+  /** Durable, non-experiential tool announcements; restored names reuse a definition in this window. */
+  toolAvailability?: { removed: string[]; definitions: Record<string, string>; restored: string[] };
   /** A read-only message slice of an already delivered parent, not a newly performed action. */
   perceptionOf?: { eventId: string; partIndexes: number[] };
   experience?: ExperienceMetadata;
@@ -135,7 +179,7 @@ export interface BotEvent {
   originEventIds?: string[];
   source: EventSource;
   content: string;
-  /** Frozen model-facing prose for a newly persisted narrative-world event. Raw content stays intact. */
+  /** Frozen model-facing prose for a newly persisted event; empty omits the event from model input. Raw content stays intact. */
   contextText?: string;
   /** New-event media projection may refer to complete earlier events; absent preserves legacy rendering. */
   mediaReuse?: boolean;
@@ -166,8 +210,6 @@ export type StreamEntry =
  * 对应 Prompt 结构中的：角色设定 / 历史压缩 / 工具列表 / 记忆摘要。
  */
 export interface PinnedContext {
-  /** Only refreshed at a normal context compression boundary. */
-  regulationSummary?: string;
   /**
    * 最初设定（Bot 的最初样子）：Bot_Definition.md 的原文。
    * 永远不变——只在创世时与上下文压缩时从定义文件刷新，

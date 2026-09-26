@@ -1,7 +1,7 @@
 /**
  * 内置记事本 App。
  *
- * Bot 的私人笔记：备忘、值得注意的事、对群友的印象、日记……
+ * 自由文本工作本：剪贴板、作业、账本、待办清单、备忘与日记……
  * 与压缩沉淀的长期记忆互补——记事本是 Bot **主动**写下、随时可翻的持久记录，
  * 不受上下文压缩影响。
  *
@@ -30,11 +30,12 @@ interface NoteFile extends NoteDocument {
 export class NotesApp implements WorldApp {
   readonly id = "notes";
   readonly name = "记事本";
-  readonly description = "你的私人笔记：备忘、值得注意的事、对人的印象、日记，随时翻看";
+  readonly description = "自由文本工作本：剪贴板、作业、账本、待办清单、备忘和日记，可搜索、精确修改与勾选";
   private pending = new Set<Promise<unknown>>();
   private closed = false;
   private generation = 0;
   private closing: Promise<void> = Promise.resolve();
+  private operationTail: Promise<void> = Promise.resolve();
 
   constructor(
     private files: WorldFiles,
@@ -57,7 +58,7 @@ export class NotesApp implements WorldApp {
       .map((n) => `- 「${n.title}」（更新于 ${noteTimeText(n.updated)}）`);
     const opening = notes.length
       ? `你打开了记事本，里面有 ${notes.length} 篇笔记。最近更新：\n${recent.join("\n")}`
-      : "你打开了记事本，里面还是空的。值得记住的事、备忘、对人的印象、日记，都可以随手记下来。";
+      : "记事本还是空的。";
     return {
       tools: [
         {
@@ -77,7 +78,7 @@ export class NotesApp implements WorldApp {
         {
           name: "write_note",
           description:
-            "写一篇新笔记。title 是标题（也是它的名字，如「群友印象」「8月6日 日记」），content 是正文（Markdown）",
+            "写一篇新的自由文本笔记。title 是标题（如「剪贴板」「作业草稿」「本月账本」「采购清单」），content 是 Markdown 正文；待办可写成 - [ ] 项目，不需要固定表格或分类。",
           inputSchema: {
             type: "object",
             properties: {
@@ -90,7 +91,7 @@ export class NotesApp implements WorldApp {
         {
           name: "edit_note",
           description:
-            "修改一篇笔记：给 content 时默认整体覆盖正文；append: true 表示把 content 追加到末尾（适合日记连载/补充印象）；给 new_title 时重命名",
+            "修改一篇笔记：给 content 时默认整体覆盖正文；append: true 表示把 content 追加到末尾（适合追加账目、剪贴内容、作业或日记）；给 new_title 时重命名。局部修改可用 replace_note_text。",
           inputSchema: {
             type: "object",
             properties: {
@@ -101,6 +102,31 @@ export class NotesApp implements WorldApp {
             },
             required: ["title"],
           },
+        },
+        {
+          name: "search_notes",
+          description: "按普通文字搜索标题和正文，不使用正则。返回命中片段、创建和编辑时间；默认忽略英文大小写，按最近编辑倒序。",
+          inputSchema: { type: "object", properties: {
+            query: { type: "string", description: "搜索文字，不能为空" },
+            case_sensitive: { type: "boolean", default: false },
+            limit: { type: "integer", minimum: 1, maximum: 50, default: 20 },
+          }, required: ["query"] },
+        },
+        {
+          name: "replace_note_text",
+          description: "在一篇笔记中精确替换原文，不使用正则。find 必须与原文完全一致；多处匹配时默认拒绝，确认全改才设 all:true。replace 可以为空以删除该片段；保留其余正文及创建时间。",
+          inputSchema: { type: "object", properties: {
+            title: { type: "string" }, find: { type: "string", description: "非空原文" },
+            replace: { type: "string", description: "替换为的文字，可以为空" }, all: { type: "boolean", default: false },
+          }, required: ["title", "find", "replace"] },
+        },
+        {
+          name: "check_note_item",
+          description: "勾选或取消勾选一条 Markdown 清单项（- [ ] / - [x]）。item 为方框后的完整文字；有重名时必须给 occurrence（从 1 起）明确第几项。只改方框，不改项目文字。",
+          inputSchema: { type: "object", properties: {
+            title: { type: "string" }, item: { type: "string" }, checked: { type: "boolean" },
+            occurrence: { type: "integer", minimum: 1 },
+          }, required: ["title", "item", "checked"] },
         },
         {
           name: "delete_note",
@@ -130,6 +156,12 @@ export class NotesApp implements WorldApp {
         return this.writeNote(args);
       case "edit_note":
         return this.editNote(args);
+      case "search_notes":
+        return this.searchNotes(args);
+      case "replace_note_text":
+        return this.replaceNoteText(args);
+      case "check_note_item":
+        return this.checkNoteItem(args);
       case "delete_note":
         return this.deleteNote(args);
       default:
@@ -148,7 +180,10 @@ export class NotesApp implements WorldApp {
 
   private async track<T>(operation: () => Promise<T>): Promise<T> {
     if (this.closed) throw new Error("记事本已关闭，请重新打开应用后操作。");
-    const task = operation();
+    // Serialise read-modify-write operations so two accepted app calls cannot
+    // silently lose an append, exact replacement or checklist update.
+    const task = this.operationTail.then(operation);
+    this.operationTail = task.then(() => {}, () => {});
     this.pending.add(task);
     try { return await task; }
     finally { this.pending.delete(task); }
@@ -161,7 +196,7 @@ export class NotesApp implements WorldApp {
     const order = args.sort === "created" ? "created" : "updated";
     const notes = (await this.loadAll()).sort((a, b) => compareNotes(a, b, order));
     if (!notes.length) {
-      return "记事本还是空的。（用 write_note 记下第一篇吧）";
+      return "记事本还是空的。";
     }
     const lines = notes.map(
       (n) =>
@@ -237,6 +272,71 @@ export class NotesApp implements WorldApp {
     if (!note) return this.notFound(args.title);
     await fs.rm(note.file, { force: true });
     return `「${note.title}」已删除。`;
+  }
+
+  private async searchNotes(args: Record<string, unknown>): Promise<string> {
+    if (typeof args.query !== "string" || !args.query.trim()) throw new Error("query 须为非空搜索文字");
+    if (args.case_sensitive != null && typeof args.case_sensitive !== "boolean") throw new Error("case_sensitive 须为布尔值");
+    const limit = args.limit ?? 20;
+    if (typeof limit !== "number" || !Number.isInteger(limit) || limit < 1 || limit > 50) throw new Error("limit 须为 1 至 50 的整数");
+    const normalize = (text: string) => args.case_sensitive === true ? text : text.toLowerCase();
+    const query = normalize(args.query);
+    const hits = (await this.loadAll()).filter(note => normalize(note.title).includes(query) || normalize(note.content).includes(query));
+    if (!hits.length) return `没有找到包含「${args.query}」的笔记。`;
+    return `找到 ${hits.length} 篇笔记，显示前 ${Math.min(limit, hits.length)} 篇（最近编辑倒序）：\n` + hits.slice(0, limit).map(note => {
+      const index = normalize(note.content).indexOf(query);
+      const start = Math.max(0, index - 50), end = Math.min(note.content.length, Math.max(index, 0) + query.length + 100);
+      const snippet = `${start ? "…" : ""}${note.content.slice(start, end)}${end < note.content.length ? "…" : ""}`;
+      return `「${note.title}」[创建 ${noteTimeText(note.created)}；最近编辑 ${noteTimeText(note.updated)}]\n${snippet}`;
+    }).join("\n\n");
+  }
+
+  private async replaceNoteText(args: Record<string, unknown>): Promise<string> {
+    if (typeof args.find !== "string" || !args.find) throw new Error("find 须为非空原文");
+    if (typeof args.replace !== "string") throw new Error("replace 须为文字，可以为空");
+    if (args.all != null && typeof args.all !== "boolean") throw new Error("all 须为布尔值");
+    const note = await this.find(args.title);
+    if (!note) return this.notFound(args.title);
+    const pieces = note.content.split(args.find), count = pieces.length - 1;
+    if (!count) return "（未找到完全匹配的原文，笔记未改变。请先查看笔记再复制要修改的片段。）";
+    if (count > 1 && args.all !== true) return `（原文出现 ${count} 次，笔记未改变。请扩大 find 使其唯一，或用 all:true 确认全部替换。）`;
+    const content = pieces.join(args.replace);
+    if (content === note.content) return `「${note.title}」的内容已符合要求，无需修改。`;
+    if (content.length > MAX_NOTE_CHARS) throw new Error(`修改后超过单篇 ${MAX_NOTE_CHARS} 字符上限，笔记未改变`);
+    await saveNoteFile(note.file, content, note.created, noteStamp(this.clock));
+    return `「${note.title}」已精确替换 ${count} 处。`;
+  }
+
+  private async checkNoteItem(args: Record<string, unknown>): Promise<string> {
+    if (typeof args.item !== "string" || !args.item.trim()) throw new Error("item 须为方框后的完整项目文字");
+    if (typeof args.checked !== "boolean") throw new Error("checked 须为布尔值");
+    if (args.occurrence != null && (typeof args.occurrence !== "number" || !Number.isInteger(args.occurrence) || args.occurrence < 1)) throw new Error("occurrence 须为从 1 起的整数");
+    const note = await this.find(args.title);
+    if (!note) return this.notFound(args.title);
+    const matches: { offset: number; checked: string }[] = [];
+    let fence: { marker: string; length: number } | null = null;
+    for (const line of note.content.matchAll(/^.*$/gm)) {
+      const boundary = /^\s{0,3}(`{3,}|~{3,})(.*)$/.exec(line[0]);
+      if (boundary) {
+        const marker = boundary[1]!;
+        if (!fence) fence = { marker: marker[0]!, length: marker.length };
+        else if (marker[0] === fence.marker && marker.length >= fence.length && !boundary[2]!.trim()) fence = null;
+        continue;
+      }
+      if (fence) continue;
+      const match = /^([ \t]*(?:[-+*]|\d+[.)])[ \t]+\[)([ xX])(\][ \t]+)(.*)$/.exec(line[0]);
+      if (match && match[4]!.trim() === args.item.trim()) matches.push({ offset: line.index! + match[1]!.length, checked: match[2]! });
+    }
+    if (!matches.length) return "（未找到完全同名的 Markdown 清单项，笔记未改变。）";
+    if (matches.length > 1 && args.occurrence == null) return `（有 ${matches.length} 条同名清单项，笔记未改变。请用 occurrence 指定从 1 起的第几项。）`;
+    const match = matches[(args.occurrence as number | undefined ?? 1) - 1];
+    if (!match) return `（该项目只有 ${matches.length} 条匹配，笔记未改变。）`;
+    const checked = args.checked ? "x" : " ";
+    if (match.checked.toLowerCase() === checked) return `「${note.title}」中的「${args.item}」已经${args.checked ? "勾选" : "取消勾选"}，无需修改。`;
+    const offset = match.offset;
+    const content = note.content.slice(0, offset) + checked + note.content.slice(offset + 1);
+    await saveNoteFile(note.file, content, note.created, noteStamp(this.clock));
+    return `已${args.checked ? "勾选" : "取消勾选"}「${note.title}」中的「${args.item}」。`;
   }
 
   // ---------- 存取 ----------

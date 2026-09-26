@@ -57,8 +57,8 @@ export class NewsApp implements WorldApp {
   async open(): Promise<{ tools: AppRawTool[]; opening: string }> {
     const recent = await this.files.readNews(5);
     const opening = recent.length
-      ? `你点开了新闻应用，首页头条扑面而来：\n${recent.map((e) => `· [${e.clock}] ${e.content}`).join("\n")}`
-      : "你点开了新闻应用，首页空荡荡的——暂时没有可用的新闻记录。";
+      ? `新闻首页：\n${recent.map((e) => `· [${e.clock}] ${e.content}`).join("\n")}`
+      : "暂时没有可用的新闻记录。";
     return {
       tools: [
         {
@@ -193,14 +193,14 @@ export class NewsApp implements WorldApp {
       const e = item.entry!;
       const detail = e.detail?.trim();
       return detail
-        ? `你点开了这条新闻——\n【T=${e.t.toFixed(1)} ${e.clock}】${e.content}\n\n${detail}`
-        : `你点开了这条新闻——\n【T=${e.t.toFixed(1)} ${e.clock}】${e.content}\n\n（这条只有一句简讯，没有更多详情。）`;
+        ? `【T=${e.t.toFixed(1)} ${e.clock}】${e.content}\n\n${detail}`
+        : `【T=${e.t.toFixed(1)} ${e.clock}】${e.content}\n\n（简讯，无更多详情。）`;
     }
     // RSS 原文：抓取网页正文
     if (!item.link) return `你点开了「${item.title ?? ""}」——但它没有附带原文链接。`;
     try {
       const text = await fetchArticleText(item.link, this.cfg.browserProxy);
-      return `你点开了这条新闻——\n${item.title}\n\n${text}`;
+      return `${item.title}\n来源：${item.link}\n\n${text}`;
     } catch (err) {
       this.logger.warn("抓取新闻原文失败（%s）: %s", item.link, err);
       return `你点开了「${item.title ?? ""}」，但原文网页打不开（${(err as Error).message ?? err}）。过会儿再试，或换一条。`;
@@ -210,9 +210,7 @@ export class NewsApp implements WorldApp {
   private renderList(items: OpenableItem[], label: string): string {
     if (!items.length) return `（新闻应用上${label ? `「${label}」` : ""}这一栏还是一片空白。）`;
     return (
-      `你划着新闻应用，${label}映入眼帘：\n` +
-      items.map((it, i) => `[${i + 1}] ${it.headline}`).join("\n") +
-      `\n（想细看哪条，就用 open_news(编号) 点进去。）`
+      `${label}：\n` + items.map((it, i) => `[${i + 1}] ${it.headline}`).join("\n")
     );
   }
 }

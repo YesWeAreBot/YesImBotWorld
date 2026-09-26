@@ -9,6 +9,7 @@ import { GrowthRuntime } from "../src/bot/growth-runtime.js";
 import type { BotModelConfig } from "../src/config.js";
 import type { BotEvent } from "../src/types.js";
 import { WorldFiles } from "../src/files.js";
+import { COMPRESSION_SOURCE_GUIDANCE } from "../src/prompts.js";
 
 const NOW = 1_103_001, OLD = [1_081_491, 1_081_592, 1_081_701, 1_081_805];
 const cfg = { baseURL: "http://unused.invalid/v1", apiKey: "", model: "fixture", growth: { enabled: true, minEpisodes: 4,
@@ -136,12 +137,59 @@ async function recentHalfHour(base: string) {
   runtime.stop();
 }
 
+async function historicalWorldReceipts(base: string) {
+  const files = new WorldFiles(base); await files.ensure();
+  const context = new BotContext(files); await context.load();
+  const ledger = new GrowthLedger(base);
+  const legacy = event("legacy-untagged-world", NOW - 30);
+  await ledger.perceive(legacy);
+  const previousJournal = await fs.readFile(ledger.file, "utf8");
+  const late: BotEvent = { id: "late-old-world-result", source: "tool", worldTime: NOW - 1, originEventIds: ["old-world:tea"],
+    content: JSON.stringify({ observation: { mode: "narrative", actorId: "bot", observationId: "old-teashop",
+      narrative: "你在先前世界的茶铺里，店员给你递了一杯热茶。", situation: "旧世界茶铺内，手里有一杯茶。" }, action: { status: "completed", intent: "去茶铺买茶" } }),
+    experience: { agency: "observed", worldPerception: true, worldEpoch: "old-world-stage", historicalWorld: true, episodeId: "old-world:tea" } };
+  await context.appendEvent(late); await ledger.perceive(late);
+  assert.ok((await fs.readFile(ledger.file, "utf8")).startsWith(previousJournal), "new provenance is appended without rewriting older evidence");
+  const reloaded = new GrowthLedger(base);
+  const saved = (await reloaded.recallEvidence({ eventIds: [late.id] }))[0]!;
+  assert.equal(saved.experience?.worldEpoch, "old-world-stage");
+  assert.equal(saved.experience?.historicalWorld, true);
+  assert.match(saved.text, /店员给你递了一杯热茶/);
+  await reloaded.perceive({ ...legacy, experience: { ...legacy.experience, worldEpoch: "retroactive-guess", historicalWorld: true } });
+  const unchanged = (await reloaded.recallEvidence({ eventIds: [legacy.id] }))[0]!;
+  assert.equal(unchanged.experience?.worldEpoch, undefined, "replaying old evidence never backfills a guessed historical world");
+  assert.equal(unchanged.experience?.historicalWorld, undefined);
+  const prefix = await context.toChatMessages("before historical review");
+  let calls = 0;
+  const runtime = new GrowthRuntime(reloaded, cfg, { now: () => NOW, unitWorldSeconds: 1 }, context, logger, { infer: async messages => {
+    calls++;
+    assert.match(String(messages[0]!.content), /historicalWorld=true.*先前世界.*不能据此新建或续期当前state/);
+    const payload = JSON.parse(String(messages[1]!.content)), evidence = payload.evidence.find((item: any) => item.id === late.id);
+    assert.equal(evidence?.experience.historicalWorld, true);
+    assert.equal(evidence?.experience.worldEpoch, "old-world-stage", "review packing keeps source boundaries even when the old result arrived recently");
+    return { content: JSON.stringify({ changes: [
+      { kind: "state", subject: "正在茶铺喝茶", statement: "现在还在茶铺里。", situation: "旧世界茶铺内", evidenceIds: [late.id] },
+      { kind: "relationship", subject: "旧世界的店员", statement: "店员曾经给我递过一杯热茶。", evidenceIds: [late.id] },
+    ] }), toolCalls: [] };
+  } });
+  runtime.tick(undefined, true); await runtime.settled();
+  assert.equal(calls, 1);
+  const status = await reloaded.reviewStatus();
+  assert.equal(status.recent[0]?.rejected?.length, 1);
+  assert.match(status.recent[0]!.rejected![0]!.reason, /先前世界的历史回执不证明当前处境/);
+  assert.deepEqual((await reloaded.recall({ at: NOW })).map(view => view.kind), ["relationship"], "historical experiences remain valid evidence without restoring their old physical situation");
+  assert.deepEqual(await context.toChatMessages("after historical review"), prefix, "review provenance does not rewrite the actor's frozen prefix");
+  assert.match(COMPRESSION_SOURCE_GUIDANCE, /先前世界的操作结果.*不代表当前世界处境/);
+  runtime.stop(); await runtime.settled();
+}
+
 async function main() {
   const base = await fs.mkdtemp(path.join(os.tmpdir(), "yesimbot-state-time-"));
   try {
     await staleAndFresh(path.join(base, "guard"));
     await auditedLegacyCorrection(path.join(base, "legacy"));
     await recentHalfHour(path.join(base, "priority"));
+    await historicalWorldReceipts(path.join(base, "historical-world"));
     console.log("PASS growth state timing: stale review rejection, evidence-based TU deadlines, partial adoption, append-only legacy correction/outbox/restart, current half-hour priority");
   } finally { await fs.rm(base, { recursive: true, force: true }); }
 }

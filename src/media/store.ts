@@ -22,7 +22,9 @@ export interface WorldMediaRow {
   size: number;
   /** 解释器产出的文本描述缓存；空串 = 尚未解释 */
   summary: string;
-  /** 是否作为「表情包」被摄取过（QQ 图片表情 sub_type=1）；发送时应按平台表情而非普通图片 */
+  /** 表情用途识别缓存；与普通图片摘要独立，不表示任何一次发送者的真实意图。 */
+  expressionSummary: string;
+  /** 曾作为平台表情被摄取；具体消息本次的用途以消息自身的 sticker 标记为准。 */
   sticker: boolean;
   createdAt: Date;
 }
@@ -67,6 +69,7 @@ export class MediaStore {
         file: "string(255)",
         size: "unsigned",
         summary: "text",
+        expressionSummary: "text",
         sticker: "boolean",
         createdAt: "timestamp",
       },
@@ -119,7 +122,7 @@ export class MediaStore {
           await this.ensureDir();
           await fs.writeFile(storedFile, data);
         }
-        // 去重命中：若本次是表情包而旧记录未标，则补标（曾作为表情包出现 → 保留表情身份）
+        // Only asset history; never override an explicit ordinary-image usage in a message.
         if (sticker && !existing[0]!.sticker) {
           await this.ctx.database.set("yesimbot_world_media", { sha256 }, { sticker: true });
         }
@@ -137,6 +140,7 @@ export class MediaStore {
         file,
         size: data.byteLength,
         summary: "",
+        expressionSummary: "",
         sticker,
         createdAt: new Date(),
       });
@@ -173,6 +177,10 @@ export class MediaStore {
 
   async setSummary(id: number, summary: string): Promise<void> {
     await this.ctx.database.set("yesimbot_world_media", { id }, { summary });
+  }
+
+  async setExpressionSummary(id: number, expressionSummary: string): Promise<void> {
+    await this.ctx.database.set("yesimbot_world_media", { id }, { expressionSummary });
   }
 
   async readFile(ref: MediaRef): Promise<Buffer> {

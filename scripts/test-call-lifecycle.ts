@@ -7,7 +7,7 @@ import { CallStore, callStore } from "../src/webui/calls.js";
 import { WorldService } from "../src/service.js";
 
 const directory = mkdtempSync(path.join(tmpdir(), "yesimbot-call-lifecycle-"));
-const input = { source: "Regulation", model: "fixture", url: "http://fixture.invalid", requestBody: "fixture request" };
+const input = { source: "Growth", model: "fixture", url: "http://fixture.invalid", requestBody: "fixture request" };
 
 async function main() {
   const store = new CallStore(1, 1);

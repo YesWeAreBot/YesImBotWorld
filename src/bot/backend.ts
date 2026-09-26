@@ -12,6 +12,8 @@ export interface BotBackend {
   generate(context: BotContext, timeLine: string, signal?: AbortSignal): Promise<ParsedToolCall>;
   /** 更新允许的工具名集（App 打开/关闭时动态调整） */
   setToolNames(names: string[]): void;
+  /** Known operations whose interface prerequisites can be executed before dispatch. */
+  setNavigableToolNames?(names: string[]): void;
   /** 可选：更新当前可用工具的完整定义（原生 tools 声明需要签名与描述） */
   setToolDefs?(defs: NamedToolDef[]): void;
   /** Refresh the provider's fixed tool declarations only at a successful context compression boundary. */
@@ -27,6 +29,7 @@ export class ChatBackend implements BotBackend {
   private toolNames: string[];
   private toolDefs: NamedToolDef[];
   private knownToolNames = new Set<string>();
+  private navigableToolNames = new Set<string>();
   private nativeDefs: ChatToolDef[] | null = null;
   private nativeWindow: { context: BotContext; revision: number } | null = null;
   private maxTokens: number;
@@ -59,6 +62,11 @@ export class ChatBackend implements BotBackend {
     for (const name of names) this.knownToolNames.add(name);
   }
 
+  setNavigableToolNames(names: string[]): void {
+    this.navigableToolNames = new Set(names);
+    for (const name of names) this.knownToolNames.add(name);
+  }
+
   setToolDefs(defs: NamedToolDef[]): void {
     this.toolDefs = structuredClone(defs);
     for (const def of defs) this.knownToolNames.add(def.name);
@@ -86,7 +94,7 @@ export class ChatBackend implements BotBackend {
   async generate(context: BotContext, timeLine: string, signal?: AbortSignal): Promise<ParsedToolCall> {
     let messages: ChatMessage[], tools: ChatToolDef[] | undefined;
     for (;;) {
-      await context.settled();
+      await context.ensureGenerationCue();
       const revision = context.windowRevision;
       const nativeToolCalls = context.generationUsesNativeTools(this.useNativeTools);
       tools = nativeToolCalls ? await context.nativeToolSnapshot(timeLine, this.currentNativeDefs(context, revision)) : undefined;
@@ -130,13 +138,8 @@ export class ChatBackend implements BotBackend {
       let args: unknown;
       try { args = JSON.parse(native.function.arguments); }
       catch { throw new ToolCallParseError("工具参数 JSON 未闭合或格式无效，本次未执行。", native.function.arguments); }
-      // duration 是本协议的通用顶层字段；原生声明里它以参数形式出现，解析时提升回顶层
-      let duration: unknown;
-      if (typeof args === "object" && args !== null && "duration" in args) {
-        duration = (args as Record<string, unknown>).duration;
-        delete (args as Record<string, unknown>).duration;
-      }
-      return validateToolCall({ name, arguments: args, duration }, this.toolNames);
+      // The shared validator normalizes native and body-JSON duration identically.
+      return validateToolCall({ name, arguments: args }, [...this.toolNames, ...this.navigableToolNames]);
     }
     // Parse known-but-inactive names too so both protocols report the same truthful availability
     // error. Do not present the historical catalogue as currently usable in an unknown-name error.
@@ -154,7 +157,7 @@ export class ChatBackend implements BotBackend {
 
   private assertAvailable(name: string): void {
     if (name === "observe") throw new ToolCallParseError("工具 observe 此刻不可用，主动观察已合并到 act(description)，日常感知与行动结果自动送达。本次没有执行操作；请依据最新能力说明表达具体意图。");
-    if (this.toolNames.includes(name)) return;
+    if (this.toolNames.includes(name) || this.navigableToolNames.has(name)) return;
     const description = this.knownToolNames.has(name) ? `工具 ${name} 此刻不可用` : `未知工具 ${JSON.stringify(name)}`;
     throw new ToolCallParseError(`${description}。本次没有执行操作；请以最近的能力变化事件和当前工具说明为准，不要因旧声明仍存在就重复调用。`);
   }

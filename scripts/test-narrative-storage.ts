@@ -142,13 +142,14 @@ async function main(): Promise<void> {
     assert.equal(timed.snapshot().stateSequence, 1);
     assert.equal(timed.readEvents(timed.snapshot().stateSequence - 1, 1)[0]!.id, stateRoot, "rereads share the actual state commit, not an unrelated later perception event");
     adjudicationTime = 115;
-    await timed.commit({ idempotencyKey: "time-body", source: "evolve", actors: { bot: { ...timed.snapshot().actors.bot!, state: "等了片刻，现在觉得有些冷。" } } });
+    await timed.commit({ idempotencyKey: "time-body", source: "evolve", worldState: timed.snapshot().worldState + "一阵冷风吹进屋里。", actors: { bot: { ...timed.snapshot().actors.bot!, state: "仍在屋里等候，冷风吹在皮肤上。" } },
+      evolution: { changes: [{ id: "wind", description: "一阵冷风吹进屋里。" }], actorEffects: [{ actorId: "bot", changeIds: ["wind"] }], perceptionSources: [] } });
     assert.equal(timed.snapshot().stateUpdatedAt, 115); assert.equal(timed.snapshot().stateSequence, 4);
     adjudicationTime = 120;
     await timed.commit({ idempotencyKey: "time-presence", source: "leave", actors: { bot: { ...timed.snapshot().actors.bot!, present: false } } });
     assert.equal(timed.snapshot().stateUpdatedAt, 120); assert.equal(timed.snapshot().stateSequence, 5);
     adjudicationTime = 125;
-    await timed.commit({ idempotencyKey: "time-world", source: "evolve", worldState: "店员已经把面煮好。" });
+    await timed.commit({ idempotencyKey: "time-world", source: "evolve", worldState: "店员已经把面煮好。", evolution: { changes: [{ id: "noodle", description: "店员已经把面煮好。" }], actorEffects: [], perceptionSources: [] } });
     assert.equal(timed.snapshot().stateUpdatedAt, 125); assert.equal(timed.snapshot().stateSequence, 6);
     const updatedStateRoot = timed.readEvents(timed.snapshot().stateSequence - 1, 1)[0]!.id;
     assert.notEqual(updatedStateRoot, stateRoot);

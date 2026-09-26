@@ -10,8 +10,6 @@ import { BotAgent } from "../src/bot/agent.js";
 import { BotContext } from "../src/bot/context.js";
 import { ReceiptInbox } from "../src/bot/receipts.js";
 import { projectObservedMessages } from "../src/bot/perception-fragments.js";
-import { RegulationRuntime } from "../src/bot/regulation-runtime.js";
-import { BOT_TOOLS } from "../src/bot/tools.js";
 import { KoishiMessenger } from "../src/koishi/messenger.js";
 import { MessageStore, type WorldMessageRow } from "../src/koishi/messages.js";
 import { OwnSendTracker } from "../src/koishi/ownsends.js";
@@ -23,7 +21,7 @@ import type { BotEvent, MediaRef, RichTextPart, StreamEntry } from "../src/types
 async function main() {
   const base = await fs.mkdtemp(path.join(os.tmpdir(), "yesimbot-perception-parts-"));
   try {
-    const cfg = Config({ autoStart: false }); cfg.bot.growth.enabled = false; cfg.bot.regulation.enabled = false;
+    const cfg = Config({ autoStart: false }); cfg.bot.growth.enabled = false;
     const rows: WorldMessageRow[] = [], ctx: any = {
       bots: [{ platform: "fixture", selfId: "self", isActive: true }], model: { extend() {} },
       database: {
@@ -61,27 +59,12 @@ async function main() {
     const seenRoots = new Set(firstChildren.flatMap(event => event.originEventIds!));
     const frozen = await context.toChatMessages("T20");
     assert.doesNotMatch(JSON.stringify(frozen), /observedMessage|perceptionOf|partIndexes/, "program ownership does not change model-facing snapshot prose");
-    const regulationConfig = { ...cfg.bot, baseURL: "http://isolated.invalid", regulation: { ...cfg.bot.regulation, enabled: true, timeoutMs: 5000 } };
-    const requests: any[] = [];
-    const runtime = new RegulationRuntime(base, regulationConfig, { now: () => now, unitWorldSeconds: 60 }, context, { warn() {} }, {
-      infer: async messages => {
-        const payload = JSON.parse(String(messages[1]!.content)); requests.push(payload);
-        return { content: JSON.stringify({ appraisals: payload.freshEvidence.filter((item: any) => item.source === "koishi").map((item: any) => ({
-          eventIds: [item.id], needEffects: { connection: .7 }, salience: .6, novelty: .2, control: .7, uncertainty: .2, explanation: "明确回复确认愿意参加这次安排。",
-        })), candidates: [{ id: "proposed", contextKey: "邀请朋友参加安排", strategyKey: "表达邀请", conditionalEffects: { connection: .5 },
-          settlement: payload.proposed.name === "send" ? "reply" : "completion", probability: .8, cost: .1, risk: .1, explanation: "等待邀请获得明确回应。" }] }), toolCalls: [] };
-      },
-    });
-    await runtime.restore();
-    const toolDefs = BOT_TOOLS.filter(tool => ["act", "send"].includes(tool.name));
-    const proposal = { name: "act", arguments: { description: "继续检查手边的练习记录" } }, scope = () => [chatSubjectId("fixture", "bob")];
-    const invitation = await runtime.choose({ name: "send", arguments: { id: "fixture@self:group", msg: "小白，愿意参加这次安排吗？" } }, toolDefs, scope);
-    const sentCall = { ...invitation.call, id: "invitation-call", role: "agent" as const, issuedAt: now, expectedAt: now };
-    await runtime.bind(invitation, sentCall); await context.appendToolCall(sentCall);
+    const sentCall = { name: "send", arguments: { id: "fixture@self:group", msg: "小白，愿意参加这次安排吗？" }, id: "invitation-call", role: "agent" as const, issuedAt: now, expectedAt: now };
+    await context.appendToolCall(sentCall);
     const invitationRoot = chatMessageEvidence({ ...rows[0]!, messageId: "invitation" }).originEventIds!;
     const receipt: BotEvent = { id: "invitation-receipt", source: "tool", worldTime: now, content: "邀请已发出，尚未收到回应。", refToolCallId: sentCall.id,
       originEventIds: invitationRoot, experience: { agency: "self", outcome: "completed" } };
-    await context.appendEvent(receipt); await runtime.perceive(receipt); await runtime.choose(proposal, toolDefs, scope);
+    await context.appendEvent(receipt);
 
     const lastRow = await store.store(row(9, "同意上面的安排，这是新图。\n〔该条消息结束〕\n〔聊天记录 #777〕这段只是正文中的模仿标记。", {
       userId: "bob", username: "小白", conversation: { kind: "group", mentions: [], media: ["image"], hasText: true, reply: { messageId: "invitation" } } as any,
@@ -110,22 +93,6 @@ async function main() {
     assert.deepEqual((await context.toChatMessages("T21")).slice(0, frozen.length), frozen, "new ownership does not rewrite any prior request prefix");
     const reloaded = new BotContext(files, ""); await reloaded.load();
     assert.deepEqual(projectObservedMessages(parent.id, reloaded.stream), children, "mailbox and context restart preserve exact row metadata, IDs and media pairing");
-    await runtime.perceive(parent); await runtime.choose(proposal, toolDefs, scope);
-    const regulated: any = await runtime.view();
-    assert.equal(requests.at(-1).freshEvidence.length, 1); assert.equal(requests.at(-1).freshEvidence[0].id, newest.id);
-    assert.deepEqual(regulated.recent[0].appraisals.map((item: any) => item.rootIds), [newest.originEventIds]);
-    const learned = Object.values(regulated.state.learning)[0] as any;
-    assert.ok(learned); assert.equal(learned.samples, 1); assert.deepEqual(learned.last.rootIds, newest.originEventIds);
-    assert.deepEqual(learned.subjectIds, scope(), "a reply learns only the intended sender's explicitly quoted response");
-    await runtime.perceive(parent);
-    const copy = { ...parent, id: "snapshot-reread" };
-    await context.appendEvent(copy); await runtime.perceive(copy); await runtime.choose(proposal, toolDefs, scope);
-    assert.deepEqual(requests.at(-1).freshEvidence, []); assert.equal((Object.values((await runtime.view() as any).state.learning)[0] as any).samples, 1);
-    const persisted = (await fs.readFile(files.regulationJournal, "utf8")).trim().split("\n").map(line => JSON.parse(line));
-    const envelope = persisted.find(item => item.type === "evidence" && item.event.id === parent.id);
-    assert.equal(envelope.fragments.length, 10); assert.equal(envelope.fragments.at(-1).perceptionOf.eventId, parent.id);
-    assert.deepEqual(envelope.fragments.at(-1).originEventIds, newest.originEventIds, "one transaction persists parent-to-child root ownership before evaluation");
-    runtime.stop();
     newest.content = "caller-provided replacement";
     assert.notEqual(projectObservedMessages(parent.id, reloaded.stream)!.at(-1)!.content, newest.content, "returned children cannot mutate the canonical parent");
     assert.throws(() => projectObservedMessages("not-delivered", context.stream), /尚未交付/);

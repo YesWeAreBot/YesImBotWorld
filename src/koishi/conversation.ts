@@ -67,13 +67,16 @@ export function isStickerElement(el: h): boolean {
 }
 
 /** Platform evidence about a message, not a guess about its author's intent. */
+export type ConversationMedia = "image" | "sticker" | "face" | "audio" | "video" | "forward";
 export interface ConversationContext {
   kind: "direct" | "group" | "unknown";
   mentions: string[];
   mentionsEveryone: boolean;
   reply?: { messageId?: string; userId?: string };
   hasText: boolean;
-  media: ("image" | "sticker" | "face" | "audio" | "video" | "forward")[];
+  media: ConversationMedia[];
+  /** Counts occurrences in this message only; absent in older rows, never inferred from asset metadata. */
+  mediaCounts?: Partial<Record<ConversationMedia, number>>;
 }
 
 export function conversationKind(isDirect?: boolean | null, channelId = "", guildId = ""): ConversationContext["kind"] {
@@ -89,6 +92,11 @@ export function describeConversation(
   reply?: ConversationContext["reply"],
 ): ConversationContext {
   const result: ConversationContext = { kind, mentions: [], mentionsEveryone: false, hasText: false, media: [], ...(reply ? { reply } : {}) };
+  const media = (type: ConversationMedia) => {
+    result.media.push(type);
+    result.mediaCounts ??= {};
+    result.mediaCounts[type] = (result.mediaCounts[type] ?? 0) + 1;
+  };
   const visit = (nodes: h[]) => {
     for (const node of nodes) {
       if (node.type === "text") result.hasText ||= !!String(node.attrs.content ?? "").trim();
@@ -98,9 +106,9 @@ export function describeConversation(
       } else if (node.type === "quote") {
         // Quoted and forwarded messages do not address the recipient of the containing message.
         if (!result.reply && node.attrs.id != null) result.reply = { messageId: String(node.attrs.id) };
-      } else if (node.type === "forward") result.media.push("forward");
-      else if (["img", "image", "mface", "sticker"].includes(node.type)) result.media.push(isSticker(node) ? "sticker" : "image");
-      else if (node.type === "face" || node.type === "audio" || node.type === "video") result.media.push(node.type);
+      } else if (node.type === "forward") media("forward");
+      else if (["img", "image", "mface", "sticker"].includes(node.type)) media(isSticker(node) ? "sticker" : "image");
+      else if (node.type === "face" || node.type === "audio" || node.type === "video") media(node.type);
       else if (node.children?.length) visit(node.children);
     }
   };
@@ -130,7 +138,13 @@ export function conversationLabel(context: ConversationContext | null | undefine
   }
   if (context.media.length) {
     const labels = { image: "图片", sticker: "表情包", face: "平台表情", audio: "语音", video: "视频", forward: "转发记录" };
-    facts.push((context.hasText ? "附有" : "仅含") + context.media.map(type => labels[type]).join("、") + (context.hasText ? "" : "，未附文字"));
+    facts.push((context.hasText ? "附有" : "仅含") + context.media.map(type => {
+      const count = context.mediaCounts?.[type];
+      return labels[type] + (Number.isSafeInteger(count) && count! > 0 ? `×${count}` : "");
+    }).join("、") + (context.hasText ? "" : "，未附文字"));
+    if (context.media.some(type => type === "sticker" || type === "face")) {
+      facts.push(context.hasText ? "表情与文字共同表意，具体含义结合上下文" : "表情参与会话表意，具体含义结合上下文");
+    }
   }
   return facts.join("；");
 }

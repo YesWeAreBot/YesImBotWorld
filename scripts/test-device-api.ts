@@ -12,6 +12,7 @@ import { BOT_TOOLS } from "../src/bot/tools.js";
 import { Config } from "../src/config.js";
 import { WorldFiles } from "../src/files.js";
 import { WorldService } from "../src/service.js";
+import { NotifyManager } from "../src/koishi/notify.js";
 import { RemoteDesktopApp } from "../src/apps/remoteDesktop.js";
 import { RfbSession } from "../src/remote/rfb.js";
 import { WebUIServer } from "../src/webui/server.js";
@@ -39,7 +40,9 @@ async function backend(dir: string) {
   bot.running = true;
   bot.backend = { setToolNames() {}, setToolDefs() {} };
   const service: any = Object.create(WorldService.prototype);
-  Object.assign(service, { bot, appManager: apps, computerDevice: null, remoteDesktopApp: null, worldActive: true, deviceTail: Promise.resolve(), devicePending: 0, config: cfg });
+  const notifyMgr = new NotifyManager(path.join(dir, "notify.json"), ["*"], true);
+  await notifyMgr.load();
+  Object.assign(service, { bot, appManager: apps, computerDevice: null, remoteDesktopApp: null, worldActive: true, deviceTail: Promise.resolve(), devicePending: 0, config: cfg, notifyMgr });
   const row = { id: 1, platform: "onebot", channelId: "42", selfId: "b", content: "cached", username: "person", userId: "person", messageId: "message", timestamp: new Date(0), self: false };
   service.store = { knownChannels: async () => [{ key: "onebot@b:42", platform: "onebot", channelId: "42", selfId: "b", isDirect: true, participants: [] }], recentChannels: async () => [{ key: "onebot@b:42", latest: row }], channelMessages: async (_platform: string, _channel: string, _n: number, selfId: string) => { assert.equal(selfId, "b"); return [row]; } };
   service.devicesInfo = async () => ({ computer: { mode: "off", on: null, docker: null, remote: null }, phone: { down: false, appOpen: apps.currentName, ...bot.status().phoneUi, chatAppName: "chat", resolution: { width: 390, height: 844 } } });
@@ -50,6 +53,7 @@ async function backend(dir: string) {
   assert.equal((await service.deviceToolCall("act", { description: "mutate world" })).ok, false);
   assert.equal((await service.deviceToolCall("open_app", { name: "notes" })).ok, true);
   const session = await service.deviceSession();
+  assert.deepEqual(session.notifications, notifyMgr.snapshot(["onebot@b:42"], session.apps.map(app => app.id)), "read-only device session includes notification policy for every installed app");
   assert.deepEqual(session.tools.find((t: any) => t.name === "nested").inputSchema, schema);
   assert.equal(opened, 1);
   const rich = await service.deviceToolCall("nested", { items: [{ value: 3 }] });

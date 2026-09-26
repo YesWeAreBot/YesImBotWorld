@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import type { HeartbeatResult } from "./tingle.js";
 import { NarrativeWorld } from "./runtime.js";
 import type { NarrativeObservation } from "./narrative-types.js";
 import type { WorldObservation } from "./state.js";
@@ -13,11 +14,10 @@ import { withEndpointLock } from "../llm/lock.js";
 import { extractHtml } from "../apps/html.js";
 import {
   clampPhoneResolution,
-  DEFAULT_PHONE_RESOLUTION,
-  parsePhoneResolution,
+  resolvePhoneResolution,
   type PhoneResolution,
 } from "../phone.js";
-import { fill, type Prompts } from "../prompts.js";
+import { COMPRESSION_SOURCE_GUIDANCE, fill, type Prompts } from "../prompts.js";
 import type { CompressionResult, RichText, ToolCallRecord } from "../types.js";
 import type { PlayerMode } from "../crossing/protocol.js";
 import { debug } from "../webui/debug.js";
@@ -59,6 +59,14 @@ export interface RemoteWorldLink {
   resolveWait(call: ToolCallRecord, deliver: (content: string) => void): Promise<boolean>;
   resolveCheckTime(deliver: (content: string) => void): Promise<boolean>;
   query(task: string): Promise<string>;
+}
+
+/** Execution-route provenance, supplied by the program rather than parsed from model prose. */
+export interface WorldActDeliveryRoute {
+  epoch: string;
+  worldName: string | null;
+  /** A late receipt stays a real historical result, but cannot describe the current world. */
+  current: boolean;
 }
 
 /**
@@ -113,11 +121,22 @@ export class WorldAgent {
     signal.throwIfAborted();
     await this.runtime.ensure(undefined, undefined, signal);
   }
+  /** Camera grounding is limited to an already delivered physical perception. */
+  async cameraScene(): Promise<{ visible: string; appearance: string; actorName: string; observedAt: string }> {
+    if (this.remote) throw new Error("正在异世界，当前相机尚不能读取远方世界的可见场景。");
+    const cursor = this.perceptionCursors.get("bot") ?? -1;
+    const ahead = this.directlyObserved.get("bot");
+    const observations = await this.runtime.perceptionsSince("bot", 0);
+    const observed = observations.filter(value => value.worldSequence <= cursor || ahead?.has(value.observationId)).at(-1);
+    if (!observed?.narrative?.trim()) throw new Error("还没有已交付的可见场景，请先实际看看周围再拍照。");
+    return { visible: observed.narrative, appearance: "", actorName: this.botName, observedAt: this.clock.timeLine(observed.observedAt) };
+  }
   /** Used after an explicit world reset/reload; old sequence cursors cannot address a new journal. */
   resetPerceptionDelivery(): void { this.perceptionCursors.clear(); this.directlyObserved.clear(); }
   /** Call only after shutdown, when replacing the saved world rather than merely pausing it. */
   resetSessionState(): void {
     this.botName = ""; this.dormantSinceTU = null; this.remote = null;
+    this.routeEpoch = randomUUID();
     this.resetPerceptionDelivery(); this.pendingReceiptActions.clear(); this.deliveryTails.clear();
   }
   /** Resume after the last known delivered cause, without replaying an entire compressed lifetime. */
@@ -160,7 +179,7 @@ export class WorldAgent {
   }
   private visitorId(v: VisitorRef): string { return "visitor:" + (v.id ?? v.name); }
   /** Read already committed perceptions; passive delivery must never invoke observe or the model. */
-  private async publishActor(actorId: string, deliver: (content: string) => void | Promise<void>, receipt?: string): Promise<void> {
+  private async publishActor(actorId: string, deliver: (content: string) => void | Promise<void>, receipt?: string, currentRoute: () => boolean = () => true): Promise<void> {
     const signal = this.maintenanceAbort.signal; signal.throwIfAborted();
     const prior = this.deliveryTails.get(actorId) ?? Promise.resolve();
     const run = prior.catch(() => {}).then(async () => {
@@ -170,12 +189,22 @@ export class WorldAgent {
         try { const parsed = JSON.parse(receipt); receiptObservation = parsed.observation ?? parsed; } catch { /* preserve a readable remote/error receipt below */ }
       }
       const cursor = this.perceptionCursors.get(actorId) ?? 0;
-      const pending = await this.runtime.perceptionsSince(actorId, cursor); signal.throwIfAborted();
       const deliveredAhead = this.directlyObserved.get(actorId) ?? new Set<string>();
       this.directlyObserved.set(actorId, deliveredAhead);
+      const deliverReceipt = async () => {
+        if (!receipt) return;
+        await deliver(receipt);
+        if (receiptObservation?.actorId === actorId && receiptObservation.worldSequence > (this.perceptionCursors.get(actorId) ?? 0)) deliveredAhead.add(receiptObservation.observationId);
+      };
+      // Do not fill a departed actor's stream with unread ambient scenes from the old
+      // world. Its own committed action still needs an honest, route-tagged receipt.
+      if (!currentRoute()) { await deliverReceipt(); return; }
+      const pending = await this.runtime.perceptionsSince(actorId, cursor); signal.throwIfAborted();
+      if (!currentRoute()) { await deliverReceipt(); return; }
       let receiptDelivered = false;
       let waitingForReceipt = false;
       for (const observation of pending) {
+        if (!currentRoute()) break;
         const isReceipt = receiptObservation?.observationId === observation.observationId;
         const wasObserved = deliveredAhead.delete(observation.observationId);
         // An action is delivered through its tool call so puppet/avatar agency and the full
@@ -190,8 +219,7 @@ export class WorldAgent {
       // A retried action still needs its execution acknowledgement even when the underlying
       // perception was already delivered. Stable source IDs prevent it becoming new evidence.
       if (receipt && !receiptDelivered) {
-        await deliver(receipt);
-        if (receiptObservation?.actorId === actorId && receiptObservation.worldSequence > (this.perceptionCursors.get(actorId) ?? 0)) deliveredAhead.add(receiptObservation.observationId);
+        await deliverReceipt();
       }
     });
     this.deliveryTails.set(actorId, run);
@@ -217,6 +245,8 @@ export class WorldAgent {
    * 只保留上下文压缩等 Bot 私有的记忆工作）；本地 Tingle 静默。
    */
   private remote: RemoteWorldLink | null = null;
+  /** Changes even for home -> elsewhere -> home; object equality alone misses that round trip. */
+  private routeEpoch = randomUUID();
   /** 穿越服务注册的在场访客和定向感知通道。 */
   private visitorsProvider: (() => PresentVisitor[]) | null = null;
   /** service 注册的常驻 Bot 实时感知通道。 */
@@ -245,6 +275,7 @@ export class WorldAgent {
 
   /** 穿越：设置/清除 Bot 所在的远方世界。回家（null）后由调用方负责 wakeDormant 补叙 */
   setRemote(link: RemoteWorldLink | null): void {
+    if (this.remote !== link) this.routeEpoch = randomUUID();
     this.remote = link;
     if (link) this.notePresenceChange();
   }
@@ -318,7 +349,7 @@ export class WorldAgent {
     private clock: WorldClock,
     private logger: Logger,
     private prompts: Prompts,
-    /** 创世时手机相关的判定选项（来自 apps 配置） */
+    /** 手机外观与首次补全选项（来自 apps 配置） */
     private phoneCfg: { resolution: string; generateShell: boolean } = { resolution: "auto", generateShell: false },
   ) {
     this.client = new ChatClient({
@@ -334,7 +365,8 @@ export class WorldAgent {
     this.runtime = new NarrativeWorld(files, clock, (messages, tools, signal) => withEndpointLock(cfg.baseURL, () => {
       const pending = this.client.complete(messages, { tools, signal, toolChoice: { type: "function", function: { name: "resolve_world" } } });
       return signal ? abortable(pending, signal) : pending;
-    }, signal), prompts);
+    }, signal), prompts, { heartbeatTimeoutMs: cfg.heartbeatTimeoutMs });
+    this.runtime.phoneAuthorityProvider = () => this.remote === null;
   }
 
   /**
@@ -398,17 +430,23 @@ export class WorldAgent {
   // ---------- 对外任务 ----------
 
   /** Deliver each committed action stage promptly; future completion stays on the world clock. */
-  async adjudicateAct(call: ToolCallRecord, deliver: (content: string) => void | Promise<void>, signal?: AbortSignal, beforeCommit?: (phase: "start" | "finish") => boolean): Promise<boolean> {
+  async adjudicateAct(call: ToolCallRecord, deliver: (content: string, route?: WorldActDeliveryRoute) => void | Promise<void>, signal?: AbortSignal, beforeCommit?: (phase: "start" | "finish") => boolean): Promise<boolean> {
     const lifetime = this.maintenanceAbort.signal; lifetime.throwIfAborted();
-    if (this.remote) return this.remote.adjudicateAct(call, deliver, signal, beforeCommit ? () => beforeCommit("finish") : undefined);
+    const remote = this.remote, epoch = this.routeEpoch, worldName = remote?.worldName ?? null;
+    const currentRoute = () => this.routeEpoch === epoch;
+    const routedDeliver = (content: string) => deliver(content, { epoch, worldName, current: currentRoute() });
+    // A route change revokes new physical commits, but not delivery of a result already
+    // saved. NarrativeWorld checks this at each start/finish durable commit boundary.
+    const routedBeforeCommit = (phase: "start" | "finish") => currentRoute() && (beforeCommit?.(phase) ?? true);
+    if (remote) return remote.adjudicateAct(call, routedDeliver, signal, () => routedBeforeCommit("finish"));
     const actionId = `bot:${call.id}`;
     this.pendingReceiptActions.set(actionId, "bot");
     try {
       const ok = await this.runtime.act("bot", call, async content => {
         lifetime.throwIfAborted();
-        await this.publishActor("bot", deliver, content);
+        await this.publishActor("bot", routedDeliver, content, currentRoute);
         await this.publishAll("bot");
-      }, signal, beforeCommit);
+      }, signal, routedBeforeCommit);
       lifetime.throwIfAborted();
       await this.publishAll("bot");
       return ok;
@@ -431,19 +469,19 @@ export class WorldAgent {
     deliver(JSON.stringify(await this.observe("bot", { target: "看看当前可见的物理钟表能否读出时间；没有可见钟表就说明无法得知。", modality: "sight" }))); return true;
   }
 
-  /** Tingle：世界心跳，推进世界演化。返回 World 为下一次心跳设定的间隔（TU），未设定则返回 null */
-  async tingle(deliver: (content: string) => void): Promise<number | null> {
+  /** Tingle：仅把已校验并保存的演化报告为提交；安静和主动让位分别返回。 */
+  async tingle(deliver: (content: string) => void): Promise<HeartbeatResult> {
     const lifetime = this.maintenanceAbort.signal; lifetime.throwIfAborted();
-    if (this.remote && !(this.visitorsProvider?.().length)) { this.notePresenceChange(); return null; }
-    await this.runtime.evolve("世界心跳：按距离当前状态时刻的实际经过时间，结算自然过程及 NPC 的自主行动。承接正在进行的工作、交谈、等待和角色行动造成的影响，以自然语言写明真正发生的经过，分别向在场角色提供他们实际能感知的新动静。常驻角色及玩家的主动选择由他们自己决定。没有合理变化时保持安静，不强制制造冲突或奇遇，也不要重播旧场景。", { heartbeat: true });
+    if (this.remote && !(this.visitorsProvider?.().length)) { this.notePresenceChange(); return { status: "yielded", reason: "常驻角色在异世界，当前无访客" }; }
+    const result = await this.runtime.evolve("世界心跳：按实际经过的世界时间演化外部环境、天气与NPC生活，保留仍有关联的进展和远处事件。受控角色不是本轮行动者，不能续写其困倦、入睡、醒来或推进待完成行动；只有本轮外部原因确实造成的物理影响可更新其状态。只向真正感知到新变化的角色投递相应片段，远处或未注意到的经过只记入externalChanges，影响后续的事实还须更新worldState。没有合理变化时保持安静，不制造冲突、奇遇或重复旧场景，不必每轮提供建议。", { heartbeat: true });
     lifetime.throwIfAborted();
-    await this.publishAll(undefined, deliver); return null;
+    await this.publishAll(undefined, deliver); return result;
   }
 
   /** 补叙离线期间的自然演化，向恢复连接的角色交付当前可感知变化。 */
   async resolveOfflineGap(fromTU: number, deliver: (content: string) => void): Promise<boolean> {
     const lifetime = this.maintenanceAbort.signal; lifetime.throwIfAborted();
-    await this.runtime.evolve('结算离线期间自然过程：fromTU=' + fromTU + '，现在=' + this.clock.now() + '。禁止替受控角色编造离线期间的决定、发言或主观经历。只把恢复感知时实际可知的变化送给角色。');
+    await this.runtime.evolve('结算离线期间的外部世界：fromTU=' + fromTU + '，现在=' + this.clock.now() + '。天气、环境、NPC与远处事件可以发展并保存。不能替受控角色编造决定、行动、发言、困倦、入睡、醒来或主观经历，不结算其待完成行动；只有外部实际原因造成的物理影响可更新角色状态。只把恢复感知时实际可知的新变化送给角色，远处和未知经过只保存于externalChanges，影响后续的事实还须更新worldState。');
     lifetime.throwIfAborted();
     await this.publishAll(undefined, deliver); return true;
   }
@@ -520,7 +558,7 @@ export class WorldAgent {
   }
 
   /** 裁定访客的 act 动作（时刻按本世界时钟换算） */
-  async visitorAct(v: VisitorRef, desc: string, duration: number, deliver: (content: string) => void, signal?: AbortSignal, taskId?: string, options: { speech?: string; target?: string } = {}): Promise<boolean> {
+  async visitorAct(v: VisitorRef, desc: string, duration: number, deliver: (content: string) => void, signal?: AbortSignal, taskId?: string, options: { speech?: string; target?: string } = {}, beforeCommit?: (phase: "start" | "finish") => boolean): Promise<boolean> {
     const lifetime = this.maintenanceAbort.signal; lifetime.throwIfAborted();
     const actorId = this.visitorId(v);
     const at = this.clock.now();
@@ -531,7 +569,7 @@ export class WorldAgent {
         lifetime.throwIfAborted();
         await this.publishActor(actorId, deliver, content);
         await this.publishAll(actorId);
-      }, signal);
+      }, signal, beforeCommit);
       lifetime.throwIfAborted();
       await this.publishAll(actorId);
       return ok;
@@ -637,28 +675,26 @@ export class WorldAgent {
   }
 
   /**
-   * 创世：判定手机规格。
-   * - 分辨率配置为 auto 时，由 World-LLM 依据世界观与角色设定决定屏幕分辨率；
-   * - 浏览器启用时，由 World-LLM 生成契合世界观的带壳截图外壳 HTML。
-   * 分辨率持久化到 meta.json；外壳 HTML 存到独立的 phoneShell.html。任一步失败都不阻塞创世（回退默认/内置值）。
+   * 创世只补全缺失的手机外观，已有 HTML 与规格跨重置复用。
+   * 用户预先写入的非空 HTML 也保留，不根据新世界定义擅自重绘。
+   * 首次生成失败不阻塞创世，浏览器仍可使用内置外壳。
    */
   private async setupPhone(botDef: string, worldDef: string, signal: AbortSignal): Promise<void> {
     const wantAuto = (this.phoneCfg.resolution || "auto").trim().toLowerCase() === "auto";
     const wantShell = this.phoneCfg.generateShell;
     if (!wantAuto && !wantShell) return;
 
-    const meta = await this.files.readMeta(); signal.throwIfAborted();
-    // 外壳生成需要知道目标分辨率：显式配置优先，auto 则先判定
-    let res = wantAuto
-      ? DEFAULT_PHONE_RESOLUTION
-      : (parsePhoneResolution(this.phoneCfg.resolution) ?? DEFAULT_PHONE_RESOLUTION);
+    const meta = await this.files.readMeta();
+    const savedShell = await this.files.readPhoneShell(); signal.throwIfAborted();
+    let res = resolvePhoneResolution(this.phoneCfg.resolution, meta);
+    const hasSpec = Number.isFinite(Number(meta.phone?.width)) && Number(meta.phone?.width) > 0
+      && Number.isFinite(Number(meta.phone?.height)) && Number(meta.phone?.height) > 0;
 
-    if (wantAuto) {
+    if (wantAuto && !hasSpec && !savedShell.trim()) {
       try {
         const spec = await this.generatePhoneSpec(botDef, worldDef, signal);
         if (spec) {
           res = spec;
-          meta.phone = spec;
           this.logger.info("手机屏幕分辨率（创世判定）：%dx%d", spec.width, spec.height);
         } else {
           this.logger.warn("World-LLM 未能给出有效的手机分辨率，使用默认 %dx%d", res.width, res.height);
@@ -667,18 +703,15 @@ export class WorldAgent {
         signal.throwIfAborted();
         this.logger.warn("手机分辨率判定调用失败: %s", err);
       }
+      signal.throwIfAborted();
+      // Read again when committing only the phone field; do not restore a stale metadata snapshot.
+      const currentMeta = await this.files.readMeta(); signal.throwIfAborted();
+      await this.files.writeMeta({ ...currentMeta, phone: res });
     }
 
-    if (wantShell) {
+    if (wantShell && !savedShell.trim()) {
       try {
-        const html = await this.generatePhoneShell(botDef, worldDef, res, signal);
-        if (html) {
-          signal.throwIfAborted();
-          await this.files.writePhoneShell(html);
-          this.logger.info("浏览器带壳截图外壳已生成（%d 字符，存于 phoneShell.html，可手动编辑）", html.length);
-        } else {
-          this.logger.warn("World-LLM 未能生成有效的外壳 HTML（缺少 {{screen}} 占位符），截图将使用内置外壳");
-        }
+        await this.generateAndSavePhoneShell(botDef, worldDef, res, signal);
       } catch (err) {
         signal.throwIfAborted();
         this.logger.warn("手机外壳生成调用失败: %s", err);
@@ -686,7 +719,36 @@ export class WorldAgent {
     }
 
     signal.throwIfAborted();
-    await this.files.writeMeta(meta);
+  }
+
+  /** Independent appearance maintenance: the service supplies its lifecycle signal,
+   * so a paused/uncreated world stays paused and no narrative/context is touched.
+   * Track the worker inside the endpoint lock: shutdown must join any started write
+   * even if cancellation has already released the endpoint-lock waiter. */
+  async regeneratePhoneShell(signal: AbortSignal): Promise<{ content: string; phone: PhoneResolution }> {
+    return withEndpointLock(this.cfg.baseURL, () => this.trackMaintenance(async () => {
+      const { botDef, worldDef } = await this.files.readDefinitions();
+      signal.throwIfAborted();
+      if (!botDef.trim() || !worldDef.trim() || botDef.includes("（尚未编写）") || worldDef.includes("（尚未编写）")) {
+        throw new Error("请先填写角色定义与世界规则，再生成手机与浏览器外壳；无需先创建世界。");
+      }
+      const phone = resolvePhoneResolution(this.phoneCfg.resolution, await this.files.readMeta());
+      signal.throwIfAborted();
+      const content = await this.generateAndSavePhoneShell(botDef, worldDef, phone, signal);
+      return { content, phone };
+    }, signal), signal);
+  }
+
+  private async generateAndSavePhoneShell(botDef: string, worldDef: string, res: PhoneResolution, signal: AbortSignal): Promise<string> {
+    const previous = await this.files.readPhoneShell(); signal.throwIfAborted();
+    const html = await this.generatePhoneShell(botDef, worldDef, res, signal);
+    signal.throwIfAborted();
+    if (!html) throw new Error("World LLM 未返回有效的外壳 HTML（需包含 {{screen}}）；原外壳已保留。");
+    if (await this.files.readPhoneShell() !== previous) throw new Error("生成期间外壳文件已被修改，本次结果未覆盖当前文件，请重试。");
+    signal.throwIfAborted();
+    await this.files.writePhoneShell(html);
+    this.logger.info("手机与浏览器外壳已生成（%d 字符，存于 phoneShell.html）", html.length);
+    return html;
   }
 
   private async generatePhoneSpec(botDef: string, worldDef: string, signal: AbortSignal): Promise<PhoneResolution | null> {
@@ -722,7 +784,7 @@ export class WorldAgent {
     ], signal);
     const html = extractHtml(result.content);
     // 必须保留 {{screen}} 占位符才能合成；不合格则弃用（退回内置外壳）
-    return html && html.includes("{{screen}}") ? html : null;
+    return !result.toolCalls.length && html && html.includes("{{screen}}") ? html : null;
   }
 
   private async generateCalendar(worldDef: string, signal: AbortSignal): Promise<CalendarSpec | null> {
@@ -739,7 +801,7 @@ export class WorldAgent {
     return parseCalendarSpec(extractJson(result.content));
   }
 
-  /** 初始化：判定世界性质、生成历法（同步模式跳过）、判定手机规格，再根据用户定义生成状态文件 */
+  /** 初始化世界性质、历法与初始状态；最后仅按需补全缺失的手机外观。 */
   async initialize(botDef: string, worldDef: string): Promise<void> {
     const signal = this.maintenanceAbort.signal;
     return this.trackMaintenance(async () => {
@@ -808,7 +870,9 @@ export class WorldAgent {
         });
       }
 
-      const system = this.prompts.world.compressSystem;
+      const configuredSystem = this.prompts.world.compressSystem;
+      const system = configuredSystem.includes(COMPRESSION_SOURCE_GUIDANCE)
+        ? configuredSystem : configuredSystem + "\n\n" + COMPRESSION_SOURCE_GUIDANCE;
       // 滚动状态：每一轮的产出作为下一轮的输入
       const persona = input.persona;
       let historySummary = input.historySummary;

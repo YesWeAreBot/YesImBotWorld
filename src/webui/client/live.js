@@ -1,7 +1,7 @@
 /* Long-lived metadata collection; mount/unmount only attaches or detaches readers. */
 (function () {
     'use strict';
-    var calls = new Map(), raw = new Map(), listeners = new Set(), request = null, error = '', connected = null, epoch = 0, refreshTimer = null, retention = null;
+    var calls = new Map(), raw = new Map(), listeners = new Set(), request = null, error = '', connected = null, epoch = 0, refreshTimer = null, retention = null, heartbeat;
     var selection = { id: null, follow: true, tab: 'response', manualTabFor: null, format: 'readable', source: 'all', search: '', wrap: true }, detailFlight = new Map(), lastPull = 0, eventSerial = 0, eventSeen = new Map();
     function allowed() { return !isVisitor() || visitorCanSee(['debug']); }
     function active(call) { return call && !call.missing && (call.status === 'pending' || call.status === 'streaming'); }
@@ -12,7 +12,7 @@
     catch (e) {
         console.error('Live calls render', e);
     } }); }
-    function source(call) { return /^bot/i.test(call.source) ? 'Bot' : /^world/i.test(call.source) ? 'World' : /^growth/i.test(call.source) ? 'Growth' : /^regulation/i.test(call.source) ? 'Regulation' : '其他'; }
+    function source(call) { return /^bot/i.test(call.source) ? 'Bot' : /^world/i.test(call.source) ? 'World' : /^growth/i.test(call.source) ? 'Growth' : '其他'; }
     function status(call) { if (call.missing)
         return '已移出缓存'; return { pending: '等待响应', streaming: '正在生成', completed: '已完成', error: '失败', cancelled: '已取消' }[call.status] || call.status; }
     function bytes(n) { return n >= 1048576 ? (n / 1048576).toFixed(1) + ' MB' : n >= 1024 ? (n / 1024).toFixed(1) + ' KB' : (n || 0) + ' B'; }
@@ -38,7 +38,7 @@
         if (selection.follow && (!selection.id || !calls.has(selection.id) || value.startedAt >= (calls.get(selection.id).startedAt || 0)))
             selection.id = ordered().at(-1)?.callId || null;
     }
-    function forget() { epoch++; calls.clear(); raw.clear(); eventSeen.clear(); eventSerial = 0; detailFlight.clear(); request = null; selection.id = null; selection.manualTabFor = null; error = ''; retention = null; }
+    function forget() { epoch++; calls.clear(); raw.clear(); eventSeen.clear(); eventSerial = 0; detailFlight.clear(); request = null; selection.id = null; selection.manualTabFor = null; error = ''; retention = null; heartbeat = undefined; }
     function selectCall(id, tab) {
         if (selection.id !== id) selection.manualTabFor = null;
         selection.id = id;
@@ -117,8 +117,14 @@
         detailFlight.set(id, pending);
         return pending;
     }
+    window.addEventListener('studio:overview', function (event) { if (allowed() && Object.prototype.hasOwnProperty.call(event.detail || {}, 'heartbeat')) { heartbeat = event.detail.heartbeat; emit(); } });
     window.addEventListener('studio:debug', function (event) { if (!allowed())
-        return; var entry = event.detail; if (entry?.kind !== 'llm.call')
+        return; var entry = event.detail;
+        if (entry?.kind === 'world.task') {
+            try { var task = typeof entry.detail === 'string' ? JSON.parse(entry.detail) : entry.detail; if (task?.task === 'tingle' && task.heartbeat) { heartbeat = task.heartbeat; emit(); } } catch (_) { /* Older task logs contain plain text. */ }
+            return;
+        }
+        if (entry?.kind !== 'llm.call')
         return; try {
         var meta = typeof entry.detail === 'string' ? JSON.parse(entry.detail) : entry.detail;
         eventSeen.set(meta.callId, ++eventSerial);
@@ -148,9 +154,11 @@
             return function () { };
         }
         var compact = !!options.compact, alive = true, scheduled = null, detailTimer = null, selectedKey = '', drawn = '', lastRevision = 0, rowNodes = new Map();
+        if (typeof lastOverview !== 'undefined' && Object.prototype.hasOwnProperty.call(lastOverview || {}, 'heartbeat')) heartbeat = lastOverview.heartbeat;
         var root = el('section', { cls: 'live-calls' + (compact ? ' live-compact' : '') }), head = compact ? el('div', { cls: 'live-compact-heading' }, [el('h3', { text: '此刻，系统在做什么' }), button('查看调用', function () { Studio.navigate('live'); }, 'live-link')]) : heading();
         var connection = el('div', { cls: 'live-connection', 'aria-live': 'polite' }), lanes = el('div', { cls: 'live-lanes' }), notice = el('div', { cls: 'live-notice', 'aria-live': 'polite' });
-        root.append(head, connection, lanes, notice);
+        var heartbeatBar = el('div', { cls: 'live-heartbeat', role: 'status', 'aria-live': 'polite', hidden: true }), heartbeatTitle = el('strong', { cls: 'live-heartbeat-title' }), heartbeatDetail = el('span', { cls: 'live-heartbeat-detail' });
+        heartbeatBar.append(heartbeatTitle, heartbeatDetail); root.append(head, connection, heartbeatBar, lanes, notice);
         container.appendChild(root);
         var insightsCleanup = null, showCallPanel = null;
         var reader = null, reading = null, readableButton = null, rawButton = null, rawFold = null, rawExpanded = false, contentKey = '', retentionNotice = null;
@@ -164,7 +172,7 @@
             showCallPanel = function () { switchPanel(false); };
             sectionTabs.append(callTab, eventTab);
             root.append(sectionTabs, workspace, insightHost);
-            var toolbar = el('div', { cls: 'live-toolbar' }), filter = el('select', { 'aria-label': '调用来源', cls: 'live-filter' }, [['all', '全部调用'], ['Bot', 'Bot'], ['World', 'World'], ['Growth', 'Growth · 成长整理'], ['Regulation', 'Regulation · 内在调节'], ['其他', '其他']].map(function (pair) { return el('option', { value: pair[0], text: pair[1], selected: selection.source === pair[0] }); }));
+            var toolbar = el('div', { cls: 'live-toolbar' }), filter = el('select', { 'aria-label': '调用来源', cls: 'live-filter' }, [['all', '全部调用'], ['Bot', 'Bot'], ['World', 'World'], ['Growth', 'Growth · 成长整理'], ['其他', '其他']].map(function (pair) { return el('option', { value: pair[0], text: pair[1], selected: selection.source === pair[0] }); }));
             filter.onchange = function () { selection.source = filter.value; render(); };
             var search = el('input', { type: 'search', cls: 'live-search', placeholder: '搜索模型、调用 ID 或状态…', 'aria-label': '搜索调用', value: selection.search });
             search.oninput = function () { selection.search = search.value; render(); };
@@ -226,12 +234,12 @@
         function schedule() { if (!alive || scheduled)
             return; scheduled = setTimeout(function () { scheduled = null; render(); }, 100); }
         function renderLanes(list) {
-            var sources = ['Bot', 'World'].concat(['Growth', 'Regulation'].filter(function (who) { return list.some(function (call) { return source(call) === who; }); }));
-            ['Growth', 'Regulation'].forEach(function (who) { if (!sources.includes(who)) lanes.querySelector('[data-live-source=' + who + ']')?.remove(); });
+            var sources = ['Bot', 'World'].concat(['Growth'].filter(function (who) { return list.some(function (call) { return source(call) === who; }); }));
+            ['Growth'].forEach(function (who) { if (!sources.includes(who)) lanes.querySelector('[data-live-source=' + who + ']')?.remove(); });
             sources.forEach(function (who) {
                 var lane = lanes.querySelector('[data-live-source="' + who + '"]');
                 if (!lane) {
-                    lane = el('article', { cls: 'live-lane', 'data-live-source': who }, [el('div', { cls: 'live-lane-heading' }, [el('span', { cls: 'live-source-mark', text: who === 'Bot' ? 'B' : who === 'World' ? 'W' : who === 'Growth' ? 'G' : 'R' }), el('strong', { text: who === 'Growth' ? '成长整理' : who === 'Regulation' ? '内在调节' : who + ' LLM' }), el('span', { cls: 'live-lane-state', role: 'status' })]), el('div', { cls: 'live-lane-model' }), el('div', { cls: 'live-lane-preview-kind' }), el('pre', { cls: 'live-lane-preview' }), el('div', { cls: 'live-lane-footer' })]);
+                    lane = el('article', { cls: 'live-lane', 'data-live-source': who }, [el('div', { cls: 'live-lane-heading' }, [el('span', { cls: 'live-source-mark', text: who === 'Bot' ? 'B' : who === 'World' ? 'W' : 'G' }), el('strong', { text: who === 'Growth' ? '成长整理' : who + ' LLM' }), el('span', { cls: 'live-lane-state', role: 'status' })]), el('div', { cls: 'live-lane-model' }), el('div', { cls: 'live-lane-preview-kind' }), el('pre', { cls: 'live-lane-preview' }), el('div', { cls: 'live-lane-footer' })]);
                     lanes.appendChild(lane);
                 }
                 var matching = list.filter(function (c) { return source(c) === who; }), call = matching.filter(active).at(-1) || matching.at(-1), pending = matching.filter(active).length;
@@ -262,6 +270,26 @@
                 }
             });
         }
+        function renderHeartbeat() {
+            heartbeatBar.hidden = heartbeat === undefined;
+            var state = heartbeat || { phase: 'stopped' }, outcome = state.lastOutcome;
+            heartbeatBar.dataset.phase = state.phase;
+            heartbeatTitle.textContent = '世界心跳 · ' + ({ idle: '尚未启动', running: '正在检查', scheduled: '等待下次检查', failed: '失败后等待重试', stopped: '已停止' }[state.phase] || '状态未知');
+            var detail = [];
+            if (state.mode) detail.push(state.mode === 'auto' ? '自动间隔' : '固定间隔');
+            if (Number.isFinite(state.intervalTU) && state.intervalTU > 0) detail.push('间隔 ' + Number(state.intervalTU.toFixed(2)) + ' TU');
+            if (Number.isFinite(state.nextAtTU)) detail.push('下次 ' + Number(state.nextAtTU.toFixed(2)) + ' TU');
+            if (state.phase === 'running') detail.push('等待本轮世界裁定');
+            if (outcome) {
+                detail.push('上次：' + ({ committed: '已校验并提交', quiet: '无新变化', yielded: '让位，未提交', failed: '执行失败' }[outcome.status] || '结果待确认'));
+                if (outcome.status === 'committed' && Number.isFinite(outcome.sequence)) detail.push('提交序号 ' + outcome.sequence);
+                if (outcome.status === 'committed' && Number.isFinite(outcome.perceptions)) detail.push(outcome.perceptions + ' 条感知');
+            }
+            if (state.consecutiveFailures) detail.push('连续失败 ' + state.consecutiveFailures + ' 次');
+            var reason = state.error || outcome?.reason;
+            if (reason) detail.push(String(reason).slice(0, 240));
+            heartbeatDetail.textContent = detail.join(' · ');
+        }
         function render() {
             if (!alive)
                 return;
@@ -274,6 +302,7 @@
             var list = ordered();
             connection.textContent = connected === false ? '连接已中断 · 保留最后收到的状态' : connected === true ? '实时事件已连接' : '等待实时连接状态';
             connection.className = 'live-connection' + (connected === false ? ' live-connection-off' : '');
+            renderHeartbeat();
             renderLanes(list);
             notice.textContent = error ? '读取调用失败：' + error : '';
             if (compact)

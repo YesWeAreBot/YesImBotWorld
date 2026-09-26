@@ -159,7 +159,7 @@ async function activeAttentionKeepsPendingEvents() {
   const actDef = BOT_TOOLS.find(tool => tool.name === "act")!;
   assert.ok(!actDef.signature.includes("observationId")); assert.ok(!actDef.description.includes("observedId"));
   assert.ok(!BOT_TOOLS.some(tool => tool.name === "observe"), "internal reads do not reintroduce a public observer");
-  assert.match(actDef.description, /主动观察、辨认或聆听也用 act/);
+  assert.match(actDef.description, /在物理世界行动或主动观察/);
   await f.world.runtime.shutdown();
 }
 async function physicalClockUsesWorldBoundary() {

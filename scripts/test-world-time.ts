@@ -19,7 +19,12 @@ const logger = { info() {}, warn() {}, error() {} } as any;
 const config = (syncRealTime: boolean, epoch = "2012-03-04 05:06"): ClockConfigData => ({ syncRealTime, epoch, realSecondsPerUnit: 2, worldSecondsPerUnit: 60, tingleEveryUnits: 30, tingleMode: "fixed", tingleMinUnits: 1, tingleMaxUnits: 100 } as ClockConfigData);
 const custom: CustomCalendar = { kind: "custom", era: "星历", units: [{ name: "年", count: 10, start: 1 }, { name: "月", count: 20, start: 1 }, { name: "日", count: 24, start: 1 }, { name: "时", count: 60, pad: 2 }, { name: "分", count: 60, pad: 2 }], epoch: [112, 3, 5, 6, 0], format: "{era}{年}年{月}月{日}日 {时}:{分}" };
 const response = (value: unknown): ChatResult => ({ content: "", toolCalls: [{ id: "local", type: "function", function: { name: "resolve_world", arguments: JSON.stringify(value) } }] });
-const inputOf = (messages: ChatMessage[]) => JSON.parse([...messages].reverse().find(m => m.role === "user")!.content as string);
+const inputOf = (messages: ChatMessage[]) => {
+  const task = messages.filter(message => message.role === "user").map(message => JSON.parse(String(message.content)))
+    .find(value => typeof value.kind === "string" && Object.hasOwn(value, "worldState"));
+  assert.ok(task, "read the original world task rather than a later validation diagnostic");
+  return task;
+};
 const initial = (date = "2026-09-19") => ({ botName: "小澈", worldState: `当前日期：${date}。房间安静。历史：2010年5月1日建成。`, actorStates: [{ actorId: "bot", state: "你站在窗边。" }], perceptions: [{ actorId: "bot", text: "阳光落在窗台。" }] });
 async function filesAndClock(sync = true, realWorld = true, epoch?: string) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "world-time-")); directories.push(directory);

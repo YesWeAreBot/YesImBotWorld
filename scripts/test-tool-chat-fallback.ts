@@ -59,12 +59,14 @@ async function main() {
     assert.ok(firstNames.includes("open_app"));
     assert.equal(firstNames.includes("select_channel"), false);
     assert.equal(firstNames.includes("send"), false, "inactive chat tools remain absent from the initial native catalogue");
-    assert.ok(context.stream.some(entry => entry.kind === "event" && /现在新增可用/.test(entry.event.content) && /select_channel/.test(entry.event.content) && /正文.*JSON|正文输出单个/.test(entry.event.content)), "the actual capability event tells the model how to call the newly unlocked channel selector");
+    assert.ok(context.stream.some(entry => entry.kind === "event" && /现在新增可用/.test(entry.event.content) && /select_channel/.test(entry.event.content)), "the delivered capability event explains the newly unlocked channel selector");
+    assert.match(JSON.stringify(first.messages[0]), /正文 JSON/, "fallback protocol is taught once in the fixed block");
 
     assert.equal((await execute(body("select_channel", { id: "onebot@fixture:channel" }))).name, "select_channel");
     assert.equal(agent.status().phoneUi.channelKey, "onebot@fixture:channel");
     assert.ok(reads > 0);
-    assert.ok(context.stream.some(entry => entry.kind === "event" && /现在新增可用/.test(entry.event.content) && /send\(/.test(entry.event.content) && /正文.*JSON|正文输出单个/.test(entry.event.content)));
+    assert.ok(context.stream.some(entry => entry.kind === "event" && /现在新增可用/.test(entry.event.content) && /send\(/.test(entry.event.content)));
+    assert.ok(context.stream.every(entry => entry.kind !== "event" || !entry.event.toolAvailability || !/原生 function 声明|正文 JSON/.test(entry.event.content)), "capability changes do not repeat the protocol preamble");
     await execute(body("read_channel", { n: 10 }));
     await execute(body("send", { msg: "实际写出的回复" }));
     assert.deepEqual(sent, [{ channel: "onebot@fixture:channel", msg: "实际写出的回复" }]);
@@ -77,13 +79,24 @@ async function main() {
     assert.equal(agent.status().phoneUi.chatOpen, false);
     for (const name of ["select_channel", "send"]) {
       const args = name === "send" ? { msg: "must not be sent" } : { id: "onebot@fixture:channel" };
-      let textError = "";
       response = body(name, args);
-      await assert.rejects(backend.generate(context, "T=1"), (error: Error) => { textError = error.message; return error.message.includes(`${name} 此刻不可用`); });
+      const textParsed = await backend.generate(context, "T=1");
       response = native(name, args);
-      await assert.rejects(backend.generate(context, "T=1"), (error: Error) => error.message === textError);
-      assert.doesNotMatch(textError, /改用\s*act|通过\s*act/);
+      const nativeParsed = await backend.generate(context, "T=1");
+      assert.equal(textParsed.name, name); assert.equal(nativeParsed.name, name);
+      assert.deepEqual(textParsed.arguments, args); assert.deepEqual(nativeParsed.arguments, args);
+      assert.equal(agent.currentToolNames().includes(name), false, "a navigable candidate is still subject to the actual execution gate");
+      if (name === "send") assert.match(await agent.prepareNavigation(textParsed, () => true), /缺少目标频道/,
+        "closing the app cannot silently redirect a targetless send to the last chat or notification");
+      assert.equal(agent.status().phoneUi.chatOpen, false, "parsing and rejected target resolution have no navigation side effect");
     }
+    agent.tempBannedTools.add("send"); agent.refreshToolGate();
+    let textError = "";
+    response = body("send", { id: "onebot@fixture:channel", msg: "still forbidden" });
+    await assert.rejects(backend.generate(context, "T=1"), (error: Error) => { textError = error.message; return error.message.includes("send 此刻不可用"); });
+    response = native("send", { id: "onebot@fixture:channel", msg: "still forbidden" });
+    await assert.rejects(backend.generate(context, "T=1"), (error: Error) => error.message === textError);
+    assert.doesNotMatch(textError, /改用\s*act|通过\s*act/);
     assert.equal(sent.length, 1); assert.equal(worldCalls, 0);
     assert.ok(requests.every(request => JSON.stringify(request.tools) === prefix));
     console.log("PASS frozen native chat workflow: actual unlock guidance, select/read/send body JSON through current gates, local platform receipts, no world fallback and unchanged cached prefixes");

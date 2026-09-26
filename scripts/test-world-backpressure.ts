@@ -65,7 +65,7 @@ async function actionResultsPassQueuedReadsButRespectWrites(withBarrier: boolean
       entered.resolve(); await release.promise;
     }
     if (request.kind === "action") return response({ worldState: "绿植已经浇过水，水壶放回桌边。", perceptions: [{ actorId: "bot", text: "你把水倒进花盆，再放下水壶。" }], outcome: { status: "completed" } });
-    if (request.kind === "evolve") return response({ worldState: "桌边有一盆绿植和一只水壶，窗外开始下雨。", perceptions: [] });
+    if (request.kind === "evolve") return response({ worldState: "桌边有一盆绿植和一只水壶，窗外开始下雨。", externalChanges: [{ id: "rain", description: "窗外开始下雨。" }], perceptions: [] });
     if (request.actorId === "visitor:b" || (!withBarrier && request.actorId === "visitor:a")) assert.match(request.worldState, /已经浇过水/, "queued reads must see the completed action rather than its stale pending scene");
     return response({ perceptions: [{ actorId: request.actorId, text: "你看见桌上的绿植。" }] });
   });

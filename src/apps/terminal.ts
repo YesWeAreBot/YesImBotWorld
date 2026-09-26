@@ -5,7 +5,7 @@
  * - 现实世界：命令真正执行在 Docker 容器里（Bot 的个人电脑，mode=docker），与主机隔离；
  * - 虚构世界：World-LLM 扮演"这台电脑"，直接生成符合世界观的终端画面与输出。
  *
- * 打开电脑（open_computer）才会坐到电脑前，之后才能敲命令；关闭电脑后屏幕熄掉，下次打开重新坐下。
+ * 设备会话的打开/关闭不代表身体移动、坐下或物理屏幕状态变化。
  */
 
 import type { Logger } from "koishi";
@@ -51,7 +51,7 @@ export class TerminalApp implements WorldApp {
     }
     return {
       tools: TOOLS,
-      opening: "终端界面已打开，可以使用这台电脑已有的命令与文件。无法支持的操作会返回原因。",
+      opening: "终端会话已打开。",
     };
   }
 
@@ -67,13 +67,13 @@ export class TerminalApp implements WorldApp {
         timeoutMs: this.cfg.computer.docker.commandTimeoutMs,
         maxOutputChars: this.cfg.computer.docker.maxOutputChars,
       });
-      return `你在终端里敲下了 ${command}，屏幕上显示：\n${res.output}${PROMPT_HINT}`;
+      return `终端 · ${cwd || this.computer.homeDir}（${res.code === null ? "退出状态未确认" : `退出码 ${res.code}`}）\n${res.output}`;
     }
     return this.virtualRun(command, cwd);
   }
 
   async close(): Promise<void> {
-    /* 屏幕熄掉，状态保留（下次打开同一台电脑还在） */
+    /* No physical power-state change is implied by closing the software session. */
   }
 
   private async isRealWorld(): Promise<boolean> {
@@ -85,7 +85,7 @@ export class TerminalApp implements WorldApp {
   private async virtualRun(command: string, cwd?: string): Promise<string | RichText> {
     try {
       const result = await this.world.executeAppAction("通过角色可用电脑的终端处理命令请求。这是软件应用请求，仅依据该设备的既定能力裁定输出与影响；保持路径和文件内容前后一致，新增文件和命令影响必须记入状态，不调用外部操作系统。设备请求不证明角色的身体已经行动或看过结果。不具备的能力如实说明。命令=" + JSON.stringify({ command, cwd: cwd || "." }));
-      return { ...result, text: result.text + PROMPT_HINT };
+      return result;
     } catch (err) {
       this.logger.warn("虚构终端输出生成失败: %s", err);
       return "（终端请求失败，未取得结果，不能据此判断是否执行成功。）" + PROMPT_HINT;

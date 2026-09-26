@@ -86,13 +86,29 @@ export function validateToolCall(parsed: unknown, allowedNames: string[]): Parse
   if (typeof args !== "object" || args === null || Array.isArray(args)) {
     throw new ToolCallParseError("arguments 必须是 JSON 对象，不能是 null、数组或单个值");
   }
-  let duration: number | undefined;
-  if (obj.duration !== undefined && obj.duration !== null) {
-    const d = Number(obj.duration);
-    if (!Number.isFinite(d) || d < 0) throw new ToolCallParseError("duration 必须是非负数字");
-    duration = d;
+  // Both body JSON and native calls use the same envelope. Native schemas expose
+  // duration as an argument; body JSON may also use that spelling after a tool update.
+  // Never silently discard either value or mutate a caller-owned argument object.
+  args = { ...args };
+  const topDuration = obj.duration === undefined ? undefined : parseDuration(obj.duration, "duration");
+  const argumentDuration = args.duration === undefined ? undefined : parseDuration(args.duration, "arguments.duration");
+  if (topDuration !== undefined && argumentDuration !== undefined && topDuration !== argumentDuration) {
+    throw new ToolCallParseError("duration 与 arguments.duration 冲突，本次没有执行。请只提供一个耗时，或让两处数值一致。");
   }
+  const duration = topDuration ?? argumentDuration;
+  delete args.duration;
   return { name, arguments: args, duration };
+}
+
+function parseDuration(value: unknown, location: string): number {
+  // Keep numeric-string compatibility, but do not turn null, booleans, arrays or
+  // empty strings into apparently valid zero/one-TU actions via Number coercion.
+  if (typeof value !== "number" && !(typeof value === "string" && value.trim())) {
+    throw new ToolCallParseError(`${location} 必须是有限非负数字，省略表示未指定耗时。`);
+  }
+  const duration = Number(value);
+  if (!Number.isFinite(duration) || duration < 0) throw new ToolCallParseError(`${location} 必须是有限非负数字。`);
+  return duration;
 }
 
 /** 扫描出第一个括号平衡的 JSON 对象（正确处理字符串与转义） */

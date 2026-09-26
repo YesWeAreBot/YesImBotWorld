@@ -17,7 +17,7 @@ import { promises as fs } from "node:fs";
 import { watch as watchDir, type FSWatcher } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import type { WebUIConfig, Config } from "../config.js";
+import { withoutRetiredSettings, type WebUIConfig, type Config } from "../config.js";
 import type { WorldFiles } from "../files.js";
 import type { GalleryStore } from "../media/gallery.js";
 import { normalizeCategory, UNSORTED_CATEGORY, sanitizeFileName } from "../media/gallery.js";
@@ -72,6 +72,9 @@ export interface DevicesInfo {
   };
   phone: {
     down: boolean;
+    physical?: import("../types.js").PhonePhysicalState;
+    /** Administrative display only; never injected as a character perception. */
+    description?: string;
     appOpen: string | null;
     chatOpen: boolean;
     channelKey: string | null;
@@ -97,6 +100,7 @@ export interface WebUIHost {
   isInitialized(): Promise<boolean>;
   worldRunning(): boolean;
   worldQueue(): number;
+  heartbeatStatus?(): import("../world/tingle.js").HeartbeatStatus | null;
   botStatus(): BotStatusSummary | null;
   getBotIdentity?(): Promise<BotIdentity | null>;
   appOpen(): string | null;
@@ -108,8 +112,6 @@ export interface WebUIHost {
   /** 独立的成长记录，不包含置顶人设或内部上下文。 */
   getGrowth?(): Promise<unknown>;
   getGrowthStatus?(): Promise<unknown>;
-  /** Internal simulation and decision audit, administrator-only. */
-  getRegulation?(): Promise<unknown>;
   prompts(): Prompts;
   savePromptsOverrides(overrides: PromptOverrides): Promise<void>;
   initWorld(force: boolean): Promise<string>;
@@ -121,6 +123,8 @@ export interface WebUIHost {
   statusText(): Promise<string>;
   /** 用户手动设置常驻 Bot 名字（写 meta.json + 刷新内存，立即生效） */
   setBotName(name: string): Promise<void>;
+  regeneratePhoneShell(): Promise<{ content: string; phone: { width: number; height: number } }>;
+  savePhoneShell(content: string): Promise<void>;
   injectEvent(text: string): Promise<string>;
   applyConfig(next: Config): Promise<{ message: string; port: number }>;
   notes(): Promise<NoteEntry[]>;
@@ -150,6 +154,7 @@ export interface WebUIHost {
   arrivePlayer(name: string, persona: string, mode?: PlayerMode): { ok: true; token: string; worldName: string; timeLine: string } | { ok: false; error: string };
   /** 管理员代理 Bot 执行任意工具调用（手动驾驶） */
   botToolCall(name: string, args: Record<string, unknown>, duration?: number, token?: string, confirmSend?: boolean): Promise<ManualToolResult>;
+  botChooseCall(selection: unknown, text: unknown, duration: number | undefined, token: string, confirmSend?: boolean): Promise<ManualToolResult>;
   acquirePlayerControl(token: string): Promise<DeviceControlResult>;
   releasePlayerControl(token: string): Promise<DeviceControlResult>;
   playerCockpit(token: string): Promise<unknown>;
@@ -313,9 +318,6 @@ export class WebUIServer {
         break;
       case "facts.jsonl":
         signal = "facts";
-        break;
-      case "regulation.jsonl":
-        signal = "regulation";
         break;
       case "stream.jsonl":
         signal = "stream";
@@ -640,6 +642,15 @@ export class WebUIServer {
       const body = await readJson(req, 1024 * 1024).catch(() => null);
       if (!body) return void sendJSON(res, 400, { error: "请求体不是合法 JSON" });
       if (typeof body.token !== "string" || !this.host.playerControlsBot?.(body.token)) return void sendJSON(res, 403, { error: "需要有效的常驻角色接管会话 token" });
+      if (Object.hasOwn(body, "selection")) {
+        if (Object.keys(body).some(key => !["token", "selection", "text", "duration", "confirmSend"].includes(key))) return void sendJSON(res, 400, { error: "选择建议时仅提交 selection、可选正文和耗时，不能覆盖工具或目标。" });
+        if (body.duration !== undefined && (typeof body.duration !== "number" || !Number.isFinite(body.duration) || body.duration < 0)) return void sendJSON(res, 400, { error: "duration 必须为有限非负数（单位 TU）" });
+        const result = await this.host.botChooseCall(body.selection, body.text, body.duration, body.token, body.confirmSend === true);
+        const rejected = !result.ok && (result.admissionRejected === true || !result.callId);
+        // A dispatched call may have an unsuccessful/unknown real outcome. Do not label it
+        // as an admission rejection that a client could safely resubmit.
+        return void sendJSON(res, rejected ? 409 : 200, { ...result, ...(!result.ok ? { error: result.text, code: rejected ? result.code ?? "SELECTION_REJECTED" : "OPERATION_RESULT" } : {}) });
+      }
       const name = String(body.name ?? "").trim();
       if (!name) return void sendJSON(res, 400, { error: "缺少工具名 name" });
       const args = (body.arguments ?? body.args ?? {}) as Record<string, unknown>;
@@ -661,7 +672,7 @@ export class WebUIServer {
       // 常驻角色必须使用已授权的驾驶舱；actorName 不是身份凭据。
       if (this.host.playerControlsBot?.(String(body.token ?? ""))) return void sendJSON(res, 400, { error: "请通过常驻角色驾驶舱提交工具调用" });
       const r = await this.crossingPost("/crossing/task", body);
-      if (!r.ok) return void sendJSON(res, 400, { error: String(r.error ?? "任务被拒绝") });
+      if (!r.ok) return void sendJSON(res, typeof r.httpStatus === "number" ? r.httpStatus : 400, { error: String(r.error ?? "任务被拒绝"), ...(r.code ? { code: r.code } : {}) });
       return void sendJSON(res, 200, { ok: true });
     }
 
@@ -715,7 +726,7 @@ export class WebUIServer {
     if (!res.ok && data.error === undefined) data.error = `HTTP ${res.status}`;
     // 给 ok 打标（crossing 返回 {ok,...}；失败时补 ok:false）
     if (data.ok === undefined) data.ok = res.ok;
-    return data;
+    return { ...data, httpStatus: res.status };
   }
 
   /** SSE 转发：把本机 crossing 的 events 流透传给浏览器 */
@@ -850,13 +861,6 @@ export class WebUIServer {
       }
     }
 
-    if (pathname === "/api/regulation") {
-      if (access.kind !== "admin") return void sendJSON(res, 403, { error: "仅管理员可读取内在调节与行动审计" });
-      if (method !== "GET") return void sendJSON(res, 405, { error: "内在调节页面只提供读取" });
-      if (!host.getRegulation) return void sendJSON(res, 503, { error: "内在调节记录尚未就绪" });
-      return void sendJSON(res, 200, await host.getRegulation());
-    }
-
     // ---------- 概览 / 状态 ----------
     if (pathname === "/api/world/state" && method === "GET") {
       if (access.kind !== "admin") return void sendJSON(res, 403, { error: "仅管理员可读取世界完整世界状态" });
@@ -888,6 +892,7 @@ export class WebUIServer {
         initialized: await host.isInitialized(),
         worldRunning: host.worldRunning(),
         worldQueue: host.worldQueue(),
+        heartbeat: isVisitor ? undefined : host.heartbeatStatus?.() ?? null,
         clock: clock
           ? {
               syncRealTime: clock.syncRealTime,
@@ -1052,9 +1057,15 @@ export class WebUIServer {
     }
     if (pathname === "/api/state/phone-shell" && method === "PUT") {
       const { content } = await readJson(req, 4 * 1024 * 1024);
-      await host.files.writePhoneShell(String(content ?? ""));
+      await host.savePhoneShell(String(content ?? ""));
       this.sendLifecycle("phoneShell");
       sendJSON(res, 200, { ok: true });
+      return;
+    }
+    if (pathname === "/api/state/phone-shell/generate" && method === "POST") {
+      const result = await host.regeneratePhoneShell();
+      this.sendLifecycle("phoneShell");
+      sendJSON(res, 200, { ok: true, ...result });
       return;
     }
 
@@ -1121,7 +1132,7 @@ export class WebUIServer {
       sendJSON(res, 200, {
         schema: schemaNode,
         // 深度复制后把 secret 字段脱敏，避免 API key / 令牌 / 密码明文回传到浏览器
-        value: maskSecrets(host.config, secretPaths),
+        value: maskSecrets(withoutRetiredSettings(host.config), secretPaths),
       });
       return;
     }
@@ -1133,7 +1144,7 @@ export class WebUIServer {
       }
       // 把未改动的（仍是掩码的）secret 还原为当前真实值，避免脱敏值覆盖原密钥
       const secretPaths = collectSecretPaths(introspect(host.configSchema));
-      const restored = restoreSecrets(next as Config, host.config, secretPaths);
+      const restored = withoutRetiredSettings(restoreSecrets(next as Config, host.config, secretPaths) as Config);
       const errors = validateConfig(host.configSchema, restored);
       if (errors.length) return void sendJSON(res, 400, { error: "配置校验失败", errors });
       const result = await host.applyConfig(restored as Config);
@@ -1281,6 +1292,7 @@ export class WebUIServer {
       const file = q.get("file") ?? "";
       if (!safeBasename(file)) return void sendJSON(res, 400, { error: "非法文件名" });
       if (folder && !safeBasename(folder)) return void sendJSON(res, 400, { error: "非法归档名" });
+      if (privateBrowserFile(file)) return void sendJSON(res, 403, { error: "浏览器会话包含登录凭据，不能通过通用存档接口读取。" });
       if (access.kind === "visitor" && !canReadDataFile(access.session, file)) {
         return void sendJSON(res, 403, { error: "访客无权读取该归档文件的内容" });
       }
@@ -1761,7 +1773,7 @@ async function listArchive(
       try {
         for (const f of await fs.readdir(full)) {
           const fsStat = await fs.stat(path.join(full, f)).catch(() => null);
-          if (fsStat?.isFile() && canRead(f)) files.push({ name: f, size: fsStat.size });
+          if (fsStat?.isFile() && !privateBrowserFile(f) && canRead(f)) files.push({ name: f, size: fsStat.size });
         }
         const manifest = await fs.readFile(path.join(full, "manifest.json"), "utf8").catch(() => "");
         if (manifest) {
@@ -1778,7 +1790,7 @@ async function listArchive(
         files: files.sort((a, b) => a.name.localeCompare(b.name)),
       });
     } else {
-      if (canRead(n)) legacy.push(n);
+      if (!privateBrowserFile(n) && canRead(n)) legacy.push(n);
     }
   }
   snapshots.sort((a, b) => b.mtime - a.mtime);
@@ -1801,6 +1813,11 @@ async function sendFile(res: http.ServerResponse, file: string, mime?: string): 
 
 function safeBasename(name: string): boolean {
   return !!name && !name.includes("/") && !name.includes("\\") && !name.includes("..");
+}
+
+/** Includes interrupted private writes; an admin archive browser is not a cookie export UI. */
+function privateBrowserFile(name: string): boolean {
+  return name === "phone-browser.json" || /^phone-browser\.json(?:\.[\w-]+)?\.tmp$/.test(name);
 }
 
 /**

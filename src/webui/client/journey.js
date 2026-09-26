@@ -105,6 +105,7 @@
             if (jobs.length) Promise.allSettled(jobs).then(function () { if (!destroyed && token === state.token) redraw(); });
         }
         function fail(error) { errorText = error && error.message ? error.message : String(error); redraw(); }
+        function admissionRejected(error) { return [400, 403, 404, 409, 422, 429].includes(error.status); }
         function log(kind, content, extra) {
             var previous = extra && extra.eventId && state.events.find(function (event) { return event.eventId === extra.eventId; });
             if (previous) {
@@ -277,6 +278,15 @@
                     state.connection = 'disconnected';
                     state.observation = null; state.currentScene = null;
                 }
+                if (!state.takeover && Array.isArray(message.opportunities)) {
+                    var sequence = Number.isFinite(message.worldSequence) ? message.worldSequence : state.currentScene && state.currentScene.worldSequence;
+                    var revision = message.opportunityRevision;
+                    if (Number.isFinite(revision) && (!Number.isFinite(state.opportunityRevision) || revision > state.opportunityRevision || message.type === 'hello' && revision === state.opportunityRevision)) {
+                        state.playerOpportunities = message.opportunities;
+                        state.opportunitySequence = sequence;
+                        state.opportunityRevision = revision;
+                    }
+                }
                 changed();
                 redraw();
             };
@@ -329,6 +339,7 @@
                 selectedTarget = state.selectedTarget = '';
                 state.operatorCollapsed = false;
                 state.observation = null; state.currentScene = null;
+                state.playerOpportunities = []; state.opportunitySequence = null; state.opportunityRevision = null;
                 state.pending = null;
                 state.unitWorldSeconds = null;
                 control = { synced: !!result.control, paused: !!(result.control && result.control.paused), busy: !!(result.control && result.control.busy) };
@@ -352,18 +363,20 @@
             state.currentScene = scene;
         }
         function sceneOpportunities() {
-            var scene = state.currentScene || state.observation && state.observation.scene;
-            return (scene && Array.isArray(scene.opportunities) ? scene.opportunities : []).map(function (item, index) {
-                return Object.assign({}, item, { id: (scene.eventId || scene.worldSequence || 'scene') + ':option:' + index, source: 'world', sourceEventId: scene.eventId });
-            });
+            return state.playerOpportunities || [];
         }
         function chooseOpportunity(item) {
             formDraft.description = item.intent; formDraft.speech = ''; formDraft.duration = '0';
             formDraft.revision = (formDraft.revision || 0) + 1; formDraft.opportunityId = item.id || null;
+            formDraft.selection = item.id ? { opportunityId: item.id, sourceEventId: item.sourceEventId } : null;
+            formDraft.selectionLabel = item.id ? item.label : '';
             selectedTarget = state.selectedTarget = ''; saveDrafts(); redraw();
         }
-        function submit() {
-            var description = formDraft.description.trim(), speech = formDraft.speech.trim(), duration = Number(formDraft.duration);
+        function submit(quickChoice) {
+            var selection = quickChoice ? { opportunityId: quickChoice.id, sourceEventId: quickChoice.sourceEventId } : formDraft.selection;
+            var chosen = selection && sceneOpportunities().find(function (item) { return item.id === selection.opportunityId && item.sourceEventId === selection.sourceEventId; });
+            if (selection && !chosen) { errorText = '这个建议已随情境更新。请重新选择，或改为自由行动。'; redraw(); return; }
+            var description = chosen ? chosen.intent : formDraft.description.trim(), speech = quickChoice || !formDraft.speech.trim() ? '' : formDraft.speech, duration = quickChoice ? 0 : Number(formDraft.duration);
             if (!description) {
                 errorText = '请写下想做的动作；想说的话可以单独填写。';
                 redraw();
@@ -374,7 +387,7 @@
                 redraw();
                 return;
             }
-            if (state.pending)
+            if (state.pending || busy || state.connection !== 'connected')
                 return;
             if (state.takeover && (!control.synced || state.mode !== 'puppet' && !control.paused || control.busy)) {
                 errorText = '请等待控制状态同步、已有操作完成后再提交。';
@@ -396,10 +409,11 @@
                 args.target = selectedTarget;
                 payload.target = selectedTarget;
             }
-            var draftRevision = formDraft.revision = (formDraft.revision || 0) + 1;
+            var draftRevision = quickChoice ? null : formDraft.revision = (formDraft.revision || 0) + 1;
             var id = 'action_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 7);
             var pending = { id: id, description: description, startedAt: Date.now(), status: 'submitting', takeover: state.takeover };
             var requestToken = state.token, body = { token: requestToken, taskId: id, kind: 'act', payload: payload };
+            if (selection) body = { token: requestToken, taskId: id, kind: 'choose', payload: { selection: selection, durationWorldSeconds: duration, ...(speech ? { text: speech } : {}) } };
             if (!state.takeover)
                 pending.body = body;
             state.pending = pending;
@@ -419,18 +433,19 @@
                 }
                 else if (state.pending === pending)
                     pending.status = 'accepted';
-                if (formDraft.revision === draftRevision) {
+                if (draftRevision !== null && formDraft.revision === draftRevision) {
                     if (formDraft.description.trim() === description) formDraft.description = '';
-                    if (formDraft.speech.trim() === speech) formDraft.speech = '';
+                    if (formDraft.speech === speech || !formDraft.speech.trim()) formDraft.speech = '';
+                    formDraft.selection = null; formDraft.opportunityId = null;
                 }
                 changed();
                 redraw();
             }).catch(function (error) {
                 if (state.token !== requestToken)
                     return;
-                if (state.pending === pending)
-                    pending.status = 'unknown';
-                log('system', '未收到请求回执。请重新观察确认结果；不会自动重发动作。');
+                var rejected = admissionRejected(error);
+                if (state.pending === pending) { if (rejected) state.pending = null; else pending.status = 'unknown'; }
+                log(rejected ? 'failure' : 'system', rejected ? '这次行动没有执行：' + error.message : '未收到请求回执。请重新观察确认结果；不会自动重发动作。', { requestId: pending.id, groupId: pending.id });
                 changed();
                 fail(error);
             });
@@ -468,8 +483,12 @@
             redraw();
             api('POST', '/api/player/task', pending.body).then(function () { if (state.token !== requestToken || state.pending !== pending)
                 return; pending.status = 'accepted'; changed(); redraw(); })
-                .catch(function (error) { if (state.token !== requestToken || state.pending !== pending)
-                return; pending.status = 'unknown'; changed(); fail(error); });
+                .catch(function (error) {
+                    if (state.token !== requestToken || state.pending !== pending) return;
+                    if (admissionRejected(error)) { state.pending = null; log('failure', '这次行动没有执行：' + error.message, { groupId: pending.id }); }
+                    else pending.status = 'unknown';
+                    changed(); fail(error);
+                });
         }
         function leave() {
             if (busy)
@@ -503,24 +522,28 @@
             });
             return modes;
         }
-        function callTool(name, args, duration, confirmSend) {
-            if (!state.takeover || !state.token || state.pending || !control.synced || control.busy || state.mode !== 'puppet' && !control.paused || !cockpit.tools.some(function (tool) { return tool.name === name; })) return;
+        function callTool(name, args, duration, confirmSend, selection) {
+            if (!state.takeover || !state.token || state.pending || state.connection !== 'connected' || !control.synced || control.busy || state.mode !== 'puppet' && !control.paused || !cockpit.tools.some(function (tool) { return tool.name === name; })) return false;
             var token = state.token, pending = { id: 'tool_' + Date.now().toString(36), takeover: true, description: name, status: 'submitting', startedAt: Date.now() };
             state.pending = pending; errorText = '';
             var intention = args.thought || args.description || args.msg || args.text || args.statement;
             log('intent', typeof intention === 'string' ? intention : WorldCockpit.label({ name: name }), { eventId: 'intent:' + pending.id, groupId: pending.id, tool: name, arguments: args, speech: args.speech }); changed(); redraw();
-            api('POST', '/api/player/tool', { token: token, name: name, arguments: args, duration: duration, confirmSend: !!confirmSend }).then(function (result) {
+            var body = selection ? { token: token, selection: selection, ...(typeof (name === 'send' ? args.msg : args.speech) === 'string' ? { text: name === 'send' ? args.msg : args.speech } : {}), duration: duration, confirmSend: !!confirmSend } : { token: token, name: name, arguments: args, duration: duration, confirmSend: !!confirmSend };
+            var request = api('POST', '/api/player/tool', body).then(function (result) {
                 if (token !== state.token) return;
                 toolResult(result, pending);
                 if (state.pending === pending) state.pending = null;
-                changed(); refreshControl(); redraw();
+                changed(); refreshControl(); redraw(); return result;
             }).catch(function (error) {
                 if (token !== state.token) return;
-                pending.status = 'unknown';
-                log('system', '请求结果未确认，不会自动重发。请查看执行中的工具或重新观察。', { groupId: pending.id });
+                var rejected = admissionRejected(error);
+                if (state.pending === pending) { if (rejected) state.pending = null; else pending.status = 'unknown'; }
+                log(rejected ? 'failure' : 'system', rejected ? '这次操作没有执行：' + error.message : '请求结果未确认，不会自动重发。请查看执行中的工具或重新观察。', { groupId: pending.id });
                 changed(); refreshControl(); fail(error);
+                return { ok: false, text: error.message };
             });
             setTimeout(refreshControl, 150);
+            return request;
         }
         function cancelTool(callId) {
             var token = state.token;
@@ -592,7 +615,11 @@
             return card;
         }
         function actionPanel() {
-            function edited() { formDraft.revision = (formDraft.revision || 0) + 1; }
+            var pendingEdit = null, badgeStamp = '', replacementStamp = '', composing = false;
+            formDraft.savedDrafts = formDraft.savedDrafts || (formDraft.savedDraft ? [formDraft.savedDraft] : []);
+            delete formDraft.savedDraft;
+            function snapshotDraft() { return { description: formDraft.description, speech: formDraft.speech, duration: formDraft.duration, target: selectedTarget }; }
+            function edited() { formDraft.revision = (formDraft.revision || 0) + 1; saveDrafts(); }
             var description = el('textarea', { cls: 'journey-input journey-action-input', rows: '2', 'data-cockpit-field': 'action:description', 'aria-label': '想做什么', placeholder: '想做什么？也可以写主动观察，例如仔细看看菜单。', oninput: function () { formDraft.description = description.value; edited(); } });
             var speech = el('textarea', { cls: 'journey-input journey-speech-input', rows: '2', 'data-cockpit-field': 'action:speech', placeholder: '角色实际说出的原话', oninput: function () { formDraft.speech = speech.value; edited(); } });
             var target = el('input', { cls: 'journey-input', type: 'text', 'aria-label': '行动目标', 'data-cockpit-field': 'action:target', placeholder: '名字或描述 · 可以留空', oninput: function () { selectedTarget = state.selectedTarget = target.value; edited(); } });
@@ -600,27 +627,61 @@
             var options = el('details', { cls: 'cockpit-options' }, [el('summary', { text: '说话与选项' }), field('说出的话 · 可选', speech), el('div', { cls: 'journey-two-fields' }, [field('行动目标', target), field('预计时长 · 世界秒', duration)]), note('直接描述想做什么，无需填写编号；世界会根据当前处境回应。')]);
             options.ontoggle = resizeDock;
             var error = el('div', { cls: 'journey-error', role: 'alert', hidden: true }), submitButton = el('button', { type: 'submit', cls: 'journey-button journey-primary', text: '提交这次行动' }), queue = el('div', { cls: 'journey-pending-host' });
-            var suggestions = el('div', { cls: 'cockpit-suggestions' }), situation = el('p', { cls: 'cockpit-situation', hidden: true }), suggestionStamp = '';
-            var form = el('form', { cls: 'journey-action' }, [el('div', { cls: 'cockpit-bar' }, [el('strong', { text: '你的下一步' }), el('span', { cls: 'cockpit-count', text: '世界行动' })]), situation, suggestions, description, options, error, submitButton, queue]);
+            var badge = el('div', { cls: 'journey-choice-draft', hidden: true }), replacement = el('div', { cls: 'journey-choice-draft', hidden: true });
+            var speechField = field('说出的原话 · 可选', speech), optionalSpeech = options.querySelector('.journey-field');
+            optionalSpeech.replaceWith(speechField);
+            var speechHost = el('div', { cls: 'journey-choice-speech', hidden: true });
+            var form = el('form', { cls: 'journey-action' }, [el('div', { cls: 'cockpit-bar' }, [el('strong', { text: '自由行动' }), el('span', { cls: 'cockpit-count', text: '写下自己的意图，或在上方点选' })]), replacement, badge, description, speechHost, options, error, submitButton, queue]);
+            form.addEventListener('compositionstart', function () { composing = true; });
+            form.addEventListener('compositionend', function () { composing = false; });
             form.onsubmit = function (event) { event.preventDefault(); if (!submitButton.disabled) submit(); };
+            form.prepareOpportunity = function (item) {
+                if (composing) { errorText = '请先完成正在输入的文字，草稿会保留。'; form.update(); return; }
+                if (!sceneOpportunities().some(function (current) { return current.id === item.id && current.sourceEventId === item.sourceEventId; })) return;
+                if (formDraft.description.trim() || formDraft.speech.trim()) { pendingEdit = item; form.update(); return; }
+                chooseOpportunity(item); form.update();
+            };
+            function detach() { formDraft.selection = null; formDraft.opportunityId = null; formDraft.selectionLabel = ''; badgeStamp = ''; edited(); redraw(); }
+            form.freeAction = detach;
             var pendingStamp = '';
             form.update = function () {
                 // These are the original DOM nodes throughout the session, including
                 // IME composition, SSE receipts and reconnection. Never re-focus them.
                 if (description.value !== formDraft.description) description.value = formDraft.description;
                 if (speech.value !== formDraft.speech) speech.value = formDraft.speech;
+                if (duration.value !== formDraft.duration && document.activeElement !== duration) duration.value = formDraft.duration;
                 if (target.value !== selectedTarget && document.activeElement !== target) target.value = selectedTarget;
                 error.hidden = !errorText; error.textContent = errorText;
-                submitButton.disabled = !!state.pending || state.connection !== 'connected' || busy;
-                var scene = state.currentScene || state.observation && state.observation.scene, items = sceneOpportunities();
-                situation.textContent = scene && scene.situation || ''; situation.hidden = !situation.textContent;
-                var nextSuggestions = JSON.stringify([items, formDraft.opportunityId, state.connection]);
-                if (nextSuggestions !== suggestionStamp) {
-                    suggestionStamp = nextSuggestions; suggestions.replaceChildren();
-                    if (items.length) suggestions.appendChild(ReadableData.opportunities(items, { select: chooseOpportunity, disabled: state.connection !== 'connected', selectedId: formDraft.opportunityId }));
-                    if (formDraft.opportunityId && !items.some(function (item) { return item.id === formDraft.opportunityId; })) suggestions.appendChild(note('建议已随情境更新；你填写的草稿仍然保留。'));
+                var selection = formDraft.selection, stale = !!selection && !sceneOpportunities().some(function (item) { return item.id === selection.opportunityId && item.sourceEventId === selection.sourceEventId; });
+                submitButton.disabled = !!state.pending || state.connection !== 'connected' || busy || stale;
+                description.hidden = !!selection; speechHost.hidden = !selection; target.disabled = !!selection;
+                if (selection && speechField.parentElement !== speechHost) speechHost.appendChild(speechField);
+                else if (!selection && speechField.parentElement !== options) options.insertBefore(speechField, options.querySelector('.journey-two-fields'));
+                var nextBadge = JSON.stringify([selection, stale, formDraft.selectionLabel]);
+                if (nextBadge !== badgeStamp) {
+                    badgeStamp = nextBadge; badge.hidden = !selection; badge.replaceChildren();
+                    if (selection) badge.append(el('p', { text: (stale ? '情境已更新 · ' : '准备行动 · ') + (formDraft.selectionLabel || formDraft.description) }), note(stale ? '台词和草稿已保留。重新选择，或解除关联后自行决定。' : formDraft.description), button('改为自由行动', detach, 'journey-subtle'));
                 }
-                submitButton.textContent = state.pending ? '等待行动回执' : '提交这次行动';
+                var nextReplacement = JSON.stringify(pendingEdit);
+                if (nextReplacement !== replacementStamp) {
+                    replacementStamp = nextReplacement; replacement.hidden = !pendingEdit; replacement.replaceChildren();
+                    if (pendingEdit) replacement.append(note('输入框里还有未提交的草稿。要改为“' + pendingEdit.label + '”吗？'), button('保留草稿', function () { pendingEdit = null; form.update(); }, 'journey-subtle'), button('暂存草稿，补充台词', function () {
+                        if (composing) { errorText = '请先完成正在输入的文字，草稿会保留。'; form.update(); return; }
+                        var item = pendingEdit; pendingEdit = null;
+                        formDraft.savedDrafts.push(snapshotDraft());
+                        if (sceneOpportunities().some(function (current) { return current.id === item.id && current.sourceEventId === item.sourceEventId; })) chooseOpportunity(item);
+                        else errorText = '这个建议已经更新，请重新选择。';
+                        redraw();
+                    }, 'journey-subtle'));
+                }
+                if (formDraft.savedDrafts.length && !badge.querySelector('[data-restore-action-draft]')) { badge.hidden = false; badge.appendChild(button('恢复暂存草稿', function () {
+                    if (composing) { errorText = '请先完成正在输入的文字，草稿会保留。'; form.update(); return; }
+                    var saved = formDraft.savedDrafts.pop();
+                    if (formDraft.description.trim() || formDraft.speech.trim()) formDraft.savedDrafts.unshift(snapshotDraft());
+                    formDraft.description = saved.description; formDraft.speech = saved.speech; formDraft.duration = saved.duration; selectedTarget = state.selectedTarget = saved.target;
+                    detach();
+                }, 'journey-subtle')); badge.lastChild.dataset.restoreActionDraft = '1'; }
+                submitButton.textContent = state.pending ? '等待行动回执' : selection ? '就这样行动' : '提交这次行动';
                 var next = JSON.stringify(state.pending); if (next === pendingStamp) return; pendingStamp = next; queue.replaceChildren();
                 if (state.pending) {
                     var pending = state.pending, labels = { submitting: '正在提交', accepted: '世界正在裁定', cancelling: '正在等待取消回执', unknown: '请求结果尚未确认' };
@@ -738,6 +799,20 @@
             shell.feedEmpty.hidden = groups.length > 0;
         }
         function cockpitData() { return { tools: cockpit.tools, pending: cockpit.pending, opportunities: cockpit.opportunities || [], situation: cockpit.situation || (state.currentScene && state.currentScene.situation) || '', choices: Object.assign({}, pickerChoices, cockpit.choices || {}), observation: state.observation, deviceSession: deviceSession, synced: control.synced, mode: state.mode, unitWorldSeconds: state.unitWorldSeconds, blocked: control.busy || state.mode !== 'puppet' && !control.paused, blockedReason: control.busy ? '此前操作正在完成，等待真实回执。' : '控制权已在其他界面归还，请离场后重新接管。', submitting: !!state.pending, uncertain: !!state.pending && state.pending.status === 'unknown' }; }
+        function openComposer() {
+            if (!shell) return;
+            shell.collapsed = state.operatorCollapsed = false; shell.controller.hidden = false;
+            shell.fold.textContent = '收起操作台 · 查看世界'; shell.fold.setAttribute('aria-expanded', 'true');
+            resizeDock(); saveDrafts();
+        }
+        function actFromMenu(item, edit) {
+            if (!shell || state.pending || state.connection !== 'connected' || busy) return;
+            if (state.takeover) {
+                shell.controller.chooseOpportunity(item, { edit: !!edit });
+                if (edit || item.replyTo) openComposer();
+            } else if (edit) { shell.controller.prepareOpportunity(item); openComposer(); }
+            else submit(item);
+        }
         function inside() {
             shell = { session: el('div', { cls: 'journey-session-host' }), observations: el('section', { cls: 'journey-observations' }), live: el('section', { cls: 'journey-live-status', 'aria-label': 'World 与 Bot 实时状态' }), history: el('div', { cls: 'journey-history-host' }), dock: el('div', { cls: 'journey-dock', 'aria-label': '悬浮操作台' }), collapsed: !!state.operatorCollapsed, sessionStamp: '', observationStamp: '', eventStamp: '' };
             shell.cards = new Map();
@@ -754,16 +829,20 @@
             var links = el('div', { cls: 'journey-session-shortcuts' });
             if (state.takeover) links.appendChild(button('操作手机与电脑 ↗', function () { Studio.navigate('devices'); }, 'journey-subtle'));
             if (!isVisitor() || visitorCanSee(['debug'])) links.appendChild(button('查看实时思考与调用 ↗', function () { Studio.navigate('live'); }, 'journey-subtle'));
-            main.append(shell.session, shell.live, links, el('div', { cls: 'journey-stream-layout' }, [shell.history, shell.observations]), shell.dock);
+            shell.menu = WorldActionMenu.mount({ choose: function (item) { actFromMenu(item, false); }, edit: function (item) { actFromMenu(item, true); }, free: function () { openComposer(); if (state.takeover) shell.controller.select('act'); else shell.controller.freeAction(); } });
+            var livePanel = el('details', { cls: 'journey-live-panel', open: !!state.liveOpen }, [el('summary', { text: '世界与角色正在做什么 · 实时生成' }), shell.live]);
+            livePanel.addEventListener('toggle', function () { state.liveOpen = livePanel.open; saveDrafts(); });
+            main.append(shell.session, shell.menu, links, livePanel, el('div', { cls: 'journey-stream-layout' }, [shell.history, shell.observations]), shell.dock);
             if (window.LiveCalls && (!isVisitor() || visitorCanSee(['debug']))) liveCleanup = LiveCalls.mount(shell.live, { compact: true });
             else shell.live.appendChild(note('连接与行动回执会实时更新；当前账号未开放模型调用内容。'));
-            shell.controller = state.takeover ? WorldCockpit.mount(cockpitData(), cockpitDraft, { call: callTool, cancel: cancelTool, resize: resizeDock, prepare: prepareTool, recover: function () { state.pending = null; changed(); refreshControl(); redraw(); } }) : actionPanel();
+            shell.controller = state.takeover ? WorldCockpit.mount(cockpitData(), cockpitDraft, { call: callTool, cancel: cancelTool, resize: resizeDock, prepare: prepareTool, changed: function () { saveDrafts(); if (shell.controller) redraw(); }, recover: function () { state.pending = null; changed(); refreshControl(); redraw(); } }) : actionPanel();
             var fold = button(shell.collapsed ? '展开操作台' : '收起操作台 · 查看世界', function () {
                 shell.collapsed = state.operatorCollapsed = !shell.collapsed;
                 shell.controller.hidden = shell.collapsed;
                 fold.textContent = shell.collapsed ? '展开操作台' : '收起操作台 · 查看世界'; fold.setAttribute('aria-expanded', String(!shell.collapsed));
                 resizeDock(); persist(key, state);
             }, 'journey-dock-grip'); fold.setAttribute('aria-expanded', String(!shell.collapsed));
+            shell.fold = fold;
             shell.controller.hidden = shell.collapsed;
             shell.dock.append(fold, shell.controller);
             shell.dock.addEventListener('focusin', function () { resizeDock(); requestAnimationFrame(revealEditor); });
@@ -795,7 +874,11 @@
                 shell.eventStamp = eventStamp; updateFeed();
                 shell.historyError.hidden = !errorText; shell.historyError.textContent = errorText;
             }
-            shell.controller.update(state.takeover ? cockpitData() : undefined); resizeDock();
+            shell.controller.update(state.takeover ? cockpitData() : undefined);
+            var scene = state.currentScene || state.observation && state.observation.scene;
+            var blocked = state.connection !== 'connected' || busy || state.takeover && (!control.synced || control.busy || state.mode !== 'puppet' && !control.paused);
+            shell.menu.update({ items: state.takeover ? cockpit.opportunities || [] : sceneOpportunities(), situation: state.takeover && cockpit.situation || scene && scene.situation || '', sceneText: scene && scene.text || '', selectedId: state.takeover ? cockpitDraft.opportunityId : formDraft.opportunityId, disabled: blocked, disabledReason: state.connection !== 'connected' ? '正在恢复世界连接，草稿会保留。' : '正在确认角色控制状态，请稍候。', busy: !!state.pending || !!(state.takeover && cockpit.pending.length) });
+            resizeDock();
         }
         function render() {
             var nextKey = state.phase === 'inside' && state.token ? 'inside:' + state.mode : 'outside:' + route + ':' + takeoverMode;

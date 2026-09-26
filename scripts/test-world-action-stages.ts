@@ -37,7 +37,7 @@ async function immediateFeedbackAndConcurrentStages() {
   const f = await fixture(), opening = deferred<ChatResult>();
   const receipts: any[] = [], duplicateReceipts: any[] = [], visitorReceipts: any[] = [], gates: string[] = [];
   f.handler(async request => {
-    if (request.kind === "evolve") return response({ worldState: request.worldState + "窗外吹来一阵风。", perceptions: [] });
+    if (request.kind === "evolve") return response({ worldState: request.worldState + "窗外吹来一阵风。", externalChanges: [{ id: "wind", description: "窗外吹来一阵风。" }], perceptions: [] });
     if (request.actorId === "bot" && request.actionPhase === "start") return opening.promise;
     if (request.actionPhase === "start") return response({ worldState: request.worldState + "访客开始擦拭书桌，尚未擦完。", perceptions: [{ actorId: request.actorId, text: "你拿起布，开始擦拭桌角。" }], outcome: { status: "ongoing" } });
     assert.equal(request.actionPhase, "finish"); assert.ok(request.time >= request.action.expectedEnd);

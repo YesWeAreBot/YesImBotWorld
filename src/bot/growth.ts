@@ -1026,6 +1026,8 @@ function normalizeMetadata(value: ExperienceMetadata): ExperienceMetadata {
     ...(value.subjectIds ? { subjectIds: stringList(value.subjectIds, "subjectIds", 200, 300) } : {}),
     ...(typeof value.opportunity === "boolean" ? { opportunity: value.opportunity } : {}),
     ...(value.worldPerception === true ? { worldPerception: true } : {}),
+    ...(value.worldEpoch !== undefined ? { worldEpoch: requiredText(value.worldEpoch, "worldEpoch", 500) } : {}),
+    ...(value.historicalWorld === true ? { historicalWorld: true } : {}),
     ...(Array.isArray(value.responseToRoots) ? { responseToRoots: [...new Set(value.responseToRoots.filter((id): id is string => typeof id === "string" && !!id))] } : {}),
     ...(value.chat ? { chat: normalizeChat(value.chat) } : {}),
   };

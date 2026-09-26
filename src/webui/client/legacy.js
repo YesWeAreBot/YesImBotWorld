@@ -255,10 +255,10 @@ function api(method, path, body, retried){
     }
     if(res.status === 403 && !retried){
       // 访客越权访问（无读权限）：提示后不再重试，避免死循环
-      throw new Error('无权访问');
+      var denied = new Error('无权访问'); denied.status = 403; throw denied;
     }
     return res.json().then(function(data){
-      if(!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
+      if(!res.ok) { var failure = new Error(data.error || ('HTTP ' + res.status)); failure.status = res.status; failure.code = data.code; throw failure; }
       return data;
     });
   });
@@ -423,18 +423,21 @@ function gotoCfg(gkey){
   switchView('config');
 }
 var PRIMARY = {
-  bot: ['mode', 'baseURL', 'apiKey', 'model', 'stream', 'growth', 'regulation'],
+  bot: ['mode', 'baseURL', 'apiKey', 'model', 'stream', 'strictToolLoop', 'growth'],
   world: ['baseURL', 'apiKey', 'model', 'stream'],
   clock: ['syncRealTime', 'epoch', 'realSecondsPerUnit', 'tingleEveryUnits', 'tingleMode', 'tingleMinUnits', 'tingleMaxUnits'],
-  apps: ['chatAppName', 'weatherEnabled', 'weatherDefaultCity', 'browserEnabled', 'phoneResolution', 'phoneShellImage', 'notesEnabled', 'computer'],
-  messaging: ['notifyChannels', 'notifyPolicy', 'wakeOnNotify', 'offlineHistory', 'typingCharsPerSec', 'sendDeferFactor']
+  apps: ['chatAppName', 'botManagedNotifications', 'weatherEnabled', 'weatherDefaultCity', 'browserEnabled', 'browserHomeURL', 'browserSearchURL', 'browserSearchFallbackURLs', 'browserAutoScreenshot', 'clockEnabled', 'camera', 'assistant', 'phoneResolution', 'phoneShellImage', 'notesEnabled', 'computer'],
+  messaging: ['notifyChannels', 'botManagedNotifyChannels', 'notifyPolicy', 'wakeOnNotify', 'offlineHistory', 'typingCharsPerSec', 'sendDeferFactor']
 };
 var CFG_ICONS = {root:'sliders', bot:'cpu', world:'gauge', clock:'activity', platformOps:'phone', apps:'monitor', captioners:'image', tts:'film', media:'folder', webui:'sliders', messaging:'edit'};
 var GROWTH_FIELD_LABELS = { enabled:'自动整理与回忆', minEpisodes:'积累几段经历后整理', reviewIntervalMs:'整理间隔（现实毫秒）', reviewTimeoutMs:'等待与生成超时（毫秒）', maxInputChars:'每次整理的输入字符预算', recallCount:'每次最多唤起几条认识' };
-var REGULATION_FIELD_LABELS = { enabled:'启用内在调节（实验性）', decisionEnabled:'让评分参与实际选择', timeoutMs:'评价与选择超时（毫秒）', maxInputChars:'每次调用的输入字符预算', candidateCount:'最多比较几个候选行动', learningRate:'经历学习速率', driftRate:'需要自然变化速率', sexualResponseEnabled:'启用阶段性生理反射模拟' };
+var BOT_FIELD_LABELS = { strictToolLoop:'等待工具结果', blockingAct:'非严格模式：等待上一行动', sendBlocking:'非严格模式：等待上一发送' };
 var AUXILIARY_LLM_FIELD_LABELS = {mode:'模型配置方式',baseURL:'模型端点',apiKey:'API 密钥',model:'模型名称',temperature:'采样温度',maxTokens:'最大输出 Token',disableThinking:'关闭思考模式',stream:'流式返回'};
-function isAuxiliaryLlmGroup(path){return path.length===3 && path[0]==='bot' && (path[1]==='growth' || path[1]==='regulation') && path[2]==='llm';}
-function cfgFieldName(path){ if(isAuxiliaryLlmGroup(path.slice(0,-1))) return AUXILIARY_LLM_FIELD_LABELS[path[path.length-1]] || path[path.length-1]; if(path[0] === 'bot' && path[1] === 'regulation') return REGULATION_FIELD_LABELS[path[2]] || path[path.length-1]; return path[0] === 'bot' && path[1] === 'growth' ? GROWTH_FIELD_LABELS[path[2]] || path[path.length-1] : path[path.length-1]; }
+function isAuxiliaryLlmGroup(path){return path.length===3 && path[0]==='bot' && path[1]==='growth' && path[2]==='llm';}
+function cfgFieldName(path){ if(isAuxiliaryLlmGroup(path.slice(0,-1))) return AUXILIARY_LLM_FIELD_LABELS[path[path.length-1]] || path[path.length-1]; if(path.length===2&&path[0]==='bot')return BOT_FIELD_LABELS[path[1]] || path[1]; return path[0] === 'bot' && path[1] === 'growth' ? GROWTH_FIELD_LABELS[path[2]] || path[path.length-1] : path[path.length-1]; }
+function updateToolLoopPolicy(){
+  document.querySelectorAll('[data-config-path="bot.blockingAct"],[data-config-path="bot.sendBlocking"]').forEach(function(input){ input.disabled=cfgCache?.bot?.strictToolLoop!==false; });
+}
 function updateLlmInheritanceNotes(){
   document.querySelectorAll('[data-llm-inherit-note]').forEach(function(note){
     var model=cfgCache?.bot;
@@ -743,6 +746,7 @@ function boolSwitch(node, path, danger){
   var sw = el('span', {cls:'sw'});
   var cb = el('input', {type:'checkbox', 'data-config-path':path.join('.'), 'aria-label':cfgFieldName(path)});
   cb.checked = value;
+  if(path.length===2&&path[0]==='bot'&&['blockingAct','sendBlocking'].includes(path[1]))cb.disabled=cfgCache?.bot?.strictToolLoop!==false;
   cb.onchange = function(){ setPath(cfgCache, path, cb.checked); };
   sw.appendChild(cb);
   sw.appendChild(el('i'));
@@ -1115,9 +1119,9 @@ function descOf(key, prefix){
       assessRealWorldUser: '世界性质判定 · user。{{worldDef}}',
       generateCalendarSystem: '历法生成 · system',
       generateCalendarUser: '历法生成 · user。{{worldDef}} {{epoch}} {{unitWorldSeconds}}',
-      phoneSpecSystem: '手机屏幕规格判定 · system（apps.phoneResolution 为 auto 时创世调用）',
+      phoneSpecSystem: '手机屏幕规格判定 · system（auto 且尚无规格与外壳时创世补全）',
       phoneSpecUser: '手机屏幕规格判定 · user。{{botDef}} {{worldDef}}',
-      phoneShellSystem: '浏览器带壳截图外壳生成 · system（创世调用）',
+      phoneShellSystem: '手机与浏览器外壳设计 · system（手动重新生成，首次创世也可补全缺失外壳）',
       phoneShellUser: '带壳截图外壳生成 · user。{{botDef}} {{worldDef}} {{width}} {{height}}；生成的 HTML 里保留 {{screen}} {{url}} {{time}} 占位符',
 
     }
@@ -1161,15 +1165,18 @@ function statePane(id, title, content, url){
   return sec;
 }
 function phoneShellPane(shellHtml, meta){
+  meta = meta || {};
+  var savedHtml = shellHtml || '', visitor = isVisitor(), busy = '', message = '';
   var sec = el('div', {cls:'section', 'data-pane':'shell'});
-  sec.appendChild(el('h3', {html:'手机外壳 <span class="hint">浏览器带壳截图的外壳 HTML（含 {{screen}} 等占位符），下方为预览；源码标签页可编辑</span>'}));
+  sec.appendChild(el('h3', {text:'手机与浏览器外壳'}));
   var body = el('div', {cls:'body'});
+  body.appendChild(el('p', {cls:'hint', text:'同一份 HTML 包含手机状态栏与浏览器工具栏，保留 {{screen}} 等占位符。已有外壳会跨世界重置与重新创世复用；手动重新设计只改变外观，不改剧情。'}));
   // 预览 iframe：用样本值替换占位符，展示外壳布局效果
   var preview = el('iframe', {sandbox:'', referrerpolicy:'no-referrer', style:'width:100%;height:560px;border:1px solid var(--line);border-radius:10px;background:#fff'});
   function renderPreview(){
     var html = shellHtml || '';
     if(!html.trim()){
-      preview.srcdoc = '<div style="font-family:sans-serif;color:#888;display:flex;align-items:center;justify-content:center;height:100%">（还没有外壳 HTML——创世或手动编辑后在此预览）</div>';
+      preview.srcdoc = '<div style="font-family:sans-serif;color:#888;display:flex;align-items:center;justify-content:center;height:100%">' + (visitor ? '（尚未设置外壳，管理员可手动生成或编辑）' : '（尚未设置外壳，可用上方按钮生成，或在下方编辑 HTML）') + '</div>';
       return;
     }
     var w = meta.phone && meta.phone.width ? meta.phone.width : 800;
@@ -1186,22 +1193,54 @@ function phoneShellPane(shellHtml, meta){
     preview.srcdoc = '<meta http-equiv="Content-Security-Policy" content="' + policy + '">' + sample;
   }
   // 源码编辑（textarea）+ 保存
-  var ta = el('textarea', {rows:16, style:'width:100%;font-family:var(--mono);font-size:12px;margin-top:8px'});
+  var ta = el('textarea', {rows:16, 'aria-label':'外壳 HTML 源码', style:'width:100%;font-family:var(--mono);font-size:12px;margin-top:8px', oninput:function(){ message = ''; syncControls(); }});
   ta.value = shellHtml || '';
-  if(isVisitor()) ta.readOnly = true;
-  body.appendChild(el('div', {cls:'toolbar', style:'margin-bottom:8px'}, isVisitor() ? [] : [
-    el('button', {text:'刷新预览', onclick:function(){ shellHtml = ta.value; renderPreview(); }}),
-    el('span', {cls:'spacer'}),
-    el('button', {cls:'primary', text:'保存外壳', onclick:function(){
-      api('PUT', '/api/state/phone-shell', {content: ta.value}).then(function(){ shellHtml = ta.value; renderPreview(); toast('手机外壳已保存', 'ok'); }).catch(showErr);
-    }})
-  ]));
+  var status = el('p', {role:'status', 'aria-live':'polite', cls:'hint', style:'line-height:1.7;margin:0 0 12px'});
+  var generateButton, previewButton, undoButton, saveButton;
+  function dirty(){ return ta.value !== savedHtml; }
+  function syncControls(){
+    ta.readOnly = visitor || !!busy;
+    if(visitor) { status.textContent = '只读预览与源码。'; return; }
+    generateButton.disabled = !!busy || dirty();
+    generateButton.textContent = busy === 'generate' ? 'World LLM 正在设计…' : savedHtml.trim() ? '让 World LLM 重新设计' : '生成手机与浏览器外壳';
+    previewButton.disabled = !!busy;
+    undoButton.disabled = !!busy || !dirty();
+    saveButton.disabled = !!busy || !dirty();
+    saveButton.textContent = busy === 'save' ? '正在保存…' : '保存外壳';
+    status.textContent = busy === 'generate' ? '正在生成外壳，原预览会保留到新设计保存成功。' : busy === 'save' ? '正在保存外壳…' : dirty() ? (message ? message + ' ' : '') + '有未保存的修改。先保存或撤销修改，再让 World LLM 重新设计。' : message || '外壳已与创世独立；可以随时手动重新设计。';
+  }
+  if(!visitor){
+    generateButton = el('button', {text:'让 World LLM 重新设计', onclick:function(){
+      if(busy || dirty()) return;
+      busy = 'generate'; message = ''; syncControls();
+      return api('POST', '/api/state/phone-shell/generate', {}).then(function(result){
+        if(!result || result.ok !== true || typeof result.content !== 'string' || !result.content.trim() || !Number.isFinite(result.phone?.width) || result.phone.width <= 0 || !Number.isFinite(result.phone?.height) || result.phone.height <= 0) throw new Error('生成结果缺少有效外壳或屏幕尺寸');
+        savedHtml = shellHtml = result.content;
+        meta.phone = Object.assign({}, meta.phone || {}, result.phone);
+        ta.value = savedHtml;
+        renderPreview();
+        message = '新外壳已保存，预览与源码已更新。';
+        toast('手机与浏览器外壳已更新', 'ok');
+      }).catch(function(error){ message = '生成未完成：' + (error.message || error) + '。当前预览与源码未替换；可刷新页面核对已保存版本。'; }).finally(function(){ busy = ''; syncControls(); });
+    }});
+    previewButton = el('button', {text:'刷新预览', onclick:function(){ if(busy) return; shellHtml = ta.value; renderPreview(); }});
+    undoButton = el('button', {text:'撤销修改', onclick:function(){ if(busy) return; ta.value = shellHtml = savedHtml; renderPreview(); message = '已撤销未保存的修改。'; syncControls(); }});
+    saveButton = el('button', {cls:'primary', text:'保存外壳', onclick:function(){
+      if(busy || !dirty()) return;
+      var submitted = ta.value;
+      busy = 'save'; message = ''; syncControls();
+      return api('PUT', '/api/state/phone-shell', {content: submitted}).then(function(){ savedHtml = shellHtml = submitted; renderPreview(); message = '外壳已保存。'; toast('手机外壳已保存', 'ok'); }).catch(function(error){ message = '保存失败：' + (error.message || error) + '。修改仍保留在源码中。'; }).finally(function(){ busy = ''; syncControls(); });
+    }});
+    body.appendChild(el('div', {cls:'toolbar', style:'margin-bottom:8px'}, [generateButton, previewButton, undoButton, el('span', {cls:'spacer'}), saveButton]));
+  }
+  body.appendChild(status);
   body.appendChild(preview);
   body.appendChild(el('div', {style:'margin-top:10px'}, [
-    el('div', {text:'源码（编辑后点“刷新预览”查看效果、点“保存外壳”落盘）：', style:'color:var(--fg-dim);font-size:12px;margin-bottom:6px'}),
+    el('div', {text:visitor ? '源码（只读）：' : '源码（编辑后可刷新预览，再保存外壳）：', style:'color:var(--fg-dim);font-size:12px;margin-bottom:6px'}),
     ta
   ]));
   renderPreview();
+  syncControls();
   sec.appendChild(body);
   return sec;
 }
@@ -1540,7 +1579,7 @@ function renderGalleryGrid(){
         actions.appendChild(sel);
       }
       actions.appendChild(el('button', {text:'描述', onclick:function(){
-        var d = prompt('写入描述（Bot 挑图依据：内容、梗/情绪、适合场合）：', e.description || '');
+        var d = prompt('个人选用备注（表情包：表态用途、适用或易误读语境；其他媒体：内容与用途）：', e.description || '');
         if(d == null) return;
         api('POST', '/api/gallery/description', {category:e.category, name:e.name, description:d}).then(function(){ toast('已保存', 'ok'); loadGallery(); }).catch(showErr);
       }}));
@@ -1848,5 +1887,6 @@ function setPath(obj, arr, val){
   cur[arr[arr.length-1]] = val;
   markCfgDirty();
   if(obj===cfgCache && arr[0]==='bot' && (arr[1]==='model' || arr[1]==='baseURL'))updateLlmInheritanceNotes();
+  if(obj===cfgCache && arr.length===2 && arr[0]==='bot' && arr[1]==='strictToolLoop')updateToolLoopPolicy();
   if(obj===cfgCache && arr[arr.length-1]==='mode' && isAuxiliaryLlmGroup(arr.slice(0,-1))){var group=arr.slice(0,-1).join('.');document.querySelectorAll('[data-config-group]').forEach(function(section){if(section.dataset.configGroup===group)section.updateLlmMode?.();});}
 }

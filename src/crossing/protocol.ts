@@ -15,9 +15,13 @@
 export type PlayerMode = "cross" | "avatar" | "puppet";
 
 /** 访客提交给主世界的任务类型 */
-export type CrossingTaskKind = "act" | "wait" | "checkTime" | "query" | "observe" | "observeVirtualApp" | "executeVirtualApp";
+export type CrossingTaskKind = "act" | "choose" | "wait" | "checkTime" | "query" | "observe" | "observeVirtualApp" | "executeVirtualApp";
 
 export interface CrossingTaskPayload {
+  /** choose: only this actor's current delivered option may be selected. */
+  selection?: import("../bot/choice.js").HumanChoiceRef;
+  /** choose: exact speech supplied by the human, never generated from a label. */
+  text?: string;
   /** act：动作描述 */
   desc?: string;
   /** act：标准跨世界时长，单位世界秒。 */
@@ -43,6 +47,13 @@ export interface CrossingTimeUnits {
   unitRealSeconds: number;
 }
 
+/** Session-local monotonic menu state; consumption can change it without a new world scene. */
+export interface CrossingOpportunityMenu {
+  opportunities: import("../bot/opportunities.js").ActionOpportunity[];
+  opportunityRevision: number;
+  worldSequence?: number;
+}
+
 /** Authorized role perceptions. Identifiers are stable across SSE reconnects; never include session credentials. */
 export interface CrossingPerceptionEvent {
   type: "event";
@@ -56,12 +67,17 @@ export interface CrossingPerceptionEvent {
   actorId?: string;
   worldSequence?: number;
   actionId?: string;
+  /** Server-derived current menu for this exact perception; [] clears a previous menu. */
+  opportunities?: import("../bot/opportunities.js").ActionOpportunity[];
+  opportunityRevision?: number;
 }
 
 /** SSE 推送给访客的消息 */
 export type CrossingSseMsg =
-  | ({ type: "hello"; worldName: string; timeLine: string; visitorId?: string } & Partial<CrossingTimeUnits>)
+  | ({ type: "hello"; worldName: string; timeLine: string; visitorId?: string } & Partial<CrossingTimeUnits> & Partial<CrossingOpportunityMenu>)
   | CrossingPerceptionEvent
+  /** UI state only: clearing a consumed menu is not a new character perception. */
+  | ({ type: "opportunities" } & CrossingOpportunityMenu)
   /** Ordered committed feedback while the action remains pending; index is stable on replay. */
   | { type: "task_progress"; taskId: string; index: number; content: string }
   /** parts retains complete envelopes, allowing reconnects to recover missing progress in order. */

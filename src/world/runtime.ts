@@ -2,26 +2,36 @@ import { createHash, randomUUID } from "node:crypto";
 import type { WorldFiles } from "../files.js";
 import type { ClockAuthority, WorldClock } from "../clock.js";
 import type { ChatMessage, ChatResult, ChatToolDef } from "../llm/chat.js";
-import type { RichText, ToolCallRecord } from "../types.js";
+import type { PhonePhysicalState, PhoneStatus, RichText, ToolCallRecord } from "../types.js";
+import { DEFAULT_PHONE_PHYSICAL_STATE, validPhonePhysicalState } from "../phone-state.js";
 import { Prompts } from "../prompts.js";
 import { debug } from "../webui/debug.js";
 import { NarrativeStore } from "./narrative-store.js";
-import type { NarrativeAction, NarrativeActor, NarrativeCommitResult, NarrativeObservation, NarrativePerception, NarrativePresentation } from "./narrative-types.js";
+import type { NarrativeAction, NarrativeActor, NarrativeCommitResult, NarrativeEvolution, NarrativeExternalChange, NarrativeObservation, NarrativePerception, NarrativePresentation } from "./narrative-types.js";
 import { validNarrativePresentation } from "./narrative-types.js";
-import { worldResolutionTool } from "./proposal.js";
+import { WORLD_EVOLUTION_AUTHORITY, worldResolutionTool } from "./proposal.js";
 import { DEVICE_TOOL_GUIDANCE, WORLD_DEVICE_AUTHORITY, detectDeviceClaim, detectDeviceRequest, deviceParagraphs, projectWorldDeviceContext, splitVirtualFileBody } from "./device-boundary.js";
 import { WORLD_TIME_AUTHORITY, assertCurrentTime, projectCurrentTime } from "./time-boundary.js";
+import { parseWorldResponse } from "./response.js";
+import { normalizeWorldEvolution } from "./evolution.js";
+import type { HeartbeatResult } from "./tingle.js";
+import { KernelError } from "./state.js";
 
 type Infer = (messages: ChatMessage[], tools: ChatToolDef[], signal?: AbortSignal) => Promise<ChatResult>;
 type Outcome = { status: "completed" | "failed" | "needs_input" | "ongoing"; reason?: string; speechSpoken?: boolean };
 export type ActionCommitPhase = "start" | "finish";
-interface Resolution { worldState?: string; actorStates?: { actorId: string; state: string }[]; perceptions: ({ actorId: string; text: string } & NarrativePresentation)[]; outcome?: Outcome; botName?: string }
-interface Change { kind: "initialize" | "action" | "observe" | "app_observe" | "app_action" | "evolve" | "arrive" | "leave"; actorId?: string; action?: NarrativeAction; actionPhase?: ActionCommitPhase; actors?: Record<string, NarrativeActor>; id: string; signal?: AbortSignal; beforeCommit?: (phase: ActionCommitPhase) => boolean }
+interface Resolution { worldState?: string; phoneState?: PhonePhysicalState; actorStates?: { actorId: string; state: string }[]; perceptions: ({ actorId: string; text: string; changeIds?: string[] } & NarrativePresentation)[]; outcome?: Outcome; botName?: string;
+  externalChanges?: NarrativeExternalChange[]; actorEffects?: { actorId: string; state: string; changeIds: string[] }[]; phoneChangeIds?: string[]; nextIntervalTU?: number }
+interface Change { kind: "initialize" | "action" | "observe" | "app_observe" | "app_action" | "evolve" | "arrive" | "leave"; actorId?: string; action?: NarrativeAction; actionPhase?: ActionCommitPhase; actors?: Record<string, NarrativeActor>; id: string; signal?: AbortSignal; beforeCommit?: (phase: ActionCommitPhase) => boolean; onValidated?: (data: { nextIntervalTU?: number; attempts: number }) => void }
 type QueueKind = "ordered" | "observe" | "action_result";
 interface QueuedOperation { kind: QueueKind; run: () => Promise<void> }
 
 /** Stateless inference: durable natural-language state carries continuity between calls. */
 export class NarrativeWorld {
+  /** Execution-owned holding posture is input only; World cannot open apps or execute pickup. */
+  phoneStatusProvider?: () => PhoneStatus;
+  /** WorldAgent disables local authority while the resident character is travelling. */
+  phoneAuthorityProvider: () => boolean = () => true;
   private opening?: Promise<NarrativeStore>;
   private tail: Promise<unknown> = Promise.resolve();
   private queue: QueuedOperation[] = [];
@@ -30,8 +40,9 @@ export class NarrativeWorld {
   private epoch = 0;
   private controllers = new Map<string, AbortController>();
   private active = new Map<string, { fingerprint: string; promise: Promise<boolean>; progress?: string; listeners: Set<(content: string) => Promise<void>> }>();
+  private heartbeatController?: AbortController;
   private observing = new Map<string, { fingerprint: string; signal: AbortSignal; promise: Promise<NarrativeObservation> }>();
-  constructor(private files: WorldFiles, private clock: WorldClock, private infer: Infer, private prompts = new Prompts()) {}
+  constructor(private files: WorldFiles, private clock: WorldClock, private infer: Infer, private prompts = new Prompts(), private limits: { heartbeatTimeoutMs?: number } = {}) {}
   private timeAuthority(tu = this.clock.now()): ClockAuthority {
     if (typeof this.clock.authority === "function") return this.clock.authority(tu);
     // Minimal injected clocks are used by offline tests/embedders; without a calendar,
@@ -272,6 +283,9 @@ export class NarrativeWorld {
       return JSON.stringify({ observation, action: { id, intent: action?.intent ?? String(call.arguments.description ?? ""), status: action?.status ?? "failed", phase: action?.phase, startedAt: action?.startedAt, expectedEnd: action?.expectedEnd, finishedAt: action?.finishedAt }, ...(observation.scene ? { scene: observation.scene } : {}) });
   }
   private async runAct(actorId: string, id: string, fingerprint: string, call: ToolCallRecord, signal?: AbortSignal, beforeCommit?: (phase: ActionCommitPhase) => boolean, progress?: () => Promise<void>): Promise<boolean> {
+    // Background inference has no externally committed side effects; abandon its stale
+    // proposal so a newly requested action can obtain its own result promptly.
+    this.heartbeatController?.abort(new Error("世界心跳让位于角色行动。"));
     const lifetime = this.lifetime.signal;
     const controller = new AbortController(); this.controllers.set(id, controller);
     const combined = AbortSignal.any([controller.signal, lifetime, ...(signal ? [signal] : [])]);
@@ -304,6 +318,7 @@ export class NarrativeWorld {
       if (store.snapshot().actions[id]?.status === "pending") {
         await abortable(progress?.() ?? Promise.resolve(), combined);
         await this.until(store.snapshot().actions[id]!.expectedEnd, combined);
+        this.heartbeatController?.abort(new Error("世界心跳让位于到期行动结算。"));
         await this.serial(async () => {
           const action = store!.snapshot().actions[id]!;
           if (action.status !== "pending") return;
@@ -331,17 +346,46 @@ export class NarrativeWorld {
     }
     signal.throwIfAborted();
   }
-  async evolve(reason: string, options: { heartbeat?: boolean } = {}): Promise<void> {
-    const signal = this.operationSignal();
-    // Action stages already settle natural progress against the current clock. A
-    // periodic heartbeat must not spend a model turn immediately before that stage,
-    // or turn its still-pending completion into an unrelated ambient event.
-    if (options.heartbeat && this.active.size) return;
+  async evolve(reason: string, options: { heartbeat?: boolean } = {}): Promise<HeartbeatResult> {
+    const signal = this.operationSignal(), started = Date.now();
+    const yielded = (): HeartbeatResult => ({ status: "yielded", reason: "让位于角色行动", elapsedMs: Date.now() - started });
+    if (options.heartbeat && (this.heartbeatController || this.heartbeatShouldYield(await this.store()))) return yielded();
     await this.ensure(undefined, undefined, signal);
-    await this.serial(async () => {
-      if (options.heartbeat && (this.active.size || Object.values((await this.store()).snapshot().actions).some(action => action.status === "pending"))) return;
-      await this.change(reason, { kind: "evolve", id: `evolve:${randomUUID()}`, signal });
-    }, signal, options.heartbeat ? "observe" : "ordered");
+    const controller = options.heartbeat ? new AbortController() : undefined;
+    if (controller) {
+      if (this.heartbeatController) return yielded();
+      this.heartbeatController = controller;
+    }
+    const combined = controller ? AbortSignal.any([signal, controller.signal]) : signal;
+    try {
+      return await this.serial(async () => {
+        if (options.heartbeat && this.heartbeatShouldYield(await this.store())) return yielded();
+        // One budget covers the complete heartbeat (endpoint wait and all repairs),
+        // not three fresh timeouts. A late model response cannot cross the commit gate.
+        const deadline = new AbortController();
+        const timeoutMs = Number.isFinite(this.limits.heartbeatTimeoutMs) && this.limits.heartbeatTimeoutMs! > 0 ? this.limits.heartbeatTimeoutMs! : 300_000;
+        const timer = options.heartbeat ? setTimeout(() => deadline.abort(new Error("WORLD_HEARTBEAT_TIMEOUT: 本轮心跳超过生成总时限，未提交的提案已取消。")), timeoutMs) : undefined;
+        const taskSignal = timer ? AbortSignal.any([combined, deadline.signal]) : combined;
+        let detail: { nextIntervalTU?: number; attempts?: number } = {};
+        try {
+          const result = await this.change(reason, { kind: "evolve", id: `evolve:${randomUUID()}`, signal: taskSignal, onValidated: value => { detail = value; } });
+          return { status: result ? "committed" : "quiet", ...detail, sequence: (await this.store()).snapshot().sequence,
+            perceptions: result?.perceptions.length ?? 0, elapsedMs: Date.now() - started };
+        } finally { if (timer) clearTimeout(timer); }
+      }, combined, options.heartbeat ? "observe" : "ordered");
+    } catch (error) {
+      if (!controller?.signal.aborted || signal.aborted || !(error === controller.signal.reason || error instanceof KernelError && error.code === "CANCELLED")) throw error;
+      return yielded();
+    } finally { if (controller && this.heartbeatController === controller) this.heartbeatController = undefined; }
+  }
+  private heartbeatShouldYield(store: NarrativeStore): boolean {
+    const snapshot = store.snapshot(), pending = Object.values(snapshot.actions).filter(action => action.status === "pending");
+    // Persisted ongoing work leaves the world free to live during a long wait. Keep a
+    // small real-time runway before its due result; a newly due action also aborts any
+    // slow heartbeat still in inference. Accepted/unrecorded actions get first use.
+    const near = this.clock.now() + 30 / Math.max(0.001, this.clock.unitRealSeconds ?? 1);
+    return pending.some(action => action.phase !== "ongoing" || action.expectedEnd <= near)
+      || [...this.active.keys()].some(id => snapshot.actions[id]?.phase !== "ongoing");
   }
   async arrive(actorId: string, name: string, persona: string, signal?: AbortSignal): Promise<void> {
     const combined = this.operationSignal(signal);
@@ -391,37 +435,55 @@ export class NarrativeWorld {
     const definitions = await this.files.readDefinitions();
     const meta = await this.files.readMeta(), virtual = !(meta.realWorld ?? this.clock.syncRealTime);
     const app = options.kind === "app_observe" || options.kind === "app_action";
-    const messages: ChatMessage[] = [{ role: "system", content: this.prompts.world.narrativeSystem + "\n<world_definition>\n" + definitions.worldDef + "\n</world_definition>\n<character_definition>\n" + definitions.botDef + "\n</character_definition>\n" + WORLD_DEVICE_AUTHORITY + "\n" + WORLD_TIME_AUTHORITY }];
+    const messages: ChatMessage[] = [{ role: "system", content: this.prompts.world.narrativeSystem + "\n<world_definition>\n" + definitions.worldDef + "\n</world_definition>\n<character_definition>\n" + definitions.botDef + "\n</character_definition>\n" + (options.kind === "evolve" ? WORLD_EVOLUTION_AUTHORITY + "\n" : "") + WORLD_DEVICE_AUTHORITY + "\n" + WORLD_TIME_AUTHORITY }];
+    options.signal?.throwIfAborted();
+    const snapshot = store.snapshot(), actors = { ...snapshot.actors, ...options.actors };
+    const canUpdatePhone = !app && ["initialize", "action", "observe", "evolve"].includes(options.kind)
+      && (!options.actorId || options.actorId === "bot") && actors.bot?.present === true && this.phoneAuthorityProvider();
+    const timeAuthority = this.timeAuthority(), stateAsOf = this.timeAuthority(snapshot.stateUpdatedAt);
+    const currentProse = (text: string) => projectCurrentTime(projectWorldDeviceContext(text), timeAuthority);
+    // Old prose files have no reliable closing delimiter. Keep the entire tail opaque:
+    // ordinary World inference cannot turn a trailing fake chat into current reality.
+    const retainedFiles = virtual && !app ? splitVirtualFileBody(snapshot.worldState) : { prose: snapshot.worldState, body: "" };
+    const recentEvolution = !app ? store.readRecentEvolution() : [];
+    const evolutionSinceTU = Math.max(snapshot.stateUpdatedAt, store.lastEvolutionAt() ?? snapshot.stateUpdatedAt);
+    const projectedWorldState = app ? projectWorldDeviceContext(retainedFiles.prose, { virtualApp: virtual }) : projectCurrentTime(projectWorldDeviceContext(retainedFiles.prose, { virtualApp: virtual }), timeAuthority);
+    messages.push({ role: "user", content: JSON.stringify({ task, kind: options.kind, actorId: options.actorId, time: timeAuthority.tu,
+      ...(options.actionPhase ? { actionPhase: options.actionPhase, action: options.action } : {}),
+      timeLine: timeAuthority.timeLine, timeAuthority, stateAsOf, elapsedWorldSeconds: Math.max(0, timeAuthority.tu - snapshot.stateUpdatedAt) * timeAuthority.unitWorldSeconds,
+      ...(snapshot.effectiveAt > timeAuthority.tu ? { stateAheadOfClock: "保存的记录时间晚于当前程序时钟；不得据此把当前时钟推到未来或重演未来记录。" } : {}),
+      stateUpdatedAt: snapshot.stateUpdatedAt, stateVersion: snapshot.sequence,
+      phoneState: snapshot.phoneState ?? DEFAULT_PHONE_PHYSICAL_STATE,
+      ...(this.phoneStatusProvider ? { phoneHeld: !this.phoneStatusProvider().down && (snapshot.phoneState?.reachable ?? true) } : {}),
+      phoneAuthority: { canUpdate: canUpdatePhone, actorId: "bot", physicalFactsOnly: true,
+        ...(snapshot.phoneState === undefined ? { legacyDefault: "手机物理条件尚未独立记录，兼容沿用可拿取、可用、可感知；位置未记录。若本次创世或物理剧情确立了不同事实，显式提交phoneState，不从旧文本猜测状态。" } : {}) },
+      deviceAuthority: { platformChat: "external_tools_only", software: app && virtual ? "virtual_app_request_only" : "device_tools_only", worldProseIsNotPlatformEvidence: true },
+      ...(retainedFiles.body ? { retainedDeviceRecords: "旧虚构文件记录的边界不明确，已隐藏并由程序原样保留。worldState输入与输出均只写物理世界段，不能补写文件原文或猜测隐藏段的场景。程序会把已有文件原样接回保存。" } : {}),
+      worldState: projectedWorldState,
+      ...(!app ? { recentEvolution, recentEvolutionScope: "仅最近几笔已提交外部经过的有限窗口，按时间排列，旧记录仍在日志；这些变化已发生，不重复上演、不把旧id当成本轮原因。长期事实以worldState为准。" } : {}),
+      ...(options.kind === "evolve" ? { evolutionSinceTU, elapsedEvolutionWorldSeconds: Math.max(0, timeAuthority.tu - evolutionSinceTU) * timeAuthority.unitWorldSeconds } : {}),
+      ...(!app ? { worldMemory: { currentChars: projectedWorldState.length, targetChars: 6000,
+        guidance: "worldState是当前工作记忆，不是逐轮流水账。实际更新时合并重复内容，保留仍有效的事实、身份、秘密、NPC目标、未解决承诺和正在发生的过程；已经结束且不再影响后续的细节留在事件日志。6000字是软目标，事实完整性优先，不硬截断；无长期变化时省略worldState，evolve的短暂经过记在externalChanges。不为整理记忆伪造事件，不额外进行一次裁定。" } } : {}), actors: Object.values(actors).filter(a => a.present || a.id === options.actorId).map(a => ({ id: a.id, name: a.name, present: a.present, state: currentProse(a.state), perception: currentProse(a.perception), ...(a.persona !== undefined ? { persona: a.persona } : {}) })), pendingActions: Object.values(snapshot.actions).filter(a => a.status === "pending" && !detectDeviceRequest(a.intent)) }) });
     for (let attempt = 0; attempt < 3; attempt++) {
       options.signal?.throwIfAborted();
-      const snapshot = store.snapshot(), actors = { ...snapshot.actors, ...options.actors };
-      const timeAuthority = this.timeAuthority(), stateAsOf = this.timeAuthority(snapshot.stateUpdatedAt);
-      const currentProse = (text: string) => projectCurrentTime(projectWorldDeviceContext(text), timeAuthority);
-      // Old prose files have no reliable closing delimiter. Keep the entire tail opaque:
-      // ordinary World inference cannot turn a trailing fake chat into current reality.
-      const retainedFiles = virtual && !app ? splitVirtualFileBody(snapshot.worldState) : { prose: snapshot.worldState, body: "" };
-      messages.push({ role: "user", content: JSON.stringify({ task, kind: options.kind, actorId: options.actorId, time: timeAuthority.tu,
-        ...(options.actionPhase ? { actionPhase: options.actionPhase, action: options.action } : {}),
-        timeLine: timeAuthority.timeLine, timeAuthority, stateAsOf, elapsedWorldSeconds: Math.max(0, timeAuthority.tu - snapshot.stateUpdatedAt) * timeAuthority.unitWorldSeconds,
-        ...(snapshot.effectiveAt > timeAuthority.tu ? { stateAheadOfClock: "保存的记录时间晚于当前程序时钟；不得据此把当前时钟推到未来或重演未来记录。" } : {}),
-        stateUpdatedAt: snapshot.stateUpdatedAt, stateVersion: snapshot.sequence,
-        deviceAuthority: { platformChat: "external_tools_only", software: app && virtual ? "virtual_app_request_only" : "device_tools_only", worldProseIsNotPlatformEvidence: true },
-        ...(retainedFiles.body ? { retainedDeviceRecords: "旧虚构文件记录的边界不明确，已隐藏并由程序原样保留。worldState输入与输出均只写物理世界段，不能补写文件原文或猜测隐藏段的场景。程序会把已有文件原样接回保存。" } : {}),
-        worldState: app ? projectWorldDeviceContext(retainedFiles.prose, { virtualApp: virtual }) : projectCurrentTime(projectWorldDeviceContext(retainedFiles.prose, { virtualApp: virtual }), timeAuthority), actors: Object.values(actors).filter(a => a.present || a.id === options.actorId).map(a => ({ id: a.id, name: a.name, present: a.present, state: currentProse(a.state), perception: currentProse(a.perception), ...(a.persona !== undefined ? { persona: a.persona } : {}) })), pendingActions: Object.values(snapshot.actions).filter(a => a.status === "pending" && !detectDeviceRequest(a.intent)) }) });
-      const result = await abortable(this.infer(messages, [worldResolutionTool(options.kind === "initialize")], options.signal), options.signal);
+      const result = await abortable(this.infer(messages, [worldResolutionTool(options.kind === "initialize", options.kind === "evolve")], options.signal), options.signal);
       options.signal?.throwIfAborted();
-      messages.push({ role: "assistant", content: result.content, ...(result.toolCalls.length ? { tool_calls: result.toolCalls } : {}) });
       let input: Resolution;
       let updates: Record<string, NarrativeActor>;
+      let evolution: NarrativeEvolution | undefined;
       try {
-        const call = result.toolCalls.length === 1 ? result.toolCalls[0] : undefined;
-        if (!call || call.function.name !== "resolve_world") throw new Error("请且仅调用一次resolve_world提交自然语言裁定。");
-        input = parseResolution(JSON.parse(call.function.arguments), options); updates = { ...options.actors };
+        const parsed = parseWorldResponse(result);
+        input = parseResolution(parsed.value, options); updates = { ...options.actors };
+        debug.emit("world.tool", "世界响应已解析，正在校验", { source: options.kind, attempt: attempt + 1, format: parsed.format, committed: false });
+        if (input.phoneState !== undefined && !canUpdatePhone) throw new Error("PHONE_PHYSICAL_AUTHORITY: 本次任务无权修改常驻角色手机物理状态；访客、应用或异世界任务须省略phoneState。");
+        if (input.phoneState?.location) assertCurrentTime(input.phoneState.location, timeAuthority, "phoneState.location");
         if (input.outcome?.status === "ongoing" && options.action!.expectedEnd <= timeAuthority.tu) throw new Error("预计结算时间在当前时刻或之前，不能返回ongoing。请裁定当下实际结果，或在需要下一步决定时返回needs_input，不得虚构未来完成。");
         // Judge against the time actually supplied to this inference. A slow call crossing
         // midnight must not invalidate a correct sampled date; the next request samples a
         // new present, and old present-date labels are then isolated in its state projection.
         for (const actor of input.actorStates ?? []) assertCurrentTime(actor.state, timeAuthority, `actorStates[${actor.actorId}]`, options.action?.speech);
+        for (const effect of input.actorEffects ?? []) assertCurrentTime(effect.state, timeAuthority, `actorEffects[${effect.actorId}]`);
+        for (const change of input.externalChanges ?? []) assertCurrentTime(change.description, timeAuthority, `externalChanges[${change.id}]`);
         if (input.worldState !== undefined) assertCurrentTime(virtual ? splitVirtualFileBody(input.worldState).prose : input.worldState, timeAuthority, "worldState", options.action?.speech);
         if (!app) for (const perception of input.perceptions) {
           assertCurrentTime(perception.text, timeAuthority, `perceptions[${perception.actorId}]`, options.action?.speech);
@@ -430,7 +492,22 @@ export class NarrativeWorld {
             assertCurrentTime(text, timeAuthority, `perceptions[${perception.actorId}].opportunities[${index}].${field}`);
           }
         }
+        const proposedWorldState = input.worldState;
         assertDeviceResolution(input, { virtual, app, task, previousWorld: snapshot.worldState, speech: options.action?.speech });
+        for (const p of input.perceptions) if (!actors[p.actorId]?.present) throw new Error("感知接收者必须是本次输入列出的在场角色。");
+        if (options.kind === "evolve") {
+          if (input.actorStates !== undefined || input.outcome !== undefined) throw new Error("EVOLUTION_ACTOR_AUTHORITY: 外部演化不能填写actorStates或outcome；受控角色保持原状态，只有本轮外部原因确实造成的客观影响可填actorEffects。");
+          const normalized = normalizeWorldEvolution({ ...input, worldState: proposedWorldState }, { storedWorldState: snapshot.worldState, projectedWorldState });
+          evolution = normalized.evolution;
+          // A quiet echo is only an acknowledgement of the read projection.
+          // Validate the original proposal first, then restore untouched persisted state.
+          if (normalized.quiet) input.worldState = undefined;
+          else if (proposedWorldState === undefined || proposedWorldState === projectedWorldState) input.worldState = normalized.worldState;
+          for (const effect of input.actorEffects ?? []) {
+            const actor = actors[effect.actorId]; if (!actor?.present) throw new Error("外部身体影响接收者必须是本次输入列出的在场角色。");
+            updates[actor.id] = { ...actor, state: effect.state };
+          }
+        }
         if (options.kind === "app_observe" && (input.worldState !== undefined || input.actorStates !== undefined || input.outcome !== undefined || input.perceptions.some(p => p.actorId !== options.actorId))) throw new Error("应用只读请求只能返回该角色的感知，不能修改状态、执行操作或投递其他角色。");
         if (options.kind === "app_action" && (input.actorStates !== undefined || !input.outcome || input.perceptions.some(p => p.actorId !== options.actorId))) throw new Error("应用操作必须返回明确outcome及本角色私有回执，不能修改角色状态或投递其他角色。");
         if (options.kind === "app_action" && input.worldState === undefined) throw new Error("应用操作必须显式返回worldState全文；没有状态变化时返回原文，不能只声明应用结果而不保存世界事实。");
@@ -438,7 +515,6 @@ export class NarrativeWorld {
           const actor = actors[update.actorId]; if (!actor || (!actor.present && update.actorId !== options.actorId)) throw new Error("不能更新本次输入之外的角色身份。");
           updates[actor.id] = { ...actor, state: update.state };
         }
-        for (const p of input.perceptions) if (!actors[p.actorId]?.present) throw new Error("感知接收者必须是本次输入列出的在场角色。");
         const primary = input.perceptions.find(p => p.actorId === options.actorId);
         if (["initialize", "action", "observe", "app_observe", "app_action", "arrive"].includes(options.kind) && !primary) throw new Error("必须向操作角色提供可读实际感知，不能只更新后台状态。");
         if (options.kind === "initialize") {
@@ -450,11 +526,14 @@ export class NarrativeWorld {
         options.signal?.throwIfAborted();
         debug.emit("world.tool", "自然语言裁定·校验失败", { source: options.kind, attempt: attempt + 1, error: String(error) }, "warn");
         if (attempt === 2) throw error;
-        const feedback = JSON.stringify({ committed: false, error: String(error), instruction: "结果未保存和交付，请修正协议与角色边界，重新提交完整自然语言结果及需要更新的状态全文。上次提案没有发生。" });
-        if (result.toolCalls.length) for (const call of result.toolCalls) messages.push({ role: "tool", tool_call_id: call.id, content: feedback });
-        else messages.push({ role: "user", content: feedback });
+        const feedback = JSON.stringify({ committed: false, attempt: attempt + 1, error: String(error).slice(0, 1200),
+          instruction: "上次提案未发生。依据最初的任务和状态修正上述字段，重新提交一个完整resolve_world；perceptions每项的text是必填正文，situation不能替代text。" + (options.kind === "evolve" ? "没有实际外部变化时perceptions:[]并省略worldState。" : "保留本次任务所需的角色感知、结果与状态字段。") });
+        // Raw responses remain in the call audit. Do not send malformed native arguments
+        // back to the provider, nor multiply a large failed world proposal in the prefix.
+        messages.push({ role: "assistant", content: "本次裁定未通过校验，尚未保存或交付。" }, { role: "user", content: feedback });
         continue;
       }
+      options.onValidated?.({ nextIntervalTU: input.nextIntervalTU, attempts: attempt + 1 });
       // Storage errors are not model errors and must not trigger another inference/side effect.
       const primary = input.perceptions.find(p => p.actorId === options.actorId);
       if (options.kind === "app_action") return store.commit({ idempotencyKey: `${options.id}:commit`, expectedSequence: snapshot.sequence, source: "app_action", actorId: options.actorId,
@@ -463,7 +542,8 @@ export class NarrativeWorld {
       }, { signal: options.signal });
       const worldChanged = input.worldState !== undefined && input.worldState !== snapshot.worldState;
       const actorChanged = Object.values(updates).some(a => JSON.stringify(a) !== JSON.stringify(snapshot.actors[a.id]));
-      if (options.kind === "evolve" && !worldChanged && !actorChanged && !input.perceptions.length) return undefined;
+      const phoneChanged = input.phoneState !== undefined && JSON.stringify(input.phoneState) !== JSON.stringify(snapshot.phoneState);
+      if (options.kind === "evolve" && !evolution && !worldChanged && !actorChanged && !phoneChanged && !input.perceptions.length) return undefined;
       const observing = options.kind === "observe" || options.kind === "app_observe";
       const stateSource = snapshot.stateSequence ? store.readEvents(snapshot.stateSequence - 1, 1)[0]?.id : undefined;
       if (options.kind === "app_observe") {
@@ -476,16 +556,19 @@ export class NarrativeWorld {
         }] };
       }
       const previousPerception = observing ? store.readPerceptions(options.actorId!).at(-1) : undefined;
-      if (observing && !worldChanged && !actorChanged && input.perceptions.length === 1 && primary!.text === actors[options.actorId!]!.perception &&
+      if (observing && !worldChanged && !actorChanged && !phoneChanged && input.perceptions.length === 1 && primary!.text === actors[options.actorId!]!.perception &&
         primary!.situation === previousPerception?.situation && JSON.stringify(primary!.opportunities) === JSON.stringify(previousPerception?.opportunities)) return undefined;
-      const perceptions = input.perceptions.map(p => ({ ...p, ...(observing && !worldChanged && !actorChanged ? { sourceEventIds: stateSource ? [stateSource] : [] } : {}) }));
+      const perceptions = input.perceptions.map(({ changeIds: _changeIds, ...p }) => ({ ...p, ...(observing && !worldChanged && !actorChanged && !phoneChanged ? { sourceEventIds: stateSource ? [stateSource] : [] } : {}) }));
       const ongoing = input.outcome?.status === "ongoing";
       const action: NarrativeAction | undefined = options.action ? { ...options.action, status: ongoing ? "pending" : input.outcome!.status as NarrativeAction["status"], phase: ongoing ? "ongoing" : "finished",
         ...(!ongoing ? { finishedAt: Math.max(this.clock.now(), snapshot.effectiveAt) } : {}), ...(input.outcome!.reason ? { reason: input.outcome!.reason } : {}) } : undefined;
       const phase: ActionCommitPhase = ongoing ? "start" : "finish";
       return store.commit({ idempotencyKey: `${options.id}:${ongoing ? "ongoing" : "commit"}`, expectedSequence: snapshot.sequence, source: options.kind, ...(options.actorId ? { actorId: options.actorId } : {}), ...(options.action ? { actionId: options.action.id, actionPhase: phase } : {}),
         ...(options.kind === "initialize" ? { initialized: true } : {}), ...(input.worldState !== undefined ? { worldState: input.worldState } : {}), actors: updates, perceptions,
-        ...(action ? { actions: { [action.id]: action } } : {}) }, { signal: options.signal, beforeCommit: options.beforeCommit ? () => options.beforeCommit!(phase) : undefined });
+        ...(input.phoneState !== undefined ? { phoneState: input.phoneState } : {}),
+        ...(evolution ? { evolution } : {}),
+        ...(action ? { actions: { [action.id]: action } } : {}) }, { signal: options.signal,
+          beforeCommit: () => (input.phoneState === undefined || this.phoneAuthorityProvider()) && (options.beforeCommit?.(phase) ?? true) });
     }
     return undefined;
   }
@@ -528,6 +611,7 @@ function assertDeviceResolution(input: Resolution, context: { virtual: boolean; 
     if (found) throw new Error(`${found.code}: ${field}：${found.message} 违规片段：${JSON.stringify(Array.from(found.excerpt).slice(0, 180).join(""))}。该字段未提交。只保留可裁定的物理事实，不得改写、续写或复用旧设备断言。`);
   };
   const previousFile = context.virtual ? splitVirtualFileBody(context.previousWorld).body : "";
+  if (input.phoneState?.location) reject("phoneState.location", input.phoneState.location);
   for (const perception of input.perceptions) {
     // Literal simulated file data may itself discuss messages. It is not a platform receipt.
     const plain = perception.text.replace(/^\s*\d+\s+(?:[|│]\s*)?/gm, "").trim();
@@ -547,6 +631,8 @@ function assertDeviceResolution(input: Resolution, context: { virtual: boolean; 
     }
   }
   for (const actor of input.actorStates ?? []) reject(`actorStates[${actor.actorId}]`, actor.state);
+  for (const effect of input.actorEffects ?? []) reject(`actorEffects[${effect.actorId}]`, effect.state);
+  for (const change of input.externalChanges ?? []) reject(`externalChanges[${change.id}]`, change.description);
   if (input.worldState !== undefined) {
     const next = context.virtual ? splitVirtualFileBody(input.worldState) : { prose: input.worldState, body: "" };
     if (next.body && !context.app && next.body !== previousFile) throw new Error("WORLD_DEVICE_BOUNDARY: 普通世界裁定不能创建或改写虚构文件原文，请通过对应应用操作。已有原文须逐字保留。");
@@ -568,15 +654,20 @@ function assertDeviceResolution(input: Resolution, context: { virtual: boolean; 
 }
 function parseResolution(value: unknown, options: Change): Resolution {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("resolve_world参数必须是对象。");
-  const input = value as Resolution, allowed = new Set(["worldState", "actorStates", "perceptions", "outcome", ...(options.kind === "initialize" ? ["botName"] : [])]);
+  const input = value as Resolution, allowed = new Set(["worldState", "phoneState", "actorStates", "perceptions", "outcome", ...(options.kind === "initialize" ? ["botName"] : []), ...(options.kind === "evolve" ? ["externalChanges", "actorEffects", "phoneChangeIds", "nextIntervalTU"] : [])]);
   if (Object.keys(input).some(key => !allowed.has(key))) throw new Error("请使用自然语言状态与perceptions，不接受实体operations或未声明字段。");
+  if (input.nextIntervalTU !== undefined && (typeof input.nextIntervalTU !== "number" || !Number.isFinite(input.nextIntervalTU) || input.nextIntervalTU <= 0)) throw new Error("nextIntervalTU必须是大于0的有限数；它只建议下次心跳间隔，不推进本轮时钟。");
   const prose = (text: unknown) => typeof text === "string" && !!text.trim() && text.length <= 200_000;
   if (input.worldState !== undefined && !prose(input.worldState)) throw new Error("worldState必须是非空自然语言全文。");
+  if (input.phoneState !== undefined && !validPhonePhysicalState(input.phoneState)) throw new Error("phoneState必须完整包含reachable、location、usable、perceptible；仅物理位置可为null，其余为布尔值，不能添加消息或软件字段。");
   if (!Array.isArray(input.perceptions) || input.perceptions.length > 100) throw new Error("perceptions必须是数组。");
   const addressed = new Set<string>();
-  for (const p of input.perceptions) {
-    if (!p || typeof p.actorId !== "string" || !prose(p.text) || Object.keys(p).some(k => !["actorId", "text", "situation", "opportunities"].includes(k)) || addressed.has(p.actorId)) throw new Error("每个接收者只能有一份非空感知文本及可选situation、opportunities。");
-    if (!validNarrativePresentation(p)) throw new Error("situation须为1至1200字的可知现状；opportunities最多4项，每项只有label(1至80字)、intent(1至600字)与可选exclusiveGroup(1至80字)。");
+  for (const [index, p] of input.perceptions.entries()) {
+    if (!p || typeof p !== "object" || Array.isArray(p) || typeof p.actorId !== "string" || !p.actorId.trim()) throw new Error(`perceptions[${index}].actorId必须指定在场角色。`);
+    if (!prose(p.text)) throw new Error(`perceptions[${index}].text缺失或无效：须为非空感知正文（最多200000字）；situation或opportunities不能替代text。没有实际感知则移除此项。`);
+    if (Object.keys(p).some(k => !["actorId", "text", "situation", "opportunities", ...(options.kind === "evolve" ? ["changeIds"] : [])].includes(k))) throw new Error(`perceptions[${index}]包含未声明字段。`);
+    if (addressed.has(p.actorId)) throw new Error(`perceptions[${index}].actorId重复：每个接收者只能有一份感知。`);
+    if (!validNarrativePresentation(p)) throw new Error(`perceptions[${index}]的situation须为1至1200字的可知现状；opportunities最多4项，每项只有label(1至80字)、intent(1至600字)与可选exclusiveGroup(1至80字)。`);
     if (["app_observe", "app_action"].includes(options.kind) && (p.situation !== undefined || p.opportunities !== undefined)) throw new Error("应用回执不能填写角色状态栏situation或剧情行动建议opportunities。");
     addressed.add(p.actorId);
   }
@@ -586,6 +677,22 @@ function parseResolution(value: unknown, options: Change): Resolution {
     for (const a of input.actorStates) {
       if (!a || typeof a.actorId !== "string" || !prose(a.state) || Object.keys(a).some(k => !["actorId", "state"].includes(k)) || ids.has(a.actorId)) throw new Error("角色状态必须是注册身份对应的完整自然语言正文。");
       ids.add(a.actorId);
+    }
+  }
+  if (input.externalChanges !== undefined) {
+    if (!Array.isArray(input.externalChanges) || input.externalChanges.length > 100) throw new Error("externalChanges必须是本轮外部变化列表。");
+    for (const [index, change] of input.externalChanges.entries()) {
+      if (!change || typeof change !== "object" || Array.isArray(change) || typeof change.id !== "string" || !change.id.trim() || change.id.length > 80) throw new Error(`externalChanges[${index}].id必须是1至80字的本轮原因标识。`);
+      if (!prose(change.description)) throw new Error(`externalChanges[${index}].description必须是非空外部经过。`);
+      if (Object.keys(change).some(key => !["id", "description"].includes(key))) throw new Error(`externalChanges[${index}]只接受id与description。`);
+    }
+  }
+  if (input.actorEffects !== undefined) {
+    if (!Array.isArray(input.actorEffects) || input.actorEffects.length > 100) throw new Error("actorEffects必须是本轮外部身体影响列表。");
+    for (const [index, effect] of input.actorEffects.entries()) {
+      if (!effect || typeof effect !== "object" || Array.isArray(effect) || typeof effect.actorId !== "string" || !effect.actorId.trim()) throw new Error(`actorEffects[${index}].actorId必须指定在场角色。`);
+      if (!prose(effect.state)) throw new Error(`actorEffects[${index}].state必须是完整非空客观状态。`);
+      if (Object.keys(effect).some(key => !["actorId", "changeIds", "state"].includes(key))) throw new Error(`actorEffects[${index}]只接受actorId、state与changeIds。`);
     }
   }
   if (input.botName !== undefined && (typeof input.botName !== "string" || !input.botName.trim() || input.botName.length > 64)) throw new Error("botName必须是1到64字的名字。");

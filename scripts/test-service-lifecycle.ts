@@ -39,7 +39,7 @@ async function fixture() {
   }
   const service: any = Object.create(WorldService.prototype);
   Object.assign(service, { files, world, logger, promptStore: new Prompts(), phoneStatus: { down: false },
-    focus: { async clear() {}, async load() {} }, notifyMgr: { async reset() {}, async load() {} },
+    focus: { async clear() {}, async load() {} }, notifyMgr: { async reset() {}, async load() {}, async clearMessages() {} },
     store: { async clear() { counts.clears++; } }, deviceTail: Promise.resolve(),
     clock: { async reset() { counts.clockResets++; }, async pause() { counts.pauses++; }, async resume() {}, timeLine: () => "T10", async load() {} },
     pinnedToolsText: () => "", worldActive: false, bot: null,

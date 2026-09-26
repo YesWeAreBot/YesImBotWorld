@@ -9,7 +9,7 @@ declare module "koishi" {
   }
 }
 
-/** 收藏夹条目的元数据（描述由 Bot 在收藏/整理时亲自撰写，供日后挑图使用） */
+/** 收藏夹条目的元数据（备注由角色自愿记录，供自己日后选用，不是媒体识别结果） */
 export interface WorldGalleryRow {
   id: number;
   /** 分类（= gallery 下的子目录名） */
@@ -18,7 +18,7 @@ export interface WorldGalleryRow {
   name: string;
   /** 文件内容哈希：用户手动移动/改名文件后靠它找回描述 */
   sha256: string;
-  /** Bot 写下的描述（内容、梗、情绪、适用场景） */
+  /** 角色自己的选用备注；不代表原作者/发送者的情绪或意图 */
   description: string;
   createdAt: Date;
 }
@@ -27,7 +27,7 @@ export interface WorldGalleryRow {
 export const MAIN_CATEGORIES = ["表情包", "meme", "截图", "照片"] as const;
 /** 表情包分类：此分类下的图片发送时应作为平台表情（而非普通图片）呈现 */
 export const STICKER_CATEGORY: string = MAIN_CATEGORIES[0];
-/** 暂未描述/分类：用户手动丢进收藏夹的东西先待在这里，等 Bot 有空整理 */
+/** 暂未分类的存放位置，不构成必须完成的整理任务 */
 export const UNSORTED_CATEGORY = "未整理";
 export const ALL_CATEGORIES: readonly string[] = [...MAIN_CATEGORIES, UNSORTED_CATEGORY];
 

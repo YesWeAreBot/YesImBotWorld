@@ -16,8 +16,15 @@ import smokeAttachments from './webui-smoke-attachments.mjs';
 import smokeLayout from './webui-smoke-layout.mjs';
 import smokeNotes from './webui-smoke-notes.mjs';
 import smokeNarrative from './webui-smoke-narrative.mjs';
-import smokeRegulation from './webui-smoke-regulation.mjs';
+import smokeGrowth from './webui-smoke-growth.mjs';
 import smokeLlmConfig from './webui-smoke-llm-config.mjs';
+import smokePhoneShell from './webui-smoke-phone-shell.mjs';
+import smokePhoneApps from './webui-smoke-phone-apps.mjs';
+import smokePhoneSetup from './webui-smoke-phone-setup.mjs';
+import smokeNotifications from './webui-smoke-notifications.mjs';
+import smokeActionMenu from './webui-smoke-action-menu.mjs';
+import smokeBrowserLibrary from './webui-smoke-browser-library.mjs';
+import smokeHeartbeat from './webui-smoke-heartbeat.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const children = [];
@@ -83,7 +90,7 @@ try {
   };
   const wait = async expression => {
     for (let i = 0; i < 100; i++) { if (await evaluate(expression)) return; await delay(100); }
-    throw new Error('Condition timed out: ' + expression + '\n' + await evaluate('document.querySelector("main")?.innerText.slice(0,1000)'));
+    throw new Error('Condition timed out: ' + expression + '\n' + await evaluate('document.querySelector("main")?.innerText.slice(0,1000)') + '\n' + errors.join('\n'));
   };
   const navigate = async route => {
     if (route === 'debug') route = 'live';
@@ -99,9 +106,21 @@ try {
   await wait("document.querySelector('.studio-avatar img')?.naturalWidth > 0");
   assert.ok(await evaluate("document.querySelector('.studio-avatar img').alt.includes('样本平台账号')"));
   const helpers = { evaluate, wait, assert, navigate, page };
-  const regulationOnly = process.env.STUDIO_SMOKE_ONLY_REGULATION === '1';
-  if (regulationOnly) { console.log('PASS', await smokeRegulation(helpers)); console.log('PASS', await smokeLlmConfig(helpers)); }
-  if (!regulationOnly) {
+  const growthOnly = process.env.STUDIO_SMOKE_ONLY_GROWTH === '1';
+  const shellOnly = process.env.STUDIO_SMOKE_ONLY_SHELL === '1';
+  const phoneAppsOnly = process.env.STUDIO_SMOKE_ONLY_PHONE_APPS === '1';
+  const playerOnly = process.env.STUDIO_SMOKE_ONLY_PLAYER === '1';
+  const notificationsOnly = process.env.STUDIO_SMOKE_ONLY_NOTIFICATIONS === '1';
+  const browserOnly = process.env.STUDIO_SMOKE_ONLY_BROWSER === '1';
+  const heartbeatOnly = process.env.STUDIO_SMOKE_ONLY_HEARTBEAT === '1';
+  if (heartbeatOnly) console.log('PASS', await smokeHeartbeat(helpers));
+  if (browserOnly) console.log('PASS', await smokeBrowserLibrary(helpers));
+  if (notificationsOnly) console.log('PASS', await smokeNotifications(helpers));
+  if (phoneAppsOnly) { console.log('PASS', await smokePhoneSetup(helpers)); console.log('PASS', await smokePhoneApps(helpers)); }
+  if (shellOnly) console.log('PASS', await smokePhoneShell(helpers));
+  if (growthOnly) { console.log('PASS', await smokeGrowth(helpers)); console.log('PASS', await smokeLlmConfig(helpers)); }
+  if (playerOnly) { console.log('PASS', await smokeJourney(helpers)); console.log('PASS', await smokeCockpit(helpers)); console.log('PASS', await smokeNarrative(helpers)); console.log('PASS', await smokeActionMenu(helpers)); }
+  if (!growthOnly && !shellOnly && !phoneAppsOnly && !playerOnly && !notificationsOnly && !browserOnly && !heartbeatOnly) {
   const routes = ['overview', 'world', 'growth', 'devices', 'player', 'live', 'debug', 'usage', 'state', 'crossing', 'config', 'prompts', 'gallery', 'media', 'data', 'visitors'];
   for (const width of [1440, 768, 375]) {
     await page('Emulation.setDeviceMetricsOverride', { width, height: 1050, deviceScaleFactor: 1, mobile: width < 600 });
@@ -177,16 +196,23 @@ try {
   console.log('PASS login cancellation, command search and theme switch');
   console.log('PASS', await smokeLayout(helpers));
   console.log('PASS', await smokeLive(helpers));
+  console.log('PASS', await smokeHeartbeat(helpers));
   console.log('PASS', await smokeAttachments(helpers));
   console.log('PASS', await smokeCharts(helpers));
   console.log('PASS', await smokeNotes(helpers));
   console.log('PASS', await smokeDevices(helpers));
+  console.log('PASS', await smokeBrowserLibrary(helpers));
   console.log('PASS', await smokeJourney(helpers));
   console.log('PASS', await smokeCockpit(helpers));
   console.log('PASS', await smokeCommands(helpers));
   console.log('PASS', await smokeNarrative(helpers));
-  console.log('PASS', await smokeRegulation(helpers));
+  console.log('PASS', await smokeActionMenu(helpers));
+  console.log('PASS', await smokeGrowth(helpers));
   console.log('PASS', await smokeLlmConfig(helpers));
+  console.log('PASS', await smokePhoneShell(helpers));
+  console.log('PASS', await smokePhoneSetup(helpers));
+  console.log('PASS', await smokePhoneApps(helpers));
+  console.log('PASS', await smokeNotifications(helpers));
   }
   assert.deepEqual(errors, [], 'Browser exceptions or unexpected external requests');
   if (process.env.STUDIO_SCREENSHOT_DIR) {

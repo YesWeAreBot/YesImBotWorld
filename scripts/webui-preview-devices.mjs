@@ -1,9 +1,20 @@
 /** Local, memory-only UI fixtures. Never invokes the world, a platform, a shell, or a network API. */
-export function createDeviceFixture() {
+import { createPhoneAppsFixture } from './webui-preview-phone-apps.mjs';
+export function createDeviceFixture(options = {}) {
   let residentMode = null;
   let paused = false, app = null, phoneDown = false, computerOn = false, channelKey = null;
   let appView = null, computerView = null, nextId = 3;
   const clone = value => JSON.parse(JSON.stringify(value));
+  const phoneApps = options.config ? createPhoneAppsFixture(options.config) : null;
+  let browserRevision = 0;
+  const browserProviders = ['https://search.preview.invalid/?q=%s', 'https://fallback.preview.invalid/?q=%s'];
+  let browserState = {mode:'text',url:'about:blank',title:'开发样本 · 浏览器主页',text:'这是本地浏览器预览，网页操作仅更新内存；不会请求外部网站。',revision:'preview-browser-0',searchProviders:browserProviders,links:[],images:[],videos:[],elements:[]};
+  const browserHistory = [];
+  function browserPage(text, title, url = browserState.url, remember = true) {
+    if (remember) browserHistory.push(clone(browserState));
+    browserState = {...browserState,text,title,url,revision:'preview-browser-'+(++browserRevision),links:[{text:'了解本地开发预览',url:'https://docs.preview.invalid/intro'},{text:'验证真实数据的空白与失败状态',url:'https://docs.preview.invalid/failures'}]};
+    return text;
+  }
   const apps = [
     { id:'chat', name:'消息', kind:'chat', description:'开发预览中的本地消息盒。不会连接或发送到聊天平台。' },
     { id:'weather', name:'天气', kind:'app', description:'开发样本：天气界面的布局验证。' },
@@ -12,6 +23,7 @@ export function createDeviceFixture() {
     { id:'news', name:'新闻', kind:'app', description:'开发样本：新闻界面的布局验证。' },
     { id:'studio_mcp', name:'创意工具', kind:'app', description:'开发样本 MCP：验证类型、枚举和结构化参数表单。' },
   ];
+  const installedApps = () => apps.concat(phoneApps?.installed() || []);
   let noteTime = 40;
   const noteStamp = value => ({label:'预览世界（T='+value+'.0）',value,clock:'world',source:'recorded'});
   const notes = [
@@ -38,24 +50,27 @@ export function createDeviceFixture() {
     const byApp = {
       chat:[tool('check_msg','查看消息列表',{n:number('数量')},[],'read'),tool('select_channel','进入会话',{id:string('频道 key')},['id'],'read'),tool('read_channel','读取消息',{n:number('数量')},[],'read'),...(channelKey?[tool('send','向本地内存发送消息',{msg:string('消息'),id:string('频道')},['msg'],'send')]:[])],
       weather:[tool('query_weather','查询开发天气样本',{city:string('城市或地区')},[],'read')],
-      browser:[tool('search','搜索开发样本',{query:string('搜索词')},['query'],'read'),tool('open_url','打开开发样本文档',{url:string('网址')},['url'],'read'),tool('open_link','打开编号链接',{n:number('链接编号')},['n'],'read'),tool('go_back','返回'),tool('scroll_down','下一屏'),tool('screenshot','截图：开发预览不生成截图')],
+      browser:[tool('search','搜索开发样本',{query:string('搜索词'),provider:{type:'integer',minimum:0}},['query'],'read'),tool('open_url','打开开发样本文档',{url:string('网址')},['url'],'read'),tool('open_link','打开编号链接',{n:number('链接编号')},['n'],'read'),tool('home','返回开发主页'),tool('go_back','返回'),tool('reload','刷新缓存样本'),tool('read_page','重新读取缓存页面',{},[],'read'),tool('scroll_down','下一屏'),tool('screenshot','截图：开发预览不生成截图')],
       notes:[tool('list_notes','列出笔记',{},[],'read'),tool('view_note','查看笔记',{title:string('标题')},['title'],'read'),tool('write_note','写笔记',{title:string('标题'),content:string('正文')},['title','content']),tool('edit_note','修改笔记',{title:string('原标题'),new_title:string('新标题'),content:string('正文')},['title']),tool('delete_note','删除笔记',{title:string('标题')},['title'])],
       news:[tool('headlines','查看开发头条',{n:number('数量')},[],'read'),tool('search_news','搜索开发新闻',{keyword:string('关键词')},['keyword'],'read'),tool('open_news','打开开发文章',{n:number('编号')},['n'],'read')],
       studio_mcp:[tool('compose_palette','把结构化参数作为开发样本回显',{title:{type:'string',title:'作品名称'},style:{type:'string',enum:['自然','明亮','安静'],default:'自然'},count:{type:'integer',minimum:1,maximum:8,default:3},include_notes:{type:'boolean',default:true},colors:{type:'array',items:{type:'string'},description:'颜色名称数组，例如 ["苔绿", "暖白"]'},options:{type:'object',properties:{contrast:{type:'number',minimum:0,maximum:1,default:0.5}}}},['title','style'])],
     };
-    return core.concat(byApp[app] || []);
+    return core.concat(byApp[app] || phoneApps?.tools(app) || []);
   }
   function snapshot() {
-    return clone({running:true,control:{paused,residentMode,busy:false,deviceBusy:false,attention:null},devices:{computer:{effectiveMode:'docker',mode:'docker',on:computerOn?'开发终端':null,docker:{exists:true,running:computerOn,status:computerOn?'running':'stopped',name:'开发预览 · 内存模拟',image:'仅布局测试 / 不创建 Docker 容器'},remote:null},phone:{down:phoneDown,appOpen:app && app!=='chat'?apps.find(a=>a.id===app)?.name:null,chatOpen:app==='chat',channelKey,channelIsGroup:channelKey==='fixture:studio',chatAppName:'消息',resolution:{width:390,height:754}}},apps:apps.map(a=>({...a,active:a.id===app})),tools:tools(),appView,computerView,chat:{channelKey,channels:channels.map(c=>({...c,latest:messages.filter(m=>m.channelKey===c.key).at(-1)})),messages:messages.filter(m=>m.channelKey===channelKey)}});
+    const installed = installedApps().map(a => ({ ...a, active: a.id === app })), running = options.running ? options.running() : true;
+    const currentState = phoneApps?.state(app);
+    return clone({running,control:{paused,residentMode,busy:false,deviceBusy:false,attention:null},devices:{computer:{effectiveMode:'docker',mode:'docker',on:computerOn?'开发终端':null,docker:{exists:true,running:computerOn,status:computerOn?'running':'stopped',name:'开发预览 · 内存模拟',image:'仅布局测试 / 不创建 Docker 容器'},remote:null},phone:{down:phoneDown,appOpen:app && app!=='chat'?installed.find(a=>a.id===app)?.name:null,chatOpen:app==='chat',channelKey,channelIsGroup:channelKey==='fixture:studio',chatAppName:'消息',resolution:{width:390,height:754}}},apps:running?installed:[],...(options.catalog?{appCatalog:options.catalog(options.config(),installed,running)}:{}),tools:running?tools():[],appView:appView&&currentState?{...appView,state:currentState}:appView,computerView,chat:{channelKey,channels:channels.map(c=>({...c,latest:messages.filter(m=>m.channelKey===c.key).at(-1)})),messages:messages.filter(m=>m.channelKey===channelKey)}});
   }
   const headlines = '开发样本 · 本地预览资讯\n\n[1] 设备工作台界面进入交互验证\n暖白工作室、手机应用与终端布局现在可以在本地预览。\n\n[2] 所有样本工具只在内存中运行\n这个测试不会启动模型，也不会向外部发送消息。';
   function result(text, name) {
     if (name==='run_command') computerView={lastTool:name,result:text};
-    else if (app) appView={id:app,name:apps.find(a=>a.id===app)?.name || app,lastTool:name,result:text};
+    else if (app) appView={id:app,name:installedApps().find(a=>a.id===app)?.name || app,lastTool:name,result:text,...(app==='browser'?{state:clone(browserState)}:{}),...(phoneApps?.state(app)?{state:phoneApps.state(app)}:{})};
     return {ok:true,text};
   }
   return {
     session:snapshot,
+    phoneCalls: () => clone(phoneApps?.calls || []),
     resident:mode => { residentMode=mode; paused=mode === "avatar"; return snapshot().control; },
     notes:() => ({notes:clone(notes)}),
     control:body => {paused=!!body.paused;return {ok:true,paused,busy:false,text:paused?'已接管本地开发样本设备。':'已交还本地开发样本设备。'};},
@@ -65,15 +80,17 @@ export function createDeviceFixture() {
       if (!residentMode && mode === 'takeover' && !paused) return {ok:false,text:'请先强制接管本地预览设备。'};
       if (!residentMode && mode === 'stealth' && ['pick_up_phone','put_down_phone','pick_media'].includes(body.name)) return {ok:false,text:'偷偷操作不能代替角色身体动作或接续其草稿。'};
       const name=body.name,args=body.args || {};
+      if (options.running && !options.running()) return {ok:false,text:'开发世界未运行，尚未操作。'};
       if (!tools().some(t=>t.name===name)) return {ok:false,text:'当前工具不可用。'};
       if (name==='send' && !body.confirmSend) return {ok:false,text:'请明确点击发送。'};
+      if (phoneApps?.handles(name)) return result(phoneApps.call(name,args),name);
       switch(name) {
         case 'open_app': {
-          const found=apps.find(a=>a.id===args.name || a.name===args.name);
+          const found=installedApps().find(a=>a.id===args.name || a.name===args.name);
           if(!found)return {ok:false,text:'没有这个预览应用。'};
           app=found.id;phoneDown=false;if(app!=='chat')channelKey=null;
           const opening=app==='news'?headlines:app==='notes'?'开发样本记事本，共 '+notes.length+' 篇笔记。':'开发预览 · '+found.name+'\n请选择一项操作。';
-          appView={id:app,name:found.name,opening};return {ok:true,text:opening};
+          appView={id:app,name:found.name,opening,...(app==='browser'?{state:clone(browserState)}:{})};return {ok:true,text:opening};
         }
         case 'close_app':app=null;appView=null;channelKey=null;return {ok:true,text:'已关闭预览应用。'};
         case 'pick_up_phone':phoneDown=false;return {ok:true,text:'已拿起预览手机。'};
@@ -90,9 +107,19 @@ export function createDeviceFixture() {
           messages.push({id:nextId,messageId:'fixture-'+nextId++,channelKey:key,userId:'preview-bot',username:'预览 Bot',content:String(args.msg),timestamp:new Date().toISOString(),self:true});return result('已添加到本地内存，未发送到外部平台。',name);
         }
         case 'query_weather':return result('天气 · '+(args.city || '开发样本城市')+'（开发样本）\n现在：多云，23°C（体感 24°C），湿度 62%，风速 8 km/h\n今天：多云，18~25°C，降水概率 20%\n明天：小雨，17~22°C，降水概率 70%\n后天：晴，16~24°C，降水概率 10%',name);
-        case 'search':case 'open_url':case 'open_link':return result('开发样本 · 阅读器\n\n'+String(args.query || args.url || '链接 '+args.n)+'\n\n这里是供页面布局验证的本地内容，不是网络搜索结果。\n\n[1] 了解本地开发预览\n[2] 验证真实数据的空白与失败状态',name);
-        case 'scroll_down':return result('开发样本 · 下一屏\n\n这段本地内容用于测试长页面的阅读体验。已经到达文档末尾。',name);
-        case 'go_back':return result('开发样本 · 返回阅读器首页。',name);
+        case 'search':case 'open_url':case 'open_link': {
+          const provider = Number.isInteger(args.provider) ? args.provider : 0;
+          if (name==='search' && (!String(args.query||'').trim() || !browserProviders[provider])) return {ok:false,text:'搜索词或搜索入口无效。'};
+          const link = name==='open_link' ? browserState.links[Number(args.n)-1] : null;
+          if (name==='open_link' && !link) return {ok:false,text:'链接编号不存在。'};
+          const url = name==='search' ? browserProviders[provider].replace('%s',encodeURIComponent(args.query)) : name==='open_link' ? link.url : String(args.url);
+          if (!/^https?:\/\//.test(url)) return {ok:false,text:'只接受 HTTP(S) 开发样本地址。'};
+          return result(browserPage('开发样本 · 阅读器\n\n'+String(args.query || url)+'\n\n这里是供页面布局验证的本地内容，不是网络搜索结果。\n\n[1] 了解本地开发预览\n[2] 验证真实数据的空白与失败状态','开发样本 · 阅读器',url),name);
+        }
+        case 'home':return result(browserPage('这是本地开发预览浏览器主页。不会访问外部网站。','开发样本 · 浏览器主页','about:blank'),name);
+        case 'read_page':case 'reload':return result(browserPage(browserState.text+'\n已重新读取当前缓存样本。',browserState.title,browserState.url,false),name);
+        case 'scroll_down':return result(browserPage('开发样本 · 下一屏\n\n这段本地内容用于测试长页面的阅读体验。已经到达文档末尾。','开发样本 · 下一屏',browserState.url,false),name);
+        case 'go_back':{const previous=browserHistory.pop();if(previous)browserState={...previous,revision:'preview-browser-'+(++browserRevision)};return result(browserState.text,name);}
         case 'screenshot':return {ok:false,text:'开发预览没有浏览器截图服务，不生成模拟截图。'};
         case 'list_notes':return result(notes.map(n=>n.title).join('\n') || '还没有笔记。',name);
         case 'view_note':{const note=notes.find(n=>n.title===args.title);return note?result(note.content,name):{ok:false,text:'笔记不存在。'};}

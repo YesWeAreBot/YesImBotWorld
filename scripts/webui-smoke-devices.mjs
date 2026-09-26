@@ -42,8 +42,8 @@ export async function smokeDevices({ evaluate, wait, assert, navigate }) {
     await wait("document.querySelector('[data-device-control]')?.getAttribute('aria-label')==='强制接管'");
   }
   await evaluate("document.querySelector('.app-back')?.click()");
-  await check("document.querySelectorAll('.phone-app-tile').length===6 && Array.from(document.querySelectorAll('.phone-app-tile')).every(n=>!n.disabled)",
-    'Stealth mode makes the six fixture apps usable without pausing Bot');
+  await check("document.querySelectorAll('.phone-app-tile').length===9 && Array.from(document.querySelectorAll('.phone-app-tile')).every(n=>!n.disabled)",
+    'Desktop exposes all installed and configurable apps without pausing Bot');
   await check("fetch('/api/device/session').then(r=>r.json()).then(r=>r.control.paused===false)", 'Default mode leaves autonomous use running');
 
   await openApp('消息', 'chat');
@@ -70,10 +70,25 @@ export async function smokeDevices({ evaluate, wait, assert, navigate }) {
 
   await openApp('浏览器', 'browser');
   const query = `本地阅读器 ${stamp}`;
-  await fill('.app-browser-address input', query);
-  await submit('.app-browser-address');
-  await wait(`document.querySelector('.app-browser-page').textContent.includes(${quote(query)})`);
-  await check("document.querySelector('.app-browser-page').textContent.includes('不是网络搜索结果')", 'Browser displays the local reader result');
+  await fill('.browser-search', query);
+  await fill('.browser-provider', '1');
+  await evaluate("document.querySelector('.browser-search-form').requestSubmit()");
+  await wait(`document.querySelector('.browser-page-text').textContent.includes(${quote(query)})`);
+  await check("document.querySelector('.browser-page-text').textContent.includes('不是网络搜索结果')", 'Browser displays the local reader result');
+  await check(`fetch('/api/device/session').then(r=>r.json()).then(r=>r.appView.lastTool==='search' && r.appView.state.url==='https://fallback.preview.invalid/?q='+encodeURIComponent(${quote(query)}))`, 'Search uses the selected provider and the actual search(query, provider) tool contract');
+  const documentUrl = `https://docs.preview.invalid/page?test=${stamp}`;
+  await wait("!document.querySelector('.browser-address').disabled");
+  await fill('.browser-address', documentUrl);
+  await evaluate("document.querySelector('.browser-address-form').requestSubmit()");
+  await wait(`document.querySelector('.browser-page-text').textContent.includes(${quote(documentUrl)})`);
+  await check(`fetch('/api/device/session').then(r=>r.json()).then(r=>r.appView.lastTool==='open_url' && r.appView.state.url===${quote(documentUrl)})`, 'Address navigation follows open_url rather than treating URLs as search queries');
+  await wait("!document.querySelector('.browser-search').disabled");
+  await evaluate(`window.__browserDraft=document.querySelector('.browser-search');__browserDraft.value='输入法里的未提交草稿';__browserDraft.focus();__browserDraft.setSelectionRange(3,3);__browserDraft.dispatchEvent(new CompositionEvent('compositionstart',{data:'草'}));
+    api('POST','/api/device/tool',{name:'read_page',args:{},mode:'stealth'});`);
+  await wait("document.querySelector('.browser-page-text').textContent.includes('已重新读取当前缓存样本')");
+  await check("document.querySelector('.browser-search')===__browserDraft && document.activeElement===__browserDraft && __browserDraft.selectionStart===3 && __browserDraft.value==='输入法里的未提交草稿'", 'Live browser cache polling preserves the input node, focus, caret and composition draft');
+  await evaluate("__browserDraft.dispatchEvent(new CompositionEvent('compositionend',{data:'草'}));delete window.__browserDraft");
+  await check("document.documentElement.scrollWidth <= innerWidth", 'The browser address, provider and reading pane fit the mobile viewport');
 
   await openApp('记事本', 'notes');
   await click('.app-notes-add');

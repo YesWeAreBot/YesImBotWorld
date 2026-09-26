@@ -15,7 +15,7 @@ import { Gateway } from "../src/koishi/gateway.js";
 import { KoishiMessenger, rawGroupConversation } from "../src/koishi/messenger.js";
 import { MessageStore, type WorldMessageRow } from "../src/koishi/messages.js";
 import { OwnSendTracker } from "../src/koishi/ownsends.js";
-import { conversationKind, isStickerElement } from "../src/koishi/conversation.js";
+import { chatMessageEvidence, conversationKind, conversationLabel, describeConversation, isStickerElement } from "../src/koishi/conversation.js";
 import { MediaRenderer } from "../src/media/render.js";
 import { richPartsText } from "../src/media/presentation.js";
 import type { RichText } from "../src/types.js";
@@ -38,10 +38,14 @@ async function main() {
     };
     const store = new MessageStore(ctx);
     const mediaRows = new Map<number, any>();
+    const mediaBySource = new Map<string, number>();
     const media: any = {
       async ingest(_src: string, type: string, _mime: string, _unused: unknown, sticker: boolean) {
+        const prior = mediaBySource.get(_src);
+        if (prior !== undefined) { mediaRows.get(prior).sticker ||= sticker; return prior; }
         const id = mediaRows.size + 1;
         mediaRows.set(id, { ref: { id, type, mime: "image/png", file: "fixture.png" }, sticker });
+        mediaBySource.set(_src, id);
         return id;
       },
       async get(id: number) { return mediaRows.get(id); },
@@ -51,7 +55,7 @@ async function main() {
     const notify: any = { isNotifyChannel: () => allowed, channelStatusText: () => allowed ? "频道通知：开启" : "频道通知：免打扰" };
     const phone = { down: false };
     const names = Object.assign(new ChannelNameResolver(ctx, store), { display: async (key: string) => "朋友群 / " + key });
-    const renderer = new MediaRenderer(media, { describe: async () => "一张用于表达情绪的图" } as any, () => true, 4);
+    const renderer = new MediaRenderer(media, { describe: async () => "猫的简笔画，没有文字" } as any, () => true, 4);
     const messaging = { ...cfg.messaging, externalSelfMessages: "off" as const, notifyPolicy: "content" as const, wakeOnNotify: false };
     const received: { value: RichText; wake: boolean }[] = [];
     let activities = 0;
@@ -67,7 +71,7 @@ async function main() {
     const sticker = h("img", { src: "fixture:never-fetched", sub_type: 1 });
     const plainSticker = await incoming([sticker]);
     assert.equal(received.at(-1)!.wake, true, "focused messages retain configured observation/wake behavior");
-    assert.deepEqual(rows.at(-1)!.conversation, { kind: "group", mentions: [], mentionsEveryone: false, hasText: false, media: ["sticker"] });
+    assert.deepEqual(rows.at(-1)!.conversation, { kind: "group", mentions: [], mentionsEveryone: false, hasText: false, media: ["sticker"], mediaCounts: { sticker: 1 } });
 
     const files = new WorldFiles(path.join(dir, "world")); await files.ensure();
     const prompts = new Prompts({ bot: { constitution: "已有用户覆盖保持不变" }, world: {} });
@@ -88,7 +92,7 @@ async function main() {
     assert.equal(parts[1]!.type, "image_url", "image remains immediately after its sender and conversation header");
     assert.match((parts[0] as any).text, /朋友群.*群聊.*无明确 @.*仅含表情包.*小明.*alice/s);
     assert.match((parts[0] as any).text, /usage="sticker"/);
-    assert.match(plainSticker.text, /表情包（按表情使用）/);
+    assert.match(plainSticker.text, /会话表情包（像 emoji 一样的表意符号/);
     assert.match(context.renderSystemText("T=1"), /已有用户覆盖保持不变/);
     assert.match(context.renderSystemText("T=1"), /群聊是多人共享的场合/);
     assert.match(JSON.stringify(await requestParts(plainSticker, false)), /朋友群.*小明/s);
@@ -99,11 +103,41 @@ async function main() {
     assert.equal(isStickerElement(h("img", { sub_type: 0, file: "vacation.gif", summary: "[动画表情]" })), false);
     const mixedSticker = await incoming([h.text("哈哈"), sticker]);
     assert.match(mixedSticker.text, /附有表情包/);
+    assert.match(mixedSticker.text, /表情与文字共同表意/);
+    const paired = await incoming([h("at", { id: "bob" }), sticker, sticker, h("face", { id: "14", name: "微笑" })]);
+    const pairedRow = rows.at(-1)!;
+    assert.deepEqual(pairedRow.conversation!.mediaCounts, { sticker: 2, face: 1 });
+    assert.match(paired.text, /@ 其他账号 "bob".*仅含表情包×2、平台表情×1.*未附文字/);
+    const pairedWire = JSON.stringify(await requestParts(paired));
+    assert.match(pairedWire, /聊天记录 #.*猫的简笔画/);
+    assert.equal((await requestParts(paired)).filter((part: any) => part.type === "image_url").length, 2, "both occurrences preserve their actual positions inside the same message");
+    assert.deepEqual(paired.parts!.filter(part => part.kind === "media").map(part => part.ref.id), [mediaBySource.get("fixture:never-fetched"), mediaBySource.get("fixture:never-fetched")]);
+    assert.doesNotMatch(paired.text, /发送者.*(?:正在开心|表示已读|喜欢猫|喜欢这张|值得收藏)/, "an image of a cat does not identify the sender's feeling or conversational meaning");
+    const again = await incoming([sticker], { userId: "bob", username: "小李" });
+    const againRow = rows.at(-1)!;
+    assert.notEqual(againRow.id, pairedRow.id);
+    assert.notDeepEqual(again.originEventIds, paired.originEventIds, "identical media sent in a different platform message is a new conversational turn");
+    assert.deepEqual(chatMessageEvidence(againRow).originEventIds, again.originEventIds, "rereading the same stored message has the same evidence identity");
+    assert.match(again.text, new RegExp("聊天记录 #" + againRow.id));
+    const deliveriesBeforeDuplicate = received.length;
+    await gateway.handle({ ...base, messageId: againRow.messageId, userId: "bob", elements: [sticker] });
+    assert.equal(received.length, deliveriesBeforeDuplicate, "a duplicated platform echo is not another sticker reply");
+    const quotedOnly = describeConversation([h("quote", { id: "q1" }, [sticker, h("at", { id: "bot-a" }), h.text("quoted words")]), sticker], "group", isStickerElement);
+    assert.deepEqual(quotedOnly.mediaCounts, { sticker: 1 });
+    assert.deepEqual(quotedOnly.mentions, []);
+    assert.equal(quotedOnly.hasText, false, "quoted text cannot turn a sticker-only reply into a text-plus-sticker message");
+    assert.doesNotMatch(conversationLabel({ kind: "group", mentions: [], mentionsEveryone: false, hasText: false, media: ["sticker"] }), /×\d/, "unknown historical quantity remains unknown");
     const ordinary = await incoming([h("img", { src: "fixture:photo" })]);
     const ordinaryId = mediaRows.size;
     mediaRows.get(ordinaryId).sticker = true; // The same bytes may later be sent as a sticker.
     assert.doesNotMatch((await renderer.render(rows.at(-1)!.content)).text, /usage="sticker"/, "per-message plain-image use survives asset metadata becoming a known sticker");
     assert.doesNotMatch(ordinary.text, /usage="sticker"/);
+    const reusedAsPlain = await incoming([h("img", { src: "fixture:never-fetched", sub_type: 0, file: "cute-cat.gif" })]);
+    assert.equal(reusedAsPlain.parts!.find(part => part.kind === "media")!.ref.id, mediaBySource.get("fixture:never-fetched"));
+    assert.match(reusedAsPlain.text, /仅含图片×1/);
+    assert.doesNotMatch(JSON.stringify(await requestParts(reusedAsPlain)), /usage=\\"sticker\\"/);
+    assert.match(JSON.stringify(await requestParts(plainSticker)), /usage=\\"sticker\\"/, "an earlier sticker occurrence keeps its own usage after the same asset is used as a normal image");
+
     // Exercise the real forwarding dispatch branch while replacing only scheduling and the platform fetch.
     let forwarded: RichText | undefined;
     const forwardingAgent: any = Object.assign(new BotAgent(cfg,
@@ -156,7 +190,7 @@ async function main() {
     assert.deepEqual(rawGroupConversation([
       { type: "at", data: { qq: "bob" } }, { type: "reply", data: { id: "quoted" } },
       { type: "image", data: { sub_type: 1 } }, { type: "forward", data: { content: [{ type: "at", data: { qq: "bot-a" } }] } },
-    ]), { kind: "group", mentions: ["bob"], mentionsEveryone: false, hasText: false, media: ["sticker", "forward"], reply: { messageId: "quoted" } });
+    ]), { kind: "group", mentions: ["bob"], mentionsEveryone: false, hasText: false, media: ["sticker", "forward"], mediaCounts: { sticker: 1, forward: 1 }, reply: { messageId: "quoted" } });
 
     focused = false;
     const popup = await incoming([sticker]);
@@ -168,7 +202,7 @@ async function main() {
     messaging.notifyPolicy = "content";
     phone.down = true;
     await incoming([h("at", { id: "bot-a" }), sticker]);
-    assert.equal(received.at(-1)!.value.text, "放在一边的手机震了一下。", "put-down phone does not expose message context");
+    assert.equal(received.at(-1)!.value.text, "手机震了一下。", "put-down phone does not expose message context or invent a position");
     phone.down = false; allowed = false;
     const before = received.length;
     await incoming([h("at", { id: "bot-a" }), h.text("看这里")]);

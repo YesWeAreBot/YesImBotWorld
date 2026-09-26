@@ -1,5 +1,6 @@
 import type { BusEnvelope } from "./bus.js";
 import type { WorldObservation } from "./state.js";
+import type { PhonePhysicalState } from "../types.js";
 
 /** Only identities, execution and provenance are machine state. World content is prose. */
 export interface NarrativeActor {
@@ -41,6 +42,8 @@ export interface NarrativeSnapshot {
   worldState: string;
   actors: Record<string, NarrativeActor>;
   actions: Record<string, NarrativeAction>;
+  /** Explicitly adjudicated physical facts; absence preserves legacy behavior without a guessed location. */
+  phoneState?: PhonePhysicalState;
 }
 /** A possible next intention, never a fact, instruction, or guaranteed outcome. */
 export interface NarrativeOpportunity {
@@ -72,6 +75,15 @@ export interface NarrativeToolReceipt {
   status: "completed" | "failed" | "needs_input";
   reason?: string;
 }
+/** External evolution has no authority to choose or finish a controlled actor's action. */
+export interface NarrativeExternalChange { id: string; description: string }
+export interface NarrativeEvolution {
+  changes: NarrativeExternalChange[];
+  /** Each bodily update/delivery cites a newly established external cause in this commit. */
+  actorEffects: { actorId: string; changeIds: string[] }[];
+  perceptionSources: { actorId: string; changeIds: string[] }[];
+  phoneChangeIds?: string[];
+}
 export interface NarrativeCommit {
   idempotencyKey: string;
   expectedSequence?: number;
@@ -81,11 +93,14 @@ export interface NarrativeCommit {
   actionPhase?: "start" | "finish";
   initialized?: boolean;
   worldState?: string;
+  phoneState?: PhonePhysicalState;
   /** Changed actor entries, addressed only by runtime-established identities. */
   actors?: Record<string, NarrativeActor>;
   actions?: Record<string, NarrativeAction>;
   perceptions?: ({ actorId: string; text: string; sourceEventIds?: string[] } & NarrativePresentation)[];
   toolReceipt?: NarrativeToolReceipt;
+  /** Present for new evolve commits; absent on historical journals and other operations. */
+  evolution?: NarrativeEvolution;
 }
 export interface NarrativeCommitResult {
   transactionId: string;
@@ -110,4 +125,25 @@ export function validNarrativePresentation(value: { situation?: unknown; opportu
     !!item && typeof item === "object" && !Array.isArray(item) &&
     Object.keys(item).every(key => ["label", "intent", "exclusiveGroup"].includes(key)) &&
     prose(item.label, 80) && prose(item.intent, 600) && (item.exclusiveGroup === undefined || prose(item.exclusiveGroup, 80)));
+}
+
+export function validNarrativeEvolution(value: NarrativeEvolution): boolean {
+  const text = (value: unknown, max: number) => typeof value === "string" && !!value.trim() && value.length <= max;
+  if (!value || typeof value !== "object" || Array.isArray(value) || Object.keys(value).some(key => !["changes", "actorEffects", "perceptionSources", "phoneChangeIds"].includes(key)) ||
+    !Array.isArray(value.changes) || !value.changes.length || value.changes.length > 100) return false;
+  const ids = new Set<string>();
+  for (const change of value.changes) {
+    if (!change || Object.keys(change).some(key => !["id", "description"].includes(key)) || !text(change.id, 80) || !text(change.description, 200_000) || ids.has(change.id)) return false;
+    ids.add(change.id);
+  }
+  const references = (refs: unknown): refs is string[] => Array.isArray(refs) && refs.length > 0 && refs.length <= 100 && new Set(refs).size === refs.length && refs.every(id => ids.has(id));
+  for (const sources of [value.actorEffects, value.perceptionSources]) {
+    if (!Array.isArray(sources) || sources.length > 100) return false;
+    const actors = new Set<string>();
+    for (const source of sources) {
+      if (!source || Object.keys(source).some(key => !["actorId", "changeIds"].includes(key)) || !text(source.actorId, 256) || actors.has(source.actorId) || !references(source.changeIds)) return false;
+      actors.add(source.actorId);
+    }
+  }
+  return value.phoneChangeIds === undefined || references(value.phoneChangeIds);
 }

@@ -14,7 +14,9 @@ var WorldCockpit = (function () {
     }
     function mount(initial, draft, actions) {
         var data = initial, selected = null, schemaStamp = '', fieldUpdaters = [], form = null, submit = null, error = null, confirmSend = null;
+        var selection = null, selectionMessage = '', localSubmitting = false, observedSubmission = false, replacement = null, composing = false;
         draft.values = draft.values || Object.create(null);
+        draft.savedOpportunityDrafts = draft.savedOpportunityDrafts || [];
         if (draft.selected === 'observe') {
             var previousObservation = draft.values.observe || {};
             draft.selected = 'act'; draft.values.act = draft.values.act || {};
@@ -28,10 +30,54 @@ var WorldCockpit = (function () {
         var search = el('input', { type: 'search', cls: 'journey-input', placeholder: '搜索能力或应用', 'aria-label': '搜索能力' });
         search.oninput = function () { list.querySelectorAll('[data-cockpit-tool]').forEach(function (node) { node.hidden = !node.textContent.toLowerCase().includes(search.value.trim().toLowerCase()); }); };
         picker.append(search, list);
-        var situation = el('p', { cls: 'cockpit-situation', hidden: true }), suggestions = el('div', { cls: 'cockpit-suggestions' }), suggestionStamp = '';
+        var selectedChoice = el('div', { cls: 'cockpit-selected-choice', hidden: true }), choiceLabel = el('strong'), choiceNote = el('p', { cls: 'journey-note' });
+        var freeAction = button('改为自由操作', function () { clearSelection(); update(data); if (actions.changed) actions.changed(); }, 'cockpit-add');
+        selectedChoice.append(el('div', {}, [choiceLabel, choiceNote]), freeAction);
+        var replacementNotice = el('div', { cls: 'cockpit-draft-notice', hidden: true, role: 'status' }), replacementText = el('p', { cls: 'journey-note' });
+        replacementNotice.append(replacementText, button('保留当前草稿', function () { replacement = null; replacementNotice.hidden = true; if (actions.resize) actions.resize(); }, 'cockpit-add'), button('暂存草稿，填写建议', function () { if (replacement) prepareChoice(replacement, true); }, 'cockpit-add'));
         var queue = el('div', { cls: 'cockpit-queue', 'aria-label': '执行中的工具' }), status = el('p', { cls: 'journey-note cockpit-control-note', role: 'status' }), formHost = el('div', { cls: 'cockpit-form-host' });
         var recovery = button('恢复输入，结果留待核对', function () { if (actions.recover) actions.recover(); }, 'journey-button cockpit-recover'); recovery.hidden = true;
-        panel.append(head, picker, situation, suggestions, status, recovery, queue, formHost);
+        var restoreDraft = button('恢复暂存草稿', function () {
+            if (composing) return report('请先完成正在输入的文字，当前草稿已保留。');
+            var saved = draft.savedOpportunityDrafts.pop(); if (!saved) return;
+            var previous = draft.values[saved.name]; if (hasContents(previous)) draft.savedOpportunityDrafts.unshift({ name: saved.name, values: copy(previous) });
+            clearSelection(); draft.values[saved.name] = saved.values; selected = null; select(saved.name);
+        }, 'cockpit-add'); restoreDraft.hidden = !draft.savedOpportunityDrafts.length;
+        panel.append(head, picker, selectedChoice, replacementNotice, status, recovery, queue, restoreDraft, formHost);
+        panel.addEventListener('compositionstart', function () { composing = true; });
+        panel.addEventListener('compositionend', function () { composing = false; });
+        function copy(value) { return JSON.parse(JSON.stringify(value)); }
+        function clearSelection() { selection = null; draft.opportunityId = null; delete draft.opportunitySelection; selectionMessage = ''; replacement = null; replacementNotice.hidden = true; }
+        function sameValue(a, b) {
+            if (a === b) return true;
+            if (!a || !b || typeof a !== 'object' || typeof b !== 'object' || Array.isArray(a) !== Array.isArray(b)) return false;
+            var keys = Object.keys(a).filter(function (key) { return a[key] !== undefined; }), others = Object.keys(b).filter(function (key) { return b[key] !== undefined; });
+            return keys.length === others.length && keys.every(function (key) { return Object.prototype.hasOwnProperty.call(b, key) && sameValue(a[key], b[key]); });
+        }
+        function currentOpportunity(item) {
+            var current = (data.opportunities || []).find(function (candidate) { return candidate.id === item.id && candidate.sourceEventId === item.sourceEventId; });
+            return current && ['label', 'intent', 'source', 'replyTo', 'call'].every(function (key) { return sameValue(current[key], item[key]); }) ? current : null;
+        }
+        function callFor(item) {
+            if (item.replyTo) return { name: 'send', arguments: { id: item.replyTo, msg: '' } };
+            return item.call ? copy(item.call) : null;
+        }
+        function selectionRef(item) { return { opportunityId: item.id, sourceEventId: item.sourceEventId }; }
+        function hasContents(values) { return !!values && (Object.keys(values).some(function (key) { return !key.startsWith('__') && values[key] !== undefined && values[key] !== '' && (typeof values[key] !== 'object' || values[key] && Object.keys(values[key]).length); }) || !!(values.__raw && values.__raw.trim())); }
+        function report(message) { selectionMessage = message; update(data); return false; }
+        function canExecute(name) { return data.synced && !data.blocked && !data.submitting && !localSubmitting && !!data.unitWorldSeconds && data.tools.some(function (tool) { return tool.name === name; }); }
+        function execute(name, args, duration, confirmed, item) {
+            if (!canExecute(name)) return report('现在暂时不能执行这项操作，请等待控制状态就绪。');
+            if (item && !currentOpportunity(item)) return report('这条建议已变化或不可用，本次没有执行。请查看最新建议；已填写的内容会保留。');
+            localSubmitting = true; observedSubmission = false; selectionMessage = ''; update(data);
+            var result;
+            try { result = actions.call(name, args, duration, confirmed, item ? selectionRef(item) : undefined); }
+            catch (failure) { localSubmitting = false; report(failure.message || '执行请求失败，请核对状态后重试。'); return false; }
+            if (result === false) { localSubmitting = false; return report('操作未提交，请等待控制状态更新后重试。'); }
+            if (result && typeof result.then === 'function') Promise.resolve(result).then(function () { localSubmitting = false; update(data); }, function (failure) { localSubmitting = false; report(failure.message || '执行结果尚未确认，请先核对执行记录。'); });
+            else if (!data.submitting) { localSubmitting = false; update(data); }
+            return true;
+        }
         function candidates(name, tool) {
             var context = data.choices || {}, devices = data.deviceSession || {}, chat = devices.chat || {}, result = null;
             if (name === 'target' && (tool.name === 'act')) {
@@ -48,10 +94,12 @@ var WorldCockpit = (function () {
             else if (context[name] && Array.isArray(context[name])) result = context[name].map(function (c) { return { value: c.value === undefined ? c.id : c.value, text: c.label || c.name || String(c.value === undefined ? c.id : c.value) }; });
             return result;
         }
-        function select(toolName) {
+        function select(toolName, preserveChoice) {
             if (!data.tools.some(function (t) { return t.name === toolName; })) return;
+            if (!preserveChoice) clearSelection();
             if (selected && selected.name === toolName && schemaStamp !== JSON.stringify(data.tools.find(function (t) { return t.name === toolName; }).inputSchema || {})) selected = null;
             draft.selected = toolName; picker.hidden = true; formHost.hidden = false; choice.textContent = '选择能力'; choice.setAttribute('aria-expanded', 'false'); update(data);
+            if (actions.changed) actions.changed();
             if (actions.resize) actions.resize();
         }
         function build(tool) {
@@ -60,6 +108,17 @@ var WorldCockpit = (function () {
             var internal = tool.name === 'think';
             var values = draft.values[tool.name] || (draft.values[tool.name] = Object.create(null)), schema = tool.inputSchema || { type: 'object', properties: {} }, timed = tool.name === 'wait' || tool.name === 'rest', readers = [];
             form = el('form', { cls: 'cockpit-form' }); form.noValidate = true;
+            form.addEventListener('input', function (event) {
+                if (!selection) return;
+                var field = event.target.dataset.cockpitField;
+                if (field === tool.name + ':speech' && tool.name === 'act' || field === 'send:msg' && selection.replyTo || field === 'duration') return;
+                if (field) { clearSelection(); selectionMessage = '已按你的修改切换为自由操作，提交时会使用表单中的完整内容。'; update(data); if (actions.changed) actions.changed(); }
+            });
+            form.addEventListener('change', function (event) {
+                if (!selection || event.target.matches('[data-cockpit-confirm-send]')) return;
+                var field = event.target.dataset.cockpitField;
+                if (field && field !== 'duration' && field !== tool.name + ':speech' && !(field === 'send:msg' && selection.replyTo)) { clearSelection(); selectionMessage = '已按你的修改切换为自由操作，提交时会使用表单中的完整内容。'; update(data); if (actions.changed) actions.changed(); }
+            });
             error = el('div', { cls: 'journey-error', role: 'alert', hidden: true });
             var primary = el('div', { cls: 'cockpit-primary-fields' }), optional = el('details', { cls: 'cockpit-options', open: !!values.__options }), extras = el('div', { cls: 'cockpit-extra-fields' });
             optional.append(el('summary', { text: internal ? '选项' : tool.name === 'act' ? '说话与选项' : '选项与预计时长' }), extras);
@@ -126,10 +185,11 @@ var WorldCockpit = (function () {
                     if (spec.maximum !== undefined) input.max = spec.maximum;
                     holder.appendChild(input); read = function () { if (input.value === '') return undefined; var number = Number(input.value); if (!Number.isFinite(number) || type === 'integer' && !Number.isInteger(number)) throw Error((fields[name] || name) + '需要有效数字。'); if (spec.minimum !== undefined && number < spec.minimum || spec.maximum !== undefined && number > spec.maximum) throw Error((fields[name] || name) + '超出了此能力支持的范围。'); return number; };
                 } else {
-                    input = el('textarea', { cls: 'journey-input', rows: tool.name === 'act' && name === 'description' ? '2' : '2', placeholder: internal && name === 'thought' ? '此刻在想什么？可以是牵挂、疑问、回忆或打算。' : tool.name === 'act' && name === 'description' ? '想做什么？例如走到窗边，把窗户推开。' : name === 'target' && tool.name === 'act' ? '用名字或描述指定，例如柜台后的店员；可以留空' : '' });
+                    input = el('textarea', { cls: 'journey-input', rows: '2', placeholder: internal && name === 'thought' ? '此刻在想什么？可以是牵挂、疑问、回忆或打算。' : tool.name === 'act' && name === 'description' ? '想做什么？例如走到窗边，把窗户推开。' : name === 'speech' ? '需要说些什么？可以留空。' : name === 'target' && tool.name === 'act' ? '用名字或描述指定，例如柜台后的店员；可以留空' : '' });
                     input.value = value === undefined ? '' : String(value); holder.appendChild(input); read = function () { return input.value === '' ? undefined : input.value; };
                 }
                 if (input) { input.dataset.cockpitField = tool.name + ':' + path; input.setAttribute('aria-label', fields[name] || name); if (required && input.tagName !== 'SELECT') input.required = true; }
+                if (input && selection && selection.replyTo && tool.name === 'send' && name === 'id') { input.disabled = true; input.dataset.choiceTarget = '1'; }
                 function save() { try { var result = read(); if (!path.includes('.')) values[name] = result; } catch (_) {} }
                 holder.addEventListener('input', save); holder.addEventListener('change', save);
                 return { node: holder, read: function () { var result = read(); if (required && result === undefined) throw Error((fields[name] || name) + '不能为空。'); return result; } };
@@ -139,7 +199,7 @@ var WorldCockpit = (function () {
                 if (name === 'observationId' && tool.name === 'act') return;
                 var control = controlFor(name, spec, values[name], required, name), row = el('label', { cls: 'journey-field' }, [el('span', { cls: 'journey-label', text: (timed && ['n', 'duration'].includes(name) ? '时长 · TU' : fields[name] || name) + (required ? '' : ' · 可选') }), control.node]);
                 if (spec.description) row.appendChild(el('details', { cls: 'cockpit-field-help' }, [el('summary', { text: '参数说明' }), note(spec.description)]));
-                (required ? primary : extras).appendChild(row);
+                (required || selection && tool.name === 'act' && name === 'speech' ? primary : extras).appendChild(row);
                 readers.push(function (args) { var value = control.read(); values[name] = value; if (value !== undefined) args[name] = value; });
             });
             var duration = el('input', { cls: 'journey-input', type: 'number', min: '0', step: 'any', value: values.__estimate || '0', 'data-cockpit-field': 'duration', 'aria-label': '预计时长（世界秒）', oninput: function () { values.__estimate = duration.value; } });
@@ -161,7 +221,9 @@ var WorldCockpit = (function () {
                     var args = {}; if (raw.value.trim()) args = JSON.parse(raw.value); else readers.forEach(function (read) { read(args); });
                     if (!args || typeof args !== 'object' || Array.isArray(args)) throw Error('工具参数必须是对象。');
                     var seconds = timed || internal ? 0 : Number(duration.value); if (!Number.isFinite(seconds) || seconds < 0) throw Error('预计时长需要为非负的世界秒。');
-                    actions.call(tool.name, args, seconds / data.unitWorldSeconds, confirmSend.checked); confirmSend.checked = false;
+                    var activeSelection = selection;
+                    if (activeSelection && !currentOpportunity(activeSelection)) throw Error('这条建议已变化或不可用，本次没有执行。请重新选择建议，或明确改为自由操作。');
+                    if (execute(tool.name, args, seconds / data.unitWorldSeconds, confirmSend.checked, activeSelection)) confirmSend.checked = false;
                 } catch (e) { error.hidden = false; error.textContent = e.message; }
             };
             formHost.replaceChildren(form);
@@ -169,13 +231,14 @@ var WorldCockpit = (function () {
         var toolStamp = '', queueStamp = '';
         function update(next) {
             data = next; data.tools = (data.tools || []).filter(function (tool) { return tool.name !== 'observe'; });
-            situation.hidden = !data.situation; situation.textContent = data.situation || '';
-            var suggested = JSON.stringify([data.opportunities || [], data.tools.map(function (tool) { return tool.name; }), data.synced, data.blocked, draft.opportunityId]);
-            if (suggested !== suggestionStamp) {
-                suggestionStamp = suggested; suggestions.replaceChildren();
-                if ((data.opportunities || []).length) suggestions.appendChild(ReadableData.opportunities(data.opportunities, { selectedId: draft.opportunityId, select: panel.useOpportunity, disabled: function (item) { return !data.synced || !!data.blocked || !data.tools.some(function (tool) { return tool.name === (item.call ? item.call.name : 'act'); }); } }));
-                if (draft.opportunityId && !(data.opportunities || []).some(function (item) { return item.id === draft.opportunityId; })) suggestions.appendChild(note('情境中的建议已更新；你已填写的草稿仍然保留，请按最新处境决定。'));
-            }
+            if (data.submitting) observedSubmission = true;
+            else if (observedSubmission) { localSubmitting = false; observedSubmission = false; }
+            var staleChoice = !!selection && !currentOpportunity(selection);
+            selectedChoice.hidden = !selection;
+            if (selection) { choiceLabel.textContent = '准备：' + selection.label; choiceNote.textContent = staleChoice ? '这条建议已失效，草稿已保留。重新选择建议，或改为自由操作后提交。' : selection.replyTo ? '请写下你自己的回复，并确认发送到所选会话。' : selection.call && selection.call.name === 'act' ? '可以补充台词；执行仍会核对这条建议是否有效。' : '执行前会核对建议与能力是否仍然可用。修改参数会转为自由操作。'; }
+            selectedChoice.classList.toggle('cockpit-stale-choice', staleChoice);
+            restoreDraft.hidden = !draft.savedOpportunityDrafts.length;
+            panel.querySelectorAll('[data-choice-target]').forEach(function (input) { input.disabled = !!(selection && selection.replyTo); });
             if (!draft.selected) draft.selected = (data.tools.find(function (t) { return t.name === 'act'; }) || data.tools[0] || {}).name;
             var tool = data.tools.find(function (t) { return t.name === draft.selected; }), changed = JSON.stringify(data.tools.map(function (t) { return [t.name, t.title, t.device]; }));
             if (toolStamp !== changed) {
@@ -194,28 +257,46 @@ var WorldCockpit = (function () {
             fieldUpdaters.forEach(function (update) { update(); });
             panel.dataset.tool = selected ? selected.name : '';
             heading.textContent = selected ? label(selected) : '角色能力'; count.textContent = data.tools.length + ' 项可用';
-            status.textContent = data.uncertain ? '请求结果尚未确认，不会自动重发。可保留执行记录并恢复输入。' : !data.synced ? '正在同步控制状态' : !tool ? '这项能力已不可用。草稿已保留，请选择当前可用能力。' : schemaChanged ? '能力参数已更新，请重新选择这项能力后执行。' : data.blocked ? data.blockedReason || '暂时不能操作角色，请检查控制状态。' : data.submitting ? '正在执行，你可以继续查看状态与准备下一步。' : '';
+            status.textContent = data.uncertain ? '请求结果尚未确认，不会自动重发。可保留执行记录并恢复输入。' : !data.synced ? '正在同步控制状态' : !tool ? '这项能力已不可用。草稿已保留，请选择当前可用能力。' : schemaChanged ? '能力参数已更新，请重新选择这项能力后执行。' : data.blocked ? data.blockedReason || '暂时不能操作角色，请检查控制状态。' : data.submitting || localSubmitting ? '正在执行，你可以继续查看状态与准备下一步。' : selectionMessage;
             recovery.hidden = !data.uncertain;
             status.classList.toggle('journey-pending', !!data.submitting);
             status.hidden = !status.textContent;
-            if (submit) { submit.disabled = !tool || schemaChanged || !data.synced || !!data.blocked || !!data.submitting || !data.unitWorldSeconds; submit.textContent = data.submitting ? '等待执行回执' : selected.name === 'think' ? '留下这段想法' : '执行 ' + label(selected); }
+            if (submit) { submit.disabled = !tool || schemaChanged || staleChoice || !data.synced || !!data.blocked || !!data.submitting || localSubmitting || !data.unitWorldSeconds; submit.textContent = data.submitting || localSubmitting ? '等待执行回执' : selected.name === 'think' ? '留下这段想法' : selection ? (selection.replyTo ? '确认发送回复' : '执行这条建议') : '执行 ' + label(selected); }
             var pending = data.pending || [], nextQueue = JSON.stringify(pending);
             if (nextQueue !== queueStamp) { queueStamp = nextQueue; queue.replaceChildren(); pending.forEach(function (call) { queue.appendChild(el('div', { cls: 'cockpit-pending' }, [el('span', { cls: 'journey-pulse' }), el('div', {}, [el('strong', { text: label(call) }), note(call.committed ? '变化已提交，等待最终回执' : '执行中 · 可请求取消')]), button('请求取消', function () { actions.cancel(call.callId || call.id); })])); }); }
             if (!selected && data.synced) formHost.textContent = '当前没有可用能力。世界与设备状态改变后，这里会自动更新。';
             if (actions.resize) actions.resize();
         }
-        panel.useOpportunity = function (item) {
-            item = (data.opportunities || []).find(function (current) { return item.id ? current.id === item.id : current.label === item.label && current.intent === item.intent; });
-            if (!item) return;
-            var call = item.call || { name: 'act', arguments: { description: item.intent } };
-            if (!data.tools.some(function (tool) { return tool.name === call.name; })) return;
-            draft.values[call.name] = Object.assign({}, JSON.parse(JSON.stringify(call.arguments || {})), { __estimate: String((call.duration || 0) * (data.unitWorldSeconds || 1)) });
-            draft.opportunityId = item.id; selected = null; select(call.name);
+        function prepareChoice(item, replaceDraft) {
+            var current = currentOpportunity(item), call = current && callFor(current);
+            if (!current || !call) return report('这条建议已变化或不可用，本次没有执行。请查看最新建议。');
+            if (!data.tools.some(function (tool) { return tool.name === call.name; })) return report('建议需要的能力暂时不可用，当前草稿已保留。');
+            if (composing) return report('请先完成正在输入的文字，当前草稿已保留。');
+            if (selection && selection.id === current.id && selection.sourceEventId === current.sourceEventId && selected && selected.name === call.name) { picker.hidden = true; formHost.hidden = false; return true; }
+            var previous = draft.values[call.name], hasDraft = hasContents(previous);
+            if (hasDraft && !replaceDraft) {
+                replacement = copy(current); replacementText.textContent = '「' + label({ name: call.name }) + '」还有未提交的内容。保留它，或先暂存，再填写「' + current.label + '」。'; replacementNotice.hidden = false; if (actions.resize) actions.resize(); return false;
+            }
+            if (hasDraft) draft.savedOpportunityDrafts.push({ name: call.name, values: copy(previous) });
+            replacement = null; replacementNotice.hidden = true;
+            draft.values[call.name] = Object.assign({}, copy(call.arguments || {}), { __estimate: String((call.duration || 0) * (data.unitWorldSeconds || 1)), __options: false });
+            selection = copy(current); draft.opportunitySelection = copy(current); draft.opportunityId = current.id; selectionMessage = ''; selected = null; select(call.name, true); return true;
+        }
+        panel.chooseOpportunity = function (item, options) {
+            var current = currentOpportunity(item), call = current && callFor(current);
+            if (!current || !call) return report('这条建议已变化或不可用，本次没有执行。请查看最新建议。');
+            var tool = data.tools.find(function (tool) { return tool.name === call.name; });
+            if (!tool) return report('建议需要的能力暂时不可用，当前草稿已保留。');
+            if (options && options.edit || current.replyTo || tool.requiresSendConfirmation) return prepareChoice(current, false);
+            return execute(call.name, copy(call.arguments || {}), call.duration || 0, false, current);
         };
+        panel.prepareOpportunity = panel.useOpportunity = function (item) { return panel.chooseOpportunity(item, { edit: true }); };
         panel.prepareAction = function (intent) { draft.values.act = { description: intent }; draft.opportunityId = null; selected = null; select('act'); };
         panel.update = update;
         panel.select = select;
         panel.setTarget = function (target) { draft.values.act = draft.values.act || {}; draft.values.act.target = target; if (!selected || selected.name !== 'act') select('act'); var input = panel.querySelector('[data-cockpit-field="act:target"]'); if (input) { input.value = target; input.dispatchEvent(new Event('change', { bubbles: true })); } };
+        if (draft.opportunitySelection && callFor(draft.opportunitySelection) && callFor(draft.opportunitySelection).name === draft.selected) selection = copy(draft.opportunitySelection);
+        else { draft.opportunityId = null; delete draft.opportunitySelection; }
         update(initial); return panel;
     }
     return { mount: mount, label: label };

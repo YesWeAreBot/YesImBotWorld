@@ -8,11 +8,13 @@
  */
 
 import type { ChatToolDef } from "../llm/chat.js";
+import { toolSummary } from "./tools.js";
 
 export interface NamedToolDef {
   name: string;
   signature: string;
   description: string;
+  summary?: string;
   inputSchema?: Record<string, unknown>;
 }
 
@@ -74,14 +76,14 @@ export function toNativeToolDefs(defs: NamedToolDef[]): ChatToolDef[] {
       properties.duration = {
         type: "number",
         minimum: 0,
-        description: "期望耗时（TU），省略通常为 0；不是超时限制或可撤销窗口。普通工具可能先执行后延迟返回，具体以工具说明为准",
+        description: "期望耗时（TU），省略通常为 0；不是超时或可撤销窗口。设备操作以实际执行结果为准。",
       };
     }
     return {
       type: "function" as const,
       function: {
         name: def.name,
-        description: def.description,
+        description: toolSummary(def),
         parameters: {
           type: "object",
           ...original,

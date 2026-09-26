@@ -128,7 +128,7 @@ export default async function smokeCockpit({ evaluate, wait, assert, navigate, p
         await run(()=>{
           const input=(key,value)=>{const e=document.querySelector('[data-cockpit-field="'+key+'"]');e.value=value;e.dispatchEvent(new Event('input',{bubbles:true}));};
           input('compose_palette:title','手动调色'); input('compose_palette:options.contrast','.75');
-          document.querySelector('.cockpit-add').click(); input('compose_palette:colors.0','苔绿');
+          document.querySelector('.cockpit-array + .cockpit-add').click(); input('compose_palette:colors.0','苔绿');
           document.querySelector('.cockpit-form').requestSubmit();
         });
         await wait(`!document.querySelector('.journey-pending')`);
@@ -162,10 +162,10 @@ export default async function smokeCockpit({ evaluate, wait, assert, navigate, p
       const data={synced:true,unitWorldSeconds:2,tools:[{name:'act',inputSchema:{type:'object',properties:{description:{type:'string'}},required:['description']}},{name:'send',requiresSendConfirmation:true,inputSchema:{type:'object',properties:{id:{type:'string'},msg:{type:'string'}},required:['id','msg']}}],deviceSession:{chat:{channels:[{key:'fixture:friend',name:'已知朋友'}]}},opportunities:[{id:'message-choice',label:'联系朋友',intent:'询问朋友周末的安排',source:'device',sourceEventId:'known-channel',call:{name:'send',arguments:{id:'fixture:friend',msg:'周末有空吗？'}}}]};
       window.__cockpitSmoke.opportunityCalls=[];
       const panel=WorldCockpit.mount(data,{}, {call:(name,args)=>window.__cockpitSmoke.opportunityCalls.push({name,args})});panel.dataset.cockpitTest='1';document.querySelector('main').appendChild(panel);
-      panel.update(structuredClone(data));panel.querySelector('.opportunity-card').click();
+      panel.update(structuredClone(data));panel.chooseOpportunity(data.opportunities[0],{edit:true});
       panel.querySelector('.cockpit-form').requestSubmit();window.__cockpitSmoke.opportunityPanel=panel;window.__cockpitSmoke.opportunityData=data;
     });
-    assert(await run(()=>window.__cockpitSmoke.opportunityCalls.length===0&&document.querySelector('[data-cockpit-field="send:msg"]').value==='周末有空吗？'&&document.querySelector('[data-cockpit-test] .journey-error').textContent.includes('确认')),'A refreshed device suggestion fills the actual tool form but never bypasses send confirmation');
+    assert(await run(()=>window.__cockpitSmoke.opportunityCalls.length===0&&!document.querySelector('[data-cockpit-test] .opportunity-card')&&document.querySelector('[data-cockpit-field="send:msg"]').value==='周末有空吗？'&&document.querySelector('[data-cockpit-test] .journey-error').textContent.includes('确认')),'Suggestions live outside the cockpit; explicitly preparing one never bypasses send confirmation');
     await run(()=>{
       const panel=window.__cockpitSmoke.opportunityPanel,input=panel.querySelector('[data-cockpit-field="send:msg"]');input.value='我自己编辑的邀请';input.dispatchEvent(new Event('input',{bubbles:true}));input.focus();window.__cockpitSmoke.suggestionDraft=input;
       const data=structuredClone(window.__cockpitSmoke.opportunityData);data.opportunities=[];panel.update(data);
@@ -184,7 +184,7 @@ export default async function smokeCockpit({ evaluate, wait, assert, navigate, p
     await run(()=>{
       const data={synced:true,unitWorldSeconds:2,tools:[{name:'view_media',inputSchema:{type:'object',properties:{media:{type:'array',items:{type:'string'}}},required:['media']}}],choices:{mediaCache:[{value:'media:1',text:'窗边的茶杯',preview:'/api/media/file?id=1'}],galleryMedia:[{value:'gallery:照片/清晨.png',text:'清晨的阳光',preview:'/api/media/file?id=2'}]}};
       const panel=WorldCockpit.mount(data,{}, {call:(name,args)=>window.__cockpitSmoke.mediaSubmission={name,args}});panel.dataset.cockpitTest='1';document.querySelector('main').appendChild(panel);
-      const add=panel.querySelector('.cockpit-add');add.click();add.click();
+      const add=panel.querySelector('.cockpit-array + .cockpit-add');add.click();add.click();
       const first=panel.querySelector('[data-cockpit-field="view_media:media.0"]'),second=panel.querySelector('[data-cockpit-field="view_media:media.1"]');first.value=JSON.stringify('media:1');second.value=JSON.stringify('gallery:照片/清晨.png');[first,second].forEach(n=>n.dispatchEvent(new Event('change',{bubbles:true})));
       panel.querySelector('.cockpit-form').requestSubmit();
     });
@@ -201,7 +201,7 @@ export default async function smokeCockpit({ evaluate, wait, assert, navigate, p
     await run(()=>document.querySelector('[data-cockpit-test]').remove());
     await run(()=>{
       const data={synced:true,unitWorldSeconds:2,tools:[{name:'reflect',inputSchema:{type:'object',properties:{statement:{type:'string'},event_ids:{type:'array',items:{type:'string'}}},required:['statement','event_ids']}}]};
-      const panel=WorldCockpit.mount(data,{}, {call:(name,args)=>window.__cockpitSmoke.evidenceSubmission={name,args}});panel.dataset.cockpitTest='1';document.querySelector('main').appendChild(panel);panel.querySelector('.cockpit-add').click();
+      const panel=WorldCockpit.mount(data,{}, {call:(name,args)=>window.__cockpitSmoke.evidenceSubmission={name,args}});panel.dataset.cockpitTest='1';document.querySelector('main').appendChild(panel);panel.querySelector('.cockpit-array + .cockpit-add').click();
       const text=panel.querySelector('[data-cockpit-field="reflect:statement"]');text.value='这件事值得记住';text.dispatchEvent(new Event('input',{bubbles:true}));text.focus();window.__cockpitSmoke.evidenceDraft=text;
       window.__cockpitSmoke.evidenceInitiallyEmpty=panel.querySelector('[data-cockpit-field="reflect:event_ids.0"]').options.length===1;
       data.choices={evidence:[{id:'perceived-exact-id',label:'刚刚亲眼看见的事件'}]};panel.update(data);

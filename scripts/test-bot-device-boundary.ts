@@ -25,7 +25,7 @@ async function main() {
       content: JSON.stringify(observation("legacy-cause", "窗边放着一张椅子。")) };
     await fs.appendFile(files.stream, JSON.stringify({ kind: "event", event: old }) + "\n");
     const context = new BotContext(files); await context.load(); const prefix = await context.toChatMessages("T100");
-    const cfg = Config({ autoStart: false }); cfg.bot.growth.enabled = false; cfg.bot.regulation.enabled = false;
+    const cfg = Config({ autoStart: false }); cfg.bot.growth.enabled = false;
     cfg.bot.repeatThresholds = [100, 200, 300]; cfg.bot.spillMinChars = 0; cfg.bot.breakLoop = false;
     const clock: any = { now: () => 100, timeLine: () => "T100", unitWorldSeconds: 1, unitRealSeconds: 1, realMsUntil: () => 0, syncRealTime: false };
     const calls: { kind: "act" | "observe"; input: unknown }[] = [];
@@ -58,6 +58,8 @@ async function main() {
       ["act", { description: "玩一会儿手机" }],
       ["act", { description: "翻翻消息" }],
       ["act", { description: "随便刷点什么", target: "手机" }],
+      ["act", { description: "伸手摸一下床头柜上的手机确认明早六点五十的闹钟已设好" }],
+      ["act", { description: "确认明早六点五十的闹钟已设好", target: "手机" }],
     ] as const) {
       const before = calls.length, denied = await dispatch(name, args);
       assert.equal(calls.length, before, `${name} must reject explicit device I/O before invoking World`);

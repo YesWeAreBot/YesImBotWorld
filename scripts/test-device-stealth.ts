@@ -4,6 +4,7 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { AppManager } from "../src/apps/manager.js";
+import { AssistantApp } from "../src/apps/assistant.js";
 import { BotAgent } from "../src/bot/agent.js";
 import { BotContext } from "../src/bot/context.js";
 import { BOT_TOOLS } from "../src/bot/tools.js";
@@ -15,7 +16,12 @@ import { WorldService } from "../src/service.js";
 const logger: any = { info() {}, warn() {}, error() {}, debug() {} };
 const gate = () => { let resolve!: () => void; const promise = new Promise<void>(r => { resolve = r; }); return { promise, resolve }; };
 const tick = () => new Promise<void>(r => setImmediate(r));
-async function until(test: () => boolean) { for (let i = 0; i < 200 && !test(); i++) await tick(); assert.ok(test(), "expected actual task completion"); }
+async function until(test: () => boolean) {
+  // Real filesystem completion is not bounded by a number of event-loop spins.
+  const deadline = Date.now() + 2000;
+  while (!test() && Date.now() < deadline) await new Promise<void>(resolve => setTimeout(resolve, 1));
+  assert.ok(test(), "expected actual task completion");
+}
 
 async function main() {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "yesimbot-stealth-"));
@@ -27,12 +33,17 @@ async function main() {
     const phone = { down: true }, context = new BotContext(files, "");
     let calls = 0, opens = 0, sends = 0, peeks = 0, block = false, fail = false;
     const entered = gate(), finish = gate(), order: string[] = [];
+    const assistantEntered = gate(), assistantFinish = gate();
+    const assistant = new AssistantApp({ historyFile: path.join(dir, "phone-assistant.json"), llm: {} as any,
+      client: { complete: async () => { assistantEntered.resolve(); await assistantFinish.promise; return { content: "仅在助手屏幕阅读的答案" } as any; } },
+      onComplete: notice => bot.notifyDevice(notice),
+    });
     const app = { id: "notes", name: "记事本", description: "fixture", async open() { opens++; return { tools: [{ name: "read_note", description: "read fixture", inputSchema: { type: "object", properties: {} } }] }; }, async close() { order.push("close"); }, async call() {
       calls++; order.push("call-start"); if (block) { entered.resolve(); await finish.promise; } if (fail) throw new Error("fixture device disconnected"); order.push("call-finish"); return "visible fixture content";
     } };
     const defs = BOT_TOOLS.filter(tool => ["open_app", "close_app", "pick_up_phone", "put_down_phone", "select_channel", "send", "check_msg", "observe_device", "act", "think", "check_status", "check_time"].includes(tool.name));
     assert.deepEqual(signatureParams(defs.find(tool => tool.name === "observe_device")!.signature), [{ name: "device", required: true, schema: { type: "string", enum: ["phone", "computer"] } }]);
-    const apps = new AppManager("chat", [app], new Set(defs.map(tool => tool.name)), logger);
+    const apps = new AppManager("chat", [app, assistant], new Set(defs.map(tool => tool.name)), logger);
     const messenger: any = { recentChannels: async () => ({ text: "cached channels" }), channelMessages: async () => ({ text: "cached messages" }), resolveKey: async () => ({ key: "onebot@fixture:channel", isPrivate: true }), putDownPhone: async () => "phone down", send: async () => { sends++; return "sent fixture message"; } };
     const world: any = { adjudicateAct: async (_call: any, deliver: any, _signal: any, commit: any) => { assert.ok(commit()); deliver("你看向周围的环境。"); return true; }, observe: async () => ({ observationId: "fixture-observation", actorId: "bot", sourceEventIds: [], entities: [] }), resolveCheckTime: async () => {} };
     const computer: any = { isOpen: false, activeToolNames: () => [], activeToolDefs: () => [], view: () => null, hasTool: () => false };
@@ -82,7 +93,7 @@ async function main() {
     assert.equal(peeks, 2);
     const screen = bot.mailbox.filter((event: any) => /当前可见界面/.test(event.content));
     assert.equal(screen.length, 1);
-    assert.match(screen[0].content, /当前可见界面.*聊天应用/);
+    assert.match(screen[0].content, /当前可见界面.*QQ/);
     assert.match(screen[0].content, /actual visible screen/);
     assert.doesNotMatch(screen[0].content, /管理员|偷偷|人类|黑客|你打开了|疑惑|感到/);
     assert.equal(bot.scheduler.isPending("pending-wait"), true, "visible changes do not cancel unrelated autonomous tasks");
@@ -125,7 +136,32 @@ async function main() {
     assert.equal(bot.manualMode, false);
     assert.equal((await stealth("send", { msg: "unfinished <img>" }, true)).ok, false);
 
+    const downForBackground = await autonomous("put_down_phone"); await until(() => !bot.scheduler.isPending(downForBackground));
+    bot.mailbox = [];
+    const streamBeforeBackground = context.stream.length;
+    await stealth("open_app", { name: "assistant" });
+    const asking = await stealth("ask", { question: "秘密输入的问题" });
+    assert.equal(asking.ok, true); await assistantEntered.promise;
+    assert.equal(bot.mailbox.length, 0, "background work does not leak the hidden immediate tool acknowledgement");
+    assert.equal(context.stream.length, streamBeforeBackground, "a hidden question is not recorded as the character's own decision");
+    await stealth("close_app");
+    assistantFinish.resolve();
+    await until(() => bot.mailbox.some((event: any) => /任务.*已完成/.test(event.content)));
+    const completion = bot.mailbox.find((event: any) => /任务.*已完成/.test(event.content));
+    assert.equal(phone.down, true);
+    assert.equal(completion.source, "system"); assert.deepEqual(completion.originEventIds, []);
+    assert.equal(completion.experience.worldPerception, false); assert.equal(completion.experience.agency, "observed");
+    assert.doesNotMatch(completion.content, /秘密输入的问题|仅在助手屏幕阅读的答案|已向.*提交问题/);
+    assert.equal(bot.mailbox.some((event: any) => event.refToolCallId === asking.callId), false, "only the normal device notification bypasses the hidden receipt filter");
+    await assistant.dispose();
+    // Device notification sources are excluded from Growth even if their wording
+    // mentions a world event; reading an assistant is not a physical perception.
+    await bot.growth.perceive({ ...completion, id: "fixture-background-completion", worldTime: 1 });
+    assert.equal((await bot.growth.recallEvidence({ eventIds: ["fixture-background-completion"] })).length, 0);
+
     await stealth("open_app", { name: "notes" });
+    const lookAfterBackground = await autonomous("observe_device", { device: "phone" }); await until(() => !bot.scheduler.isPending(lookAfterBackground));
+    phone.down = false;
     const previousCalls = calls;
     let delayedDone = false;
     const delayed = service.deviceToolCall("read_note", {}, 9, false, "stealth").then((result: any) => { delayedDone = true; return result; });

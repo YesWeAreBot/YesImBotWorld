@@ -63,17 +63,22 @@ export default async function smokeNarrative({ evaluate, wait, assert, navigate,
       await wait(`document.querySelector('.journey-state-body').textContent.includes('米饭现在就有')&&!document.querySelector('.journey-pending')`);
       assert(await run(()=>window.__narrativeInput.isConnected&&document.activeElement===window.__narrativeInput&&window.__narrativeInput.value==='我还想问问今天有没有汤'&&!document.querySelector('[data-cockpit-tool="observe"]')),'Active observation uses act, while incoming scene updates preserve the composing draft');
       await run(()=>window.__narrativeInput.dispatchEvent(new CompositionEvent('compositionend',{bubbles:true})));
-      await wait(`Array.from(document.querySelectorAll('.journey-dock .opportunity-card')).some(node=>node.textContent.includes('选米饭套餐'))`);
-      await run(()=>{[...document.querySelectorAll('.journey-dock .opportunity-card')].find(node=>node.textContent.includes('选米饭套餐')).click();});
-      assert(await run(mode=>document.querySelector(mode==='cross'?'.journey-action-input':'[data-cockpit-field="act:description"]').value==='向店员点一份米饭套餐'&&!document.querySelector('.journey-pending')&&document.querySelector('.journey-dock .readable-opportunities').textContent.includes('取舍组'),mode),'Opportunity selection fills an editable intention and labels tradeoffs without executing it');
+      await wait(`Array.from(document.querySelectorAll('.world-action-menu [data-action-choice]')).some(node=>node.textContent.includes('选米饭套餐'))`);
+      await run(mode=>{
+        const input=document.querySelector(mode==='cross'?'.journey-action-input':'[data-cockpit-field="act:description"]');input.value='';input.dispatchEvent(new Event('input',{bubbles:true}));
+        const choice=[...document.querySelectorAll('[data-action-choice]')].find(node=>node.textContent.includes('选米饭套餐'));
+        document.querySelector('[data-action-edit="'+choice.dataset.actionChoice+'"]').click();
+        [...document.querySelectorAll('.journey-dock button')].find(node=>node.textContent==='暂存草稿，填写建议')?.click();
+      },mode);
+      assert(await run(mode=>document.querySelector(mode==='cross'?'.journey-action-input':'[data-cockpit-field="act:description"]').value==='向店员点一份米饭套餐'&&!document.querySelector('.journey-pending')&&!document.querySelector('.journey-dock .world-action-menu')&&document.querySelector('.world-action-menu').textContent.includes('取舍'),mode),'Suggestions sit beside the story; supplementing speech explicitly opens the editor without executing the choice');
       await run(async mode=>{
-        const input=document.querySelector(mode==='cross'?'.journey-action-input':'[data-cockpit-field="act:description"]');input.value='这份草稿请保留';input.dispatchEvent(new Event('input',{bubbles:true}));input.focus();window.__opportunityDraft=input;
+        const input=document.querySelector(mode==='cross'?'.journey-speech-input':'[data-cockpit-field="act:speech"]');input.value='这份草稿请保留';input.dispatchEvent(new Event('input',{bubbles:true}));input.focus();window.__opportunityDraft=input;
         const update=await api('POST','/api/preview/opportunities',{text:'店员暂时去厨房了。',situation:'柜台暂时无人。',opportunities:[]});window.__oldOpportunityScene=update.previousScene;
       },mode);
-      await wait(`!document.querySelector('.journey-dock .opportunity-card')`);
-      assert(await run(()=>window.__opportunityDraft.isConnected&&document.activeElement===window.__opportunityDraft&&window.__opportunityDraft.value==='这份草稿请保留'&&document.querySelector('.journey-dock').textContent.includes('草稿仍然保留')),'A changed scene retires old suggestions without stealing focus or discarding an edited draft');
+      await wait(`!document.querySelector('.world-action-menu [data-action-choice]') && /失效|过期|情境已更新/.test(document.querySelector('.journey-dock').textContent)`);
+      assert(await run(()=>window.__opportunityDraft.isConnected&&document.activeElement===window.__opportunityDraft&&window.__opportunityDraft.value==='这份草稿请保留'),'A changed scene retires old suggestions without stealing focus or discarding an edited draft');
       await run(async()=>{await api('POST','/api/preview/opportunities',{replayScene:window.__oldOpportunityScene});await new Promise(resolve=>setTimeout(resolve,150));});
-      assert(await run(()=>!document.querySelector('.journey-dock .opportunity-card')&&window.__opportunityDraft.value==='这份草稿请保留'),'A late scene replay cannot revive obsolete suggestions');
+      assert(await run(()=>!document.querySelector('.world-action-menu [data-action-choice]')&&window.__opportunityDraft.value==='这份草稿请保留'),'A late scene replay cannot revive obsolete suggestions');
       assert(await run(()=>![...document.querySelectorAll('.journey-feed-scene')].some(node=>node.textContent.includes('选米饭套餐')||node.textContent.includes('exclusiveGroup'))),'Suggested choices are never rendered as factual scene outcomes');
       assert(await run(()=>document.documentElement.scrollWidth<=innerWidth),'Natural scenes and operation dock fit a phone');
       await click(mode==='cross'?'离开世界':'归还控制并离场');

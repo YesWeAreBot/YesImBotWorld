@@ -1,5 +1,7 @@
 import { h, type Context, type Session } from "koishi";
 import { channelKey } from "./channels.js";
+import { quoteTag } from "./quotes.js";
+export { quoteTag } from "./quotes.js";
 import { needsMsgIds, type MessagingConfig, type PlatformOpsConfig } from "../config.js";
 import type { MediaRenderer } from "../media/render.js";
 import { MEDIA_PLACEHOLDER, mediaPlaceholder, escapeMediaStorageText } from "../media/render.js";
@@ -15,11 +17,12 @@ import type { RequestStore } from "./requests.js";
 import { anonymousChatNoticeEvidence, chatMessageEvidence, conversationKind, conversationLabel, describeConversation, isStickerElement, type ConversationContext } from "./conversation.js";
 import { messageSequence } from "./message-order.js";
 import { firstName, formatMessageSender, isLegacySenderPlaceholder, sessionSenderName } from "./identity.js";
+import { canUsePhone, canPerceivePhone } from "../phone-state.js";
 export { isStickerElement } from "./conversation.js";
 
 export interface GatewayCallbacks {
   /** 向 Bot-LLM 投递通知事件；wake 表示是否唤醒 wait() 中的 Bot */
-  notify(content: RichText, wake: boolean): void;
+  notify(content: RichText, wake: boolean): boolean | void;
   /** 外部（其他插件/指令输出）以 Bot 账号发出的消息（externalSelfMessages 开启时）；msgId 为平台消息 id（可能为空） */
   selfMessage(channelKey: string, content: RichText, msgId: string, sendArgs: { msg: string } | null, sender?: WorldMessageRow): void | Promise<void>;
   /** 任意频道收到了新消息（不管是否聚焦/通知）。用于打断"过会儿再发"的延期发送意图 */
@@ -62,7 +65,8 @@ export class Gateway {
       // Reserve the same queue position used by confirmed account replies before any
       // media work starts. Never return the queued promise to platform dispatch.
       const ticket = this.captureSessionTicket(session);
-      const next = this.queueMessage(key, () => this.handle(session, ticket));
+      const notifyOnArrival = this.notificationAllowed(key);
+      const next = this.queueMessage(key, () => this.handle(session, ticket, notifyOnArrival));
       void next.catch((err) => {
         logger.warn("消息处理失败: %s", err);
       });
@@ -173,8 +177,9 @@ export class Gateway {
     }
 
     const msgTag = needsMsgIds(this.ops) ? `（msg:${messageId}）` : "";
+    if (saved) await this.notifyList.updatePreview?.(key, { ...saved, content: `[${notice}]` });
     await this.deliverChannelNotice(key, async () => ({ text: `你正留意着 ${await this.names.display(key)}，看到${notice}${msgTag}。` }),
-      saved ? chatMessageEvidence(saved) : {}, ticket, true);
+      saved ? chatMessageEvidence(saved) : {}, ticket, true, saved ?? undefined);
   }
 
   /** 别人戳了 Bot：转为手机通知并入库（群里别人互戳与 Bot 自己戳人不理会） */
@@ -196,6 +201,7 @@ export class Gateway {
     const channelId = groupId || `private:${pokerId}`;
     const key = channelKey(platform, channelId, session.selfId ?? session.bot?.selfId);
     const ticket = this.store.captureLive();
+    const notifyOnArrival = this.notificationAllowed(key);
     const who = await this.lookupUsername(platform, channelId, pokerId, selfId);
 
     // 入库：打开频道时能看到这条互动
@@ -214,9 +220,10 @@ export class Gateway {
       isDirect: !groupId,
     }, ticket);
 
+    await this.notifyList.receive?.(key, saved, notifyOnArrival);
     await this.deliverChannelNotice(key, async () => ({ text: groupId
       ? `手机提示：${who} 在群 ${await this.names.display(key)} 里戳了戳你。`
-      : `手机提示：${who} 戳了戳你。` }), chatMessageEvidence(saved), ticket);
+      : `手机提示：${who} 戳了戳你。` }), chatMessageEvidence(saved), ticket, false, saved, notifyOnArrival);
   }
 
   /**
@@ -242,6 +249,7 @@ export class Gateway {
     const lift = String(raw.sub_type ?? "") === "lift_ban" || Number(raw.duration ?? 0) <= 0;
     const operatorId = String(raw.operator_id ?? "");
     const ticket = this.store.captureLive();
+    const notifyOnArrival = this.notificationAllowed(key);
     const who = operatorId ? await this.lookupUsername(platform, groupId, operatorId, selfId) : "管理员";
     const dur = formatBanDuration(Number(raw.duration ?? 0), this.clockInfo());
 
@@ -267,6 +275,7 @@ export class Gateway {
       isDirect: false,
     }, ticket);
 
+    await this.notifyList.receive?.(key, saved, notifyOnArrival);
     await this.deliverChannelNotice(key, async () => {
     const display = await this.names.display(key);
     const text = whole
@@ -277,29 +286,44 @@ export class Gateway {
         ? `手机提示：你在群 ${display} 的禁言被${who}解除了，可以说话了。`
         : `手机提示：你在群 ${display} 被${who}禁言了${dur ? `（${dur}）` : ""}，期间没法在这个群里发消息。`;
     return { text };
-    }, chatMessageEvidence(saved), ticket);
+    }, chatMessageEvidence(saved), ticket, false, saved, notifyOnArrival);
   }
 
   /** Notification permission and screen visibility are independent, rechecked
    * after names/media await. A hidden screen never carries channel/subject facts. */
   private async deliverChannelNotice(key: string, render: () => Promise<RichText>, evidence: Pick<RichText, "originEventIds" | "experience">,
-    ticket: MessageOrderTicket, focusedOnly = false): Promise<void> {
-    const visible = () => !this.phone.down && this.focus.isFocused(key);
+    ticket: MessageOrderTicket, focusedOnly = false, row?: WorldMessageRow, notifyOnArrival = this.notificationAllowed(key)): Promise<void> {
+    const visible = () => canUsePhone(this.phone) && this.focus.isFocused(key);
     if (focusedOnly && !visible()) return;
-    if (!visible() && !this.notifyList.isNotifyChannel(key)) return;
-    if (this.phone.down) {
-      this.callbacks.notify({ text: "放在一边的手机震了一下。", ...anonymousChatNoticeEvidence(evidence, ticket.observedAt.getTime()) }, this.cfg.wakeOnNotify);
+    if (!visible() && (!notifyOnArrival || !this.notificationAllowed(key))) return;
+    if (!canUsePhone(this.phone)) {
+      if (notifyOnArrival) this.deliverVibration(evidence, ticket.observedAt.getTime(), key);
       return;
     }
     const content = await render();
     if (focusedOnly && !visible()) return;
-    if (!visible() && !this.notifyList.isNotifyChannel(key)) return;
-    if (this.phone.down) {
-      this.callbacks.notify({ text: "放在一边的手机震了一下。", ...anonymousChatNoticeEvidence(evidence, ticket.observedAt.getTime()) }, this.cfg.wakeOnNotify);
+    if (!visible() && (!notifyOnArrival || !this.notificationAllowed(key))) return;
+    if (!canUsePhone(this.phone)) {
+      if (notifyOnArrival) this.deliverVibration(evidence, ticket.observedAt.getTime(), key);
       return;
     }
-    this.callbacks.notify({ ...content, ...evidence, experience: { ...evidence.experience, agency: "observed", chat: { channelKey: key, kind: "notice" } } },
-      this.notifyList.isNotifyChannel(key) && (visible() || this.cfg.wakeOnNotify));
+    const accepted = this.callbacks.notify({ ...content, ...evidence, experience: { ...evidence.experience, agency: "observed", chat: { channelKey: key, kind: "notice" } } },
+      notifyOnArrival && this.shouldWake(key, visible()));
+    if (accepted !== false && row) await this.notifyList.markSeen?.(key, [row]);
+  }
+
+  private notificationAllowed(key: string): boolean {
+    return this.notifyList.allowsNotification?.(key) ?? (this.chatNotificationsAllowed() && this.notifyList.isNotifyChannel(key));
+  }
+  private shouldWake(key: string, visible = false): boolean {
+    return (this.notifyList.vibrates?.(key) ?? ((this.notifyList.notificationMode ?? "vibrate") === "vibrate" && this.notifyList.isNotifyChannel(key))) && (visible || this.cfg.wakeOnNotify);
+  }
+  private chatNotificationsAllowed(): boolean {
+    return this.notifyList.allowsAppNotification?.("chat") ?? this.notifyList.notificationMode !== "off";
+  }
+  private deliverVibration(evidence: Pick<RichText, "originEventIds" | "experience">, at: number, key?: string): void {
+    if (!canPerceivePhone(this.phone) || !this.chatNotificationsAllowed() || !(this.notifyList.vibrates?.(key) ?? ((this.notifyList.notificationMode ?? "vibrate") === "vibrate" && (!key || this.notifyList.isNotifyChannel(key))))) return;
+    this.callbacks.notify({ text: "手机震了一下。", ...anonymousChatNoticeEvidence(evidence, at) }, this.cfg.wakeOnNotify);
   }
 
   /** 从消息记录里查某人的名字（查不到就用 id） */
@@ -329,8 +353,9 @@ export class Gateway {
       comment: session.content?.trim() || undefined,
     });
     // 手机被放下：只感觉到震动，不呈现内容（请求仍已登记，拿起手机后可处理）
-    if (this.phone.down) {
-      this.callbacks.notify({ text: "放在一边的手机震了一下。" }, this.cfg.wakeOnNotify);
+    if (!this.chatNotificationsAllowed()) return;
+    if (!canUsePhone(this.phone)) {
+      this.deliverVibration({}, Date.now());
       return;
     }
     const who = req.username && req.username !== req.userId ? `${req.username}（${req.userId}）` : req.userId;
@@ -343,7 +368,9 @@ export class Gateway {
         : kind === "guild"
           ? `手机弹出提示：${who} 邀请你加入群 ${guild}${note}。${hint}`
           : `手机弹出提示：${who} 申请加入你管理的群 ${guild}${note}。${hint}`;
-    this.callbacks.notify({ text }, this.cfg.wakeOnNotify);
+    if (!canUsePhone(this.phone)) { this.deliverVibration({}, Date.now()); return; }
+    if (!this.chatNotificationsAllowed()) return;
+    this.callbacks.notify({ text }, (this.notifyList.appVibrates?.("chat") ?? (this.notifyList.notificationMode ?? "vibrate") === "vibrate") && this.cfg.wakeOnNotify);
   }
 
   private captureSessionTicket(session: Session): MessageOrderTicket {
@@ -372,9 +399,14 @@ export class Gateway {
     if (messageId && await this.store.findByMessageId(platform, channelId, messageId, bot.selfId)) return;
     // Outgoing tool arguments must not include incoming-only annotations such as
     // “@的是你”, which were never part of the platform message actually sent.
-    const content = await this.serializeElements(message.elements, { containerMsgId: messageId });
-    if (!content.trim()) return;
     const direct = session?.event?.channel?.type == null ? undefined : session.isDirect;
+    const { content, conversation } = await this.serializeMessage(message.elements, {
+      platform, channelId, selfId: bot.selfId, containerMsgId: messageId,
+      isDirect: direct ?? channelId.startsWith("private:"), guildId: session?.guildId,
+      // A command's before-send session can still belong to its invoking peer.
+      quote: session?.userId === bot.selfId ? session.quote : undefined,
+    });
+    if (!content.trim()) return;
     const identity = await this.names.identity(key, { isDirect: direct ?? channelId.startsWith("private:"), guildId: session?.guildId });
     // before-send may carry the invoking peer's session; only an account-authored
     // echo may supply the account's observed nickname.
@@ -383,14 +415,13 @@ export class Gateway {
       selfId: bot.selfId, platform, channelId, guildId: session?.guildId ?? "",
       userId: bot.selfId, username: firstName(observedName, identity.displayName), content, timestamp: new Date(message.timestamp), timestampSource: message.timestampSource ?? "local-confirmed", platformSequence: message.platformSequence, self: true, senderOrigin: "external", senderOwned: true, messageId,
       isDirect: direct ?? channelId.startsWith("private:"),
-      conversation: describeConversation(message.elements,
-        conversationKind(direct, channelId, session?.guildId), isStickerElement),
+      conversation,
     }, ticket);
     // Store all enabled modes, but expand media only when that mode actually exposes
     // the message. A put-down phone event must never smuggle images into awareness.
-    const visible = this.cfg.externalSelfMessages === "simulate" || (this.cfg.externalSelfMessages === "event" && !this.phone.down);
+    const visible = this.cfg.externalSelfMessages === "simulate" || (this.cfg.externalSelfMessages === "event" && canUsePhone(this.phone));
     const rendered: RichText = visible
-      ? { ...await this.renderer.render(content), ...chatMessageEvidence(saved) }
+      ? { ...prefixRichText(`〔聊天记录 #${saved.id}〕（${conversationLabel(saved.conversation, bot.selfId)}）\n`, await this.renderer.render(content)), ...chatMessageEvidence(saved) }
       : this.cfg.externalSelfMessages === "event"
         ? { text: "", ...anonymousChatNoticeEvidence(chatMessageEvidence(saved), saved.observedAt?.getTime()) }
         : { text: "", originEventIds: [] };
@@ -414,7 +445,7 @@ export class Gateway {
       timestampSource: session.timestamp == null ? "local-observed" : "platform", platformSequence: sessionSequence(session) }, ticket);
   }
 
-  private async handle(session: Session, ticket: MessageOrderTicket = this.captureSessionTicket(session)): Promise<void> {
+  private async handle(session: Session, ticket: MessageOrderTicket = this.captureSessionTicket(session), arrivalPermission?: boolean): Promise<void> {
     if (!session.content && !session.elements?.length) return;
     if (!consistentAccountSession(session)) return;
     if (session.userId && session.bot && session.platform === session.bot.platform && String(session.userId) === String(session.selfId ?? session.bot.selfId)) {
@@ -422,49 +453,20 @@ export class Gateway {
       return;
     }
 
+    const key = channelKey(session.platform ?? "unknown", session.channelId ?? "unknown", session.selfId ?? session.bot?.selfId);
+    const notifyOnArrival = arrivalPermission ?? this.notificationAllowed(key);
     const selfId = session.selfId ?? session.bot?.selfId ?? undefined;
     const senderOwned = this.ctx.bots.some(bot => bot.platform === session.platform && bot.selfId === session.userId);
     if (session.messageId && session.channelId && await this.store.findByMessageId(
       session.platform ?? "unknown", session.channelId, String(session.messageId), selfId,
     )) return;
     const elements = session.elements ?? h.parse(session.content ?? "");
-    let content = await this.serializeElements(elements, {
-      containerMsgId: session.messageId ?? undefined,
-      selfId,
+    const { content, conversation } = await this.serializeMessage(elements, {
+      platform: session.platform ?? "unknown", channelId: session.channelId ?? "unknown", selfId,
+      containerMsgId: session.messageId ?? undefined, isDirect: session.isDirect, guildId: session.guildId,
+      quote: session.quote, annotateSelf: true,
     });
     if (!content.trim()) return;
-
-    const conversation = describeConversation(elements,
-      conversationKind(session.isDirect, session.channelId, session.guildId), isStickerElement,
-      session.quote ? {
-        ...(session.quote.id ? { messageId: String(session.quote.id) } : {}),
-        ...(session.quote.user?.id != null ? { userId: String(session.quote.user.id) } : {}),
-      } : undefined);
-    // Some adapters expose only a quoted message id. Resolve it locally and within this account/channel;
-    // a missing author is unknown, never evidence that the reply is addressed to the Bot.
-    if (conversation.reply?.messageId && !conversation.reply.userId) {
-      const original = await this.store.findByMessageId(session.platform ?? "unknown", session.channelId ?? "unknown", conversation.reply.messageId, selfId);
-      if (original?.userId) conversation.reply.userId = original.userId;
-    }
-
-    // 引用回复：适配器会把被引用消息摘到 session.quote（不在 elements 里）。
-    // 以标签形式前置：信息可读（谁、说了什么），且 Bot 照抄 <quote id="…"/> 即可自己引用回复。
-    // 被引用的是 Bot 自己的消息时显式点破——账号昵称未必等于它的自我认知
-    const quote = session.quote;
-    if (quote && (quote.id || quote.content || quote.elements)) {
-      const qUser = quote.user as { name?: string; nick?: string; id?: string } | undefined;
-      const quoteUserId = conversation.reply?.userId;
-      const original = quote.id ? await this.store.findByMessageId(session.platform ?? "unknown", session.channelId ?? "unknown", String(quote.id), selfId) : null;
-      const identity = { platform: session.platform ?? "unknown", selfId, accountIds: this.ctx.bots.filter(bot => bot.platform === session.platform).map(bot => bot.selfId) };
-      const recordedName = original?.userId === selfId && isLegacySenderPlaceholder(original) ? "" : original?.username;
-      content =
-        quoteTag({
-          id: needsMsgIds(this.ops) && quote.id ? quote.id : undefined,
-          name: formatMessageSender({ platform: session.platform ?? "unknown", selfId, userId: quoteUserId ?? "",
-            username: firstName(recordedName, (quote as unknown as { member?: { nick?: string } }).member?.nick, qUser?.nick, qUser?.name), senderOrigin: original?.senderOrigin ?? (recordedName ? undefined : "unknown"), senderOwned: original?.senderOwned }, identity),
-          text: truncate(plainText(quote.elements ?? h.parse(quote.content ?? "")), 40) || undefined,
-        }) + ` ${content}`;
-    }
 
     const saved = await this.store.store({
       selfId: session.selfId ?? session.bot?.selfId ?? "",
@@ -484,33 +486,36 @@ export class Gateway {
       conversation,
     }, ticket);
 
-    const key = channelKey(session.platform ?? "unknown", session.channelId ?? "unknown", session.selfId ?? session.bot?.selfId);
+    await this.notifyList.receive?.(key, saved, notifyOnArrival);
     // 频道有新动静：先让系统侧（延期发送意图等）知情，再走通知策略
     this.callbacks.channelActivity(key);
     // 聚焦决定可见正文；通知设置独立决定震动／唤醒。
-    const focused = this.focus.isFocused(key);
-    const mayNotify = this.notifyList.isNotifyChannel(key);
+    let focused = this.focus.isFocused(key);
+    const mayNotify = notifyOnArrival && this.notificationAllowed(key);
     if (!focused && !mayNotify) return;
 
     // 手机被放下：本会通知的消息一律降级为"感觉到震动"，不呈现任何内容
-    if (this.phone.down) {
-      if (!this.notifyList.isNotifyChannel(key)) return;
-      this.callbacks.notify({ text: "放在一边的手机震了一下。",
-        ...anonymousChatNoticeEvidence(chatMessageEvidence(saved), saved.observedAt?.getTime()) }, this.cfg.wakeOnNotify);
+    if (!canUsePhone(this.phone)) {
+      if (notifyOnArrival) this.deliverVibration(chatMessageEvidence(saved), saved.observedAt?.getTime() ?? ticket.observedAt.getTime(), key);
       return;
     }
 
-    const notification = focused
+    let notification = focused
       ? await this.renderFocused(key, session, content, conversation, saved)
       : await this.renderNotification(key, session, content, conversation, saved);
     // Rendering images or resolving names can finish after the phone was put down.
     // Recheck the actual delivery boundary before exposing text or participant facts.
-    if (this.phone.down) {
-      if (!this.notifyList.isNotifyChannel(key)) return;
-      this.callbacks.notify({ text: "放在一边的手机震了一下。",
-        ...anonymousChatNoticeEvidence(chatMessageEvidence(saved), saved.observedAt?.getTime()) }, this.cfg.wakeOnNotify);
+    if (!canUsePhone(this.phone)) {
+      if (notifyOnArrival) this.deliverVibration(chatMessageEvidence(saved), saved.observedAt?.getTime() ?? ticket.observedAt.getTime(), key);
       return;
     }
+    if (focused && !this.focus.isFocused(key)) {
+      focused = false;
+      if (!notifyOnArrival || !this.notificationAllowed(key)) return;
+      notification = await this.renderNotification(key, session, content, conversation, saved);
+      if (!canUsePhone(this.phone)) { this.deliverVibration(chatMessageEvidence(saved), ticket.observedAt.getTime(), key); return; }
+    }
+    if (!focused && (!notifyOnArrival || !this.notificationAllowed(key))) return;
     // Only full message delivery grants the evidence identity and its participants.
     // A vibration/count/channel preview is not the unseen message's body.
     const evidence = focused || this.cfg.notifyPolicy === "content"
@@ -519,15 +524,53 @@ export class Gateway {
     if (!focused && this.cfg.notifyPolicy === "channel" && evidence.experience) {
       evidence.experience.chat = { channelKey: key, kind: "notice" };
     }
-    this.callbacks.notify({ ...notification, ...evidence },
-      this.notifyList.isNotifyChannel(key) && (focused || this.cfg.wakeOnNotify));
+    const accepted = this.callbacks.notify({ ...notification, ...evidence }, notifyOnArrival && this.shouldWake(key, focused));
+    if (accepted !== false && (focused || this.cfg.notifyPolicy === "content")) await this.notifyList.markSeen?.(key, [saved]);
+  }
+
+  /** Normalize only platform quote elements/session metadata, never matching text
+   * written by a participant. Adapter representations of the same reply share one tag. */
+  private async serializeMessage(elements: h[], opts: {
+    platform: string; channelId: string; selfId?: string; containerMsgId?: string;
+    isDirect?: boolean; guildId?: string; quote?: Session["quote"]; annotateSelf?: boolean;
+  }): Promise<{ content: string; conversation: ConversationContext }> {
+    const quote = opts.quote;
+    const elementQuotes = collectElementQuotes(elements);
+    const elementIds = [...elementQuotes.keys()].filter(Boolean);
+    // An adapter may strip the id from session.quote but leave it on its element.
+    // A unique explicit element id is evidence; multiple conflicting ids are not.
+    const quoteId = quote?.id ? String(quote.id) : quote && elementIds.length === 1 ? elementIds[0] : undefined;
+    const conversation = describeConversation(elements, conversationKind(opts.isDirect, opts.channelId, opts.guildId), isStickerElement,
+      quote ? { ...(quoteId ? { messageId: quoteId } : {}), ...(quote.user?.id != null ? { userId: String(quote.user.id) } : {}) } : undefined);
+    const original = conversation.reply?.messageId
+      ? await this.store.findByMessageId(opts.platform, opts.channelId, conversation.reply.messageId, opts.selfId) : null;
+    if (original?.userId && conversation.reply && !conversation.reply.userId) conversation.reply.userId = original.userId;
+    let content = await this.serializeElements(elements, {
+      containerMsgId: opts.containerMsgId, selfId: opts.annotateSelf ? opts.selfId : undefined,
+      elementQuotes, seenQuotes: new Set(), sessionQuote: !!quote, sessionQuoteId: quoteId,
+    });
+    if (quote) {
+      const qUser = quote.user as { name?: string; nick?: string; id?: string } | undefined;
+      const fallback = elementQuotes.get(quoteId ?? "");
+      const recordedName = original && original.userId === opts.selfId && isLegacySenderPlaceholder(original) ? "" : original?.username;
+      const username = firstName(recordedName, (quote as unknown as { member?: { nick?: string } }).member?.nick, qUser?.nick, qUser?.name, fallback?.name);
+      const quoteUserId = conversation.reply?.userId;
+      const name = username || quoteUserId ? formatMessageSender({ platform: opts.platform, selfId: opts.selfId, userId: quoteUserId ?? "", username,
+        senderOrigin: original?.senderOrigin ?? (recordedName ? undefined : "unknown"), senderOwned: original?.senderOwned },
+        { platform: opts.platform, selfId: opts.selfId, accountIds: this.ctx.bots.filter(bot => bot.platform === opts.platform).map(bot => bot.selfId) }) : undefined;
+      content = quoteTag({ id: quoteId, name,
+        text: truncate(plainText(quote.elements ?? h.parse(quote.content ?? "")), 40) || fallback?.text || undefined }) + content;
+    }
+    return { content, conversation };
   }
 
   /** 元素树 → 存储文本：媒体下载入资产库并替换为占位符 */
   private async serializeElements(
     elements: h[],
-    opts: { containerMsgId?: string; selfId?: string } = {},
+    opts: { containerMsgId?: string; selfId?: string; seenQuotes?: Set<string>;
+      elementQuotes?: Map<string, { name?: string; text?: string }>; sessionQuote?: boolean; sessionQuoteId?: string } = {},
   ): Promise<string> {
+    opts = { ...opts, seenQuotes: opts.seenQuotes ?? new Set(), elementQuotes: opts.elementQuotes ?? collectElementQuotes(elements) };
     let out = "";
     for (const el of elements) {
       switch (el.type) {
@@ -571,9 +614,10 @@ export class Gateway {
           break;
         }
         case "quote": {
-          // 开启需要消息编号的操作时带上被引用的消息 id，Bot 能看懂引用链并可跟进引用
-          const quotedId = el.attrs.id;
-          out += needsMsgIds(this.ops) && quotedId ? `[引用 msg:${quotedId}]` : "[引用了一条消息]";
+          const quotedId = el.attrs.id == null ? "" : String(el.attrs.id);
+          if (opts.seenQuotes!.has(quotedId) || (opts.sessionQuote && (!quotedId || quotedId === opts.sessionQuoteId))) break;
+          opts.seenQuotes!.add(quotedId);
+          out += quoteTag({ id: quotedId || undefined, ...opts.elementQuotes!.get(quotedId) });
           break;
         }
         default:
@@ -601,7 +645,7 @@ export class Gateway {
   private async renderFocused(key: string, session: Session, content: string, conversation: ConversationContext, sender: WorldMessageRow): Promise<RichText> {
     const rendered = await this.renderer.render(content);
     const msgTag =
-      needsMsgIds(this.ops) && session.messageId ? `(msg:${session.messageId}) ` : "";
+      `〔聊天记录 #${sender.id}〕` + (needsMsgIds(this.ops) && session.messageId ? ` (msg:${session.messageId})` : "") + "\n";
     const identity = await this.names.identity(key, { isDirect: session.isDirect, guildId: session.guildId });
     const who = formatMessageSender(sender, identity);
     const header = `你正留意着 ${await this.names.display(key)}，看到新消息（${conversationLabel(conversation, session.selfId ?? session.bot?.selfId)}）\n${identity.text}\n${msgTag}发送者：${who}\n消息正文：\n`;
@@ -609,17 +653,18 @@ export class Gateway {
   }
 
   private async renderNotification(key: string, session: Session, content: string, conversation: ConversationContext, sender: WorldMessageRow): Promise<RichText> {
+    const cue = this.notifyList.notificationMode === "silent" ? "手机屏幕提示" : "手机响了一下";
     switch (this.cfg.notifyPolicy) {
       case "count":
-        return { text: "手机响了一下：收到一条新消息。" };
+        return { text: `${cue}：收到一条新消息。` };
       case "channel":
-        return { text: `手机响了一下：收到来自 ${await this.names.display(key)} 的消息。` };
+        return { text: `${cue}：收到来自 ${await this.names.display(key)} 的消息。` };
       case "content": {
         const rendered = await this.renderer.render(content);
-        const msgTag = needsMsgIds(this.ops) && session.messageId ? `(msg:${session.messageId}) ` : "";
+        const msgTag = `〔聊天记录 #${sender.id}〕` + (needsMsgIds(this.ops) && session.messageId ? ` (msg:${session.messageId})` : "") + "\n";
         const identity = await this.names.identity(key, { isDirect: session.isDirect, guildId: session.guildId });
         const who = formatMessageSender(sender, identity);
-        const header = `手机响了一下：收到来自 ${await this.names.display(key)} 的消息（${conversationLabel(conversation, session.selfId ?? session.bot?.selfId)}）\n${identity.text}\n${msgTag}发送者：${who}\n消息正文：\n`;
+        const header = `${cue}：收到来自 ${await this.names.display(key)} 的消息（${conversationLabel(conversation, session.selfId ?? session.bot?.selfId)}）\n${identity.text}\n${msgTag}发送者：${who}\n消息正文：\n`;
         return prefixRichText(header, rendered, "\n〔该条消息结束〕");
       }
     }
@@ -643,7 +688,7 @@ export function prefixRichText(prefix: string, rendered: RichText, suffix = ""):
 
 /** 标签属性转义（与 Koishi 元素语法一致） */
 function escAttr(s: string): string {
-  return s.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
+  return s.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
 /** at 元素的标签文本形式（Bot 可照抄发出） */
@@ -656,14 +701,20 @@ export function faceTag(id: string, name?: string): string {
   return `<face id="${escAttr(id)}"${name ? ` name="${escAttr(name)}"` : ""}/>`;
 }
 
-/** quote（引用回复）的标签文本形式：带上被引用者与摘要，信息可读、照抄可用（出站只认 id） */
-export function quoteTag(opts: { id?: string; name?: string; text?: string }): string {
-  const attrs = [
-    opts.id ? `id="${escAttr(opts.id)}"` : "",
-    opts.name ? `name="${escAttr(opts.name)}"` : "",
-    opts.text ? `text="${escAttr(opts.text)}"` : "",
-  ].filter(Boolean);
-  return `<quote ${attrs.join(" ")}/>`;
+/** Quote children describe the referenced message, not the containing message.
+ * Merge adapter duplicates by their actual id without interpreting ordinary text. */
+function collectElementQuotes(elements: h[], quotes = new Map<string, { name?: string; text?: string }>()): Map<string, { name?: string; text?: string }> {
+  for (const element of elements) {
+    if (element.type === "quote") {
+      const id = element.attrs.id == null ? "" : String(element.attrs.id);
+      const previous = quotes.get(id);
+      const name = typeof element.attrs.name === "string" ? element.attrs.name : undefined;
+      const text = typeof element.attrs.text === "string" ? element.attrs.text : plainText(element.children);
+      quotes.set(id, { ...(previous?.name || name ? { name: previous?.name || name } : {}),
+        ...(previous?.text || text ? { text: previous?.text || truncate(text, 40) } : {}) });
+    } else if (element.type !== "forward" && element.children?.length) collectElementQuotes(element.children, quotes);
+  }
+  return quotes;
 }
 
 /** 元素树 → 纯文本摘要（不下载媒体，用于引用消息的内容预览） */

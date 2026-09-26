@@ -11,7 +11,7 @@ export interface WorldMeta {
   realWorld?: boolean;
   /** 常驻 Bot 的名字（创世时由 World-LLM 从 Bot_Definition 判定；用户改定义后可重判/手动改） */
   botName?: string;
-  /** 手机屏幕分辨率（配置 apps.phoneResolution 为 auto 时创世由 World-LLM 决定） */
+  /** 手机屏幕分辨率（auto 首次判定，随外观跨重置保留；显式配置仍优先） */
   phone?: { width?: number; height?: number };
   /**
    * @deprecated 创世时生成的浏览器带壳截图外壳原存于 meta.json，现已迁移到独立的
@@ -51,13 +51,14 @@ const WORLD_DEF_TEMPLATE = `# 世界定义
  * ├── News.jsonl           # World-LLM 维护：世界重大事件列表（JSONL 格式，世界中心）
  * ├── facts.jsonl          # World-LLM 维护：Bot 的小事记（JSONL 格式，Bot 中心）
  * ├── growth.jsonl        # 已感知经历与长期成长记录
- * ├── regulation.jsonl    # 内在调节状态、行动预测与学习审计
+ * ├── regulation.jsonl    # 已停用机制的旧审计，仅随存档保留，不参与运行
  * ├── clock.json           # World Clock 状态
  * ├── meta.json            # 世界元数据（创世时判定：是否现实世界等）
  * ├── focus.json           # Bot 正在关注的频道
  * ├── pinned.json          # Bot-LLM 置顶上下文 + 计数器
  * ├── stream.jsonl         # Bot-LLM 工作窗口（Tool Call 流）
  * ├── browserCache.json    # 虚构世界浏览器页面缓存（同一网址总是呈现同一页面）
+ * ├── phone-browser.json   # 浏览器历史、书签与会话（含 Cookie，仅属主可读写）
  * ├── Notes/               # Bot 的记事本：一篇笔记一个 Markdown 文件（文件名即标题）
  * ├── gallery/             # 收藏夹（分类子目录见 media/gallery.ts；描述元数据存数据库）
  * └── archive/             # 归档：压缩/重置/手动存档的历史快照（每份一个时间戳文件夹）
@@ -72,7 +73,7 @@ export class WorldFiles {
   /** 自然语言世界的权威日志；Markdown 状态只是可重建镜像。 */
   readonly narrativeJournal: string;
   readonly growthJournal: string;
-  readonly regulationJournal: string;
+  private readonly legacyAuditJournals: string[];
   readonly contextCommit: string;
   /** Present until all genesis metadata and the initial character context are saved. */
   readonly genesisPending: string;
@@ -89,19 +90,26 @@ export class WorldFiles {
   readonly pinned: string;
   readonly stream: string;
   readonly browserCache: string;
+  readonly phoneClock: string;
+  readonly phoneAssistant: string;
+  /** Private browser state, including login cookies; never a general WebUI data document. */
+  readonly phoneBrowser: string;
+  /** Character knowledge, scoped to this world's lifetime and archive position. */
+  readonly phoneToolCatalog: string;
+  readonly computerToolCatalog: string;
   readonly notesDir: string;
   readonly archiveDir: string;
   readonly galleryDir: string;
   /** 工具结果溢出（spill）目录：超大结果全文落盘到这，上下文里只留 head/tail 预览 */
   readonly spillDir: string;
-  /** 创世时 World-LLM 生成的浏览器带壳截图外壳（完整 HTML，含 {{screen}} 等占位符） */
+  /** 可独立生成/编辑、跨重置复用的浏览器截图外壳（完整 HTML，含 {{screen}} 等占位符） */
   readonly phoneShell: string;
 
   constructor(readonly base: string) {
     this.worldJournal = path.join(base, "world-transactions.jsonl");
     this.narrativeJournal = path.join(base, "world-narrative.jsonl");
     this.growthJournal = path.join(base, "growth.jsonl");
-    this.regulationJournal = path.join(base, "regulation.jsonl");
+    this.legacyAuditJournals = [path.join(base, "regulation.jsonl")];
     this.genesisPending = path.join(this.base, "genesis-pending.json");
     this.contextCommit = path.join(base, "context-commit.json");
     this.botDef = path.join(base, "Bot_Definition.md");
@@ -117,6 +125,11 @@ export class WorldFiles {
     this.pinned = path.join(base, "pinned.json");
     this.stream = path.join(base, "stream.jsonl");
     this.browserCache = path.join(base, "browserCache.json");
+    this.phoneClock = path.join(base, "phone-clock.json");
+    this.phoneAssistant = path.join(base, "phone-assistant.json");
+    this.phoneBrowser = path.join(base, "phone-browser.json");
+    this.phoneToolCatalog = path.join(base, "phone-tool-catalog.json");
+    this.computerToolCatalog = path.join(base, "computer-tool-catalog.json");
     this.notesDir = path.join(base, "Notes");
     this.archiveDir = path.join(base, "archive");
     this.galleryDir = path.join(base, "gallery");
@@ -365,7 +378,7 @@ export class WorldFiles {
       this.narrativeJournal,
       this.worldJournal,
       this.growthJournal,
-      this.regulationJournal,
+      ...this.legacyAuditJournals,
       this.contextCommit,
       this.genesisPending,
       this.botStatus,
@@ -379,6 +392,11 @@ export class WorldFiles {
       this.focus,
       this.notify,
       this.browserCache,
+      this.phoneClock,
+      this.phoneAssistant,
+      this.phoneBrowser,
+      this.phoneToolCatalog,
+      this.computerToolCatalog,
       this.phoneShell,
     ]) {
       if (file === this.narrativeJournal && narrativeSnapshot !== undefined) {
@@ -390,7 +408,8 @@ export class WorldFiles {
       }
       if (await this.exists(file)) {
         const target = path.join(dir, path.basename(file));
-        if (file === this.regulationJournal) await this.snapshotRegulationJournal(target);
+        if (file === this.phoneBrowser) await this.copyBrowserState(file, target);
+        else if (this.legacyAuditJournals.includes(file)) await this.snapshotAppendJournal(file, target);
         else await fs.copyFile(file, target);
         saved.push(path.basename(file));
       }
@@ -403,9 +422,19 @@ export class WorldFiles {
     return path.basename(dir);
   }
 
+  /** Create private copies with restrictive permissions from their first byte, even
+   * when restoring an older or externally imported archive with permissive modes. */
+  private async copyBrowserState(source: string, target: string): Promise<void> {
+    const temp = `${target}.${randomUUID()}.tmp`;
+    try {
+      await fs.writeFile(temp, await fs.readFile(source), { flag: "wx", mode: 0o600 });
+      await fs.rename(temp, target);
+    } finally { await fs.rm(temp, { force: true }); }
+  }
+
   /** The append-only journal commits at a newline; a concurrent write may leave a partial copied tail. */
-  private async snapshotRegulationJournal(target: string): Promise<void> {
-    await fs.copyFile(this.regulationJournal, target);
+  private async snapshotAppendJournal(source: string, target: string): Promise<void> {
+    await fs.copyFile(source, target);
     const file = await fs.open(target, "r+");
     try {
       let end = (await file.stat()).size;
@@ -416,7 +445,7 @@ export class WorldFiles {
         let offset = 0;
         while (offset < length) {
           const { bytesRead } = await file.read(buffer, offset, length - offset, start + offset);
-          if (!bytesRead) throw new Error("内在调节存档副本读取不完整");
+          if (!bytesRead) throw new Error("旧审计存档副本读取不完整");
           offset += bytesRead;
         }
         const newline = buffer.subarray(0, length).lastIndexOf(0x0a);
@@ -434,7 +463,7 @@ export class WorldFiles {
       this.narrativeJournal,
       this.worldJournal,
       this.growthJournal,
-      this.regulationJournal,
+      ...this.legacyAuditJournals,
       this.contextCommit,
       this.genesisPending,
       this.botStatus,
@@ -448,10 +477,18 @@ export class WorldFiles {
       this.focus,
       this.notify,
       this.browserCache,
+      this.phoneClock,
+      this.phoneAssistant,
+      this.phoneBrowser,
+      this.phoneToolCatalog,
+      this.computerToolCatalog,
       this.phoneShell,
     ]) {
       const src = path.join(snapDir, path.basename(file));
-      if (await this.exists(src)) await fs.copyFile(src, file);
+      if (await this.exists(src)) {
+        if (file === this.phoneBrowser) await this.copyBrowserState(src, file);
+        else await fs.copyFile(src, file);
+      }
       else await fs.rm(file, { force: true });
     }
     await this.kernel?.reload();
@@ -489,17 +526,18 @@ export class WorldFiles {
     );
   }
 
-  /** 重置全部运行时状态（保留用户定义文件与固定的小事记），旧状态归档 */
+  /** 重置运行时状态，保留定义、固定小事记及独立手机外观；旧状态完整归档。 */
   async reset(): Promise<void> {
     await this.atomicWrite(path.join(this.base, "bot-receipts-epoch"), randomUUID());
     // 固定的小事记跨越"这辈子"保留：先归档全部旧状态，再只把固定条目留回 facts.jsonl
     const pinnedFacts = await this.readPinnedFacts();
+    const { phone } = await this.readMeta();
     await this.snapshot("重置");
     for (const file of [
       this.narrativeJournal,
       this.worldJournal,
       this.growthJournal,
-      this.regulationJournal,
+      ...this.legacyAuditJournals,
       this.contextCommit,
       this.genesisPending,
       this.botStatus,
@@ -513,7 +551,11 @@ export class WorldFiles {
       this.focus,
       this.notify,
       this.browserCache,
-      this.phoneShell,
+      this.phoneClock,
+      this.phoneAssistant,
+      this.phoneBrowser,
+      this.phoneToolCatalog,
+      this.computerToolCatalog,
     ]) {
       await fs.rm(file, { force: true });
     }
@@ -523,6 +565,7 @@ export class WorldFiles {
     }
     await this.kernel?.reload();
     await this.narrative?.reload();
+    if (phone) await this.writeMeta({ phone });
     if (pinnedFacts.length) await this.writeFacts(pinnedFacts);
   }
 

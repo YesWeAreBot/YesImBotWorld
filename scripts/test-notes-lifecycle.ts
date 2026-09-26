@@ -29,7 +29,7 @@ async function closeDrainsLocalIO() {
       const files = new WorldFiles(dir); await files.ensure();
       const logger = { info() {}, warn() {} } as any;
       const app = new NotesApp(files, { now: () => 10, clockString: () => "上午" } as any, logger);
-      const manager = new AppManager("聊天", [app], new Set(), logger);
+      let manager = new AppManager("聊天", [app], new Set(), logger);
       await manager.open(app);
       if (tool !== "write_note") await manager.call("write_note", { title: "旧笔记", content: "旧世界的内容" });
       const entered = deferred(), release = deferred();
@@ -57,6 +57,7 @@ async function closeDrainsLocalIO() {
         await tick();
         assert.equal(await files.exists(files.notesDir), false, "the old operation cannot recreate Notes after reset");
         await assert.rejects(app.call("delete_note", { title: "旧笔记" }), /已关闭/);
+        manager = new AppManager("聊天", [app], new Set(), logger);
         await manager.open(app);
         await manager.call("write_note", { title: "旧笔记", content: "新世界的新内容" });
         await tick();

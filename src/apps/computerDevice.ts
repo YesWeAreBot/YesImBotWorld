@@ -20,6 +20,7 @@ import { renderSignature, type AppToolDef, type WorldApp } from "./app.js";
 import type { FileManagerApp } from "./files.js";
 import type { RemoteDesktopApp } from "./remoteDesktop.js";
 import type { TerminalApp } from "./terminal.js";
+import { LearnedToolCatalog } from "./tool-catalog.js";
 
 export interface ComputerOpenResult {
   /** 打开电脑的拟人化开场 */
@@ -38,6 +39,7 @@ interface ActiveComputer {
 
 export class ComputerDevice {
   private active: ActiveComputer | null = null;
+  private readonly learnedTools: LearnedToolCatalog;
 
   constructor(
     private terminal: TerminalApp,
@@ -52,7 +54,32 @@ export class ComputerDevice {
     private logger: Logger,
     private otherToolNames: () => string[] = () => [],
     private realWorld: boolean = clock.syncRealTime,
-  ) {}
+    catalogFile?: string,
+  ) {
+    this.learnedTools = new LearnedToolCatalog(catalogFile, error => this.logger.warn("电脑已学工具目录保存/读取失败：%s", error));
+  }
+
+  loadToolCatalog(): Promise<void> { return this.learnedTools.load(); }
+
+  /** Learning follows actual attention, independently of who opened the physical device. */
+  async learnCurrentTools(): Promise<void> {
+    const active = this.active;
+    if (!active) return;
+    for (const app of active.apps) {
+      if (app.connected === false) continue;
+      await this.learnedTools.remember(this.catalogOwner(app), active.defs.filter(def => active.toolMap.get(def.name)?.app === app));
+    }
+  }
+
+  /** A past tool is a navigation candidate only; callers must reopen and verify hasTool. */
+  knownToolDefs(): AppToolDef[] {
+    if (!this.available) return [];
+    const apps = this.realWorld && this.cfg.mode === "remote_desktop" ? [this.remote!]
+      : [this.terminal, this.filesApp].filter((app): app is TerminalApp | FileManagerApp => !!app);
+    return this.learnedTools.known(apps.map(app => this.catalogOwner(app)), [...this.reserved, "observe", ...this.otherToolNames()]).map(entry => entry.def);
+  }
+
+  private catalogOwner(app: WorldApp): string { return `${this.realWorld ? this.cfg.mode : "virtual"}:${app.id}`; }
 
   /** Configured capability, without starting a container or connecting to the desktop. */
   get available(): boolean {
@@ -70,12 +97,12 @@ export class ComputerDevice {
   }
 
   /** 打开电脑：按世界性质与实现方式选择可用的工具并展开 */
-  async open(): Promise<ComputerOpenResult | { error: string }> {
+  async open(opts: { learn?: boolean } = {}): Promise<ComputerOpenResult | { error: string }> {
     await this.close();
     const real = await this.isRealWorld();
     if (!real) {
       // 虚构世界：World-LLM 扮演这台电脑（终端 + 资源管理器）
-      return this.openAs([this.terminal, this.filesApp].filter(Boolean) as WorldApp[]);
+      return this.openAs([this.terminal, this.filesApp].filter(Boolean) as WorldApp[], opts.learn !== false);
     }
     switch (this.cfg.mode) {
       case "off":
@@ -83,11 +110,11 @@ export class ComputerDevice {
       case "docker": {
         const ready = await this.computer.ensureReady();
         if (!ready.ok) return { error: ready.error ?? "电脑没有开机。" };
-        return this.openAs([this.terminal, this.filesApp].filter(Boolean) as WorldApp[]);
+        return this.openAs([this.terminal, this.filesApp].filter(Boolean) as WorldApp[], opts.learn !== false);
       }
       case "remote_desktop": {
         if (!this.remote) return { error: "当前无法查看远程桌面的画面，暂时不能使用这台电脑。" };
-        return this.openAs([this.remote]);
+        return this.openAs([this.remote], opts.learn !== false);
       }
     }
   }
@@ -141,13 +168,13 @@ export class ComputerDevice {
   }
 
   /** 打开一组电脑组件（终端/资源管理器，或远程桌面），收集并展开它们的工具 */
-  private async openAs(apps: WorldApp[]): Promise<ComputerOpenResult> {
+  private async openAs(apps: WorldApp[], learn: boolean): Promise<ComputerOpenResult> {
     const toolMap = new Map<string, { app: WorldApp; tool: string }>();
     const defs: AppToolDef[] = [];
     const openings: string[] = [];
     for (const app of apps) {
       const { tools, opening } = await app.open();
-      if (opening) openings.push(opening);
+      if (opening) openings.push(typeof opening === "string" ? opening : opening.text);
       for (const t of tools) {
         let exposed = t.name;
         // Keep app homonyms distinct from the retired tool in frozen historical declarations.
@@ -164,6 +191,7 @@ export class ComputerDevice {
       }
     }
     this.active = { apps, toolMap, defs };
+    if (learn) await this.learnCurrentTools();
     const head =
       apps.length > 1
         ? `电脑会话已打开：${apps.map((a) => a.name).join("、")}。\n${openings.join("\n")}`

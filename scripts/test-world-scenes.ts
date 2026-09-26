@@ -53,7 +53,7 @@ async function main() {
     assert.equal(messages[0]!.role, "system");
     assert.match(String(messages[0]!.content), /world_definition/);
     assert.equal(messages.at(-1)!.role, "user");
-    const value = JSON.parse(String(messages.at(-1)!.content)) as Request;
+    const value = JSON.parse(String(messages.find(message => message.role === "user")!.content)) as Request;
     assert.equal(value.kind, kind); return value;
   }
   function expect(kind: string, output: Resolution, check?: (request: Request) => void) {

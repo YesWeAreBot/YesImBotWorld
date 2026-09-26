@@ -20,7 +20,6 @@ export interface CognitiveModelConfig {
 
 export interface BotModelConfig {
   growth: GrowthConfig;
-  regulation: RegulationConfig;
   baseURL: string;
   apiKey: string;
   model: string;
@@ -32,6 +31,8 @@ export interface BotModelConfig {
   nativeToolCalls: boolean;
   disableWait: boolean;
   ignoreSendDuration: boolean;
+  /** Wait for each autonomous tool's actual result before requesting another decision. Missing legacy values also enable it. */
+  strictToolLoop?: boolean;
   blockingAct: boolean;
   /** send 的阻塞：上一条还没完成回显前，拒绝新的发送 */
   sendBlocking: boolean;
@@ -56,18 +57,6 @@ export interface BotModelConfig {
   modalities: ModalitySupport;
 }
 
-export interface RegulationConfig {
-  llm?: CognitiveModelConfig;
-  enabled: boolean;
-  decisionEnabled: boolean;
-  timeoutMs: number;
-  maxInputChars: number;
-  candidateCount: number;
-  learningRate: number;
-  driftRate: number;
-  sexualResponseEnabled: boolean;
-}
-
 export interface GrowthConfig {
   llm?: CognitiveModelConfig;
   enabled: boolean;
@@ -76,6 +65,14 @@ export interface GrowthConfig {
   reviewTimeoutMs: number;
   maxInputChars: number;
   recallCount: number;
+}
+
+/** Koishi retains unknown keys. Drop retired settings before exposing or saving them. */
+export function withoutRetiredSettings(config: Config): Config {
+  const bot = config.bot as BotModelConfig & { regulation?: unknown };
+  if (!bot || typeof bot !== "object" || Array.isArray(bot) || !("regulation" in bot)) return config;
+  const { regulation: _retired, ...activeBot } = bot;
+  return { ...config, bot: activeBot };
 }
 
 export interface CaptionerConfig {
@@ -126,6 +123,8 @@ export interface WorldModelConfig {
   /** 以流式方式请求 LLM（SSE 边生成边返回）。不支持的旧后端可关闭，改为一次性返回 */
   stream: boolean;
   maxToolRounds: number;
+  /** Total real-time budget for a heartbeat, including correction attempts. */
+  heartbeatTimeoutMs?: number;
   compressMaxInputChars: number;
   waitNarrateMinRealSeconds: number;
 }
@@ -270,13 +269,45 @@ export interface ComputerConfig {
   remoteDesktop: RemoteDesktopConfig;
 }
 
+/** 相机照片生成：兼容 images/generations，不默认联网生成。 */
+export interface AppCameraConfig {
+  enabled: boolean;
+  baseURL: string;
+  apiKey: string;
+  model: string;
+  size: string;
+  quality: string;
+  promptMaxChars: number;
+}
+
+/** 手机内的问答应用，独立历史，不作为角色或世界的裁定者。 */
+export interface AssistantConfig {
+  enabled: boolean;
+  name: string;
+  mode: "inherit" | "independent";
+  baseURL: string;
+  apiKey: string;
+  model: string;
+  temperature: number;
+  maxTokens: number;
+  disableThinking: boolean;
+  stream: boolean;
+}
+
 /** 手机应用（Apps）：聊天平台之外，Bot 可以用 open_app 打开的应用 */
 export interface AppsConfig {
   chatAppName: string;
+  botManagedNotifications: boolean;
   weatherEnabled: boolean;
   weatherDefaultCity: string;
   browserEnabled: boolean;
   browserSearchURL: string;
+  browserHomeURL: string;
+  browserAutoScreenshot: boolean;
+  browserSearchFallbackURLs: string[];
+  clockEnabled: boolean;
+  camera: AppCameraConfig;
+  assistant: AssistantConfig;
   browserProxy: string;
   newsEnabled: boolean;
   newsFeeds: string[];
@@ -374,7 +405,7 @@ export const Config: Schema<Config> = Schema.intersect([
     serializeSameEndpoint: Schema.boolean()
       .default(true)
       .description(
-        "同源推理端点互斥：Bot、World、成长整理和内在调节实际使用的 baseURL 同源（协议+主机+端口相同）时，" +
+        "同源推理端点互斥：Bot、World、成长整理实际使用的 baseURL 同源（协议+主机+端口相同）时，" +
           "请求排队执行、绝不并发——World 任务（act 裁定、Tingle 等）期间同端点的 Bot 生成会短暂等待。" +
           "适用于并发请求下会饿死请求甚至崩溃的后端（模型换载层、单实例本地部署等）。" +
           "若你的后端能真正并发处理多个请求，关闭本项可让各 LLM 并行工作。" +
@@ -384,17 +415,6 @@ export const Config: Schema<Config> = Schema.intersect([
 
   Schema.object({
     bot: Schema.object({
-      regulation: Schema.object({
-        enabled: Schema.boolean().default(false).description("实验性内在调节：依据已交付经历维护需要、递质样信号与行动期待。每次自主决策增加一次评价请求，模型可独立配置；失败保留原候选，历史与原始证据持久保存"),
-        llm: cognitiveModelSchema(),
-        decisionEnabled: Schema.boolean().default(true).description("让需要、风险、成本与已学期待的评分参与实际行动选择；关闭后只评价原候选并学习实际结果"),
-        timeoutMs: Schema.natural().min(1000).max(300000).default(90000).description("单次评价超时（现实毫秒），包含共享端点排队；本地模型可能需要数十秒完成结构化输出，过短会持续回退；超时不虚构奖励或学习结果"),
-        maxInputChars: Schema.natural().min(4000).max(200000).default(64000).description("评价请求字符预算，完整作者边界和可用工具不可截断；预算不足时沿用原候选"),
-        candidateCount: Schema.natural().min(1).max(3).default(3).description("最多比较几个候选（含原候选）；只有最终选中的一个会执行"),
-        learningRate: Schema.number().min(0).max(1).default(0.3).description("新结果修正同一身份、情境和策略期待的基础速率；0 暂停期待更新"),
-        driftRate: Schema.number().min(0).max(0.5).default(0).description("每世界小时连接与探索需要的自然增长率；0 仅随真实经历变化，不凭时间创造饥饿或身体疲劳"),
-        sexualResponseEnabled: Schema.boolean().default(false).description("启用独立的性生理反射模拟：积累明确身体感知中的刺激与抑制，模拟峰值及恢复期。内部阶段不等于世界已发生的生理事件，也不代表自愿、愉悦或关系认同"),
-      }).description("内在调节与经验学习（实验）"),
       growth: Schema.object({
         enabled: Schema.boolean().default(true).description("自动整理已感知经历，形成可修订的关系、习惯和性格倾向，并在相关情境中唤起记忆；模型可独立配置，请求不改写当前上下文前缀"),
         llm: cognitiveModelSchema(),
@@ -449,19 +469,18 @@ export const Config: Schema<Config> = Schema.intersect([
           "无视 send 的 duration：消息不再按\"打字耗时\"延迟发出，" +
             "而是立即发送（也不再有超大 duration 的拦截与发出前的 cancel 窗口）。工具描述会同步说明",
         ),
+      strictToolLoop: Schema.boolean()
+        .default(true)
+        .description("等待工具结果（默认开启）：工具返回实际结果、失败或需要进一步决定的反馈后，才请求下一次 Bot 生成。等待期间世界、消息接收和人工操作继续运行。明确的后台任务以启动回执为本次结果。"),
       blockingAct: Schema.boolean()
         .default(true)
         .description(
-          "act() 的专注模式（默认开启）：上一个动作还没完成（结果交付）前，新的 act 会被直接拒绝并提示——" +
-            "不能被 repeat 等参数绕过；但其他工具调用（发消息、等待、看状态等）不受影响、照常进行。" +
-            "一个人同时只能专注做一件事，做别的不受影响。关闭后允许一个 act 进行中再开下一个 act",
+          "关闭‘等待工具结果’后生效：上一个 act 未返回前限制新的 act，其他能力仍可使用。关闭后允许多个动作意图并行。",
         ),
       sendBlocking: Schema.boolean()
         .default(true)
         .description(
-          "send 的阻塞（默认开启）：上一条消息还没发出、结果还没回显前，" +
-            "新的发送会被直接拒绝并提示——避免 Bot 在看不到自己上一条消息的情况下连发意思相近、前后不连贯的消息。" +
-            "其他工具调用不受影响。关闭后允许在上一条消息未回显时继续发下一条",
+          "关闭‘等待工具结果’后生效：上一条发送未返回前限制新的发送，其他能力仍可使用。关闭后允许多个发送并行。",
         ),
       waitRateThreshold: Schema.natural()
         .max(100)
@@ -560,6 +579,7 @@ export const Config: Schema<Config> = Schema.intersect([
             "大多数 OpenAI 兼容后端都支持；个别后端不支持 stream 且传入会报错时，请关闭本项（改为一次性返回整段结果）",
         ),
       maxToolRounds: Schema.natural().default(8).description("单次响应中允许的最大工具调用轮数"),
+      heartbeatTimeoutMs: Schema.number().min(1000).max(1800000).default(300000).description("单轮世界心跳的生成总时限（现实毫秒），包含端点等待及最多3次校验修正。超时取消未提交提案并退避重试，不影响已保存事实。"),
       compressMaxInputChars: Schema.natural()
         .default(100000)
         .description(
@@ -607,13 +627,13 @@ export const Config: Schema<Config> = Schema.intersect([
       tingleEveryUnits: Schema.number()
         .min(0)
         .default(1800)
-        .description("每过多少个 Time Unit 产生一次 Tingle（触发 World-LLM 推进世界、生成 News）。默认 1800（同步模式下即 30 分钟）。0 表示禁用"),
+        .description("世界心跳的基准间隔（TU），触发 World-LLM 检查外部进展。默认 1800（同步模式下即 30 分钟）。0 表示禁用；失败会退避重试"),
       tingleMode: Schema.union([
         Schema.const("fixed").description("固定间隔（使用上面的 tingleEveryUnits）"),
-        Schema.const("auto").description("由 World 在每次 Tingle 时根据世界节奏动态决定下一次间隔"),
+        Schema.const("auto").description("安静时逐步延长，实际变化时采用 World 建议的间隔"),
       ])
         .default("fixed")
-        .description("Tingle 间隔模式。auto 模式下 World 会获知当前历法、时刻与 TU 换算关系，自行决定下一次心跳的间隔"),
+        .description("Tingle 间隔模式。auto 模式结合已校验的 World 建议与安静退避，间隔受上下限约束。固定模式成功后保持基准间隔；两种模式失败都会退避"),
       tingleMinUnits: Schema.number()
         .min(0)
         .default(300)
@@ -621,7 +641,7 @@ export const Config: Schema<Config> = Schema.intersect([
       tingleMaxUnits: Schema.number()
         .min(0)
         .default(14400)
-        .description("auto 模式下下一次 Tingle 间隔的上限（TU）。防止 World 把心跳拖得太久。默认 14400（同步模式下即 4 小时）"),
+        .description("auto 模式下心跳间隔上限（TU），也用于两种模式的失败退避上限（不会低于固定基准间隔）。默认 14400（同步模式下即 4 小时）"),
       offlineNarrateMinUnits: Schema.number()
         .min(0)
         .default(600)
@@ -763,6 +783,9 @@ export const Config: Schema<Config> = Schema.intersect([
       chatAppName: Schema.string()
         .default("QQ")
         .description("聊天平台在 Bot 手机里的应用名。open_app 打开它 = 看一眼最近消息（check_msg）"),
+      botManagedNotifications: Schema.boolean()
+        .default(false)
+        .description("允许 Bot 在手机设置 App 中修改全局通知模式、各应用通知权限及限时免打扰。与聊天频道管理权限独立；关闭仅禁止 Bot 修改，管理员仍可在设备操作台调整，已保存设置保留。"),
       weatherEnabled: Schema.boolean()
         .default(true)
         .description(
@@ -777,17 +800,39 @@ export const Config: Schema<Config> = Schema.intersect([
         .description(
           "内置浏览器应用：现实世界设定对接真实互联网（搜索 + 打开网页 + 保存网页图片）；" +
             "虚构世界设定由 World-LLM 生成符合世界观的网页。" +
-            "两种模式都支持网页截图并自动存入收藏夹「截图」分类（需要安装 koishi-plugin-puppeteer，未安装时仅截图不可用）",
+            "安装 koishi-plugin-puppeteer 后支持真实网页点击、输入、滚动和截图；未安装时降级为文字和链接浏览",
         ),
-      browserSearchURL: Schema.string()
-        .default("https://www.so.com/s?q=%s")
-        .description(
-          "现实世界模式的搜索引擎地址，%s 为搜索词占位（无 %s 时追加在末尾）。" +
-            "默认 360 搜索（中国大陆可直连、结果页可解析、跳转链可还原）。可选：" +
-            "DuckDuckGo Lite https://lite.duckduckgo.com/lite/?q=%s（需能访问外网）、" +
-            "自建 SearxNG 实例 http://…/search?q=%s（最干净可控）。" +
-            "百度/搜狗/必应不推荐：页面过大、反爬或对无 cookie 请求返回不相关结果",
-        ),
+      browserHomeURL: Schema.string().default("portal")
+        .description("浏览器默认页：portal 为探索门户（搜索、Bilibili、新闻），也可填写网址。"),
+      browserAutoScreenshot: Schema.boolean().default(true)
+        .description("真实浏览器操作后附上当前屏幕。原生图片多模态开启时可直接看图操作；未开启时仍能使用页面文字和可操作元素。"),
+      browserSearchURL: Schema.string().default("https://www.bing.com/search?q=%s")
+        .description("默认搜索网址，%s 替换为搜索词。真实浏览器使用独立会话保留 Cookie；验证码需要用户在页面上处理或换搜索源。"),
+      browserSearchFallbackURLs: Schema.array(Schema.string()).default([
+        "https://www.bing.com/search?q=%s", "https://www.baidu.com/s?wd=%s", "https://www.so.com/s?q=%s", "https://duckduckgo.com/?q=%s",
+      ]).description("备用搜索源；当前搜索遇到验证或不可用时可主动切换，不反复轰炸同一地址。支持自建 SearxNG。"),
+      clockEnabled: Schema.boolean().default(true).description("时钟应用：世界时间、闹钟、计时器和秒表；切换应用后继续计时。"),
+      camera: Schema.object({
+        enabled: Schema.boolean().default(false).description("启用相机：基于角色可见场景生成照片，自动保存到相册；不自动发到聊天。"),
+        baseURL: Schema.string().default("https://api.openai.com/v1").description("图片生成服务地址，需支持 /images/generations。"),
+        apiKey: Schema.string().role("secret").default("").description("图片生成服务 API Key"),
+        model: Schema.string().default("").description("图像模型 ID，填写后才提供相机。"),
+        size: Schema.string().default("1024x1024").description("图片尺寸（由模型支持情况决定）。"),
+        quality: Schema.string().default("").description("图像质量参数；留空不传。"),
+        promptMaxChars: Schema.number().min(500).max(12000).default(4000).description("摄影提示词字符上限。"),
+      }).description("相机与图片模型：World 模型仅整理可见场景和构图，图像模型负责生成。"),
+      assistant: Schema.object({
+        enabled: Schema.boolean().default(false).description("启用手机内的独立问答助手。"),
+        name: Schema.string().default("小助手").description("应用名称，可自定义。"),
+        mode: Schema.union([Schema.const("inherit").description("借用 World 模型"), Schema.const("independent").description("独立模型")]).default("inherit"),
+        baseURL: Schema.string().default("https://api.openai.com/v1").description("独立模式的 OpenAI 兼容地址。"),
+        apiKey: Schema.string().role("secret").default("").description("独立模式 API Key"),
+        model: Schema.string().default("").description("独立模式模型 ID"),
+        temperature: Schema.number().min(0).max(2).step(0.05).default(0.7),
+        maxTokens: Schema.number().min(128).max(65536).default(4096),
+        disableThinking: Schema.boolean().default(false).description("独立模式：禁用模型思考。"),
+        stream: Schema.boolean().default(true).description("独立模式：流式显示回答。"),
+      }).description("手机问答助手：回答在 App 内流式显示；不加入总览的角色/世界生成面板。"),
       browserProxy: Schema.string()
         .default("")
         .description(
@@ -812,14 +857,14 @@ export const Config: Schema<Config> = Schema.intersect([
         .description(
           "Bot 手机的屏幕分辨率（竖屏，格式「宽x高」，如 800x1280、1080x2400）。" +
             "影响浏览器 App 截图尺寸与 WebUI「设备」页手机模型的展示比例。" +
-            "填 auto 则在创世（world.init）时由 World-LLM 依据世界观与角色设定自动决定（存入 meta.json）",
+            "填 auto 使用已保存的屏幕规格；首次创世且外壳与规格均未保存时，由 World-LLM 依据设定决定（存入 meta.json，重置后保留）。已有外壳但无规格时使用默认值",
         ),
       phoneShellImage: Schema.string()
         .default("")
         .description(
           "浏览器带壳截图的自定义外壳图片路径（png/jpg/webp；绝对路径或相对 Koishi 根目录）。" +
             "图片会以拉伸方式覆盖在网页截图最上层，屏幕区域需为透明（常见的设备边框素材即可）。" +
-            "留空则使用创世时 World-LLM 生成的外壳 UI（存于数据目录的 phoneShell.html，可在 WebUI 编辑）；" +
+            "留空则使用已保存的外壳 UI（phoneShell.html，跨重置复用，可在 WebUI 编辑或让 World-LLM 重新生成）；" +
             "没有生成过则使用内置的通用手机外壳",
         ),
       notesEnabled: Schema.boolean()
@@ -950,8 +995,8 @@ export const Config: Schema<Config> = Schema.intersect([
         model: Schema.string().default("").description("视觉模型名"),
         prompt: Schema.string()
           .role("textarea")
-          .default("请用中文简明扼要地描述这张图片的内容（一两句话，保留关键细节，如文字、表情、梗）。")
-          .description("解释提示词"),
+          .default("请用中文简述这张图片中可见的内容与清晰文字；分清画面事实和猜测，不推断发送者的真实情绪、喜好或意图。")
+          .description("普通图片的解释提示词；平台表情包另外按表意用途解释，不由素材判断发送者本次心意"),
         maxTokens: Schema.natural().default(512).description("最大生成 token 数"),
       }).description("图片 → 文本解释器（Bot-LLM 不具备图片能力时外挂）"),
       audio: Schema.object({
@@ -982,7 +1027,7 @@ export const Config: Schema<Config> = Schema.intersect([
           .description("解释提示词"),
         maxTokens: Schema.natural().default(512).description("最大生成 token 数"),
       }).description("视频 → 文本解释器"),
-    }).description("外挂多模态解释器：把 Bot-LLM 不具备的模态解释为文本（解释结果按媒体缓存，同一文件只解释一次）"),
+    }).description("外挂多模态解释器：把 Bot-LLM 不具备的模态解释为文本（按媒体及呈现用途缓存，不重复解释相同用途）"),
   }),
 
   Schema.object({
@@ -1113,8 +1158,8 @@ export const Config: Schema<Config> = Schema.intersect([
       botManagedNotifyChannels: Schema.boolean()
         .default(false)
         .description(
-          "允许 Bot 自己管理通知频道列表（channel_notify 工具，像真人给聊天设免打扰/开提醒）。" +
-            "开启后上面的列表只是初始值，此后的变更持久化在 notify.json",
+          "允许 Bot 在聊天 App 内管理各频道通知与限时免打扰（channel_notify）。" +
+            "不控制手机或应用级通知权限。上面的列表作为初始值；关闭仅禁止 Bot 修改，已保存设置保留，管理员仍可在设备操作台调整。",
         ),
       notifyPolicy: Schema.union([
         Schema.const("count").description("收到一条消息"),

@@ -13,6 +13,7 @@ import type { BotEvent, CompressionResult, EventSource, ExperienceMetadata, Medi
 import type { WorldAgent } from "../world/agent.js";
 import type { NotifyManager } from "../koishi/notify.js";
 import { normalizeMsgId } from "../koishi/markers.js";
+import { resolveOutgoingQuote } from "../koishi/quotes.js";
 import { debug } from "../webui/debug.js";
 import { createBackend, type BotBackend } from "./backend.js";
 import type { BotContext } from "./context.js";
@@ -20,24 +21,31 @@ import { describeToolCall, Scheduler, type ScheduleOptions } from "./scheduler.j
 import { deviceKind, type DeviceKind } from "../apps/deviceTools.js";
 import { GrowthLedger, type GrowthKind, type ReflectionOpportunity, type ReflectionRelation } from "./growth.js";
 import { GrowthRuntime } from "./growth-runtime.js";
-import { RegulationRuntime, StaleRegulationDecision, type RegulationChoice } from "./regulation-runtime.js";
 import { ReceiptInbox } from "./receipts.js";
 import { DeliberationBudget, thoughtError } from "./deliberation.js";
-import { collectOpportunities, type ActionOpportunity } from "./opportunities.js";
+import { collectOpportunities, currentWorldEpoch, type ActionOpportunity } from "./opportunities.js";
+import { choiceRejection, type ChoiceSelection } from "./choice.js";
+import { conversationMaterialReminder } from "./conversation-material.js";
+import { ToolCapabilityAnnouncements } from "./tool-capabilities.js";
+import { planToolNavigation } from "./navigation.js";
+import { canReachPhone, canUsePhone, canPerceivePhone, phonePhysicalState, phoneUnavailableReason } from "../phone-state.js";
 import { spillNarrativeText } from "./narrative-spill.js";
 import type { WorldObservation } from "../world/state.js";
 import { typingSlackTU } from "./typing.js";
-import { BOT_TOOLS, renderToolsText, toolLayer, type BotToolDef } from "./tools.js";
+import { BOT_TOOLS, renderToolsText, renderToolHelp, renderToolHelpIndex, toolLayer, type BotToolDef } from "./tools.js";
 import type { AppToolDef } from "../apps/app.js";
 import { signatureParams } from "./nativeTools.js";
 import { sliceText } from "../text.js";
 import { detectDeviceRequest, DEVICE_TOOL_GUIDANCE } from "../world/device-boundary.js";
-import { SCENE_CHOICE_GUIDANCE, THOUGHT_RUNTIME_GUIDANCE } from "../prompts.js";
+import { SCENE_CHOICE_GUIDANCE, THOUGHT_RUNTIME_GUIDANCE, TOOL_HELP_GUIDANCE, TOOL_RESULT_GUIDANCE, SLEEP_AND_DEVICE_GUIDANCE } from "../prompts.js";
 
 /** 代理执行单个工具调用的回传结果（管理员「手动驾驶」Bot） */
 export interface ManualToolResult {
   ok: boolean;
   callId?: string;
+  /** Explicitly rejected before dispatch; never infer this from a real receipt's prose. */
+  admissionRejected?: true;
+  code?: "STALE_SELECTION" | "SELECTION_REJECTED";
   /** 工具结果 / 校验拒绝原因 */
   text: string;
   content?: RichText;
@@ -102,13 +110,13 @@ export interface MessengerApi {
   viewForward(id: string): Promise<RichText>;
   poke(id: string, userId?: string): Promise<string>;
   handleRequest(requestId: string, approve: boolean, reason?: string): Promise<string>;
-  listFriends(): Promise<string>;
+  listFriends(options?: { cursor?: string; limit?: number; preview?: boolean }): Promise<string | RichText>;
   userInfo(userId: string): Promise<string>;
   sendLike(userId: string, times: number): Promise<string>;
   deleteFriend(userId: string): Promise<string>;
   setProfile(opts: { nickname?: string; signature?: string; avatar?: string }): Promise<string>;
   setModelShow(model: string): Promise<string>;
-  listGroups(): Promise<string>;
+  listGroups(options?: { cursor?: string; limit?: number; preview?: boolean }): Promise<string | RichText>;
   groupInfo(id: string): Promise<string>;
   listMembers(id: string): Promise<string>;
   memberInfo(id: string, userId: string): Promise<string>;
@@ -131,6 +139,7 @@ export interface MessengerApi {
 }
 
 interface MailboxItem {
+  contextHint?: { text: string };
   experience?: ExperienceMetadata;
   growthReferences?: { claimId: string; recordId: string }[];
   /** Retry the same durable IDs when an append/counter checkpoint fails. */
@@ -158,7 +167,7 @@ interface MailboxItem {
  * 阻塞规则：上下文修改（事件注入、压缩）只发生在两次生成之间 ——
  * 事件先进 mailbox，在下一次生成开始前统一追加。
  *
- * wait/rest 主动暂停生成；pending act 只依据 blockingAct 收起下一次 act，不暂停其他能力。
+ * 默认在工具真实返回后继续生成；显式关闭严格循环时才允许操作与后续决策并行。
  */
 
 /** 延期发送意图：duration 明显超过打字时间的 send，不自动发出，到点询问 Bot 是否要发 */
@@ -178,10 +187,13 @@ export class BotAgent {
   private backend: BotBackend;
   readonly scheduler: Scheduler;
   readonly growth: GrowthLedger;
-  readonly regulation: RegulationRuntime;
   private readonly growthRuntime: GrowthRuntime;
   private growthToolWrites = new Set<Promise<string | RichText>>();
   private operationCalls = new Map<string, ToolCallRecord>();
+  private pendingOperationNotices = new Map<string, BotEvent>();
+  private failedToolHelp = new Set<string>();
+  private pendingToolHelp = new Set<string>();
+  private navigationOutcomes = new Map<string, boolean>();
   private readonly receipts: ReceiptInbox;
   private retired = false;
   private receiptsPending = false;
@@ -199,8 +211,11 @@ export class BotAgent {
   private wakeFn: (() => void) | null = null;
   private deliberation: DeliberationBudget;
   private awaitingToolRetry = false;
+  private awaitingToolResult: string | null = null;
   private thoughtGuidanceDelivered = false;
+  private expressionGuidanceDelivered = false;
   private opportunityStamp: string | undefined;
+  private announcedOpportunities: ActionOpportunity[] = [];
   private lastGenAt = 0;
   /**
    * 近期已发消息的签名滑动窗口（频道+内容+图片），用于拦截"近期反复说同一句"——
@@ -261,7 +276,7 @@ export class BotAgent {
   private puppetCalls = new Set<string>();
   private controlAuditTail: Promise<void> = Promise.resolve();
   private autonomousDispatch: Promise<void> | null = null;
-  private deviceExecution = new AsyncLocalStorage<{ stealth: boolean }>();
+  private deviceExecution = new AsyncLocalStorage<{ stealth: boolean; external?: boolean }>();
   private stealthCalls = new Set<string>();
   private attention: DeviceKind | null = null;
   /** Explicitly looking at the nearby screen need not pick up the phone. */
@@ -271,7 +286,10 @@ export class BotAgent {
   private concealedDevices = new Set<DeviceKind>();
   private perceivedToolNames: string[] = [];
   private perceivedAppDefs: AppToolDef[] = [];
-  private announcedToolDefs: Map<string, string> | null = null;
+  private perceivedCapabilities: BotToolDef[] | null = null;
+  private capabilityAnnouncements: ToolCapabilityAnnouncements | null = null;
+  private capabilityWindow = -1;
+  private pendingCapabilityNotice: BotEvent | null = null;
   /**
    * 外部注入（管理员代理）工具调用的结果回传表：callId → 解析器。
    * 结果经 scheduler 的 deliver 通道（source=tool）回传；校验拒绝时的 system 提示在此暂存，
@@ -322,11 +340,10 @@ export class BotAgent {
     /** Passive pixels from the already-open desktop; called only while Bot attends it. */
     private peekDevice?: (kind: DeviceKind) => Promise<RichText | null>,
   ) {
-    this.toolDefs = (tools ?? BOT_TOOLS).filter(tool => tool.name !== "observe");
+    this.toolDefs = (tools ?? BOT_TOOLS).filter(tool => !["observe", "choose"].includes(tool.name));
     this.deliberation = new DeliberationBudget(context.stream);
     this.growth = new GrowthLedger(files.base);
     this.growthRuntime = new GrowthRuntime(this.growth, config.bot, clock, context, logger);
-    this.regulation = new RegulationRuntime(files.base, config.bot, clock, context, logger);
     this.receipts = new ReceiptInbox(files.base);
     this.repeatGuard = new RepeatGuard({
       thresholds: config.bot.repeatThresholds ?? [3, 5, 8],
@@ -345,7 +362,13 @@ export class BotAgent {
     this.scheduler = new Scheduler(
       clock,
       (content, ref, outcome) => {
+        if (ref && this.navigationOutcomes.has(ref)) this.navigationOutcomes.set(ref, outcome?.ok === true);
+        if (outcome?.ok === false && typeof content !== "string") {
+          const { contextHint: _hint, ...raw } = content;
+          content = raw;
+        }
         const performed = ref ? this.operationCalls.get(ref) : undefined;
+        if (outcome?.ok === false && performed?.role === "agent" && !performed.control && !["act", "wait", "rest", "cancel", "help"].includes(performed.name)) this.pendingToolHelp.add(performed.name);
         if (ref) this.operationCalls.delete(ref);
         if (ref && this.stealthCalls.has(ref)) {
           this.externalToolResults.get(ref)?.resolve({ ok: outcome?.ok ?? true, text: toPlainText(content), ...(typeof content === "string" ? {} : { content }) });
@@ -392,7 +415,7 @@ export class BotAgent {
       },
       logger,
     );
-    this.refreshToolGate(false);
+    this.refreshToolGate();
   }
 
   // ---------- 工具分层 ----------
@@ -413,6 +436,7 @@ export class BotAgent {
     const names = [...this.layerNames("core")];
     if (this.phoneUi.chatOpen) {
       names.push(...this.layerNames("chat"));
+      if (!autonomous && this.notifyList) names.push("channel_notify");
       if (this.phoneUi.channelKey) {
         names.push(...this.layerNames("channel"));
         if (this.phoneUi.channelIsGroup) names.push(...this.layerNames("group"));
@@ -429,10 +453,11 @@ export class BotAgent {
     const location = this.crossing?.location();
     const meaningful = (name: string): boolean => {
       switch (name) {
+        case "choose": return false; // Retired model shortcut; human menus resolve stable references separately.
         case "think": return !autonomous || this.deliberation.canThink;
         case "observe": return false; // Retired public tool; historical receipts remain readable.
-        case "act": return this.config.bot.blockingAct === false || !pending.some(task => task.name === "act");
-        case "pick_up_phone": return this.phone.down;
+        case "act": return !this.strictToolLoop && this.config.bot.blockingAct === false || !pending.some(task => task.name === "act");
+        case "pick_up_phone": return this.phone.down && canReachPhone(this.phone);
         case "put_down_phone": return !this.phone.down;
         case "open_app": return !!this.apps;
         case "close_app": return this.phoneUi.chatOpen || !!this.apps?.currentName;
@@ -440,6 +465,7 @@ export class BotAgent {
         case "close_computer": return !!this.computer?.isOpen;
         case "exit_forward": return this.phoneUi.forwardStack.length > 0;
         case "channel_notify": return !!this.notifyList;
+        case "phone_notifications": return !!this.notifyList;
         case "cancel": return pending.some(task => !task.committed);
         case "travel": return !travelling && !!this.crossing?.voluntaryWorlds().some(name => name !== location);
         case "go_home": return !travelling && !!location;
@@ -447,10 +473,26 @@ export class BotAgent {
       }
     };
     // 打破死循环：临时禁用被判定为「反复调用」的工具（下次压缩后自然恢复）
-    return [...new Set(names)].filter((n) => (includeBanned || !this.tempBannedTools.has(n)) && meaningful(n));
+    return [...new Set(names)].filter((n) => (includeBanned || !this.tempBannedTools.has(n)) && meaningful(n) &&
+      (this.classifyDevice(n) !== "phone" || ["pick_up_phone", "put_down_phone"].includes(n) ||
+        phonePhysicalState(this.phone).usable && (!autonomous || canReachPhone(this.phone))));
   }
 
-  private refreshToolGate(notify = true): void {
+  /** Previously discovered app operations are candidates, not permission to bypass their owner. */
+  private learnedDeviceDefs(): BotToolDef[] {
+    const phone = this.apps?.knownToolDefs?.() ?? [], computer = this.computer?.knownToolDefs?.() ?? [];
+    const conflicts = new Set(phone.filter(def => computer.some(other => other.name === def.name)).map(def => def.name));
+    return [...phone, ...computer].filter(def => !conflicts.has(def.name) && !this.toolDefs.some(core => core.name === def.name));
+  }
+
+  private navigableToolNames(): string[] {
+    if (this.residentControl?.mode === "puppet") return [];
+    return [...this.toolDefs.filter(def => this.classifyDevice(def.name) === "phone" && !["exit_forward", "pick_up_phone", "put_down_phone", "close_app"].includes(def.name)), ...this.learnedDeviceDefs()]
+      .map(def => def.name).filter(name => !this.tempBannedTools.has(name));
+  }
+
+  /** Keep execution gates live; announce only the net change at a delivery boundary. */
+  private refreshToolGate(): void {
     if (this.deviceExecution.getStore()?.stealth) return;
     let allowed = this.currentToolNames(undefined, true);
     let appDefs = [...(this.apps?.activeToolDefs() ?? []), ...(this.computer?.activeToolDefs() ?? [])];
@@ -458,7 +500,7 @@ export class BotAgent {
     // An unattended screen is not an omniscient connection monitor. Body/phone posture
     // is immediately felt, while hidden app changes wait until the next actual look/touch.
     const hidden = (name: string) => {
-      if (!this.announcedToolDefs || name === "pick_up_phone" || name === "put_down_phone") return false;
+      if (!this.perceivedCapabilities || name === "pick_up_phone" || name === "put_down_phone") return false;
       const kind = this.classifyDevice(name);
       return !!kind && (this.concealedDevices.has(kind) || (this.deviceAttention !== kind && !(this.deviceOperations > 0 && this.attention === kind)));
     };
@@ -468,29 +510,34 @@ export class BotAgent {
     this.perceivedAppDefs = structuredClone(appDefs);
     allowed = this.perceivedToolNames.filter(name => !this.tempBannedTools.has(name) && (this.residentControl?.mode !== "puppet" || this.autonomousDuringPuppet(name)));
     this.backend.setToolNames(allowed);
-    this.backend.setToolDefs?.([...this.toolDefs, ...appDefs]);
+    this.backend.setNavigableToolNames?.(this.navigableToolNames());
+    this.backend.setToolDefs?.([...this.toolDefs, ...this.learnedDeviceDefs(), ...appDefs]);
     const defs = [...this.toolDefs, ...appDefs].filter(def => allowed.includes(def.name));
     this.context.setCurrentToolsText(renderToolsText(defs));
-    const next = new Map(defs.map(def => [def.name, JSON.stringify(def)]));
-    if (notify && this.announcedToolDefs) {
-      const removed = [...this.announcedToolDefs.keys()].filter(name => !next.has(name));
-      const added = defs.filter(def => !this.announcedToolDefs!.has(def.name));
-      const changed = defs.filter(def => this.announcedToolDefs!.has(def.name) && this.announcedToolDefs!.get(def.name) !== next.get(def.name));
-      if (removed.length || added.length || changed.length) {
-        const lines = ["（当前能力发生变化，立即生效；之前的工具说明保留为历史记录，以本事件为准。"];
-        if (removed.length) lines.push(`现在不可用：${removed.join("、")}。调用这些工具不会执行操作。`);
-        if (removed.some(name => name === "act" || name === "observe") && this.pendingWorldOperations()) {
-          lines.push("已有动作尚未返回，当前专注设置暂停新的 act；结果会自动交付，无需重复提交。仍可思考或处理独立设备操作，不必用 rest 代替。");
-        }
-        if (removed.includes("think") && !this.deliberation.canThink) lines.push("这一段内心活动暂告一段落；新的实际感知或操作结果到来后，可以继续想。无需改用其他工具重复记录同一想法。");
-        if (added.length) lines.push(`现在新增可用：\n${renderToolsText(added)}`);
-        if (changed.length) lines.push(`以下工具的参数或语义已更新：\n${renderToolsText(changed)}`);
-        if (this.config.bot.nativeToolCalls && (added.length || changed.length)) lines.push('原生 function 声明会在整理记忆后更新；新能力或新参数尚未出现在声明中时，可在正文输出单个 {"name":"工具名","arguments":{},"duration":0} 调用。缺少原生声明不表示要用 act 代替设备工具。');
-        this.pushEvent("system", lines.join("\n") + "）");
-      }
-    }
-    this.announcedToolDefs = next;
+    this.perceivedCapabilities = structuredClone(defs);
     if (this.awaitingToolRetry && !this.pendingWorldOperations()) this.wakeFn?.();
+  }
+
+  private async announceToolChanges(): Promise<void> {
+    this.refreshToolGate();
+    if (!this.capabilityAnnouncements || this.capabilityWindow !== this.context.windowRevision) {
+      this.capabilityAnnouncements = new ToolCapabilityAnnouncements(this.context.pinned.toolsText, this.context.stream);
+      this.capabilityWindow = this.context.windowRevision;
+    }
+    if (!this.pendingCapabilityNotice) {
+      const notice = this.capabilityAnnouncements.prepare(this.perceivedCapabilities ?? [], this.navigableToolNames());
+      if (!notice) return;
+      this.pendingCapabilityNotice = { id: this.context.nextEventId(), source: "system", originEventIds: [],
+        worldTime: this.clock.now(), content: notice.content, toolAvailability: notice.update };
+    }
+    const event = this.pendingCapabilityNotice;
+    // A failed write must not make an unreceived definition count as already explained.
+    await this.context.appendEvent(event);
+    this.capabilityAnnouncements.commit(event.toolAvailability!);
+    this.pendingCapabilityNotice = null;
+    this.publishPerception(event);
+    // Live state may have changed while persistence yielded, or after a failed write.
+    if (this.capabilityAnnouncements.prepare(this.perceivedCapabilities ?? [], this.navigableToolNames())) await this.announceToolChanges();
   }
 
   /**
@@ -513,37 +560,13 @@ export class BotAgent {
   private async enterChannel(key: string, isPrivate: boolean): Promise<void> {
     const isGroup = !isPrivate;
     const prev = this.phoneUi;
-    const toolsetChanged =
-      !prev.channelKey || prev.channelIsGroup !== isGroup;
     this.phoneUi = { chatOpen: true, channelKey: key, channelIsGroup: isGroup, forwardStack: [] };
     this.refreshToolGate();
     // 注意力转移到别的频道：打断之前挂着的"过会儿再发"念头（频道切换并不总是先离开旧频道）
     if (prev.channelKey && prev.channelKey !== key) {
       this.interruptAllDeferred("你把注意力转去了别处");
     }
-    if (toolsetChanged) {
-      const current = new Set(this.currentToolNames());
-      const defs = [...this.layerDefs("channel"), ...(isGroup ? this.layerDefs("group") : [])].filter(def => current.has(def.name));
-      const lines: string[] = [];
-      if (defs.length) {
-        lines.push(
-          `频道内可用操作（id 参数可省略，缺省即当前频道；离开频道或关闭应用后失效）：\n${renderToolsText(defs)}`,
-        );
-      }
-      // @全体成员是群聊页专属的消息写法（不是独立工具）：进群页时告知
-      if (isGroup) {
-        lines.push(
-          `在群聊页里发消息还可以 @全体成员：在 msg 中写 <at type="all"/>（或 [@全体成员]）。` +
-            `这需要你是群管理员/群主，且每天次数有限——只在真正需要通知所有人时才用。`,
-        );
-      }
-      if (lines.length) {
-        this.pushEvent(
-          "system",
-          `（你正在 ${key} 的${isGroup ? "群聊" : "私聊"}页面里。${lines.join("\n")}）`,
-        );
-      }
-    }
+    if (prev.channelKey !== key || prev.channelIsGroup !== isGroup) this.pushEvent("system", `当前${isGroup ? "群聊" : "私聊"}：${key}。`);
   }
 
   // ---------- 生命周期 ----------
@@ -566,7 +589,6 @@ export class BotAgent {
 
   async stop(): Promise<void> {
     this.growthRuntime.stop();
-    this.regulation.stop();
     this.retired = true;
     this.perceptionListeners.clear();
     this.receipts.deactivate();
@@ -577,7 +599,7 @@ export class BotAgent {
       await this.settleGrowthWrites();
       await this.draining;
       await this.context.settled();
-      await this.receipts.settled(); await this.regulation.settled(); return;
+      await this.receipts.settled(); return;
     }
     this.running = false;
     this.abort?.abort();
@@ -593,7 +615,6 @@ export class BotAgent {
     await this.drainMailbox();
     await this.context.settled();
     await this.receipts.settled();
-    await this.regulation.settled();
     this.loopPromise = null;
     for (const [id, pending] of this.externalToolResults) {
       if (this.scheduler.isPending(id)) continue;
@@ -638,6 +659,7 @@ export class BotAgent {
     /** 手动驾驶（管理员接管 Bot）是否暂停了自主生成 */
     paused: boolean;
     awaitingToolRetry: boolean;
+    awaitingToolResult: string | null;
     opportunities: ActionOpportunity[];
     /** 手机界面状态（WebUI「设备」页窥视手机用） */
     phoneUi: { chatOpen: boolean; channelKey: string | null; channelIsGroup: boolean; forwardDepth: number };
@@ -650,6 +672,7 @@ export class BotAgent {
       pendingTasks: this.scheduler.pendingCount,
       paused: this.manualPaused,
       awaitingToolRetry: this.awaitingToolRetry,
+      awaitingToolResult: this.awaitingToolResult,
       opportunities: this.actionOpportunities(),
       phoneUi: {
         chatOpen: this.phoneUi.chatOpen,
@@ -661,31 +684,76 @@ export class BotAgent {
   }
 
   /** Suggestions use only delivered scenes and perceived capabilities, never hidden device state. */
-  actionOpportunities(mode?: "avatar" | "puppet"): ActionOpportunity[] {
-    const names = mode ? this.manualTools(mode) : [...(this.announcedToolDefs?.keys() ?? [])];
-    return collectOpportunities(this.context.stream, names);
+  private consumedHumanChoices = new Set<string>();
+
+  actionOpportunities(mode?: "avatar" | "puppet", ignoredCallId?: string): ActionOpportunity[] {
+    const names = mode ? this.manualTools(mode) : (this.perceivedCapabilities ?? []).map(def => def.name);
+    const history = this.context.opportunityStream();
+    return collectOpportunities(ignoredCallId ? history.filter(entry => entry.kind !== "tool_call" || entry.call.id !== ignoredCallId) : history, names)
+      .map(option => option.call?.name === "open_app" && option.call.arguments.name === "chat"
+        ? { ...option, call: { ...option.call, arguments: { ...option.call.arguments, name: this.config.apps?.chatAppName || "QQ" } } } : option)
+      .filter(option => !mode || !this.consumedHumanChoices.has(option.source === "world" ? `world:${option.sourceEventId}` : `device:${option.id}`));
+  }
+
+  private get perceivedWorldEpoch(): string {
+    // Route changes enter the mailbox synchronously, including while a human call is admitted.
+    const queued = [...this.mailbox].reverse().find(item => item.source === "system" && item.experience?.worldTransition);
+    return queued?.experience?.worldTransition?.epoch ?? currentWorldEpoch(this.context.opportunityStream());
   }
 
   private async announceOpportunities(opportunities: ActionOpportunity[]): Promise<void> {
-    const prefix = "（当前可考虑的行动机会；建议不是事实、命令或结果保证，可自由选择其他行动。";
+    const prefix = "（当前可考虑的行动机会；";
     const lines = opportunities.map((option, index) => `${index + 1}. [${option.source === "world" ? "世界" : "设备"}] ${option.label}：${option.intent}` +
       (option.exclusiveGroup ? `〔取舍组 ${option.exclusiveGroup}，可能无法同时选择〕` : "") +
-      (option.call ? `\n   可用调用：${JSON.stringify(option.call)}` : ""));
-    const content = prefix + "旧建议不代表现在仍可用；未选择也不算已经行动或放弃承诺。）\n" +
+      (option.replyTo ? `\n   使用 send，id=${JSON.stringify(option.replyTo)}，msg 由你自行组织；不是物理 act。` : "") +
+      (option.call ? `\n   对应工具：${JSON.stringify(option.call)}` : ""));
+    const content = prefix + "有合适的就使用对应工具，也可自由行动。物理行动用 act；聊天和软件必须通过实际设备工具。建议不代表已经行动或保证结果。）\n" +
       (lines.length ? lines.join("\n") : "此前的建议已不再作为当前选择；仍可依照当前能力自由行动。");
     const stamp = JSON.stringify([this.context.windowRevision, opportunities]);
     if (stamp === this.opportunityStamp) return;
     const prior = [...this.context.stream].reverse().find(entry => entry.kind === "event" && entry.event.source === "system" && entry.event.content.startsWith(prefix));
     if ((!opportunities.length && !prior) || (prior?.kind === "event" && prior.event.content === content)) {
+      this.announcedOpportunities = structuredClone(opportunities);
       this.opportunityStamp = stamp; return;
     }
     const event: BotEvent = { id: this.context.nextEventId(), source: "system", originEventIds: [], worldTime: this.clock.now(), content };
     await this.context.appendEvent(event);
+    this.announcedOpportunities = structuredClone(opportunities);
     this.opportunityStamp = stamp;
     this.publishPerception(event);
   }
 
   // ---------- 事件注入（唯一入口） ----------
+
+  /** Background device signals remain perceptible even when a hidden controller
+   * started their timers/promises. Do not inherit that tool's private receipt scope. */
+  notifyDevice(content: RichText, opts: { wake?: boolean } = {}): void {
+    this.deviceExecution.run({ stealth: false }, () => this.pushEvent("system", {
+      ...content,
+      originEventIds: content.originEventIds ?? [],
+      experience: { ...content.experience, agency: "observed", opportunity: false, worldPerception: false },
+    }, { wake: opts.wake ?? true }));
+  }
+
+  /** The service calls this only after committed physical facts change. */
+  phonePhysicalStateChanged(): void {
+    if (!canUsePhone(this.phone)) {
+      if (this.attention === "phone") this.attention = null;
+      this.observingPlacedPhone = false;
+      this.interruptAllDeferred("手机当前不可操作");
+      for (const task of this.scheduler.pending()) {
+        const call = this.operationCalls.get(task.id);
+        if (call?.role === "system" && !call.control && phonePhysicalState(this.phone).usable) continue;
+        if (this.classifyDevice(task.name) !== "phone" || task.committed || this.scheduler.cancel(task.id) !== "cancelled") continue;
+        const text = "手机状态变化，此操作已取消。";
+        this.externalToolResults.get(task.id)?.resolve({ ok: false, callId: task.id, text });
+        this.externalToolResults.delete(task.id);
+        if (!this.stealthCalls.has(task.id)) this.pushEvent("system", text, { ref: task.id });
+        this.stealthCalls.delete(task.id); this.puppetCalls.delete(task.id); this.operationCalls.delete(task.id);
+      }
+    }
+    this.refreshToolGate();
+  }
 
   /**
    * 向 Bot 的意识流投递事件。实际追加发生在两次生成之间（阻塞规则）。
@@ -696,7 +764,11 @@ export class BotAgent {
     content: string | RichText,
     opts: { ref?: string; wake?: boolean; originEventIds?: string[] } = {},
   ): void {
-    const rich = this.puppetReceipt(content, opts.ref);
+    let rich = this.puppetReceipt(content, opts.ref);
+    if (source === "system" && rich.experience?.worldTransition) this.generationAbort?.abort();
+    if ((source === "world" || rich.experience?.worldPerception) && rich.experience?.worldEpoch && rich.experience.worldEpoch !== this.perceivedWorldEpoch) {
+      rich = { ...rich, experience: { ...rich.experience, historicalWorld: true } };
+    }
     const puppetResult = source === "tool" && !!opts.ref && this.puppetCalls.has(opts.ref);
     // 手动驾驶（管理员代理）结果回传：捕获被校验拒绝时的 system 提示（source=system 且 ref 命中）。
     // 真正执行结果由 scheduler deliver 通道回传，不在此处理。
@@ -731,7 +803,7 @@ export class BotAgent {
         : source === "world" ? "新的世界感知到达"
         : source === "koishi" ? "新的聊天事件到达"
         : "新的事件到达";
-      const interruption = `（${kind === "rest" ? "休息" : "等待"}计时被中断：${cause}。实际经过 ${elapsed.toFixed(1)} TU；未继续计时到原定时刻。）`;
+      const interruption = `计时中断：${cause}；经过 ${elapsed.toFixed(1)} TU。`;
       if (cancellation === "cancelled") {
         this.externalToolResults.get(callId)?.resolve({ ok: false, callId, text: interruption });
         this.externalToolResults.delete(callId);
@@ -750,6 +822,7 @@ export class BotAgent {
 
     this.mailbox.push({
       source,
+      contextHint: rich.contextHint,
       experience: rich.experience,
       growthReferences: rich.growthReferences,
       originEventIds: opts.originEventIds ?? rich.originEventIds ?? (source === "world" ? observationOrigins(rich.text) : undefined),
@@ -784,6 +857,7 @@ export class BotAgent {
     const first = rich.parts?.[0];
     return {
       ...rich,
+      contextHint: undefined, // An abbreviated result must never hide external-control provenance.
       experience: { ...rich.experience, agency: "imposed", opportunity: false },
       text: rich.text.startsWith(prefix) ? rich.text : prefix + rich.text,
       ...(rich.parts ? { parts: first?.kind === "text" && first.text.startsWith(prefix) ? rich.parts : [{ kind: "text", text: prefix }, ...rich.parts] } : {}),
@@ -902,6 +976,12 @@ export class BotAgent {
     for (const id of cancelled) this.finishPause(id);
     if (this.waiting && cancelled.includes(this.waiting.callId)) { this.waiting = null; this.wakeFn?.(); }
     for (const id of cancelled) {
+      const operation = this.operationCalls.get(id);
+      if (operation?.role === "agent" && !operation.control && !this.stealthCalls.has(id)) {
+        this.pushEvent("system", operation.name === "send"
+          ? "（接管时此消息尚未提交，已取消，没有发出。）"
+          : "（接管已取消尚未提交的后续操作；已发生的结果不撤销。）", { ref: id, originEventIds: [] });
+      }
       this.operationCalls.delete(id);
       this.externalToolResults.get(id)?.resolve({ ok: false, text: "（管理员接管前已取消尚未提交的调用。）" });
       this.externalToolResults.delete(id);
@@ -912,7 +992,7 @@ export class BotAgent {
 
   get manualBusy(): boolean { return this.autonomousDispatch !== null || this.scheduler.pendingCount > 0; }
   get deviceBusy(): boolean { return this.deviceOperations > 0; }
-  get deviceAttention(): DeviceKind | null { return this.attention === "phone" && this.phone.down && !this.observingPlacedPhone ? null : this.attention; }
+  get deviceAttention(): DeviceKind | null { return this.attention === "phone" && (!canPerceivePhone(this.phone) || this.phone.down && !this.observingPlacedPhone) ? null : this.attention; }
 
   get residentMode(): "avatar" | "puppet" | null { return this.residentControl?.mode ?? null; }
 
@@ -997,7 +1077,8 @@ export class BotAgent {
   /** 当前分层真正允许的工具与原始应用 schema；读取无副作用。 */
   manualTools(mode?: "avatar" | "puppet"): AppToolDef[] {
     const allowed = new Set(this.currentToolNames(undefined, false, false));
-    return [...this.toolDefs, ...(this.apps?.activeToolDefs() ?? []), ...(this.computer?.activeToolDefs() ?? [])]
+    const operatorDefs = this.toolDefs.some(def => def.name === "channel_notify") ? [] : BOT_TOOLS.filter(def => def.name === "channel_notify");
+    return [...this.toolDefs, ...operatorDefs, ...(this.apps?.activeToolDefs() ?? []), ...(this.computer?.activeToolDefs() ?? [])]
       .filter(def => allowed.has(def.name) && (mode !== "puppet" || this.puppetToolAllowed(def.name)))
       .map(def => {
         const params = signatureParams(def.signature);
@@ -1021,7 +1102,7 @@ export class BotAgent {
   async injectExternalToolCall(
     name: string,
     args: Record<string, unknown> = {},
-    opts: { duration?: number; stealth?: boolean; control?: { mode: "avatar" | "puppet"; sessionId: string } } = {},
+    opts: { duration?: number; stealth?: boolean; control?: { mode: "avatar" | "puppet"; sessionId: string }; choice?: { selection: ChoiceSelection; validate: (ignoredCallId?: string) => void } } = {},
   ): Promise<ManualToolResult> {
     if (!opts.control) return this.executeExternalToolCall(name, args, opts);
     if (this.residentClosing || this.residentControl?.sessionId !== opts.control.sessionId || this.residentControl.mode !== opts.control.mode) return { ok: false, text: "角色接管会话已结束或正在交还。" };
@@ -1037,11 +1118,12 @@ export class BotAgent {
   private async executeExternalToolCall(
     name: string,
     args: Record<string, unknown> = {},
-    opts: { duration?: number; stealth?: boolean; control?: { mode: "avatar" | "puppet"; sessionId: string } } = {},
+    opts: { duration?: number; stealth?: boolean; control?: { mode: "avatar" | "puppet"; sessionId: string }; choice?: { selection: ChoiceSelection; validate: (ignoredCallId?: string) => void } } = {},
   ): Promise<ManualToolResult> {
     if (!this.running) {
       return { ok: false, text: "（Bot-LLM 当前未在运行，无法代理其工具调用。）" };
     }
+    try { opts.choice?.validate(); } catch (error) { return choiceRejection(error); }
     if (opts.control && (this.residentClosing || this.residentControl?.sessionId !== opts.control.sessionId || this.residentControl.mode !== opts.control.mode)) return { ok: false, text: "角色接管会话已改变，此调用没有执行。" };
     if (opts.control?.mode === "puppet" && !this.puppetToolAllowed(name)) return { ok: false, text: "身体操纵不能代替角色思考、反思或休息；请使用观察与身体/设备能力。" };
     if (!args || typeof args !== "object" || Array.isArray(args) || (opts.duration !== undefined && (!Number.isFinite(opts.duration) || opts.duration < 0))) return { ok: false, text: "工具参数必须为对象，duration 必须为有限非负数。" };
@@ -1060,7 +1142,9 @@ export class BotAgent {
       id: this.context.nextToolId(),
       role: "system", // 管理员代理；avatar 的角色意图与模型自主生成可审计区分
       ...(opts.control ? { control: { ...opts.control } } : {}),
+      ...(opts.choice ? { selection: { ...opts.choice.selection } } : {}),
       name,
+      ...(name === "act" ? { worldEpoch: this.perceivedWorldEpoch } : {}),
       arguments: args,
       ...(duration && duration > 0 ? { duration } : {}),
       issuedAt,
@@ -1103,7 +1187,13 @@ export class BotAgent {
       this.pushEvent("system", "（运行或控制会话已结束，此调用没有开始。）", { ref: call.id });
       return { ok: false, callId: call.id, text: "（运行或控制会话已结束，此调用没有开始。）" };
     }
-    await this.deviceExecution.run({ stealth: !!opts.stealth }, () => this.dispatch(call));
+    try { opts.choice?.validate(call.id); } catch (error) {
+      this.externalToolResults.delete(call.id); this.stealthCalls.delete(call.id); this.puppetCalls.delete(call.id);
+      const text = (error as Error).message;
+      this.pushEvent("system", text, { ref: call.id });
+      return { ...choiceRejection(error), callId: call.id };
+    }
+    await this.deviceExecution.run({ stealth: !!opts.stealth, external: !opts.control }, () => this.dispatch(call));
 
     // 校验拒绝（未进入调度）：dispatch 已同步经 pushEvent(system) 推送了拒绝原因（ref=call.id），
     // 且 scheduler 无对应 pending 任务 → 兜底以该拒绝原因回传；否则等待 scheduler deliver 的结果。
@@ -1114,6 +1204,11 @@ export class BotAgent {
       entry.resolve({ ok: false, text: entry.systemText ?? `（${name} 未被接受。）` });
     }
     const result = await resultPromise;
+    if (opts.choice && result.ok) {
+      const selection = opts.choice.selection;
+      this.consumedHumanChoices.add(name === "act" ? `world:${selection.sourceEventId}` : `device:${selection.opportunityId}`);
+      if (this.consumedHumanChoices.size > 512) this.consumedHumanChoices.delete(this.consumedHumanChoices.values().next().value!);
+    }
     this.puppetCalls.delete(call.id);
     if (opts.control) await this.auditControl({ phase: "receipt", callId: call.id, control: opts.control, ok: result.ok, text: result.text }).catch(() => {});
     return result;
@@ -1121,12 +1216,40 @@ export class BotAgent {
 
   // ---------- 主循环 ----------
 
+  private get strictToolLoop(): boolean { return this.config.bot.strictToolLoop !== false; }
+
+  /** Human/stealth operations and background app jobs do not own the model's decision turn. */
+  private autonomousPendingResults(): string[] {
+    return this.scheduler.pending().flatMap(task => {
+      const call = this.operationCalls.get(task.id);
+      // wait/rest already own the timer gate. Excluding them lets memory maintenance
+      // run during that pause, without issuing any new model decision before wake-up.
+      return call?.role === "agent" && !call.control && !["wait", "rest"].includes(call.name) && !this.stealthCalls.has(task.id) ? [task.id] : [];
+    });
+  }
+
+  private async waitForToolResults(): Promise<void> {
+    const ids = this.autonomousPendingResults();
+    if (!ids.length || !this.running || this.manualPaused) return;
+    // Separate from the finished model request, so handback cannot reuse an aborted signal.
+    this.generationAbort = new AbortController();
+    const signal = AbortSignal.any([this.abort!.signal, this.generationAbort.signal]);
+    this.awaitingToolResult = ids[0]!;
+    try { await abortable(Promise.all(ids.map(id => this.scheduler.whenSettled(id))), signal); }
+    catch (error) { if (!signal.aborted) throw error; }
+    finally { this.awaitingToolResult = null; }
+    // Receipts are delivered to the mailbox before whenSettled resolves. The next loop
+    // drains them durably, along with incoming messages, before constructing any request.
+  }
+
   private async runLoop(): Promise<void> {
     this.logger.info("Bot-LLM 开始持续推理");
     while (this.running) {
       try {
         this.refreshToolGate();
-        await this.drainMailbox();
+        // Deliver facts now; transient capability/menu changes can settle during throttle,
+        // rest or manual control and need announcing only if another inference will see them.
+        await this.drainMailbox(false);
 
         const identityUpdate = await this.context.refreshChatAccounts(this.clock.now());
         if (identityUpdate) this.publishPerception(identityUpdate);
@@ -1135,6 +1258,13 @@ export class BotAgent {
         // 短睡后回到循环顶部重排邮箱，保证注入的事件及时进入上下文。
         if (this.manualPaused) {
           await sleep(250, this.abort?.signal);
+          continue;
+        }
+
+        // A pending receipt is a scheduling concern, not another model decision.
+        // This also covers returning from manual control while a committed operation is unfinished.
+        if (this.strictToolLoop && this.autonomousPendingResults().length) {
+          await this.waitForToolResults();
           continue;
         }
 
@@ -1160,10 +1290,10 @@ export class BotAgent {
         this.refreshToolGate();
         await this.drainMailbox();
         if (!this.running || this.manualPaused || this.waiting || this.compressionRequested) continue;
+        if (this.strictToolLoop && this.autonomousPendingResults().length) continue;
 
         let parsed: ParsedToolCall;
-        let regulated: RegulationChoice;
-        let decisionCurrent = () => this.running && !this.manualPaused && !this.generationAbort?.signal.aborted;
+        const decisionCurrent = () => this.running && !this.manualPaused && !this.generationAbort?.signal.aborted;
         try {
           this.generationAbort = new AbortController();
           const signal = AbortSignal.any([this.abort!.signal, this.generationAbort.signal]);
@@ -1172,21 +1302,11 @@ export class BotAgent {
             const error = thoughtError(parsed.arguments.thought);
             if (error) throw new ToolCallParseError(error);
           }
-          const available = [...this.toolDefs, ...this.perceivedAppDefs].filter(def => this.announcedToolDefs?.has(def.name));
-          const gate = JSON.stringify([...this.announcedToolDefs ?? []]);
-          const control = JSON.stringify(this.residentControl);
-          if (this.config.bot.regulation?.enabled) decisionCurrent = () => {
-            this.refreshToolGate();
-            return this.running && !this.manualPaused && !signal.aborted && !this.compressionRequested &&
-              gate === JSON.stringify([...this.announcedToolDefs ?? []]) && control === JSON.stringify(this.residentControl);
-          };
-          regulated = await this.regulation.choose(parsed, available, call => this.regulationScope(call), signal, decisionCurrent);
-          parsed = regulated.call;
           this.parseFailures = 0;
         } catch (err) {
           if (!this.running) break;
           if (this.manualPaused) continue;
-          if (err instanceof StaleRegulationDecision || this.generationAbort?.signal.aborted) continue;
+          if (this.generationAbort?.signal.aborted) continue;
           if (err instanceof ToolCallParseError) {
             this.parseFailures++;
             this.logger.warn(
@@ -1196,7 +1316,7 @@ export class BotAgent {
             );
             // 「工具此刻不可用 / 未知工具」是可执行的明确原因（分层允许集造成）——必须原样透传给模型，
             // 让它知道该先 open_app 进聊天应用、select_channel 进频道，而不是吞成"恍惚"后原地重试同一个调用。
-            if (/(此刻不可用|未知工具)/.test(err.message) || err.message.startsWith("think.thought")) {
+            if (/(此刻不可用|未知工具)/.test(err.message) || /^(think\.thought|(?:arguments\.)?duration\b)/.test(err.message) || err.message.endsWith("本次没有执行操作。")) {
               this.pushEvent("system", `（${err.message}）`);
               await this.backoffInvalidToolRetry();
               continue;
@@ -1268,12 +1388,15 @@ export class BotAgent {
         }
 
         if (!decisionCurrent()) continue;
+        const navigationError = await this.prepareNavigation(parsed, decisionCurrent);
+        if (!decisionCurrent()) continue;
         const call = this.finalize(parsed);
-        await this.regulation.bind(regulated!, call);
-        if (!decisionCurrent()) { await this.regulation.abandon(call.id); continue; }
-        for (const event of await this.regulation.drain()) this.publishPerception(event);
-        if (!decisionCurrent()) { await this.regulation.abandon(call.id); continue; }
         await this.context.appendToolCall(call);
+        if (navigationError) {
+          this.pushEvent("system", navigationError, { ref: call.id });
+          this.pendingToolHelp.add(call.name);
+          continue;
+        }
         debug.emit("bot.tool", `${call.id} ${call.name}`, {
           id: call.id,
           name: call.name,
@@ -1290,13 +1413,23 @@ export class BotAgent {
           call.duration ? ` +${call.duration}TU` : "",
         );
         if (!decisionCurrent()) {
-          await this.regulation.abandon(call.id);
           this.pushEvent("system", "（这次调用已记录，但执行前控制权或可用能力发生变化，没有执行。）", { ref: call.id });
           continue;
         }
         const dispatch = this.dispatch(call);
         this.autonomousDispatch = dispatch;
         try { await dispatch; } finally { if (this.autonomousDispatch === dispatch) this.autonomousDispatch = null; }
+        // A screen interaction is one decision step. Its receipt must enter the next
+        // request before deciding what to touch next; other actors still own their
+        // individual queue slots, and world actions retain their concurrency setting.
+        // A future send is still cancellable typing, not an already submitted
+        // platform operation. Keep its decision window open for new input/cancel.
+        const futureSend = call.name === "send" && call.expectedAt > this.clock.now();
+        if (!this.strictToolLoop && decisionCurrent() && !futureSend && (call.name === "observe_device" || this.classifyDevice(call.name))) {
+          const signal = AbortSignal.any([this.abort!.signal, this.generationAbort!.signal]);
+          try { await abortable(this.scheduler.whenSettled(call.id), signal); }
+          catch (error) { if (!decisionCurrent()) continue; throw error; }
+        }
       } catch (err) {
         if (!this.running) break;
         this.logger.error("Bot-LLM 循环出错: %s", err);
@@ -1306,13 +1439,28 @@ export class BotAgent {
     this.logger.info("Bot-LLM 停止推理");
   }
 
-  private async drainMailbox(): Promise<void> {
+  private async drainMailbox(announceCapabilities = true): Promise<void> {
     if (this.draining) return this.draining;
-    this.draining = this.drainMailboxUnlocked().finally(() => { this.draining = null; });
+    this.draining = this.drainMailboxUnlocked(announceCapabilities).finally(() => { this.draining = null; });
     return this.draining;
   }
 
-  private async drainMailboxUnlocked(): Promise<void> {
+  private async drainMailboxUnlocked(announceCapabilities: boolean): Promise<void> {
+    if (this.running) {
+      for (const guidance of [TOOL_HELP_GUIDANCE, TOOL_RESULT_GUIDANCE, SLEEP_AND_DEVICE_GUIDANCE]) {
+        const added = await this.context.ensureGuidance(guidance, this.clock.now());
+        if (added) this.publishPerception(added);
+      }
+    }
+    if (this.running && !this.expressionGuidanceDelivered) {
+      const guidance = await this.context.ensureExpressionGuidance(this.clock.now());
+      if (guidance) this.publishPerception(guidance);
+      this.expressionGuidanceDelivered = true;
+    }
+    if (this.running) {
+      const retirement = await this.context.retireLegacyRegulation(this.clock.now());
+      if (retirement) this.publishPerception(retirement);
+    }
     if (this.running && !this.thoughtGuidanceDelivered && this.toolDefs.some(def => def.name === "think")) {
       if (!this.context.stream.some(entry => entry.kind === "event" && entry.event.source === "system" && entry.event.content === THOUGHT_RUNTIME_GUIDANCE + "\n\n" + SCENE_CHOICE_GUIDANCE)) {
         const event: BotEvent = { id: this.context.nextEventId(), source: "system", worldTime: this.clock.now(),
@@ -1322,7 +1470,6 @@ export class BotAgent {
       }
       this.thoughtGuidanceDelivered = true;
     }
-    await this.regulation.restore();
     if (!this.growthRestored) {
       await this.growth.restorePerceptions(this.context.stream);
       this.growthRestored = true;
@@ -1334,12 +1481,11 @@ export class BotAgent {
       await this.context.appendEvent(event);
       this.publishPerception(event);
       await this.growth.perceive(event, event.originEventIds ?? [event.id]);
-      await this.regulation.perceive(event);
       const origin = this.context.stream.find(entry => entry.kind === "tool_call" && entry.call.id === event.refToolCallId);
       if (this.deliberation.perceive(event, origin?.kind === "tool_call" ? origin.call : undefined)) this.parseFailures = 0;
       debug.emit("bot.event", `[tool receipt] ${event.id}`, { ...event, recovered: true });
     });
-    if (!this.mailbox.length) { await this.offerReflection(); return; }
+    if (!this.mailbox.length) { await this.offerReflection(announceCapabilities); return; }
     const count = this.mailbox.length;
     for (let index = 0; index < count; index++) {
       const item = this.mailbox[0]!;
@@ -1370,6 +1516,7 @@ export class BotAgent {
         originEventIds: item.originEventIds,
         source: item.source,
         content: item.content,
+        contextHint: item.contextHint,
         worldTime: item.worldTime,
         refToolCallId: item.refToolCallId,
         attachments: item.attachments,
@@ -1388,7 +1535,6 @@ export class BotAgent {
         this.logger.warn("感知证据保存失败，保留当前事件与邮箱，写入恢复前暂停新的推理：%s", err);
         throw err;
       });
-      await this.regulation.perceive(event);
       if (this.deliberation.perceive(event, originCall?.kind === "tool_call" ? originCall.call : undefined)) this.parseFailures = 0;
       this.noteProgress(event);
       const resultLabel = event.refToolCallId
@@ -1404,16 +1550,27 @@ export class BotAgent {
       });
       this.mailbox.shift();
     }
-    await this.offerReflection();
+    await this.offerReflection(announceCapabilities);
   }
 
-  private async offerReflection(): Promise<void> {
+  private async offerReflection(announceCapabilities: boolean): Promise<void> {
+    if (this.running && announceCapabilities) await this.announceToolChanges();
+    if (this.running && announceCapabilities && !this.manualPaused) await this.announceFailedToolHelp();
     // Maintenance never edits the active request: only this serialized delivery boundary may
     // append its results. Avatar control defers private automatic changes until handback.
     if (this.running && !this.manualPaused) {
+      if (announceCapabilities) await this.announcePendingOperations();
       const opportunities = this.actionOpportunities();
-      await this.announceOpportunities(opportunities);
-      for (const event of await this.regulation.drain()) this.publishPerception(event);
+      if (announceCapabilities) await this.announceOpportunities(opportunities);
+      if (this.currentToolNames().includes("send")) {
+        const material = conversationMaterialReminder(this.context.stream, this.clock.now());
+        if (material) {
+          // An optional, source-linked reminder. It neither wakes the character nor
+          // enters growth as a new experience, and never creates a send operation.
+          await this.context.appendEvent(material);
+          this.publishPerception(material);
+        }
+      }
       for (const event of [...await this.growthRuntime.drain(), ...await this.growthRuntime.remember(undefined, opportunities)]) {
         this.publishPerception(event);
         debug.emit("bot.event", `[growth] ${event.id}`, event);
@@ -1515,7 +1672,7 @@ export class BotAgent {
         return;
       }
     }
-    const content: RichText = { text: "（这段内心独白已记下。）", originEventIds: [],
+    const content: RichText = { text: "（这段内心独白已记下。）", contextHint: { text: "" }, originEventIds: [],
       experience: { internalThought: true, agency: call.role === "agent" || call.control?.mode === "avatar" ? "self" : "unknown", opportunity: false } };
     const pending = this.externalToolResults.get(call.id);
     if (pending) {
@@ -1538,6 +1695,7 @@ export class BotAgent {
       id: this.context.nextToolId(),
       role: "agent",
       name: parsed.name,
+      ...(parsed.name === "act" ? { worldEpoch: this.perceivedWorldEpoch } : {}),
       arguments: parsed.arguments,
       duration,
       issuedAt,
@@ -1545,25 +1703,82 @@ export class BotAgent {
     };
   }
 
-  /** Only perceived routing is used; inspecting hidden device state would disclose stealth actions. */
-  private regulationScope(call: ParsedToolCall): string[] {
-    const scope = [`world:${this.crossing?.location() ?? "home"}`];
-    if (["send", "check_chat", "select_channel", "read_channel"].includes(call.name)) {
-      scope.push(`chat:${String(call.arguments.id ?? this.phoneUi.channelKey ?? "unselected")}`);
-    }
-    for (const key of ["id", "target", "entity_id", "channelId", "reply_to", "app", "path"]) {
-      const value = call.arguments[key];
-      if (typeof value === "string" || typeof value === "number") scope.push(`${call.name}:${key}:${value}`);
-    }
-    if (call.name === "send" && typeof call.arguments.msg === "string") {
-      for (const match of call.arguments.msg.matchAll(/<at\s+id=["']([^"']+)["']/g)) scope.push(`recipient:${match[1]}`);
-    }
-    return scope;
-  }
-
   // ---------- 工具派发 ----------
 
   private async dispatch(call: ToolCallRecord): Promise<void> {
+    await this.dispatchTool(call);
+    // Synchronous validation refusals have no scheduled tool receipt. Timer expiry and
+    // cancel's status are not usage mistakes and must not trigger a tutorial.
+    if (call.role === "agent" && !call.control && !["wait", "rest", "cancel"].includes(call.name) &&
+      this.mailbox.some(item => item.source === "system" && item.refToolCallId === call.id && !item.experience?.internalThought)) this.pendingToolHelp.add(call.name);
+  }
+
+  private async announceFailedToolHelp(): Promise<void> {
+    for (const name of this.pendingToolHelp) {
+      const def = [...this.toolDefs, ...this.learnedDeviceDefs(), ...this.perceivedAppDefs].find(def => def.name === name);
+      if (!def) { this.pendingToolHelp.delete(name); continue; }
+      const content = renderToolHelp(def);
+      if (!this.failedToolHelp.has(content) && !this.context.stream.some(entry => entry.kind === "event" && entry.event.source === "system" && entry.event.content === content)) {
+        const event: BotEvent = { id: this.context.nextEventId(), source: "system", originEventIds: [], worldTime: this.clock.now(), content };
+        await this.context.appendEvent(event);
+        this.publishPerception(event);
+      }
+      this.failedToolHelp.add(content);
+      this.pendingToolHelp.delete(name);
+    }
+  }
+
+  private async prepareNavigation(parsed: ParsedToolCall, current: () => boolean): Promise<string | undefined> {
+    const builtin = this.toolDefs.some(def => def.name === parsed.name);
+    const learned = this.learnedDeviceDefs().some(def => def.name === parsed.name);
+    if (this.tempBannedTools.has(parsed.name) || !builtin && !learned) return `${parsed.name} 此刻不可用。`;
+    if (this.residentControl?.mode === "puppet") return this.autonomousDuringPuppet(parsed.name) ? undefined : "身体与设备正受外部操纵。";
+    if (toolLayer(parsed.name) !== "core" && misusedTargetKeys(parsed.arguments).length) return "目标参数应使用 id。";
+    const app = learned ? this.apps?.toolOwner?.(parsed.name) : null;
+    const computer = learned && this.computer?.knownToolDefs?.().some(def => def.name === parsed.name);
+    const device = app ? "phone" : computer ? "computer" : this.classifyDevice(parsed.name);
+    if (!device) return undefined;
+    const plan = await planToolNavigation(parsed, {
+      phone: this.phone, chatOpen: this.phoneUi.chatOpen, channelKey: this.phoneUi.channelKey,
+      channelIsGroup: this.phoneUi.channelIsGroup, chatApp: this.config.apps?.chatAppName || "chat", builtin,
+      device, app,
+      activeAppId: app && !this.apps?.hasTool(parsed.name) ? null : this.apps?.view()?.id,
+      computerOpen: computer ? this.computer?.hasTool(parsed.name) : this.computer?.isOpen, computerAvailable: this.computer?.available,
+    }, id => this.messenger.resolveKey(id));
+    if (plan.error) return plan.error;
+    if (plan.steps.some(step => !this.toolDefs.some(def => def.name === step.name) || this.tempBannedTools.has(step.name))) return "所需的前置操作不可用。";
+    for (const step of plan.steps) {
+      if (!current()) return "操作已中止。";
+      this.refreshToolGate();
+      const call = this.finalize(step);
+      call.navigationFor = parsed.name;
+      await this.context.appendToolCall(call);
+      debug.emit("bot.tool", `${call.id} ${call.name}`, call);
+      if (!current()) { this.pushEvent("system", "操作已中止。", { ref: call.id }); return "操作已中止。"; }
+      this.navigationOutcomes.set(call.id, false);
+      let succeeded = false;
+      try {
+        await this.dispatch(call);
+        const signal = this.generationAbort && this.abort ? AbortSignal.any([this.abort.signal, this.generationAbort.signal]) : this.abort?.signal;
+        await abortable(this.scheduler.whenSettled(call.id), signal);
+        succeeded = this.navigationOutcomes.get(call.id) === true;
+      } catch (error) { if (!current()) return "操作已中止。"; throw error; }
+      finally { this.navigationOutcomes.delete(call.id); }
+      await this.drainMailbox(false);
+      if (!succeeded) return `${call.name} 未完成，${parsed.name} 未执行。`;
+      const receipts = this.context.stream.filter(entry => entry.kind === "event" && entry.event.refToolCallId === call.id);
+      if (!receipts.length || receipts.some(entry => entry.kind === "event" && (entry.event.source === "system" || entry.event.experience?.outcome === "failed" || entry.event.experience?.outcome === "unknown"))) return `${call.name} 未完成，${parsed.name} 未执行。`;
+      // A returned error string cannot claim that the requested screen actually opened.
+      if (step.name === "pick_up_phone" && !canUsePhone(this.phone) ||
+        step.name === "open_app" && (app ? this.apps?.view()?.id !== app.id : !this.phoneUi.chatOpen) ||
+        step.name === "select_channel" && this.phoneUi.channelKey !== step.arguments.id ||
+        step.name === "open_computer" && !this.computer?.isOpen) return `${step.name} 未完成，${parsed.name} 未执行。`;
+    }
+    this.refreshToolGate();
+    return undefined;
+  }
+
+  private async dispatchTool(call: ToolCallRecord): Promise<void> {
     if (call.role === "agent" && !call.control && call.name !== this.pauseConfirmArmed) this.pauseConfirmArmed = null;
     if (call.control && (this.residentClosing || this.residentControl?.sessionId !== call.control.sessionId || this.residentControl.mode !== call.control.mode)) {
       this.pushEvent("system", "（角色接管会话已结束，此调用没有执行。）", { ref: call.id });
@@ -1579,7 +1794,7 @@ export class BotAgent {
     const allowed = call.role === "agent" && this.classifyDevice(call.name)
       ? this.perceivedToolNames.filter(name => !this.tempBannedTools.has(name)) : this.currentToolNames(undefined, false, call.role === "agent");
     if (!allowed.includes(call.name)) {
-      this.pushEvent("system", `（工具 ${call.name} 此刻不可用，这次调用没有执行。请依据最新能力变化事件和当前状态选择可用操作。）`, { ref: call.id });
+      this.pushEvent("system", this.classifyDevice(call.name) === "phone" && phoneUnavailableReason(this.phone) || `${call.name} 此刻不可用。`, { ref: call.id });
       return;
     }
     if ((call.role === "agent" || call.control) && ["act", "rest", "nap", "travel", "go_home"].includes(call.name)) {
@@ -1607,6 +1822,15 @@ export class BotAgent {
       return;
     }
     switch (call.name) {
+      case "help": {
+        const name = typeof call.arguments.tool === "string" ? call.arguments.tool.trim() : "";
+        const defs = [...this.toolDefs, ...this.learnedDeviceDefs(), ...(call.role === "agent" ? this.perceivedAppDefs : [...(this.apps?.activeToolDefs() ?? []), ...(this.computer?.activeToolDefs() ?? [])])];
+        const def = defs.find(def => def.name === name);
+        const current = [...new Map((call.role === "agent" ? this.perceivedCapabilities ?? [] : defs.filter(def => this.currentToolNames(undefined, false, false).includes(def.name))).map(def => [def.name, def])).values()];
+        return this.dispatchLocal(call, async () => ({ text: name ? def ? renderToolHelp(def) : `没有 ${name} 的使用说明。` : renderToolHelpIndex(current), originEventIds: [] }));
+      }
+      case "phone_notifications":
+        return this.dispatchLocal(call, async () => this.notifyList ? this.notifyList.operate(call.arguments) : "通知管理不可用。");
       case "think":
         return this.dispatchThought(call);
       case "wait":
@@ -1704,18 +1928,11 @@ export class BotAgent {
           if ("error" in resolved) return resolved.error;
           // 已经在这个频道里：点进是多余操作，提醒它用 read_channel 刷新/读更多，而不是重复点进
           if (this.phoneUi.chatOpen && this.phoneUi.channelKey === resolved.key) {
-            return (
-              `你已经在 ${resolved.key} 里了，无需再次点进。` +
-              `想刷新消息或看更多（更早的）消息，用 read_channel 即可。`
-            );
+            return `当前已在 ${resolved.key}。`;
           }
           // 进入/切换到新频道：顺手回显这个频道的最近消息，让 Bot 看到这里在聊什么
           await this.enterChannel(resolved.key, resolved.isPrivate);
-          const messages = await this.messenger.channelMessages(resolved.key, 10);
-          const text =
-            (typeof messages === "string" ? messages : messages.text) +
-            "\n（想刷新或看更早的消息，用 read_channel 调大 n。）";
-          return typeof messages === "string" ? text : { ...messages, text };
+          return this.messenger.channelMessages(resolved.key, 10);
         });
       }
       case "read_channel": {
@@ -1724,13 +1941,11 @@ export class BotAgent {
           this.pushEvent("system", "（你还没进入任何频道：先 open_app 打开聊天应用，再用 select_channel 进入一个频道。）", { ref: call.id });
           return;
         }
-        const key = this.phoneUi.channelKey;
+        const key = this.channelArg(call)!;
         return this.dispatchLocal(call, async () => {
-          const messages = await this.messenger.channelMessages(key, clampInt(call.arguments.n, 10, 200, 10), { intro: "read" });
-          const text =
-            (typeof messages === "string" ? messages : messages.text) +
-            "\n（若觉得还没读全，就把 n 调大一些再调用一次 read_channel 看更早的消息。）";
-          return typeof messages === "string" ? text : { ...messages, text };
+          const target = await this.switchToTarget(key);
+          if ("error" in target) throw new Error(target.error);
+          return this.messenger.channelMessages(target.key, clampInt(call.arguments.n, 10, 200, 10), { intro: "read" });
         });
       }
       case "check_gallery": {
@@ -1753,7 +1968,7 @@ export class BotAgent {
           this.pushEvent(
             "system",
             "（gallery_save 需要 media_id（媒体编号）、category（分类：表情包 / meme / 截图 / 照片）" +
-              "和 description（你自己写的描述：这是什么、什么梗/情绪、适合什么场合发）。）",
+              "和 description（自己的选用备注：表情包记表态用途与适用或易误读的语境；其他媒体记内容与用途，不代写原发送者意图）。）",
             { ref: call.id },
           );
           return;
@@ -1813,23 +2028,27 @@ export class BotAgent {
           this.phoneUi = { chatOpen: false, channelKey: null, channelIsGroup: false, forwardStack: [] };
           this.phone.down = true;
           this.refreshToolGate();
-          this.interruptAllDeferred("你把手机放到了一边");
-          const focusNote = await this.messenger.putDownPhone();
-          return (
-            `你把手机放到了一边${closedApp ? `（「${closedApp}」已关闭）` : ""}。` +
-            `之后再有消息你只会感觉到它震一下，不会看到内容——想看手机时先 pick_up_phone。\n${focusNote}`
-          );
+          this.interruptAllDeferred("你已放下手机");
+          await this.messenger.putDownPhone();
+          return `手机已放下${closedApp ? `，「${closedApp}」已关闭` : ""}。`;
         });
       case "pick_up_phone":
         return this.dispatchLocal(call, async () => {
           if (!this.phone.down) return "（手机本来就在你手里。）";
           this.phone.down = false;
-          return "你把手机拿回手里，消息通知恢复正常。（想看消息就打开聊天应用。）";
+          const screen = this.phoneUi.chatOpen
+            ? this.phoneUi.channelKey ? `${this.config.apps?.chatAppName || "QQ"} 频道 ${this.phoneUi.channelKey}` : `${this.config.apps?.chatAppName || "QQ"} 的消息列表，尚未选择频道`
+            : this.apps?.currentName ? `「${this.apps.currentName}」` : "手机桌面";
+          return `已拿起手机。当前显示：${phonePhysicalState(this.phone).usable ? screen : "设备无法正常使用"}。` + this.phoneDesktopBadge();
         });
       case "channel_notify": {
         const allowRaw = call.arguments.allow;
-        if (allowRaw === undefined || allowRaw === null) {
-          this.pushEvent("system", "（channel_notify 需要 allow 参数（true 开启通知 / false 免打扰）。）", { ref: call.id });
+        if (allowRaw === undefined && call.arguments.mute_seconds === undefined) {
+          this.pushEvent("system", "请填写 allow 或 mute_seconds。", { ref: call.id });
+          return;
+        }
+        if (allowRaw !== undefined && typeof allowRaw !== "boolean") {
+          this.pushEvent("system", "allow 须为 true 或 false。", { ref: call.id });
           return;
         }
         const id = this.channelArg(call);
@@ -1837,12 +2056,11 @@ export class BotAgent {
           this.pushEvent("system", "（channel_notify 需要 id 参数，或先进入一个频道。）", { ref: call.id });
           return;
         }
-        const allow = isTruthy(allowRaw);
         return this.dispatchLocal(call, async () => {
           const resolved = await this.messenger.resolveKey(id);
           if ("error" in resolved) return resolved.error;
           if (!this.notifyList) return "（当前无法修改频道通知设置。）";
-          await this.notifyList.set(resolved.key, allow);
+          await this.notifyList.set(resolved.key, allowRaw as boolean | undefined, call.arguments.mute_seconds as number | undefined, call.role === "system");
           return `${resolved.key} 的通知设置已更新。${this.notifyList.channelStatusText(resolved.key)}`;
         });
       }
@@ -1863,32 +2081,29 @@ export class BotAgent {
           const closed = await this.apps?.closeCurrent();
           if (closed) {
             this.refreshToolGate();
-            return `你关闭了「${closed}」，它的操作已失效。`;
+            return `「${closed}」已关闭。` + this.phoneDesktopBadge();
           }
           if (this.phoneUi.chatOpen) {
             this.phoneUi = { chatOpen: false, channelKey: null, channelIsGroup: false, forwardStack: [] };
             this.refreshToolGate();
-            return "你关闭了聊天应用，相关操作已失效（手机还在手里，有消息仍会通知你）。";
+            return "聊天应用已关闭。" + this.phoneDesktopBadge();
           }
-          return "（当前没有打开的应用。）";
+          return "（当前没有打开的应用。）" + this.phoneDesktopBadge();
         });
       case "open_computer":
         return this.dispatchLocal(call, async () => {
-          const res = await this.computer?.open();
+          const res = await this.computer?.open({ learn: !this.stealthCalls.has(call.id) });
           if (!res) return "（这台电脑不可用。）";
           if ("error" in res) return `（电脑会话未能打开：${res.error}）`;
           this.refreshToolGate();
-          const lines = res.defs.length
-            ? renderToolsText(res.defs)
-            : "（这台电脑没有提供任何操作。）";
-          return `${res.opening}\n接下来可以像普通能力一样调用（close_computer 结束会话后失效）：\n${lines}`;
+          return res.opening;
         });
       case "close_computer":
         return this.dispatchLocal(call, async () => {
           if (!this.computer?.isOpen) return "（电脑本来就关着。）";
           await this.computer.close();
           this.refreshToolGate();
-          return "你关掉了电脑，它提供的操作已失效。";
+          return "电脑会话已关闭。";
         });
       case "unsend": {
         const id = this.channelArg(call) ?? "";
@@ -1998,7 +2213,7 @@ export class BotAgent {
         return this.dispatchLocal(call, async () => this.messenger.handleRequest(requestId, approve, reason));
       }
       case "list_friends":
-        return this.dispatchLocal(call, async () => this.messenger.listFriends());
+        return this.dispatchLocal(call, async () => this.messenger.listFriends(call.arguments));
       case "user_info": {
         const userId = String(call.arguments.user_id ?? call.arguments.userId ?? call.arguments.id ?? "");
         if (!userId) {
@@ -2043,7 +2258,7 @@ export class BotAgent {
         return this.dispatchLocal(call, async () => this.messenger.setModelShow(model));
       }
       case "list_groups":
-        return this.dispatchLocal(call, async () => this.messenger.listGroups());
+        return this.dispatchLocal(call, async () => this.messenger.listGroups(call.arguments));
       case "group_info": {
         const id = this.channelArg(call) ?? "";
         if (!id) {
@@ -2229,7 +2444,7 @@ export class BotAgent {
           const appName = this.apps.currentName;
           return this.dispatchLocal(call, async () => {
             try {
-              return await this.apps!.call(call.name, call.arguments);
+              return await this.apps!.call(call.name, call.arguments, { operator: call.role === "system" });
             } catch (err) {
               throw new Error(`「${appName}」的 ${call.name} 操作失败：${(err as Error).message ?? err}`);
             }
@@ -2252,27 +2467,30 @@ export class BotAgent {
     }
   }
 
-  /**
-   * 调度类调用的受理确认；排队/期望时刻不能被解释为实际已开始或已完成。
-   * 这从源头消除了"结果尚未进邮箱 → Bot 以为工具没反应 → 重复调用"的信息真空，
-   * 且不引入任何等待延迟。带 duration 的调用额外附上编号（可 cancel）与预计完成时刻。
-   */
-  private ackStart(call: ToolCallRecord): void {
-    // A body controller's request is an administrative intention, not something already perceived.
-    if (call.control?.mode === "puppet" || this.puppetCalls.has(call.id)) return;
-    // 按 expectedAt 判断（而非 duration）：ignoreSendDuration 会把 expectedAt 拉回当下，此时按即时调用确认
-    if (call.expectedAt - call.issuedAt > 0) {
-      this.pushEvent(
-        "system",
-        `${call.id} ${describeToolCall(call)} 已受理，期望完成时刻 T=${call.expectedAt.toFixed(1)}；实际执行和结果交付可能仍需等待，不证明已经完成。`,
-        { ref: call.id },
-      );
-    } else {
-      this.pushEvent(
-        "system",
-        `${call.id} ${describeToolCall(call)} 已受理，正在等待执行或返回结果；完成后结果会自动送达，不必重复提交。`,
-        { ref: call.id },
-      );
+  /** Announce only work which the next decision really needs to know is still pending. */
+  private async announcePendingOperations(): Promise<void> {
+    const pending = this.scheduler.pending();
+    for (const id of this.pendingOperationNotices.keys()) {
+      if (!pending.some(task => task.id === id)) this.pendingOperationNotices.delete(id);
+    }
+    for (const task of pending) {
+      const call = this.operationCalls.get(task.id);
+      if (!call || call.role !== "agent" || call.control || this.stealthCalls.has(task.id)) continue;
+      let event = this.pendingOperationNotices.get(task.id);
+      // A delivered stage or previous notice already explains that call's progress.
+      if (this.context.stream.some(entry => entry.kind === "event" && entry.event.refToolCallId === task.id &&
+        (entry.event.source === "tool" || entry.event.toolProgress === "pending" && !event))) continue;
+      if (!event) {
+        const futureSend = call.name === "send" && !task.committed && call.expectedAt > this.clock.now();
+        event = { id: this.context.nextEventId(), source: "system", refToolCallId: task.id,
+          toolProgress: "pending", originEventIds: [], worldTime: this.clock.now(),
+          content: futureSend ? `${task.id} 正在准备发送，尚未提交；预计 T=${call.expectedAt.toFixed(1)} 发送，可用 cancel 取消。`
+            : `${task.id} ${describeToolCall(call)} 正在处理，结果尚未返回。` };
+        this.pendingOperationNotices.set(task.id, event);
+      }
+      await this.context.appendEvent(event);
+      this.pendingOperationNotices.delete(task.id);
+      this.publishPerception(event);
     }
   }
 
@@ -2305,7 +2523,7 @@ export class BotAgent {
           });
         }
         const elapsed = Math.max(0, this.clock.now() - startedTU);
-        return { text: `（等待计时到期，实际经过 ${elapsed.toFixed(1)} TU，原定 ${n} TU。）`, originEventIds: [] };
+        return { text: `等待结束，经过 ${elapsed.toFixed(1)} TU。`, originEventIds: [] };
       },
     });
   }
@@ -2323,7 +2541,7 @@ export class BotAgent {
     }
     // blockingAct：一个人同时只能专注做一件事。上一个动作还没完成时，新的 act 直接拒绝并提示，
     // 不调用 World-LLM 裁定；也不像 repeat 那样给 Bot 留绕过口（专注模式不可无视）。
-    if (this.config.bot.blockingAct) {
+    if (this.strictToolLoop || this.config.bot.blockingAct) {
       const pendingActs = this.scheduler.pendingByName("act");
       if (pendingActs.length) {
         this.pushEvent(
@@ -2352,7 +2570,6 @@ export class BotAgent {
     }
     this.lastAct = { sig, callId: call.id };
     this.lastActBlock = null; // 成功发起（或重置）一个 act，重复计数归零
-    this.ackStart(call);
     let actionCompleted = false;
     this.schedule(call, {
       executeAt: "now",
@@ -2360,15 +2577,18 @@ export class BotAgent {
       cancellation: "cooperative",
       resultOk: () => actionCompleted,
       run: async (task) => {
-        const parts: string[] = [];
-        const ok = await this.world.adjudicateAct(call, async (content) => {
+        const parts: RichText[] = [];
+        const worldEpoch = call.worldEpoch ?? this.perceivedWorldEpoch;
+        const ok = await this.world.adjudicateAct(call, async (content, route) => {
+          const result: RichText = { text: content, originEventIds: observationOrigins(content),
+            experience: { worldPerception: true, worldEpoch,
+              ...(route?.current === false || worldEpoch !== this.perceivedWorldEpoch ? { historicalWorld: true } : {}) } };
           let ongoing = false;
           try { ongoing = JSON.parse(content)?.action?.status === "pending"; } catch { /* preserve ordinary passive and final receipts below */ }
-          if (!ongoing) { parts.push(content); return; }
+          if (!ongoing) { parts.push(result); return; }
           // A committed beginning is an experience now, not proof of the eventual outcome.
-          for (const text of parts.splice(0)) this.pushEvent("world", { text, originEventIds: observationOrigins(text) });
-          const rich = this.puppetReceipt(this.describeExperience({ text: content, originEventIds: observationOrigins(content),
-            experience: { worldPerception: true } }, call), call.id);
+          for (const part of parts.splice(0)) this.pushEvent("world", part);
+          const rich = this.puppetReceipt(this.describeExperience(result, call), call.id);
           if (this.retired) await this.receipts.save(rich, this.clock.now(), call.id);
           else this.pushEvent("tool", this.spillResult(rich, call.id + "-start"), { ref: call.id, wake: true });
         }, task.signal, phase => {
@@ -2377,7 +2597,7 @@ export class BotAgent {
         });
         if (task.cancelled()) return null;
         const adjudicatedFailure = parts.some((part) => {
-          try { return JSON.parse(part)?.action?.status === "failed"; } catch { return false; }
+          try { return JSON.parse(part.text)?.action?.status === "failed"; } catch { return false; }
         });
         actionCompleted = ok && !adjudicatedFailure;
         if (!ok && !adjudicatedFailure) throw new Error("世界未能裁定此动作，结果尚未确认");
@@ -2387,13 +2607,13 @@ export class BotAgent {
         // wrongly attributes those earlier world events to this newly completed choice.
         let actionIndex = parts.length - 1;
         for (let index = parts.length - 1; index >= 0; index--) {
-          try { if (JSON.parse(parts[index]!)?.action) { actionIndex = index; break; } } catch { /* retain an opaque remote receipt as unknown below */ }
+          try { if (JSON.parse(parts[index]!.text)?.action) { actionIndex = index; break; } } catch { /* retain an opaque remote receipt as unknown below */ }
         }
-        const observation = (text: string): RichText & { source: "world" } => ({ text, source: "world",
-          originEventIds: observationOrigins(text), experience: { agency: "observed", opportunity: false },
+        const observation = (part: RichText): RichText & { source: "world" } => ({ ...part, source: "world",
+          experience: { ...part.experience, agency: "observed", opportunity: false },
         });
-        const text = parts[actionIndex]!;
-        return { text, originEventIds: observationOrigins(text) ?? [], experience: { worldPerception: true },
+        const result = parts[actionIndex]!;
+        return { ...result, originEventIds: result.originEventIds ?? [],
           precedingObservations: parts.slice(0, actionIndex).map(observation),
           followingObservations: parts.slice(actionIndex + 1).map(observation),
         };
@@ -2427,45 +2647,37 @@ export class BotAgent {
       // 打开聊天应用：切走当前 App，落在消息列表页（解锁 chat 层操作）并刷新列表
       return this.dispatchLocal(call, async () => {
         const closed = await this.apps?.closeCurrent();
-        const firstOpen = !this.phoneUi.chatOpen;
         this.phoneUi = { chatOpen: true, channelKey: null, channelIsGroup: false, forwardStack: [] };
         this.refreshToolGate();
         const rich = await this.messenger.recentChannels(10);
         const prefix = closed ? `（你关掉了「${closed}」）` : "";
-        const unlock = firstOpen
-          ? `（聊天应用已打开，新增可用操作（关闭应用后失效）：\n${renderToolsText(this.layerDefs("chat"))}\n` +
-            `要**发消息**，先 select_channel 点进某个频道（进频道后才解锁频道内的完整操作），再用 send 发送；` +
-            `想发图文混排，先查看/选定媒体，再在 msg 的原位置填写 <media ref="media:12"/>；` +
-            `没点进频道时，若某频道刚来了新消息、收到它的提醒，也能 send 带上它的 id 直接快捷回复。）\n\n`
-          : "";
+        const unlock = `${this.config?.apps?.chatAppName || "QQ"} · 消息列表\n`;
         return typeof rich === "string"
           ? { text: prefix + unlock + rich }
-          : { ...rich, text: prefix + unlock + rich.text };
+          : { ...rich, text: prefix + unlock + rich.text,
+            ...(rich.parts?.length ? { parts: [{ kind: "text" as const, text: prefix + unlock }, ...rich.parts] } : {}) };
       });
     }
     return this.dispatchLocal(call, async () => {
       try {
-        const { closed, opening, defs } = await this.apps!.open(resolved.app);
+        const { closed, opening } = await this.apps!.open(resolved.app, { learn: !this.stealthCalls.has(call.id) });
         // 手机同屏只有一个应用：打开 MCP 应用时聊天界面随之退出
         const chatWasOpen = this.phoneUi.chatOpen;
         this.phoneUi = { chatOpen: false, channelKey: null, channelIsGroup: false, forwardStack: [] };
         this.refreshToolGate();
-        const lines = defs.length
-          ? renderToolsText(defs)
-          : "（这个应用没有提供任何操作。）";
         const closedNote = closed
           ? `（「${closed}」已被关掉）`
           : chatWasOpen
             ? "（聊天应用已被关掉）"
             : "";
         // 拟人化应用（终端 / 资源管理器等）自带开场描述，覆盖通用的“你打开了「xx」”
-        const head = opening
-          ? `${opening}${closedNote ? `\n${closedNote}` : ""}`
-          : `你打开了「${resolved.app.name}」。${closedNote}`;
-        return (
-          `${head}\n` +
-          `接下来可以像普通能力一样调用（关闭应用或打开其他应用后失效）：\n${lines}`
-        );
+        const tail = closedNote ? `\n${closedNote}` : "";
+        if (opening && typeof opening !== "string") {
+          return { ...opening, text: opening.text + tail,
+            ...(opening.parts?.length ? { parts: [...opening.parts, { kind: "text" as const, text: tail }] } : {}),
+          };
+        }
+        return (opening || `你打开了「${resolved.app.name}」。`) + tail;
       } catch (err) {
         this.refreshToolGate();
         return `（「${resolved.app.name}」启动失败：${(err as Error).message ?? err}）`;
@@ -2474,7 +2686,6 @@ export class BotAgent {
   }
 
   private dispatchLocal(call: ToolCallRecord, run: () => Promise<string | RichText>): void {
-    this.ackStart(call);
     this.schedule(call, { executeAt: "now", run: async () => {
       const result = run();
       if (call.name !== "reflect") return result;
@@ -2513,10 +2724,18 @@ export class BotAgent {
     let revealOnAttention = false;
     this.scheduler.schedule(call, {
       ...opts, serialKey: "devices",
+      // Actual local UI results are already known. Only human receipt timing and
+      // operations deliberately scheduled for later (e.g. typing) retain duration.
+      ...(call.role === "agent" && !call.control && !stealth && opts.executeAt === "now" ? { delivery: "immediate" as const } : {}),
       beforeStart: () => {
         if (!this.running) throw new Error("设备所属世界已停止，此操作没有执行");
         if (call.control && (this.residentClosing || this.residentControl?.sessionId !== call.control.sessionId)) throw new Error("角色接管会话已结束，此设备操作没有执行");
         if (call.role === "agent" && this.residentControl?.mode === "puppet" && !this.autonomousDuringPuppet(call.name)) throw new Error("身体与设备正受外部操纵，此自主操作没有执行");
+        if (kind === "phone" && call.name !== "observe_device") {
+          if (call.name === "pick_up_phone" && !canReachPhone(this.phone)) throw new Error(phoneUnavailableReason(this.phone));
+          if (!["pick_up_phone", "put_down_phone"].includes(call.name) &&
+            (stealth || call.role === "system" && !call.control ? !phonePhysicalState(this.phone).usable : !canUsePhone(this.phone))) throw new Error(phoneUnavailableReason(this.phone));
+        }
         if (call.role === "agent" || call.control) {
           revealOnAttention = this.concealedDevices.has(kind);
           this.attention = kind;
@@ -2525,7 +2744,7 @@ export class BotAgent {
           this.refreshToolGate();
         }
         if (stealth) this.concealedDevices.add(kind);
-        if (!this.currentToolNames().includes(call.name) || (phoneApp && this.apps?.view()?.id !== phoneApp)) {
+        if (!this.currentToolNames(undefined, false, !stealth && call.role === "agent").includes(call.name) || (phoneApp && this.apps?.view()?.id !== phoneApp)) {
           throw new Error("设备界面已改变，此操作已不可用；请查看当前界面后重新决定");
         }
         opts.beforeStart?.();
@@ -2552,17 +2771,30 @@ export class BotAgent {
     this.refreshToolGate();
   }
 
+  /** Visible desktop facts only: no notification delivery, message preview or read acknowledgement. */
+  private phoneDesktopBadge(): string {
+    if (!this.notifyList || this.phoneUi.chatOpen || this.apps?.currentName || !canReachPhone(this.phone) || !canPerceivePhone(this.phone)) return "";
+    const unread = this.notifyList.snapshot().unread;
+    const name = this.config.apps?.chatAppName?.trim() || "聊天应用";
+    return unread > 0 ? `${name} 图标上有未读角标：${unread > 99 ? "99+" : unread}。` : `${name} 图标上没有未读角标。`;
+  }
+
   /** Read the current interface only. This cannot open, connect, or change device state. */
   private async deviceObservation(kind: DeviceKind): Promise<RichText> {
+    if (kind === "phone" && (!canReachPhone(this.phone) || !canPerceivePhone(this.phone))) return { text: "目前看不到可辨认的手机界面。", originEventIds: [] };
     let pixels: RichText | null = null;
     try { if (kind === "phone" || this.computer?.isOpen) pixels = await this.peekDevice?.(kind) ?? null; }
     catch (error) { this.logger.debug("读取可见设备画面失败：%s", error); }
-    const view = kind === "phone" ? this.apps?.view()?.result : this.computer?.view()?.result;
+    if (kind === "phone" && (!canReachPhone(this.phone) || !canPerceivePhone(this.phone))) return { text: "目前看不到可辨认的手机界面。", originEventIds: [] };
+    if (kind === "phone") await this.apps?.learnCurrentTools?.();
+    else await this.computer?.learnCurrentTools?.();
+    const view = kind === "phone" ? this.apps?.screen() : this.computer?.view()?.result;
     const visible = pixels ?? (typeof view === "string" ? { text: view } : view);
     const label = kind === "phone"
-      ? `手机当前显示：${this.phoneUi.chatOpen ? "聊天应用" + (this.phoneUi.channelKey ? `，频道 ${this.phoneUi.channelKey}` : "，消息列表") : this.apps?.currentName ?? "桌面"}`
+      ? `手机当前显示：${this.phoneUi.chatOpen ? (this.config.apps?.chatAppName || "QQ") + (this.phoneUi.channelKey ? `，频道 ${this.phoneUi.channelKey}` : "，消息列表") : this.apps?.currentName ?? "桌面"}`
       : !this.computer ? "当前没有可用电脑" : `电脑当前${this.computer.isOpen ? "处于打开状态" : "已关闭"}`;
     const heading = `（你正看着${kind === "phone" ? "手机" : "电脑"}，当前可见界面：${label}。）` +
+      (kind === "phone" ? this.phoneDesktopBadge() : "") +
       (visible?.text ? `\n${pixels ? "界面上显示的内容" : "已有界面回显"}（不是你的行动或心理记录）：\n` : "");
     return {
       text: heading + (visible?.text ? (visible.parts?.length ? visible.text : truncate(visible.text, 3000)) : ""),
@@ -2732,16 +2964,8 @@ export class BotAgent {
       return false;
     }
     this.pauseConfirmArmed = call.name === "rest" ? "rest" : "wait";
-    const pending = this.scheduler.pending().filter(task => task.name !== "wait" && task.name !== "rest" &&
-      !task.control && !this.stealthCalls.has(task.id) && this.operationCalls.get(task.id)?.role === "agent");
-    const opportunity = pending.length
-      ? `已经发起、尚未返回的操作：${pending.map(task => `${task.id}（${task.name}）`).join("、")}；它们的结果会实际交付，不必重做。`
-      : "当前没有尚未返回的自主操作；可以依据已知处境做一件具体的事，用 act 提交真实身体动作，或在实际需要时读取设备内容。";
-    const guidance = this.config.bot.disableWait
-      ? "wait 当前关闭；不要用 rest 反复空等消息。"
-      : "wait 与 rest 共用此暂停占比；换一个计时工具不会重新获得预算。";
-    this.pushEvent("system", `（最近 ${windowTU} TU 内，自主 wait/rest 实际暂停共 ${paused.toFixed(1)} TU（${rate}%），已达 ${threshold}% 提醒阈值；这次 ${call.name} 没有开始。${guidance}${opportunity}` +
-      `如确实需要继续休息或等已有操作，请结合实际身体感知与当前任务判断，紧接着再调用 ${call.name} 并带 confirm: true；这只确认本次计时，仍计入暂停时长，不证明已经睡眠或恢复体力。）`, { ref: call.id, originEventIds: [] });
+    this.logger.debug("暂停额度已耗尽：%s，最近 %s TU 暂停 %s TU，阈值 %s%%", call.name, windowTU, paused.toFixed(1), threshold);
+    this.pushEvent("system", "等待额度已耗尽", { ref: call.id, originEventIds: [] });
     return true;
   }
 
@@ -2997,7 +3221,7 @@ export class BotAgent {
 
   private dispatchSend(call: ToolCallRecord): void {
     // sendBlocking：上一条消息还没回显前，拒绝新的 send（避免连发相近/不连贯的消息）
-    if (this.config.bot.sendBlocking) {
+    if (this.strictToolLoop || this.config.bot.sendBlocking) {
       const busy = sendBusyMessage(SEND_TOOL_NAMES.flatMap((n) => this.scheduler.pendingByName(n)));
       if (busy) {
         this.pushEvent("system", busy, { ref: call.id });
@@ -3006,13 +3230,13 @@ export class BotAgent {
     }
     const id = this.channelArg(call) ?? "";
     if (call.arguments.msg !== undefined && typeof call.arguments.msg !== "string") {
-      this.pushEvent("system", "（消息没有发出：msg 必须是你准备发送的正文字符串，不能是消息对象、消息列表或其他参数结构。）", { ref: call.id });
+      this.pushEvent("system", "本次未发送：msg 必须为正文字符串。", { ref: call.id });
       return;
     }
-    const msg = call.arguments.msg ?? "";
+    let msg = call.arguments.msg ?? "";
     const aliases = ["images", "replyTo", "quote", "atSender", "at"].filter(key => Object.hasOwn(call.arguments, key));
     if (aliases.length) {
-      this.pushEvent("system", `（消息没有发出：send 不接受旧参数 ${aliases.join("、")}。媒体使用 media，引用消息使用 reply_to，是否自动提醒被引用者使用 at_sender；请修正参数后重新发送。）`, { ref: call.id });
+      this.pushEvent("system", `本次未发送：不支持参数 ${aliases.join("、")}。`, { ref: call.id });
       return;
     }
     const mediaRaw = call.arguments.media;
@@ -3022,15 +3246,23 @@ export class BotAgent {
     }
     const media = Array.isArray(mediaRaw) ? (mediaRaw as (string | number)[]) : [];
     const replyRaw = call.arguments.reply_to;
-    const replyTo = normalizeMsgId(replyRaw);
+    let replyTo = normalizeMsgId(replyRaw);
     if (replyRaw !== undefined && !replyTo) {
-      this.pushEvent("system", "（消息没有发出：reply_to 必须是完整的平台消息 ID，或消息记录中的 msg:ID / (msg:ID)。media:N 和 gallery:路径是媒体引用，不能用作被回复的消息 ID；不要填写说明文字或只抽取其中的数字。）", { ref: call.id });
+      this.pushEvent("system", "本次未发送：reply_to 需要完整消息 ID，不能用媒体引用。", { ref: call.id });
       return;
     }
+    // Both quote entry paths have the same body for length/repetition checks.
+    // Keep the original tool call intact in append-only history for auditing.
+    const quote = resolveOutgoingQuote(msg, replyTo);
+    if (quote.error !== undefined) {
+      this.pushEvent("system", `本次未发送：${quote.error}`, { ref: call.id });
+      return;
+    }
+    msg = quote.msg; replyTo = quote.replyTo;
     const atRaw = call.arguments.at_sender;
     const atSender = !(atRaw === false || atRaw === "false" || atRaw === 0);
     if (!id) {
-      this.pushEvent("system", "（send 现在没有可发的频道：你需要先用 select_channel 点进某个频道，或等某个频道来新消息后带上它的 id 快捷回复。）", { ref: call.id });
+      this.pushEvent("system", "缺少目标频道：填写 id，或先选择频道。", { ref: call.id });
       return;
     }
     if (!msg && !media.length) {
@@ -3063,10 +3295,21 @@ export class BotAgent {
       const failures = results.filter((r): r is PickFailure => !r.ok);
       if (failures.length) return `（选图未完成，没有发送消息：${failures.map(r => `${r.refText}：${r.error}`).join("；")}）`;
       const selected = results.filter((r): r is PickResult => r.ok);
-      const rows = selected.map((r, index) => r.ref.type === "audio"
-        ? `${refs[index]} → media:${r.ref.id}（音频；当前 send 不支持发送音频，没有选为可发送内容）`
-        : `${refs[index]} → <media ref="media:${r.ref.id}"/>${r.sticker ? "（表情包，发送时在原位置独立成一条）" : ""}`);
-      return `已确认以下媒体引用；尚未发送任何消息：\n${rows.join("\n")}\n请先确认内容，再将可发送的图片或视频的 media 标签放入 send.msg 对应位置，或将它们的引用放入 send.media 在末尾追加。选图本身不创建草稿，也不会自动发送。`;
+      const rows = selected.map((r, index) => {
+        const original = refs[index]!.trim();
+        if (r.ref.type === "audio") return `${original} → media:${r.ref.id}（音频；当前 send 不支持发送音频，没有选为可发送内容）`;
+        // Equal bytes do not imply equal usage: an explicit gallery category can
+        // choose an ordinary image even if this asset was previously a sticker.
+        const gallery = original.startsWith("gallery:");
+        const ref = gallery ? original : `media:${r.ref.id}`;
+        // The inline grammar does not support quotes or angle brackets in paths.
+        // Keep those verified filenames as JSON string values for send.media.
+        const insertion = /["'<>]/.test(ref) ? `send.media 引用 ${JSON.stringify(ref)}` : `<media ref="${ref}"/>`;
+        return `${original} → ${insertion}${gallery ? `（对应资源 media:${r.ref.id}；保留图库分类用途）` : ""}` +
+          (r.sticker ? "（会话表意符号；平台表情包，发送时在原位置独立成一条）" : "");
+      });
+      return { text: `已确认以下媒体引用；尚未发送任何消息：\n${rows.join("\n")}\n如决定发送，将可发送的媒体标签放入 send.msg 对应位置，或把引用放入 send.media 在末尾追加。选中不要求补充解说或收藏，不创建草稿，也不会自动发送；实际发送以 send 回执为准。`,
+        contextHint: { text: `可用媒体引用（尚未发送）：\n${rows.join("\n")}` } };
     });
   }
 
@@ -3076,14 +3319,13 @@ export class BotAgent {
     if (longLimit > 0 && msg.length > longLimit && !isTruthy(call.arguments.confirm_long)) {
       this.pushEvent(
         "system",
-        `（本次发送 ${call.id} 的正文为 ${msg.length} 个字符，超过 ${longLimit} 的长度提醒阈值，本次尚未提交到聊天平台。若确实需要这些内容，可加 confirm_long: true；否则只保留尚未表达的新内容。此提示不撤销或否认之前任何一次发送的回执。）`,
+        "正文过长，本次未发送。确需发送可用 confirm_long: true。",
         { ref: call.id },
       );
       return;
     }
     if (this.maybeDeferSend(call, "text", id, msg)) return;
     if (this.gateSendDuration(call, "打字")) return;
-    this.ackStart(call);
     const insist = isTruthy(call.arguments.insist);
     let sent = false;
     this.schedule(call, {
@@ -3100,13 +3342,15 @@ export class BotAgent {
   private async deliverSend(id: string, msg: string, media: (string | number)[], replyTo: string | undefined, atSender: boolean, insist: boolean, resend = false, onReceipt?: (receipt: MessageSendReceipt) => void): Promise<string | RichText> {
     const target = await this.switchToTarget(id);
     if ("error" in target) return target.error;
+    const execution = this.deviceExecution.getStore();
+    if (execution?.stealth || execution?.external ? !phonePhysicalState(this.phone).usable : !canUsePhone(this.phone)) return `本次未发送。${phoneUnavailableReason(this.phone) ?? "手机不可用。"}`;
     // Check at actual execution, after resolving aliases and after earlier queued sends settle.
     // A cancelled, invalid or rejected attempt is not something the person has already said.
     const sig = JSON.stringify([target.key, msg, media.map(String)]);
     const recentRepeat = this.recentSendSigs.filter(s => s === sig).length;
-    if (!resend && this.uncertainSendSigs.has(sig)) return "（同一内容的上次发送没有取得完整确认，可能已经送达；本次没有重复提交。请先 read_channel 检查记录，确认需要重发时再使用 resend: true。）";
+    if (!resend && this.uncertainSendSigs.has(sig)) return "上次发送结果未知，可能已送达；本次未重发。核对后可用 resend: true。";
     if (!resend && this.config.messaging.recentRepeatThreshold > 0 && recentRepeat >= this.config.messaging.recentRepeatThreshold) {
-      return `（你最近已经向这个频道发出过相同内容 ${recentRepeat} 次。本次没有再次发送。没有新的意思就无需换个措辞再说；确有必要重复时才使用 resend: true。）`;
+      return "相同内容已发送，本次未重发。确需重复可用 resend: true。";
     }
     const receipt: MessageSendReceipt = this.messenger.sendReceipt
       ? await this.messenger.sendReceipt(target.key, msg, media, replyTo, atSender, insist)
@@ -3145,7 +3389,7 @@ export class BotAgent {
 
   private dispatchCancel(call: ToolCallRecord): void {
     const target = String(call.arguments.id ?? call.arguments.toolcall_id ?? "");
-    const result = this.scheduler.cancel(target);
+    const result = call.role === "agent" && this.stealthCalls.has(target) ? "not_found" : this.scheduler.cancel(target);
     if (result === "cancelled") {
       this.finishPause(target);
       this.operationCalls.delete(target);
@@ -3190,7 +3434,7 @@ export class BotAgent {
       run: async () => {
         this.finishPause(call.id);
         const elapsed = Math.max(0, this.clock.now() - startedTU);
-        return { text: `（休息计时到期，实际经过 ${elapsed.toFixed(1)} TU，原定 ${n} TU。可继续观察或行动；此回执只说明计时，身体状态以实际观测为准。）`, originEventIds: [] };
+        return { text: `休息计时结束，经过 ${elapsed.toFixed(1)} TU。`, originEventIds: [] };
       },
     });
   }
@@ -3233,7 +3477,7 @@ export class BotAgent {
     this.refreshToolGate();
     try {
       // The memory writer cannot mutate objective world state.
-      await this.context.applyCompression(result, this.clock.now(), snapshot, await this.growth.summary(this.clock.now()), await this.regulation.summary());
+      await this.context.applyCompression(result, this.clock.now(), snapshot, await this.growth.summary(this.clock.now()));
     } catch (error) {
       for (const name of previousBans) this.tempBannedTools.add(name);
       this.refreshToolGate();
@@ -3324,86 +3568,15 @@ function pickMeta(variants: string[], seed?: number): string {
   return variants[n % variants.length]!;
 }
 
-/**
- * blockingAct 专注模式的拦截提示：存在未完成的 act 时返回提示文本（Bot 不可绕过），否则返回 null。
- * 供 dispatchAct 使用，也便于冒烟测试覆盖。
- * 措辞纯正面、不点名任何工具：负面指令（"不要 act"）反而会强化模型对 act 的倾向，
- * 也不指定 "等" 等具体动作，避免把复读通成另一种路径依赖。
- *
- * repeatCount 为连续重复提交同一动作的次数（可选，默认 1）：重复次数越多，提示越明确地
- * 压下"继续重复"的冲动——递进式加压，避免温和的固定文案在长上下文里被模型无视而原地打转。
- */
-export function actBusyMessage(
-  pendingActs: ToolCallRecord[],
-  repeatCount: number = 1,
-): string | null {
+/** A pending action is not a completed action; retain its concrete identity. */
+export function actBusyMessage(pendingActs: ToolCallRecord[], _repeatCount = 1): string | null {
   if (!pendingActs.length) return null;
-  const pdesc = String(pendingActs[0]?.arguments.description ?? "").trim();
-  const what = pdesc ? `「${truncate(pdesc, 60)}」` : "上一件事";
-  const escalate = escalatingRepeatHint(repeatCount);
-  return `（${what}的请求已受理，尚未返回结果；受理不证明身体动作已经开始。结果会自动送到你这里。${escalate}。）`;
+  const intent = String(pendingActs[0]?.arguments.description ?? "").trim();
+  return `${intent ? `「${truncate(intent, 60)}」` : "上一动作"}尚未返回结果，本次未提交。`;
 }
 
-/**
- * 相同动作未出结果就再次提交的拦截提示（非 blockingAct 的"上一件完全相同的事"拦截）。
- * repeatCount 为连续重复次数，用于递进式加压。
- */
-export function repeatingActMessage(sig: string, repeatCount: number, callId: string): string {
-  const what = sig ? `「${truncate(sig, 48)}」` : "这件事";
-  const escalate = escalatingRepeatHint(repeatCount);
-  // 只在重复次数还少时提示 repeat 绕过口；一旦连续重复多次，就不再给绕过口（避免模型借此破防）
-  const bypass = repeatCount < 4 ? "确实要同时再做一遍同样的事时，再在参数里加 repeat。" : "";
-  return (
-    `（${what}的请求（${callId}）已受理，尚未返回结果，这次没有重复提交；` +
-    `结果会自动以事件的形式送到你这里。${escalate}。${bypass}）`
-  );
-}
-
-/** 依据连续重复次数，生成越来越直白的"别重复"提示（空串 = 无需额外加压）。
- *  刻意不指向任何具体替代动作（不暗示 wait、不暗示 act），避免与其它拦截互相推诿、
- *  把模型逼进「act 被拦→去 wait、wait 被拦→去 act」的死循环。
- *  每一档都做至少 10 套字面差异较大的变体随机返回（真随机，打破固定文案的循环感）。 */
-function escalatingRepeatHint(repeatCount: number): string {
-  if (repeatCount >= 4) {
-    return pickMeta([
-      `这已经是你连续第 ${repeatCount} 次重复发起同一个动作了——它既不会因此变快，也不会重复执行；请停止重复提交同一个动作`,
-      `同一个动作你已经连着第 ${repeatCount} 次发起了——多发起几次它也不会更快或更慢，白白消耗；现在请停下来，别再提交它了`,
-      `这已经是第 ${repeatCount} 次了，还是那个动作——重复它带不来任何新的东西；就此打住，换个思路`,
-      `注意，同样是这个动作，你已经连续提了 ${repeatCount} 次。它不会因为你多提就多做或做快，别再浪费这一步了`,
-      `第 ${repeatCount} 次了，你仍在提交同一个动作。它已经受理过一次，往后的重复都是空的，请立即停手`,
-      `这个动作你已经反复到第 ${repeatCount} 次，早就该停了。重复不会叠加效果，只会拖延你自己`,
-      `看清楚了：同一个动作，你已经提交了 ${repeatCount} 遍。再提交多少次结果都一样，现在请停止`,
-      `你已经连续 ${repeatCount} 次发起同一件事，这是无效的。请明确地想一件不同的事，或就停在原处`,
-      `反复提交相同动作（已 ${repeatCount} 次）没有任何意义，它只做一次。别再重复，把这一步留给真正需要做的事`,
-      `这是第 ${repeatCount} 次了，你一遍遍重复同一个动作，而它一次就够。停止这种空转，去做别的`,
-    ]);
-  }
-  if (repeatCount >= 2) {
-    return pickMeta([
-      `这是你第 ${repeatCount} 次重复发起同一动作——原请求仍在等待结果，无需再提交`,
-      `同一个动作你已经是第 ${repeatCount} 次发起了——尚未取得结果，无需再补一次`,
-      `这动作你已重复到第 ${repeatCount} 次——请求已经受理，结果会自动送达`,
-      `你第 ${repeatCount} 次提起同一个动作了，原请求已受理，不用再提一次`,
-      `同一个动作你已经说了 ${repeatCount} 遍，请以原请求的实际回执为准`,
-      `提醒：这是你第 ${repeatCount} 次发起同一件事，已有请求，重复是多余的`,
-      `这动作你已经提到第 ${repeatCount} 次，只需要提交一次请求`,
-      `同一个动作反复到第 ${repeatCount} 次，可以停了——原请求的结果会自动送达`,
-      `你已连续第 ${repeatCount} 次发起同一个动作，它尚未返回，无需重复提及`,
-      `同一个动作你提了 ${repeatCount} 次，第一次请求已经受理，后面的没有再次执行`,
-    ]);
-  }
-  return pickMeta([
-    "请求已受理，结果会自动送达，不用再发起一次",
-    "原请求还没有结果，不必再重复",
-    "已有请求尚未返回，无需再来一次",
-    "这个动作已经提交，尚需等待真实结果，别重复提交",
-    "不必再次发起，原请求的回执会自动送达",
-    "动作请求已受理，重复提交是多余的",
-    "这件事的请求已在处理队列中，无须你再次发起",
-    "是否执行完毕以最终回执为准，不必重复",
-    "已经受理的请求不用再提，结果会自动送达",
-    "此请求还没有结果，重复提交不会推进它",
-  ]);
+export function repeatingActMessage(sig: string, _repeatCount: number, callId: string): string {
+  return `${callId}${sig ? `「${truncate(sig, 48)}」` : ""}尚未返回结果，本次未重复提交。`;
 }
 
 /** Only send submits a platform message; pick_media merely resolves stable references. */
@@ -3419,7 +3592,7 @@ function isBreakLoopSafeTool(name: string): boolean {
  */
 export function sendBusyMessage(pending: ToolCallRecord[]): string | null {
   if (!pending.length) return null;
-  return `（发送 ${pending.map(call => call.id).join("、")} 仍在处理，最终回执尚未交付；它可能已经提交到平台，不能据此认为没有发出。本次新的 send 没有提交。请等原调用的回执，不要缩短或改写同一内容重发。）`;
+  return `发送 ${pending.map(call => call.id).join("、")} 仍在处理，可能已经提交到平台；本次未发送。`;
 }
 
 function clampInt(value: unknown, min: number, max: number, fallback: number): number {
@@ -3442,9 +3615,7 @@ function isTruthy(value: unknown): boolean {
 export function shortBanGateMessage(minutes: number, robot: boolean): string | null {
   if (robot) return null;
   if (minutes > 0 && minutes < 1) {
-    return `禁言时长 ${minutes} 分钟不到 1 分钟（低于 60 秒的禁言几乎没有实际意义）已被拦下——` +
-      `如果你确实要这么短的禁言（比如在自己群测试接口），再调用一次 group_ban 并加上 robot: true；` +
-      `否则请给出至少 1 分钟的时长。`;
+    return "禁言不足 1 分钟，本次未执行。确需短暂禁言可用 robot: true。";
   }
   return null;
 }

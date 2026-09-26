@@ -159,7 +159,7 @@ async function tingleDoesNotCreateDuplicateLoops() {
   const old = deferred<number | null>(), current = deferred<number | null>(); let calls = 0;
   const deliveries: string[] = []; let oldDeliver!: (text: string) => void;
   const world = { tingle(deliver: (text: string) => void) { calls++; if (calls === 1) { oldDeliver = deliver; return old.promise; } return current.promise; } } as WorldAgent;
-  const timer = new TingleTimer({ tingleEveryUnits: 5, tingleMode: "fixed" } as ClockConfigData, { unitRealSeconds: 1 } as WorldClock, world, text => deliveries.push(text), logger);
+  const timer = new TingleTimer({ tingleEveryUnits: 5, tingleMode: "fixed" } as ClockConfigData, { unitRealSeconds: 1, now: () => 0 } as WorldClock, world, text => deliveries.push(text), logger);
   const fire = () => { const [id, fn] = [...timers][0]!; timers.delete(id); fn(); };
   try {
     timer.start(); fire(); assert.equal(calls, 1);

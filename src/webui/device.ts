@@ -4,6 +4,8 @@ import type { RichText } from "../types.js";
 import { deviceKind } from "../apps/deviceTools.js";
 import type { KnownChannel, WorldMessageRow } from "../koishi/messages.js";
 import type { DevicesInfo } from "./server.js";
+import type { DeviceAppCatalogEntry } from "./app-catalog.js";
+import type { PhoneNotificationsSnapshot } from "../koishi/notify.js";
 
 export interface DeviceTool extends AppToolDef {
   device: "phone" | "computer";
@@ -14,9 +16,12 @@ export interface DeviceSession {
   control: { paused: boolean; busy: boolean; residentMode?: "avatar" | "puppet" | null; deviceBusy?: boolean; attention?: "phone" | "computer" | null };
   devices: DevicesInfo;
   apps: { id: string; name: string; description: string; kind: "chat" | "app"; active: boolean }[];
+  /** Setup/discovery UI; never used to expose unavailable tools to the actor. */
+  appCatalog?: DeviceAppCatalogEntry[];
   tools: DeviceTool[];
-  appView: { id: string; name: string; opening?: string; lastTool?: string; result?: string | RichText } | null;
+  appView: { id: string; name: string; opening?: string | RichText; lastTool?: string; result?: string | RichText; state?: unknown } | null;
   computerView: { lastTool?: string; result?: string | RichText } | null;
+  notifications?: PhoneNotificationsSnapshot;
   chat: { channelKey: string | null; channels: (KnownChannel & { latest?: WorldMessageRow })[]; messages: WorldMessageRow[] };
 }
 export interface DeviceControlResult extends ManualToolResult { paused: boolean; busy: boolean }

@@ -73,6 +73,29 @@ async function main() {
       const item = restarted.stream.find(entry => entry.kind === "event" && entry.event.id === id);
       assert.ok(item?.kind === "event" && item.event.contextText === undefined, "unrelated data cannot impersonate a world projection");
     }
+    const beforeLateWorld = await restarted.toChatMessages("before late old-world result");
+    const latePayload = JSON.parse(envelope("你在先前世界的餐厅里点好了一碗面。", true));
+    latePayload.observation.scene.situation = "旧世界餐厅内，服务员已接过菜单。";
+    latePayload.observation.scene.opportunities = [{ label: "旧菜单候选", intent: "尚未执行的旧世界后续选择" }];
+    const lateWorld = event("ev_historical_world", JSON.stringify(latePayload), { source: "tool", refToolCallId: "compacted-old-world-call", contextHint: { text: "" },
+      experience: { worldPerception: true, historicalWorld: true, worldEpoch: "old-world-epoch" } });
+    await restarted.appendEvent(lateWorld);
+    const lateSaved = restarted.stream.find(entry => entry.kind === "event" && entry.event.id === lateWorld.id);
+    if (lateSaved?.kind !== "event") throw new Error("missing historical-world event");
+    assert.equal(lateSaved.event.content, lateWorld.content, "late historical results preserve the complete real JSON for audit and evidence");
+    assert.match(lateSaved.event.contextText!, /先前世界的操作结果，不代表当前处境/);
+    assert.match(lateSaved.event.contextText!, /当时可知处境：旧世界餐厅内/);
+    assert.ok(lateSaved.event.contextText!.includes(latePayload.observation.narrative), "a compacted call reference does not prevent trusted late World results from rendering their actual narrative");
+    assert.doesNotMatch(lateSaved.event.contextText!, /当前可知处境|需要你决定下一步|旧菜单候选|尚未执行的旧世界后续选择|PRIVATE_DIAGNOSTIC/);
+    assert.match(restarted.serializeForCompression([lateSaved]), /先前世界的操作结果，不代表当前处境/);
+    assert.doesNotMatch(restarted.serializeForCompression([lateSaved]), /opportunities|旧菜单候选|当前可知处境/);
+    const afterLateWorld = await restarted.toChatMessages("after late old-world result");
+    assert.deepEqual(afterLateWorld.slice(0, beforeLateWorld.length), beforeLateWorld, "late-result qualification only appends; older provider prefixes remain byte-identical");
+    await restarted.appendEvent(lateWorld);
+    assert.deepEqual(await restarted.toChatMessages("retried late old-world result"), afterLateWorld, "append retry reuses the frozen historical projection");
+    const lateReload = new BotContext(files); await lateReload.load();
+    assert.deepEqual(await lateReload.toChatMessages("reloaded late old-world result"), afterLateWorld, "historical source labels and old prefixes remain byte-identical across restart");
+
     const ref: MediaRef = { id: 1, type: "image", mime: "image/png", file: "/unused/fixture.png" };
     const media = event("ev_8", envelope("图前原始正文"), { attachments: [ref], parts: [{ kind: "text", text: envelope("图前原始正文") }, mediaPart(ref, { name: "菜单照片", summary: "菜单照片摘要" }), { kind: "text", text: "图后原文" }], contextText: "不能用这句话替换图文" });
     await restarted.appendEvent(media);
@@ -85,6 +108,16 @@ async function main() {
     assert.ok(mediaParts[0]!.type === "text" && mediaParts[0]!.text.includes("菜单照片摘要") && mediaParts[0]!.text.includes('"mode":"narrative"'));
     assert.ok(mediaParts[2]!.type === "text" && mediaParts[2]!.text.includes("图后原文"));
     assert.ok(!JSON.stringify(mediaParts).includes("不能用这句话替换图文"));
+    const alreadyFrozen = event("ev_legacy_frozen_historical", envelope("旧存档原始世界正文。"), {
+      experience: { worldPerception: true, historicalWorld: true }, contextText: "旧版本已经冻结的文本：当前可知处境：旧城桥边。",
+    });
+    await fs.appendFile(files.stream, JSON.stringify({ kind: "event", event: alreadyFrozen }) + "\n");
+    const legacyReload = new BotContext(files); legacyReload.attachmentLoader = restarted.attachmentLoader; await legacyReload.load();
+    const legacyMessages = await legacyReload.toChatMessages("old frozen archive");
+    assert.ok(String(legacyMessages.at(-1)?.content).includes(alreadyFrozen.contextText!));
+    assert.ok(!String(legacyMessages.at(-1)?.content).includes("先前世界的操作结果"), "loading an older frozen historical event must not apply a new rendering policy");
+    await legacyReload.appendEvent({ ...alreadyFrozen, contextHint: { text: "新的显示策略不能覆盖旧前缀" } });
+    assert.deepEqual(await legacyReload.toChatMessages("retried old frozen archive"), legacyMessages, "retries preserve old contextText even after the projection policy changes");
     console.log("PASS frozen narrative context: one readable scene, unchanged raw receipts/roots, preserved old cache prefix, append retry/restart, puppet agency and untouched media/source boundaries");
   } finally { await fs.rm(dir, { recursive: true, force: true }); }
 }

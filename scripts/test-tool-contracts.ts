@@ -15,7 +15,7 @@ import type { ToolCallRecord } from "../src/types.js";
 async function main() {
 const logger = { info() {}, warn() {}, error() {} } as any;
 const call: ToolCallRecord = { id: "tc_42", role: "agent", name: "act", arguments: { description: "走到门边，推开木门" }, issuedAt: 0, expectedAt: 0 };
-for (const name of ["check_status", "check_time", "recall"]) {
+for (const name of ["check_status", "check_time", "recall", "choose"]) {
   assert(!BOT_TOOL_NAMES.includes(name), `legacy tool ${name} must not be advertised`);
   assert.throws(() => validateToolCall({ name, arguments: {} }, BOT_TOOL_NAMES), /未知工具/);
 }
@@ -36,7 +36,7 @@ const failure = await new Promise<{ text: string; ok?: boolean }>(resolve => {
 });
 assert.equal(failure.ok, false);
 assert.match(failure.text, /走到门边，推开木门/);
-assert.match(failure.text, /tc_42/);
+assert.match(failure.text, /失败[：:]门没有打开，结果尚未确认/);
 assert.doesNotMatch(failure.text, /动作 act/);
 const dir = await fs.mkdtemp(path.join(os.tmpdir(), "world-tool-contracts-"));
 try {
@@ -61,7 +61,8 @@ try {
   assert.match(result.text, /走到门边/); assert.equal(calls, 1);
   await agent.drainMailbox();
   const records = context.stream.filter(e => e.kind === "event");
-  assert(records.some(e => e.kind === "event" && /动作「走到门边/.test(e.event.content)), "start receipt includes the intended action");
+  assert(records.some(e => e.kind === "event" && /走到门边/.test(e.event.content)), "the actual failure still identifies the intended action");
+  assert(!records.some(e => e.kind === "event" && /已受理/.test(e.event.content)), "an already resolved action needs no separate acceptance notice");
   await agent.stop();
 } finally { await fs.rm(dir, { recursive: true, force: true }); }
 console.log("PASS tool contracts: removed legacy names, object-only arguments, declared growth/media protocols, concrete action failures and truthful adjudication outcomes");

@@ -1,9 +1,10 @@
 import { promises as fs } from "node:fs";
+import { createHash } from "node:crypto";
 import { appendJsonLine } from "../jsonl.js";
 import type { WorldFiles } from "../files.js";
 import type { ChatMessage, ChatToolDef, ContentPart } from "../llm/chat.js";
 import type { AttachmentLoadFn } from "../media/parts.js";
-import { BOT_PROMPT_DEFAULTS, CHAT_ACCOUNTS_NOTICE_PREFIX, CHAT_IDENTITY_GUIDANCE, WORLD_PERCEPTION_SCOPE, type Prompts } from "../prompts.js";
+import { BOT_PROMPT_DEFAULTS, CHAT_ACCOUNTS_NOTICE_PREFIX, CHAT_EXPRESSION_GUIDANCE, CHAT_IDENTITY_GUIDANCE, WORLD_PERCEPTION_SCOPE, type Prompts } from "../prompts.js";
 import type {
   BotEvent,
   CompressionResult,
@@ -15,6 +16,7 @@ import type {
 import { renderToolsText } from "./tools.js";
 import { canonicalizeArgs } from "./repeatGuard.js";
 import { mediaOpen, mediaPart, mediaText, richPartsText } from "../media/presentation.js";
+import { archiveOpportunityHistory } from "./opportunities.js";
 
 // Exact program-authored legacy receipts only; ordinary dialogue about sleep stays intact.
 const LEGACY_REST_INTERRUPTS = new Set([
@@ -23,6 +25,9 @@ const LEGACY_REST_INTERRUPTS = new Set([
   "什么东西响了一下，你从浅睡中转醒。", "你迷迷糊糊睁眼，原来是旁边有动静。", "一阵声响惊动了你，小憩到此为止。",
   "你从半睡半醒中被拉回现实。",
 ]);
+
+const LEGACY_REGULATION_HEADING = "# 需要与行动取向（整理时的快照）\n";
+export const REGULATION_RETIREMENT_NOTICE = "（旧内在调节机制已停用。）\n旧记录中的需要缺口、递质样信号、收益预测与候选取舍来自已停用的程序估计，不再表示你当前的身体感受、情绪、动机或行动要求；固定提示中的旧‘需要与行动取向’快照也已失效。不要为了获得这些分数而行动，不把它们或本次停用当成亲身经历、性格变化或成长证据，整理记忆时也不要将其重新归纳成当前倾向。角色设定、真实见闻、自己的想法及有亲历依据的关系和成长仍然保留；依据它们和眼下真实处境自由决定。";
 
 export interface CompressionSnapshot {
   entries: StreamEntry[];
@@ -34,11 +39,14 @@ interface CompressionCommit {
   counters: { tool: number; event: number };
   previousStream: StreamEntry[];
   stream: StreamEntry[];
+  opportunityHistory?: StreamEntry[];
 }
 
 interface PinnedPersist {
   pinned: PinnedContext;
   counters: { tool: number; event: number };
+  /** Delivered menu sources only; never rendered as new observations or added to growth. */
+  opportunityHistory?: StreamEntry[];
   /** Exact provider prefix for this working window. Missing in pre-upgrade archives. */
   rendered?: { systemText: string; nativeToolCalls?: boolean; nativeTools?: ChatToolDef[] };
 }
@@ -63,6 +71,9 @@ export class BotContext {
     updatedAt: 0,
   };
   stream: StreamEntry[] = [];
+  private retainedOpportunityHistory: StreamEntry[] = [];
+  /** Menu reconstruction may consult delivered pre-compression sources without replaying their prose. */
+  opportunityStream(): readonly StreamEntry[] { return [...this.retainedOpportunityHistory, ...this.stream]; }
   /** 附件加载器（chat 模式 + 原生多模态时由 service 注入） */
   attachmentLoader: AttachmentLoadFn | null = null;
   /** 运行时熔断：生成请求 400/413（模型不支持附件/请求体过大）后停用附件注入，避免持续报错 */
@@ -140,16 +151,19 @@ export class BotContext {
       }
       this.pinned = raw.pinned;
       this.counters = raw.counters;
+      if (raw.opportunityHistory !== undefined && !Array.isArray(raw.opportunityHistory)) throw new Error("已保存的行动建议来源损坏");
+      this.retainedOpportunityHistory = structuredClone(raw.opportunityHistory ?? []);
       this.frozenSystemText = raw.rendered?.systemText ?? null;
       this.frozenNativeTools = raw.rendered?.nativeTools === undefined ? undefined : structuredClone(raw.rendered.nativeTools);
       this.frozenNativeMode = raw.rendered?.nativeToolCalls ?? (raw.rendered?.nativeTools !== undefined ? true : undefined);
       this.renderedNeedsSave = false;
       // 注意：置顶区保留持久化时的工具列表（保护前缀缓存）。
-      // 与当前实际可用工具的差异由 service 层通过 toolsChangeNotice() 以 Event 形式告知 Bot，
+      // 与当前实际可用工具的差异由 Bot 的交付边界以 Event 形式告知，
       // 置顶列表在下次 rest 压缩（applyCompression）时才同步为当前列表。
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
       this.frozenSystemText = null; this.frozenNativeTools = undefined; this.frozenNativeMode = undefined; this.renderedNeedsSave = false;
+      this.retainedOpportunityHistory = [];
       this.pinned.persona = (await this.files.readDefinitions()).botDef;
     }
     // 迁移/兜底：置顶区缺少「最初设定」（旧版 pinned.json 或没有 pinned.json 的旧世界），
@@ -190,8 +204,47 @@ export class BotContext {
     return this.mutate(() => this.persistPinnedUnlocked());
   }
 
+  /** Upgrade interpretation by appending guidance; never rebuild a previously sent prefix. */
+  async ensureGuidance(content: string, worldTime: number): Promise<BotEvent | undefined> {
+    return this.mutate(async () => {
+      if ((this.frozenSystemText ?? this.buildSystemText("")).includes(content) ||
+        this.stream.some(entry => entry.kind === "event" && entry.event.source === "system" && entry.event.content === content)) return;
+      const event: BotEvent = { id: `ev_guidance_${createHash("sha256").update(content).digest("hex").slice(0, 24)}`, source: "system", worldTime, content, originEventIds: [] };
+      await this.appendEntry({ kind: "event", event });
+      return event;
+    });
+  }
+
+  async ensureExpressionGuidance(worldTime: number): Promise<BotEvent | undefined> {
+    return this.mutate(async () => {
+      if ((this.frozenSystemText ?? this.buildSystemText("")).includes(CHAT_EXPRESSION_GUIDANCE)
+        || this.stream.some(entry => entry.kind === "event" && entry.event.source === "system" && entry.event.content === CHAT_EXPRESSION_GUIDANCE)) return;
+      const event: BotEvent = { id: this.nextEventId(), source: "system", worldTime, content: CHAT_EXPRESSION_GUIDANCE, originEventIds: [] };
+      await this.appendEntry({ kind: "event", event });
+      await this.persistPinnedUnlocked();
+      return event;
+    });
+  }
+
+  /** Retire only program-authored legacy guidance, without changing a frozen provider prefix. */
+  async retireLegacyRegulation(worldTime: number): Promise<BotEvent | undefined> {
+    return this.mutate(async () => {
+      if (this.stream.some(entry => entry.kind === "event" && entry.event.source === "system" && entry.event.content === REGULATION_RETIREMENT_NOTICE)) return;
+      const oldSummary = (this.pinned as PinnedContext & { regulationSummary?: unknown }).regulationSummary;
+      const legacy = typeof oldSummary === "string" && !!oldSummary.trim()
+        || this.frozenSystemText?.includes(LEGACY_REGULATION_HEADING)
+        || this.stream.some(entry => entry.kind === "event" && entry.event.source === "system" && entry.event.id.startsWith("ev_regulation_"));
+      if (!legacy) return;
+      const event: BotEvent = { id: this.nextEventId(), source: "system", worldTime, content: REGULATION_RETIREMENT_NOTICE, originEventIds: [] };
+      await this.appendEntry({ kind: "event", event });
+      await this.persistPinnedUnlocked();
+      return event;
+    });
+  }
+
   private async persistPinnedUnlocked(): Promise<void> {
     const data: PinnedPersist = { pinned: this.pinned, counters: this.counters,
+      ...(this.retainedOpportunityHistory.length ? { opportunityHistory: this.retainedOpportunityHistory } : {}),
       ...(this.frozenSystemText !== null ? { rendered: { systemText: this.frozenSystemText, ...(this.frozenNativeMode !== undefined ? { nativeToolCalls: this.frozenNativeMode } : {}), ...(this.frozenNativeTools !== undefined ? { nativeTools: this.frozenNativeTools } : {}) } } : {}) };
     await this.files.atomicWrite(this.files.pinned, JSON.stringify(data, null, 2));
     this.renderedNeedsSave = false;
@@ -229,6 +282,9 @@ export class BotContext {
     await this.mutate(async () => {
       const existing = this.stream.find(entry => entry.kind === "event" && entry.event.id === event.id);
       const stored = { ...event };
+      // A producer's hint applies only to the first durable append. Keep the raw receipt for
+      // recovery and evidence; retries and old archives must reuse their committed projection.
+      delete stored.contextHint;
       delete stored.contextText;
       delete stored.mediaReuse;
       if (existing?.kind === "event") {
@@ -239,11 +295,28 @@ export class BotContext {
       } else {
         if (hasEventMedia(event)) stored.mediaReuse = true;
         const call = event.refToolCallId ? this.stream.find(entry => entry.kind === "tool_call" && entry.call.id === event.refToolCallId) : undefined;
-        const projected = narrativeContextText(event, call?.kind === "tool_call" ? call.call.name : undefined);
+        const projected = receiptContextText(event) ?? narrativeContextText(event, call?.kind === "tool_call" ? call.call.name : undefined);
         if (projected !== undefined) stored.contextText = projected;
       }
       await this.appendEntry({ kind: "event", event: stored });
       await this.persistPinnedUnlocked();
+    });
+  }
+
+  /** End a silent tool turn before requesting another assistant turn. Persist the delimiter:
+   * a transient suffix would disappear from the next request and invalidate the shared prefix.
+   * This is protocol text, not a receipt, perception, wake-up or learning signal.
+   */
+  async ensureGenerationCue(): Promise<void> {
+    await this.mutate(async () => {
+      const last = [...this.stream].reverse().find(entry => entry.kind === "tool_call" || !isHiddenConfirmation(entry.event));
+      if (last?.kind !== "tool_call") return;
+      const event: BotEvent = {
+        id: `ev_generation_${last.call.id}`, source: "system", generationCue: true,
+        worldTime: last.call.issuedAt, originEventIds: [], content: "请选择下一步。",
+      };
+      // The call-derived ID needs no counter checkpoint and makes retries/restarts idempotent.
+      await this.appendEntry({ kind: "event", event });
     });
   }
 
@@ -348,7 +421,6 @@ export class BotContext {
       "# 过往经历（压缩）\n" + this.pinned.historySummary,
       "# 记忆摘要\n" + this.pinned.memoryDigest,
       ...(this.pinned.growthSummary ? ["# 经历之后形成的认识与倾向\n这些是可修订、受情境限制的记忆，不是必须执行的命令。临时状态有适用时段，较新的回忆或变化事件优先。\n" + this.pinned.growthSummary] : []),
-      ...(this.pinned.regulationSummary ? ["# 需要与行动取向（整理时的快照）\n这些倾向会随经历与时间改变；较新的变化事件优先。它们不是必须执行的命令，也不证明外界事实或他人的意愿。\n" + this.pinned.regulationSummary] : []),
       "# 时间\n世界以 Time Unit (TU) 计时" +
         (this.timeInfo ? `，${this.timeInfo}` : "") +
         (this.waitRemoved
@@ -367,6 +439,7 @@ export class BotContext {
   }
 
   static renderEventLine(event: BotEvent): string {
+    if (event.generationCue) return event.content;
     const ref = event.refToolCallId ? ` ref="${event.refToolCallId}"` : "";
     const echo = event.statusEcho ? `\n\n（这条事件发生时你的状态：\n${event.statusEcho}\n）` : "";
     return `<event id="${event.id}" t="${event.worldTime.toFixed(1)}" src="${event.source}"${ref}>${frozenEventText(event)}${echo}</event>`;
@@ -378,6 +451,7 @@ export class BotContext {
     loader: AttachmentLoadFn | null,
     window: ReturnType<BotContext["newMediaWindow"]>,
   ): Promise<ContentPart[]> {
+    if (event.generationCue) return [{ type: "text", text: event.content }];
     const existing = window.events.get(event.id);
     if (existing) return structuredClone(await existing);
     const admitted: { key: string; size: number }[] = [];
@@ -446,6 +520,7 @@ export class BotContext {
 
   renderStreamText(): string {
     return this.stream
+      .filter(entry => entry.kind === "tool_call" || !isHiddenConfirmation(entry.event))
       .map((e) =>
         e.kind === "tool_call"
           ? BotContext.renderToolCallLine(e.call)
@@ -478,6 +553,7 @@ export class BotContext {
       { role: "system", parts: [{ type: "text", text: systemText }] },
     ];
     for (const entry of entries) {
+      if (entry.kind === "event" && isHiddenConfirmation(entry.event)) continue;
       const role = entry.kind === "tool_call" ? "assistant" : "user";
       let parts: ContentPart[];
       if (entry.kind === "tool_call") {
@@ -511,11 +587,14 @@ export class BotContext {
   /** 供压缩用：序列化当前工作窗口（把连续重复的工具调用折叠成一条汇总，避免千篇一律的历史占满压缩输入） */
   serializeForCompression(entries: StreamEntry[] = this.stream): string {
     const lines: string[] = [];
-    const calls = new Map(entries.flatMap(entry => entry.kind === "tool_call" ? [[entry.call.id, entry.call] as const] : []));
+    // A selected compression slice may start with a receipt whose call precedes the slice.
+    // Resolve that identity without rebuilding its already frozen narrative projection.
+    const calls = new Map([...this.stream, ...entries].flatMap(entry => entry.kind === "tool_call" ? [[entry.call.id, entry.call] as const] : []));
     let i = 0;
     while (i < entries.length) {
       const entry = entries[i]!;
       if (entry.kind !== "tool_call") {
+        if (entry.event.generationCue) { i++; continue; }
         const call = entry.event.refToolCallId ? calls.get(entry.event.refToolCallId) : undefined;
         if (entry.event.source === "system" && call?.name === "rest" && LEGACY_REST_INTERRUPTS.has(entry.event.content)) {
           // Read projection only: the original event and frozen Bot prefix stay byte-identical.
@@ -525,7 +604,16 @@ export class BotContext {
           i++;
           continue;
         }
-        lines.push(BotContext.renderEventLine(entry.event));
+        // Thinking is already recorded in the assistant's call. Other quiet/short receipts
+        // still carry completed facts needed by memory: never make omission look like failure
+        // or let an unconfirmed call become evidence that an action happened.
+        if (!(call?.name === "think" && entry.event.experience?.internalThought && isHiddenConfirmation(entry.event))) {
+          const narrative = entry.event.source === "world" || entry.event.experience?.worldPerception
+            || entry.event.source === "tool" && ["act", "observe"].includes(call?.name ?? "");
+          const compressionEvent = narrative && !isHiddenConfirmation(entry.event)
+            ? entry.event : { ...entry.event, contextText: undefined };
+          lines.push(BotContext.renderEventLine(compressionEvent));
+        }
         i++;
         continue;
       }
@@ -591,7 +679,7 @@ export class BotContext {
   }
 
   /** Only retire the prefix which was actually summarized. Never write objective world state. */
-  async applyCompression(result: CompressionResult, worldTime: number, snapshot?: CompressionSnapshot, growthSummary?: string, regulationSummary?: string): Promise<void> {
+  async applyCompression(result: CompressionResult, worldTime: number, snapshot?: CompressionSnapshot, growthSummary?: string): Promise<void> {
     await this.mutate(async () => {
       const prefix = snapshot?.entries ?? this.stream;
       const key = (e: StreamEntry) => e.kind === "tool_call" ? e.call.id : e.event.id;
@@ -603,13 +691,13 @@ export class BotContext {
       const commit: CompressionCommit = {
         previousStream: this.stream,
         stream: remaining,
+        opportunityHistory: archiveOpportunityHistory([...this.retainedOpportunityHistory, ...prefix]),
         counters: { ...this.counters },
         pinned: {
           botDefinition: botDef, persona: botDef,
           historySummary: result.historySummary, toolsText: this.toolsText,
           memoryDigest: result.memoryDigest, updatedAt: worldTime,
           ...(growthSummary !== undefined || this.pinned.growthSummary !== undefined ? { growthSummary: growthSummary ?? this.pinned.growthSummary } : {}),
-          ...(regulationSummary !== undefined || this.pinned.regulationSummary !== undefined ? { regulationSummary: regulationSummary ?? this.pinned.regulationSummary } : {}),
         },
       };
       // Commit intent is durable before truncating either file. A crash can replay this cutover.
@@ -630,7 +718,8 @@ export class BotContext {
       return;
     }
     const commit = JSON.parse(raw) as CompressionCommit;
-    if (!Array.isArray(commit.previousStream) || !Array.isArray(commit.stream) || !commit.pinned || !commit.counters) {
+    if (!Array.isArray(commit.previousStream) || !Array.isArray(commit.stream) || !commit.pinned || !commit.counters ||
+      commit.opportunityHistory !== undefined && !Array.isArray(commit.opportunityHistory)) {
       throw new Error("记忆提交记录损坏，需要恢复归档；当前上下文未被丢弃");
     }
     const lines = (entries: StreamEntry[]) => entries.length ? entries.map((entry) => JSON.stringify(entry)).join("\n") + "\n" : "";
@@ -642,12 +731,14 @@ export class BotContext {
       tool: Math.max(this.counters.tool, commit.counters.tool),
       event: Math.max(this.counters.event, commit.counters.event),
     };
-    const persisted: PinnedPersist = { pinned: commit.pinned, counters };
+    const opportunityHistory = structuredClone(commit.opportunityHistory ?? []);
+    const persisted: PinnedPersist = { pinned: commit.pinned, counters, ...(opportunityHistory.length ? { opportunityHistory } : {}) };
     await this.files.atomicWrite(this.files.pinned, JSON.stringify(persisted, null, 2));
     await fs.rm(this.compressionCommitPath, { force: true });
     // Publish one complete window only after both files and the recovery marker are committed.
     // On any failure, reads keep the old coherent view and settled() must recover before rendering.
     this.stream = commit.stream;
+    this.retainedOpportunityHistory = opportunityHistory;
     this.pinned = commit.pinned;
     this.counters = counters;
     this.resetRenderingAfterCompression();
@@ -668,9 +759,24 @@ function frozenEventText(event: BotEvent): string {
   return canUseContextText(event) ? event.contextText! : event.parts?.length ? richPartsText(event.parts) : event.content;
 }
 
+function isHiddenConfirmation(event: BotEvent): boolean {
+  return canUseContextText(event) && event.contextText === "" && !event.statusEcho;
+}
+
+/** Only explicit program hints shorten receipts; arbitrary tool/remote prose is never matched. */
+function receiptContextText(event: BotEvent): string | undefined {
+  if (hasEventMedia(event) || typeof event.contextHint?.text !== "string") return undefined;
+  if (event.experience?.historicalWorld === true) return undefined;
+  // Preserve uncertainties and failures even if a producer accidentally forwards a success hint.
+  if (event.experience?.outcome === "failed" || event.experience?.outcome === "unknown") return undefined;
+  if (!event.contextHint.text && event.statusEcho) return undefined;
+  return event.contextHint.text;
+}
+
 /** Projection happens once at append, never while loading or rendering historical events. */
 function narrativeContextText(event: BotEvent, toolName?: string): string | undefined {
-  if (hasEventMedia(event) || (event.source !== "world" && !(event.source === "tool" && ["act", "observe"].includes(toolName ?? "")))) return undefined;
+  if (hasEventMedia(event) || (event.source !== "world" && !(event.source === "tool" &&
+    (["act", "observe"].includes(toolName ?? "") || event.experience?.worldPerception === true)))) return undefined;
   let text = event.parts?.length ? richPartsText(event.parts) : event.content;
   let controlNote = "";
   if (text.startsWith("（以下是外部操纵你身体/设备产生的回执，")) {
@@ -685,16 +791,18 @@ function narrativeContextText(event: BotEvent, toolName?: string): string | unde
     const body = typeof observation.narrative === "string" ? observation.narrative : observation.scene?.text ?? parsed.scene?.text;
     if (typeof body !== "string" || !body.trim()) return undefined;
     const sections = controlNote ? [controlNote] : [];
+    const historical = event.experience?.historicalWorld === true;
+    if (historical) sections.push("（先前世界的操作结果，不代表当前处境。）");
     sections.push(WORLD_PERCEPTION_SCOPE);
     if (parsed.recovered === true) sections.push("（以下是已保存处境的回读，不是新发生的行动。）");
     if (parsed.action && typeof parsed.action === "object") {
-      if (typeof parsed.action.intent === "string" && parsed.action.intent.trim()) sections.push(`本次操作：${parsed.action.intent}`);
-      const status: Record<string, string> = { pending: "仍在进行", completed: "已完成", needs_input: "已推进到需要你决定下一步的地方，本次裁定结束；后续不会自动执行", failed: "未完成", cancelled: "已取消" };
+      if (parsed.action.status !== "completed" && typeof parsed.action.intent === "string" && parsed.action.intent.trim()) sections.push(`${historical ? "先前" : "本次"}操作：${parsed.action.intent}`);
+      const status: Record<string, string> = { pending: historical ? "在该记录时仍在进行" : "仍在进行", needs_input: historical ? "当时已推进到新的决定点，本次裁定已结束" : "已推进到需要你决定下一步的地方，本次裁定结束；后续不会自动执行", failed: "未完成", cancelled: "已取消" };
       if (Object.hasOwn(status, parsed.action.status)) sections.push(`行动结果：${status[parsed.action.status]}`);
     }
     sections.push(body);
     const situation = observation.situation ?? observation.scene?.situation ?? parsed.scene?.situation;
-    if (typeof situation === "string" && situation.trim()) sections.push(`当前可知处境：${situation}`);
+    if (typeof situation === "string" && situation.trim()) sections.push(`${historical ? "当时" : "当前"}可知处境：${situation}`);
     return sections.join("\n\n");
   } catch { return undefined; }
 }

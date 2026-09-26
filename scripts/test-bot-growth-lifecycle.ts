@@ -30,7 +30,7 @@ async function fixture(running = false) {
   const context = new BotContext(files); await context.load();
   const config = Config({ autoStart: false });
   config.bot.baseURL = `http://${randomUUID()}.invalid`; config.bot.model = "fixture";
-  config.bot.growth.enabled = true; config.bot.growth.minEpisodes = 1; config.bot.regulation.enabled = false;
+  config.bot.growth.enabled = true; config.bot.growth.minEpisodes = 1;
   const clock = { now: () => 100000, unitWorldSeconds: 1, syncRealTime: true, timeLine: () => "T100000", realMsUntil: () => 0 } as any;
   const agent = new BotAgent(config, clock, files, context, {} as any, {} as any, null, null, null, { down: false }, logger) as any;
   const event: BotEvent = { id: "old-event", source: "world", worldTime: 99999, content: "晚饭后在河边散步，感到平静。", originEventIds: ["old-root"],

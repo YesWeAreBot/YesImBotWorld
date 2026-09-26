@@ -142,7 +142,7 @@ async function main() {
     phone.down = false;
     renderer.render = async (text: string) => { const rich = await renderBeforeRace(text); phone.down = true; return rich; };
     const delayed = await incoming("render-race", "渲染完成时已放下手机，不能看到");
-    assert.equal(delayed.text, "放在一边的手机震了一下。");
+    assert.equal(delayed.text, "手机震了一下。");
     assert.doesNotMatch(JSON.stringify(delayed), /alice|渲染完成|group|chat-user/);
     renderer.render = renderBeforeRace;
     phone.down = false;

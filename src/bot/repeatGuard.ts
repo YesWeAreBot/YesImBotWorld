@@ -3,7 +3,7 @@
  *
  * 移植自 DeepSeek Harness 的 `dsh-repeat-tool-reminder` 设计：
  * - 观察每个工具调用，按 (工具名, 规范化参数) 做链式计数；
- * - 连续重复达到配置阈值时，注入**递进式**提醒（首阈值温和、后续详细），
+ * - 连续重复达到配置阈值时，追加简短提醒，
  *   让模型停止复读、去读上一次结果、换一个动作或收尾；
  * - **纯 advisory**：从不否决、从不改写、从不拦截调用（决策权完全在模型）；
  * - **denied 调用也计数**（被拦截/拒绝的工具调用同样推进链，模型反复撞被拒的调用正是该打断的循环）；
@@ -45,13 +45,13 @@ interface Chain {
 }
 
 export interface RepeatGuardConfig {
-  /** 连续重复达到这些次数时各触发一次提醒（升序；首个为温和档，其余为详细档）。空数组 = 关闭 */
+  /** 连续重复达到这些次数时各触发一次提醒（升序；每个阈值提示一次）。空数组 = 关闭 */
   thresholds: number[];
   /** 参与计数的工具名匹配（* 通配）；空 = 全部工具 */
   include: string[];
   /** 透明的工具名匹配（既不计数也不重置，如 bookkeeping 工具） */
   exclude: string[];
-  /** 详细提醒里参数预览的字符上限（防止大 payload 无限进入下一次请求） */
+  /** 内部诊断参数预览的字符上限；不呈现给角色。 */
   argumentsPreviewChars: number;
   /** 交替循环检测：窗口内序列以某个短周期重复这么多轮才判定为循环（默认 3） */
   cycleRepeatMin?: number;
@@ -59,77 +59,17 @@ export interface RepeatGuardConfig {
   cycleMaxPeriod?: number;
 }
 
-/**
- * 从多套语义等价的文案里随机挑一套（本地实现，避免与 agent 循环依赖）。
- * 只用于非事实性的引导话术；事实性内容（工具名、次数、参数）由调用方在外层拼接，绝不随机。
- * 不传 seed 时用真随机，让同一档每次都可能有不同表述，最大限度打破"固定文案"的循环感。
- */
-function pickMeta(variants: string[], seed?: number): string {
-  if (variants.length <= 1) return variants[0] ?? "";
-  const n = seed !== undefined && Number.isFinite(seed) ? Math.abs(Math.floor(seed)) : Math.floor(Math.random() * 0x7fffffff);
-  return variants[n % variants.length]!;
+/** A repetition pattern is known; whether the attempts helped is not. */
+function repeatedCallReminder(toolName: string): string {
+  return `同一 ${toolName} 调用正在重复，请先检查上次结果。`;
 }
 
-/** 温和首阈值提醒（不点名工具与参数），≥10 套字面差异大的变体随机 */
-function gentleReminder(): string {
-  return pickMeta([
-    "你正在用完全相同的参数重复调用同一个工具。仔细分析上一次的结果再决定是否要继续：" +
-      "如果事情还没完成，试着换一种做法或换一组参数，而不是原样再调用一次；如果已经掌握足够信息，也可以就此收尾。",
-    "你连续用一模一样的参数调用同一个工具。先别急着再来一次——回头看上一次的结果：" +
-      "没做完就换个方法或换个参数，做完了就不必再调。",
-    "同一个工具、同样的参数，你已经在反复调用了。停下来想想：这是不是真的还需要？" +
-      "需要就换个方式，不需要就到此为止。",
-    "检测到重复：你正在原封不动地重复上一次的工具调用。请先读上次它返回了什么，再决定是否值得再试一次；" +
-      "若值得，改个参数或换个路径。",
-    "你似乎在循环调用同一个工具、同一组参数。如果上次没成功，原样重来多半也不会成功——请换一种策略。",
-    "注意，你已经用同样的输入调用了同一个工具多次。请先冷静，回头看看结果，再判断下一步，而不是机械地重发。",
-    "同样的调用又出现了。除非你预期输入有变化会带来不同结果，否则这样做没有价值——换个角度吧。",
-    "提醒一下：你在反复提交重复的工具请求。先确认上一次的结果是否已满足需求；没满足就想新办法。",
-    "停下！你陷入了重复调用同一个工具、同样参数的循环。重新审视目标，尝试不同的手段。",
-    "同一个动作、同样的参数，你已经做了不止一次。若结果没有推进，重复它就是浪费——改变你的做法。",
-  ]);
+function cycleReminder(pattern: string[]): string {
+  return `操作序列正在重复：${pattern.join(" → ")}。请先检查上次结果。`;
 }
 
-/** 详细提醒：点名工具、连击数、规范化参数。事实部分（工具/次数/参数）原样保留，只随机引导语骨架 */
-function detailedReminder(toolName: string, count: number, canonicalArguments: string, previewChars: number): string {
-  const preview =
-    canonicalArguments.length <= previewChars
-      ? canonicalArguments
-      : `${canonicalArguments.slice(0, previewChars)}… (+${canonicalArguments.length - previewChars} more chars)`;
-  const guidance = pickMeta([
-    "这些重复调用没有在推进进度。不要再用这组参数调用这个工具；请查看最新一次结果，换一个动作、换一组参数，或在证据已足够时结束当前任务。",
-    "这样重复下去只是在原地踏步。别再原样调用它了——看最新结果，换个动作或参数，或者就此收尾。",
-    "同样的调用反复出现，没有带来任何新东西。请停止原样重复：要么换个做法，要么确认任务已完成、直接收尾。",
-    "原样重试已经证明没有进展。改变输入、换个工具，或者承认这一步做完了——别再做相同的调用。",
-    "重复的代价是零收益。如果你在等一个不同的结果，就得给它一个不同的输入；若已无计可施，就该结束。",
-    "你正在原地打转。这个调用不会再产生新信息，请停止复制粘贴式的重复，转向下一个实质动作。",
-    "同样的请求一遍遍发出，现实不会因此改变。要么调整参数再试，要么换个方向，要么停下来收尾。",
-    "已经够了——这组参数不会再有新结果。继续重复只是燃烧你自己，请立刻改弦更张或结束任务。",
-    "机械重复救不了任何事。检查最新结果、换条路走，或者确认目标已达成、干净利落地收尾。",
-    "反复调用同一工具等于停在原地。若你已穷尽这个手段，就该尝试别的，或判定完成并结束。",
-  ]);
-  return `检测到重复的工具调用：\n- 工具：${toolName}\n- 连续调用次数：${count}\n- 参数：${preview}\n${guidance}`;
-}
-
-/** 交替循环提醒：点明这是一段周期性反复、没有新结果的循环，≥10 套字面差异大的变体随机 */
-function cycleReminder(pattern: string[], periods: number): string {
-  const seq = pattern.join(" → ");
-  return pickMeta([
-    `检测到你在反复执行同一组动作：${seq}（这一组动作已连续重复了 ${periods} 轮，每轮完全相同）。` +
-      `你陷入了循环——没有任何新结果、没有任何进展。请立即停下这个模式：换一件完全不同的事情做，或者如果手头的事其实已经做完，就明确收尾，不要再重复这一组动作。`,
-    `你在一遍又一遍地做同一组事：${seq}（已经 ${periods} 轮，毫无变化）。这是循环陷阱，没有任何进展。` +
-      `现在立刻换一件完全不同的事，或确认完成、就此收尾——别再走这一圈了。`,
-    `警告：你在原地打转——${seq} 这组动作已经反复了 ${periods} 轮，每轮都一样，毫无推进。` +
-      `请立即打破它：去做别的、完全不同的事，或者如果确实没事可做了就明确结束。`,
-    `这已经是一个死循环了：${seq} 连着转了 ${periods} 圈，每圈毫无差别。你在消耗自己却不去任何地方。` +
-      `立刻跳出来，做一件性质完全不同的事，或承认此事已了结。`,
-    `同一组动作 ${seq} 你已经重复了 ${periods} 个来回，像踩着跑步机原地不动。没有新输入就没有新进展，请马上换一件事。`,
-    `${seq} —— 这套组合已经循环了 ${periods} 轮，结果是零。你被困住了，唯一的出路是变向：去做别的事。`,
-    `反复的 ${seq}（第 ${periods} 轮）说明你已经失去了方向。停下手里的重复，抬头看看真正该做什么。`,
-    `你已经在这个固定动作串 ${seq} 里原地转了 ${periods} 圈。重复不会带来突破，请彻底换一个安排。`,
-    `检测到循环依赖：${seq} 反复出现，累计 ${periods} 轮且无进展。请主动打破它，走向一个全新的选择。`,
-    `你反复地 ${seq}，一共 ${periods} 轮，世界没有任何回应变化。这已经是空转，请立刻抽身，做点不一样的。`,
-  ]);
+function previewArguments(canonical: string, maxChars: number): string {
+  return canonical.length <= maxChars ? canonical : `${canonical.slice(0, maxChars)}… (+${canonical.length - maxChars} more chars)`;
 }
 
 /** 校验阈值（dsh 同款 fail-loud：空/非整数/小于 2/重复都抛错，绝不静默回退） */
@@ -156,6 +96,10 @@ export interface ObserveResult {
   count: number;
   /** 是否是交替循环（而非单工具重复） */
   cycle: boolean;
+  /** Internal diagnostics only; model notices never repeat arguments or counts. */
+  argumentsPreview: string;
+  cyclePattern?: string[];
+  cyclePeriods?: number;
 }
 
 /**
@@ -165,7 +109,6 @@ export interface ObserveResult {
 export class RepeatGuard {
   private thresholds: number[];
   private thresholdSet: Set<number>;
-  private firstThreshold: number | null;
   private includePatterns: RegExp[];
   private excludePatterns: RegExp[];
   private argumentsPreviewChars: number;
@@ -180,7 +123,6 @@ export class RepeatGuard {
   constructor(config: RepeatGuardConfig) {
     this.thresholds = validateThresholds(config.thresholds);
     this.thresholdSet = new Set(this.thresholds);
-    this.firstThreshold = this.thresholds[0] ?? null;
     this.includePatterns = config.include.map(wildcardToRegExp);
     this.excludePatterns = config.exclude.map(wildcardToRegExp);
     this.argumentsPreviewChars = config.argumentsPreviewChars;
@@ -207,25 +149,22 @@ export class RepeatGuard {
     // —— 交替循环检测（跨工具周期性反复，如 act↔wait，从周期 p=2 起）——
     const cycleNotice = this.pushWindowAndDetectCycle(key);
     if (cycleNotice) {
-      return { notice: cycleNotice, toolName: call.name, count: 0, cycle: true };
+      return { notice: cycleNotice.notice, toolName: call.name, count: 0, cycle: true,
+        argumentsPreview: previewArguments(canonical, this.argumentsPreviewChars), cyclePattern: cycleNotice.pattern, cyclePeriods: this.cycleRepeatMin };
     }
 
     if (this.thresholds.length === 0) return null;
     if (!this.tracked(call.name)) return null;
     const count = this.chain !== null && this.chain.key === key ? this.chain.count + 1 : 1;
     this.chain = { key, count };
-    const notice = !this.thresholdSet.has(count)
-      ? null
-      : count === this.firstThreshold
-        ? gentleReminder()
-        : detailedReminder(call.name, count, canonical, this.argumentsPreviewChars);
-    return { notice, toolName: call.name, count, cycle: false };
+    const notice = this.thresholdSet.has(count) ? repeatedCallReminder(call.name) : null;
+    return { notice, toolName: call.name, count, cycle: false, argumentsPreview: previewArguments(canonical, this.argumentsPreviewChars) };
   }
 
   /** 推进滚动窗口，检测「交替循环」；命中返回循环提醒，否则 null。
-   *  只从周期 p=2 起检测——p=1 的「连续相同工具」交给单工具链计数（带参数详细提醒），
+   *  只从周期 p=2 起检测——p=1 的「连续相同工具」交给单工具链计数，
    *  这里专治两个或更多工具交替反复的循环（单工具链识别不了的那种）。 */
-  private pushWindowAndDetectCycle(key: string): string | null {
+  private pushWindowAndDetectCycle(key: string): { notice: string; pattern: string[] } | null {
     this.window.push(key);
     const maxLen = this.cycleMaxPeriod * this.cycleRepeatMin;
     if (this.window.length > maxLen) this.window = this.window.slice(this.window.length - maxLen);
@@ -256,7 +195,7 @@ export class RepeatGuard {
       const signature = canonicalCycle(rawPattern);
       if (signature === this.lastCycleSignature) return null; // 同一个循环不重复刷屏
       this.lastCycleSignature = signature;
-      return cycleReminder(pattern, this.cycleRepeatMin);
+      return { notice: cycleReminder(pattern), pattern };
     }
     return null;
   }

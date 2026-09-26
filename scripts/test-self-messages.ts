@@ -59,7 +59,7 @@ async function main() {
     store, {} as never, { render: async (text: string) => ({ text }) } as never,
     { isFocused: (key: string) => focusedKeys.has(key) } as never, { isNotifyChannel: () => false } as never,
     { down: false }, {} as never, tracker, new ChannelNameResolver(app, store), () => null,
-    { notify(value) { deliveryOrder.push({ kind: "incoming", content: value.text }); }, channelActivity() {}, async selfMessage(key, rich, id) { const content = rich.text; await deliveryDelays.get(content); selfEvents.push({ key, content, id }); deliveryOrder.push({ kind: "self", content }); } });
+    { notify(value) { deliveryOrder.push({ kind: "incoming", content: value.text }); }, channelActivity() {}, async selfMessage(key, rich, id, _args, sender) { const content = sender?.content ?? rich.text; await deliveryDelays.get(content); selfEvents.push({ key, content, id }); deliveryOrder.push({ kind: "self", content }); } });
   const drain = async () => {
     for (let i = 0; i < 5; i++) {
       await new Promise<void>(resolve => setImmediate(resolve));
@@ -232,7 +232,7 @@ async function main() {
 
     // The feature-off path ignores both adapter echoes and other-client messages.
     const off = new Gateway(app, { ...cfg.messaging, externalSelfMessages: "off" }, cfg.platformOps,
-      store, {} as never, {} as never, {} as never, {} as never, { down: false }, {} as never,
+      store, {} as never, {} as never, {} as never, { isNotifyChannel: () => false } as never, { down: false }, {} as never,
       new OwnSendTracker(), {} as never, () => null,
       { notify() {}, channelActivity() {}, selfMessage() { assert.fail("off must not notify"); } });
     await (off as any).handle(human);

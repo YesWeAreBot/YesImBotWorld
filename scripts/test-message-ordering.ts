@@ -87,7 +87,7 @@ async function main() {
     assert.equal(notify.isNotifyChannel(key), false); assert.ok(JSON.parse(await readFile(path.join(dir, "notify.json"), "utf8")).deny.includes(key));
     const failure = new NotifyManager(path.join(dir, "missing", "notify.json"), ["*"], true);
     await assert.rejects(failure.set(key, false)); assert.equal(failure.isNotifyChannel(key), true);
-    assert.match(notify.channelStatusText(key), /免打扰.*打开频道仍能看见/);
+    assert.match(notify.channelStatusText(key), /频道通知：免打扰；未读 0 条/, "status exposes actual policy/count; focus and delivery behavior are verified below");
 
     const phone = { down: false }, focus = { isFocused: () => true, focus: async () => {} };
     const names: any = { display: async () => "测试群", identity: async () => ({ platform: "onebot", channelId: "group", selfId: "account", accountIds: ["account"], displayName: "群名片", text: "你的群名片：群名片" }) };

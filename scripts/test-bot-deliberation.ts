@@ -47,8 +47,8 @@ async function fixture(world: any = {}) {
   const context = new BotContext(files, "old tool block"); await context.load();
   const cfg = Config({ autoStart: false });
   Object.assign(cfg.bot, { minIntervalMs: 0, retryDelayMs: 1, maxWindowChars: 1_000_000, restCompressMinChars: 1_000_000,
-    nativeToolCalls: false, waitRateThreshold: 0 });
-  cfg.bot.growth.enabled = false; cfg.bot.regulation.enabled = false;
+    nativeToolCalls: false, strictToolLoop: false, waitRateThreshold: 0 });
+  cfg.bot.growth.enabled = false;
   const clock: any = { now: () => 10, timeLine: () => "T=10", realMsUntil: (at: number) => at > 10 ? 60_000 : 0,
     unitWorldSeconds: 1, unitRealSeconds: 1, syncRealTime: true };
   const agent = new BotAgent(cfg, clock, files, context, world, {} as any, null, null, null, { down: false }, logger, BOT_TOOLS) as any;
@@ -76,6 +76,8 @@ async function localThoughtAndFrozenPrefix() {
   assert.ok(ack?.kind === "event" && !ack.event.content.includes("也许他"), "do not echo an imagined fact as a new observation");
   assert.deepEqual(await f.agent.growth.recallEvidence({ n: 10 }), []);
   const messages = await f.context.toChatMessages("new time", true);
+  assert.ok(ack?.kind === "event" && ack.event.contextText === "", "the internal thought receipt is durable but silent to the model");
+  assert.ok(!JSON.stringify(messages).includes("这段内心独白已记下"));
   assert.deepEqual(messages.slice(0, original.length), original, "upgrading and thinking preserve the entire sent prefix");
   assert.equal(messages.filter(message => JSON.stringify(message.content).includes("也许他只是忙")).length, 1);
   const reloaded = new BotContext(f.files, "different tools"); await reloaded.load();
@@ -110,7 +112,7 @@ async function slowActionAllowsThoughtAndIndependentWork() {
   assert.equal(f.agent.status().awaitingToolRetry, false);
   for (const name of ["act", "observe", "think"]) assert.ok(!f.allowed().includes(name), `${name} is unavailable while the action is pending / thought allowance is exhausted`);
   assert.ok(f.allowed().includes("observe_device"));
-  assert.ok(f.context.stream.some(entry => entry.kind === "event" && entry.event.content.includes("已受理")));
+  assert.ok(f.context.stream.some(entry => entry.kind === "event" && entry.event.toolProgress === "pending"), "the unfinished action is announced when a later decision needs its status");
   assert.ok(!f.context.stream.some(entry => entry.kind === "event" && entry.event.content.includes("睡醒")));
   assert.deepEqual((await f.context.toChatMessages("later", false)).slice(0, before.length), before);
   slow.pending[0]!.finish();

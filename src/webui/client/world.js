@@ -142,9 +142,8 @@
             var item = (reviewStatus?.recentIsolations || []).flatMap(function (batch) { return batch.claims || []; }).find(function (claim) { return claim.claimId === view.claimId && (view.records || []).some(function (record) { return record.id === claim.recordId; }); });
             return item?.reason || '原记录缺少可核验的身份、频道范围或行为依据，暂不用于自动回忆及当前行为判断；保留原始记录等待复核。';
         }
-        var controls = el('div', { cls: 'world-controls' }), content = el('div'), regulationHolder = el('div');
-        holder.append(Studio.title('A CHARACTER, WITH A HISTORY', '角色与成长', '从亲历的事情中形成认识与习惯，理解它们如何改变，又在什么情境下被想起。', [Studio.button('刷新记录', 'refresh', refresh)]), regulationHolder, controls, content);
-        var regulation = InnerRegulation.mount(regulationHolder);
+        var controls = el('div', { cls: 'world-controls' }), content = el('div');
+        holder.append(Studio.title('A CHARACTER, WITH A HISTORY', '角色与成长', '从亲历的事情中形成认识与习惯，理解它们如何改变，又在什么情境下被想起。', [Studio.button('刷新记录', 'refresh', refresh)]), controls, content);
         var search = el('input', { cls: 'world-search', placeholder: '搜索对象、内容或适用情境', 'aria-label': '搜索成长记录', oninput: function () { q = search.value.toLowerCase().trim(); draw(); } });
         controls.appendChild(search);
         var group = el('div', { cls: 'world-filter-group growth-kind-filters', role: 'group', 'aria-label': '成长类型' });
@@ -154,7 +153,7 @@
         [['all', '全部历史'], ['active', '当前有效'], ['inactive', '未在沿用']].forEach(function (item) { var b = Studio.button(item[1], null, function () { lifecycle = item[0]; lifecycleGroup.querySelectorAll('button').forEach(function (node) { node.classList.toggle('active', node === b); node.setAttribute('aria-pressed', String(node === b)); }); draw(); }); b.classList.toggle('active', lifecycle === item[0]); b.setAttribute('aria-pressed', String(lifecycle === item[0])); lifecycleGroup.appendChild(b); });
         controls.appendChild(lifecycleGroup);
         content.appendChild(el('div', { cls: 'studio-skeleton' }));
-        function refresh() { regulation.refresh(); if (busy || !alive)
+        function refresh() { if (busy || !alive)
             return; busy = true; Promise.all([Studio.fetchGrowth(), isVisitor() ? Promise.resolve(null) : api('GET', '/api/bot/growth/status').then(function (status) { return { status: status }; }).catch(function (error) { return { error: error.message || String(error) }; })]).then(function (result) { if (!alive)
             return; var next = Array.isArray(result[0]) ? result[0] : []; reviewStatus = result[1]?.status || null; reviewError = result[1]?.error || null; var stamp = JSON.stringify([next, reviewStatus, reviewError]); if (stamp !== dataStamp) { rows = next; dataStamp = stamp; draw(); } }).catch(function (e) { if (alive) {
             dataStamp = null; Studio.error(content, e, refresh); } }).finally(function () { busy = false; }); }
@@ -163,12 +162,12 @@
             var box = el('section', { cls: 'studio-panel growth-detail growth-review-status', 'aria-label': '成长整理进度' }, [el('h3', { text: '经历正在如何整理' })]);
             if (reviewError) { box.appendChild(el('p', { cls: 'growth-hint', text: '暂时无法读取整理进度：' + reviewError })); return box; }
             if (!reviewStatus) { box.appendChild(el('p', { cls: 'growth-hint', text: '正在读取审阅状态。' })); return box; }
-            box.appendChild(el('div', { cls: 'regulation-metrics' }, [['待审阅经历', reviewStatus.pending], ['历史待补审', reviewStatus.deferred], ['已完成审阅', reviewStatus.reviews], ['未采纳提案', reviewStatus.rejected], ['审阅未完成', reviewStatus.failures]].map(function (item) { return el('div', { cls: 'regulation-metric' }, [el('span', { text: item[0] }), el('strong', { text: Number.isFinite(item[1]) ? String(item[1]) : '未记录' })]); })));
+            box.appendChild(el('div', { cls: 'growth-review-metrics' }, [['待审阅经历', reviewStatus.pending], ['历史待补审', reviewStatus.deferred], ['已完成审阅', reviewStatus.reviews], ['未采纳提案', reviewStatus.rejected], ['审阅未完成', reviewStatus.failures]].map(function (item) { return el('div', { cls: 'growth-review-metric' }, [el('span', { text: item[0] }), el('strong', { text: Number.isFinite(item[1]) ? String(item[1]) : '未记录' })]); })));
             box.appendChild(el('p', { cls: 'growth-hint', text: '待审阅与历史补审都是尚未处理的经历；未采纳提案不会变成角色认识。完成审阅也可能暂时没有新结论。' }));
             if (reviewStatus.isolations || reviewStatus.corrections) {
                 box.appendChild(el('p', { cls: 'growth-correction-summary', text: '已隔离 ' + (reviewStatus.isolations || 0) + ' 批待复核记录 · 已撤回 ' + (reviewStatus.corrections || 0) + ' 项判断。隔离与撤回不会新增经历，也不会删除原始事实。' }));
-                (reviewStatus.recentCorrections || []).slice(0, 3).forEach(function (correction) { box.appendChild(el('article', { cls: 'regulation-learning-record growth-correction-audit' }, [el('strong', { text: worldTime(correction.at) + ' · 已撤回' }), el('p', { text: correction.reason }), el('small', { text: '认识 ' + correction.claimId + ' · 审计 ' + correction.id })])); });
-                (reviewStatus.recentIsolations || []).slice(0, 3).forEach(function (batch) { box.appendChild(el('article', { cls: 'regulation-learning-record growth-isolation-audit' }, [el('strong', { text: worldTime(batch.at) + ' · 待复核 · 已隔离' }), el('p', { text: (batch.claims || []).length + ' 项旧认识暂停自动沿用；尚未判定原结论真伪。' }), el('small', { text: '审计 ' + batch.id })])); });
+                (reviewStatus.recentCorrections || []).slice(0, 3).forEach(function (correction) { box.appendChild(el('article', { cls: 'growth-audit-record growth-correction-audit' }, [el('strong', { text: worldTime(correction.at) + ' · 已撤回' }), el('p', { text: correction.reason }), el('small', { text: '认识 ' + correction.claimId + ' · 审计 ' + correction.id })])); });
+                (reviewStatus.recentIsolations || []).slice(0, 3).forEach(function (batch) { box.appendChild(el('article', { cls: 'growth-audit-record growth-isolation-audit' }, [el('strong', { text: worldTime(batch.at) + ' · 待复核 · 已隔离' }), el('p', { text: (batch.claims || []).length + ' 项旧认识暂停自动沿用；尚未判定原结论真伪。' }), el('small', { text: '审计 ' + batch.id })])); });
             }
             var reviews = reviewStatus.recent || [];
             if (reviewStatus.lastOutcome === 'failed') box.appendChild(el('p', { cls: 'growth-review-outcome', text: '最近一次审阅未完成，尚未得到可提交的结果；原经历保留等待后续整理。' }));
@@ -176,11 +175,11 @@
             var failures = reviewStatus.recentFailures || (reviewStatus.lastFailure ? [reviewStatus.lastFailure] : []);
             if (failures.length) {
                 box.appendChild(el('h4', { text: '最近未完成的审阅' }));
-                failures.forEach(function (failure) { box.appendChild(el('article', { cls: 'regulation-learning-record growth-review-failure' }, [el('strong', { text: worldTime(failure.at) + ' · 未完成' }), el('p', { text: failure.reason }), Number.isFinite(failure.realAt) ? el('small', { text: '现实时间 ' + new Date(failure.realAt).toLocaleString() }) : null])); });
+                failures.forEach(function (failure) { box.appendChild(el('article', { cls: 'growth-audit-record growth-review-failure' }, [el('strong', { text: worldTime(failure.at) + ' · 未完成' }), el('p', { text: failure.reason }), Number.isFinite(failure.realAt) ? el('small', { text: '现实时间 ' + new Date(failure.realAt).toLocaleString() }) : null])); });
             }
             if (!reviews.length) box.appendChild(el('p', { text: '尚无完成的审阅。可以在运行洞察中查看 Growth 调用是否等待、生成或中断。' }));
             reviews.forEach(function (review) {
-                var rejected = review.rejected || [], section = el('article', { cls: 'regulation-learning-record' }, [el('strong', { text: worldTime(review.at) + ' · ' + (review.backlogId ? '历史补审' : '近期审阅') }), el('p', { text: '留下 ' + (review.records?.length || 0) + ' 项认识记录 · 未采纳 ' + rejected.length + ' 项提案' })]);
+                var rejected = review.rejected || [], section = el('article', { cls: 'growth-audit-record' }, [el('strong', { text: worldTime(review.at) + ' · ' + (review.backlogId ? '历史补审' : '近期审阅') }), el('p', { text: '留下 ' + (review.records?.length || 0) + ' 项认识记录 · 未采纳 ' + rejected.length + ' 项提案' })]);
                 if (review.sampledEventIds) section.appendChild(el('p', { cls: 'growth-hint', text: '本次读取 ' + review.sampledEventIds.length + ' 项经历' + (review.omittedEvidenceCount ? ' · 未纳入本次样本 ' + review.omittedEvidenceCount + ' 项' : '') }));
                 if (rejected.length) section.appendChild(el('ul', { cls: 'growth-review-rejections' }, rejected.map(function (item) { return el('li', { text: '提案 ' + (item.index + 1) + '：' + item.reason }); })));
                 box.appendChild(section);
@@ -302,6 +301,6 @@
         window.addEventListener('studio:debug', onDebug);
         var timer = setInterval(onRefresh, 15000);
         refresh();
-        return function () { alive = false; regulation.dispose(); clearInterval(timer); window.removeEventListener('studio:refresh', onRefresh); window.removeEventListener('studio:debug', onDebug); };
+        return function () { alive = false; clearInterval(timer); window.removeEventListener('studio:refresh', onRefresh); window.removeEventListener('studio:debug', onDebug); };
     });
 })();

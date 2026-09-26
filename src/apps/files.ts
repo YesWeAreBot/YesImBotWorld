@@ -160,7 +160,7 @@ export class FileManagerApp implements WorldApp {
     }
     return {
       tools: TOOLS,
-      opening: "文件资源管理器已打开，可以查看和操作这台电脑已有的目录与文件。",
+      opening: "文件资源管理器已打开。",
     };
   }
 
@@ -309,7 +309,7 @@ export class FileManagerApp implements WorldApp {
         : fullBody;
     const remaining =
       total > end ? `\n----\n（还有 ${total - end} 行；可用 start/max_lines 继续查看）` : "";
-    return `${this.displayPath(target)} (${total} 行)\n----\n${body}${remaining}${READ_ONLY_HINT}`;
+    return `${this.displayPath(target)} (${total} 行)\n----\n${body}${remaining}`;
   }
 
   private async write(args: Record<string, unknown>): Promise<string> {
@@ -475,7 +475,7 @@ export class FileManagerApp implements WorldApp {
       `3. 只输出屏幕上显示的内容，不要解释或旁白。`;
     try {
       const result = await this.world.observeVirtualApp(task);
-      return { ...result, text: result.text + READ_ONLY_HINT };
+      return result;
     } catch (err) {
       this.logger.warn("虚构资源管理器文件内容生成失败: %s", err);
       return "（文件内容查询失败，未取得结果。）" + READ_ONLY_HINT;

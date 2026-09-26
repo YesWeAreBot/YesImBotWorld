@@ -3,6 +3,8 @@
   min-width:0
 }
 .live-calls [hidden] { display:none!important }
+.live-heartbeat{display:flex;align-items:baseline;flex-wrap:wrap;gap:5px 12px;margin:0 0 14px;padding:10px 12px;border:1px solid var(--line);border-radius:10px;font-size:11px;line-height:1.6;overflow-wrap:anywhere;background:var(--surface,var(--card));color:var(--fg-dim)}
+.live-heartbeat-title{font-weight:600;color:var(--fg);flex-shrink:0}.live-heartbeat-detail{min-width:0;flex:1 1 260px}.live-heartbeat[data-phase=failed]{border-color:var(--warn)}.live-heartbeat[data-phase=failed] .live-heartbeat-title{color:var(--warn)}
 
 .live-page-heading h1 {
   font-size:30px;
@@ -695,6 +697,3 @@
     font-size:25px
   }
 }
-
-.live-lane[data-live-source=Regulation] { grid-column:1 / -1; }
-.live-lane[data-live-source=Regulation] .live-source-mark { color:var(--accent2); background:color-mix(in srgb,var(--accent2) 12%,var(--surface)); }

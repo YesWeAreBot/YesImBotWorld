@@ -44,7 +44,8 @@ async function main() {
       f.agent.pushEvent("koishi", "有人叫你", { wake: true });
       const result = await pending;
       assert.equal(result.callId, id); assert.equal(result.ok, false);
-      assert.match(result.text, /实际经过 7\.0 TU/);
+      assert.match(result.text, /计时中断.*经过 7\.0 TU/);
+      assert.doesNotMatch(result.text, /睡着|睡醒|体力恢复/, "a timer interruption is not a bodily sleep result");
       assert.equal(f.agent.externalToolResults.size, 0);
       assert.equal(f.agent.scheduler.isPending(id), false);
       assert.equal(f.agent.waiting, null);

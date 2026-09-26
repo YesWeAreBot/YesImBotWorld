@@ -7,6 +7,7 @@ import { Config } from "../src/config.js";
 import { WorldFiles } from "../src/files.js";
 import { BotContext } from "../src/bot/context.js";
 import { BotAgent } from "../src/bot/agent.js";
+import { BOT_TOOLS } from "../src/bot/tools.js";
 import { Gateway } from "../src/koishi/gateway.js";
 import { KoishiMessenger } from "../src/koishi/messenger.js";
 import { normalizeMsgId } from "../src/koishi/markers.js";
@@ -46,9 +47,16 @@ async function fixture() {
   const ids = await Promise.all(["CAT", "DOG", "BIRD"].map(label => media.ingest(dataUrl(png(label)), "image")));
   const refs = await Promise.all(ids.map(async id => (await media.get(id!))!.ref));
   for (const [i, summary] of ["猫的摘要", "狗的摘要", "鸟的摘要"].entries()) await media.setSummary(ids[i]!, summary);
+  const captionCalls: { id: number; sticker: boolean; detailed?: boolean }[] = [];
   const captioner = {
-    describe: async (ref: MediaRef) => (await media.get(ref.id))?.summary || null,
-    describeDetailed: async (ref: MediaRef) => `详细：${(await media.get(ref.id))?.summary}`,
+    describe: async (ref: MediaRef, options: { sticker?: boolean } = {}) => {
+      captionCalls.push({ id: ref.id, sticker: !!options.sticker });
+      return options.sticker ? "可能用途：轻松表示收到；正式拒绝的场合容易误读" : (await media.get(ref.id))?.summary || null;
+    },
+    describeDetailed: async (ref: MediaRef, options: { sticker?: boolean } = {}) => {
+      captionCalls.push({ id: ref.id, sticker: !!options.sticker, detailed: true });
+      return options.sticker ? "可能用途：轻松表示收到；不代表原发送者的真实意图" : `详细：${(await media.get(ref.id))?.summary}`;
+    },
   } as any;
   const renderer = new MediaRenderer(media, captioner, () => true, 8);
   const messenger = Object.create(KoishiMessenger.prototype) as any;
@@ -62,7 +70,7 @@ async function fixture() {
     resolveBot: async () => ({ bot, platform: "fixture", channelId: "private:peer", isDirect: true }),
     storeSelf: async (_target: any, content: string) => { stored.push(content); },
   });
-  return { root, media, gallery, refs, renderer, messenger, sent, stored };
+  return { root, media, gallery, refs, renderer, messenger, sent, stored, captionCalls };
 }
 async function context(root: string) {
   const files = new WorldFiles(root); await files.ensure();
@@ -144,7 +152,7 @@ async function galleryAndSend() {
   const listing = await f.messenger.gallery("照片") as RichText;
   assert.equal(listing.text, richPartsText(listing.parts!)); assert.ok(listing.parts![0]?.kind === "text");
   const mediaParts = listing.parts!.filter(part => part.kind === "media");
-  assert.deepEqual(mediaParts.map(part => [part.ref.id, part.name, part.summary]), [[cat.id, "gallery:照片/cat.png", "收藏猫"], [dog.id, "gallery:照片/dog.png", "收藏狗"]]);
+  assert.deepEqual(mediaParts.map(part => [part.ref.id, part.name, part.summary, part.galleryNote]), [[cat.id, "gallery:照片/cat.png", undefined, "收藏猫"], [dog.id, "gallery:照片/dog.png", undefined, "收藏狗"]], "A past personal note cannot masquerade as visual recognition");
   const detailed = await f.messenger.viewMedia([`media:${dog.id}`, "gallery:照片/cat.png"]) as RichText;
   assert.equal(detailed.text, richPartsText(detailed.parts!)); assert.deepEqual(detailed.parts!.filter(p => p.kind === "media").map(p => p.ref.id), [dog.id, cat.id]);
   assert.ok(detailed.parts!.some(p => p.kind === "text" && p.text === "\n"));
@@ -170,7 +178,7 @@ async function galleryAndSend() {
   assert.equal(await f.media.ingest(dataUrl(png("CAT")), "image"), cat.id); assert.deepEqual(await f.media.readFile(cat), png("CAT"));
   // Selection is independent from sending: no hidden auto-send buffer or occurrence slots.
   const chooser = Object.create(BotAgent.prototype) as any; let selected: string = "";
-  chooser.messenger = f.messenger; chooser.dispatchLocal = (_call: unknown, fn: () => Promise<string>) => fn().then(result => { selected = result; });
+  chooser.messenger = f.messenger; chooser.dispatchLocal = (_call: unknown, fn: () => Promise<string | RichText>) => fn().then(result => { selected = typeof result === "string" ? result : result.contextHint?.text ?? result.text; });
   const sendCount = f.sent.length;
   await chooser.dispatchPickMedia({ arguments: { media: [`media:${dog.id}`, `media:${cat.id}`] } });
   assert.ok(selected.includes("尚未发送")); assert.ok(selected.indexOf(mediaSendTag(dog)) < selected.indexOf(mediaSendTag(cat))); assert.equal(f.sent.length, sendCount);
@@ -184,6 +192,113 @@ async function galleryAndSend() {
   assert.ok(echoFailure.text.startsWith("消息已发送"));
   assert.match(echoFailure.text, /不要因回显缺失重复发送/);
   console.log("PASS gallery names/summaries verified against asset hashes, strict ref parsing, read-only selection, exact outgoing image bytes and sticker/text ordering");
+}
+async function optionalGalleryWorkflow() {
+  const f = await fixture(), [cat, dog] = f.refs as [MediaRef, MediaRef];
+  const toolText = ["check_gallery", "check_media", "view_media", "gallery_save", "gallery_move", "pick_media"]
+    .map(name => BOT_TOOLS.find(tool => tool.name === name)!.description).join("\n");
+  assert.doesNotMatch(toolText, /看到喜欢|发图先来这里|有空时看看|别偷懒|必须先 view_media/);
+  assert.match(toolText, /先确定自己想表达的态度或接话方式/);
+  assert.match(toolText, /选中不等于已发/);
+  const empty = await f.messenger.gallery();
+  assert.match(empty.text, /无需先收藏/);
+  await fs.copyFile(cat.file, path.join(f.gallery.dirOf("未整理"), "cat.png"));
+  const overview = await f.messenger.gallery();
+  assert.match(overview.text, /未整理不是待办/);
+  const beforeMove = f.captionCalls.length;
+  const moved = await f.messenger.galleryMove("未整理/cat.png", "表情包");
+  assert.match(moved, /移进了「表情包」/);
+  assert.match(moved, /没有发送消息/);
+  assert.equal(f.captionCalls.length, beforeMove, "Classification does not compel a caption request or explanatory task");
+  assert.deepEqual(await fs.readFile(path.join(f.gallery.dirOf("表情包"), "cat.png")), png("CAT"));
+  const note = "我可以用来轻松表示收到；不适合正式拒绝，可能被读成敷衍";
+  const updated = await f.messenger.galleryMove("表情包/cat.png", "表情包", note);
+  assert.match(updated, /选用备注已更新/);
+  assert.equal((await f.gallery.findMeta("表情包", "cat.png"))?.description, note, "Same-category note edits must not be silently ignored");
+  const listing = await f.messenger.gallery("表情包") as RichText;
+  const stickerPart = listing.parts!.find(part => part.kind === "media");
+  assert.ok(stickerPart?.kind === "media");
+  assert.equal(stickerPart.ref.id, cat.id); assert.equal(stickerPart.galleryNote, note);
+  assert.equal(stickerPart.summary, undefined, "Sticker purpose and personal note cannot become a visual-summary fact");
+  assert.match(stickerPart.expressionSummary!, /轻松表示收到/);
+  assert.doesNotMatch(stickerPart.expressionSummary!, /猫的摘要/);
+  const cache = await f.messenger.checkMedia(10, "image");
+  assert.match(cache, new RegExp(`表情包 media:${cat.id}`));
+  assert.match(cache, /可能表意（非原发送者意图）/);
+  assert.match(cache, /你的收藏备注（非原图识别）/);
+  assert.doesNotMatch(cache, /猫的摘要/, "Legacy visual cache is not served as conversational-use interpretation");
+  const inspected = await f.messenger.viewMedia([`media:${cat.id}`]) as RichText;
+  const inspectedPart = inspected.parts!.find(part => part.kind === "media");
+  assert.ok(inspectedPart?.kind === "media"); assert.equal(inspectedPart.ref.id, cat.id);
+  assert.equal(inspectedPart.galleryNote, note); assert.match(inspectedPart.expressionSummary!, /轻松表示收到/);
+  assert.deepEqual(inspected.attachments?.map(ref => ref.id), [cat.id]);
+  f.messenger.renderer = new MediaRenderer(f.media, f.messenger.captioner, () => false, 0);
+  const textOnly = await f.messenger.viewMedia([`media:${cat.id}`]) as RichText;
+  assert.equal(textOnly.attachments, undefined); assert.match(textOnly.text, /轻松表示收到/);
+  assert.match(textOnly.text, /不代表原发送者/); assert.doesNotMatch(textOnly.text, /猫的摘要/);
+  assert.ok(f.captionCalls.some(call => call.id === cat.id && call.sticker && call.detailed), "Text-only inspection uses the same sticker interpretation contract");
+  const saved = await f.messenger.gallerySave(`media:${dog.id}`, "照片", "我记录的散步照片", "walk.png");
+  assert.match(saved, /你的选用备注/); assert.match(saved, /没有发送消息/);
+  assert.equal(f.sent.length, 0, "Browsing, classification and collection never announce or send anything");
+  assert.deepEqual(await fs.readFile(path.join(f.gallery.dirOf("照片"), "walk.png")), png("DOG"));
+  const picked = await f.messenger.resolveMediaRefs([`media:${cat.id}`, "gallery:照片/walk.png"]);
+  assert.deepEqual(picked.map((item: any) => [item.ok, item.ref.id, item.sticker]), [[true, cat.id, true], [true, dog.id, false]]);
+  assert.equal(f.sent.length, 0);
+  console.log("PASS optional gallery workflow: expression-first tool guidance, no collection task, optional notes, real note edits, unchanged assets and selection without sending");
+}
+async function selectedGalleryUsageSurvivesSending() {
+  const f = await fixture(), cat = f.refs[0]!;
+  await f.media.ingest(dataUrl(png("CAT")), "image", undefined, undefined, true);
+  for (const category of ["照片", "表情包"]) await fs.copyFile(cat.file, path.join(f.gallery.dirOf(category), "cat.png"));
+  const chooser = Object.create(BotAgent.prototype) as any; let selected = "";
+  chooser.messenger = f.messenger;
+  chooser.dispatchLocal = (_call: unknown, run: () => Promise<string | RichText>) => run().then(result => { selected = typeof result === "string" ? result : result.contextHint?.text ?? result.text; });
+  const refs = ["gallery:照片/cat.png", "gallery:表情包/cat.png", "gallery:照片/cat.png"];
+  await chooser.dispatchPickMedia({ arguments: { media: refs } });
+  const tags = [...selected.matchAll(/<media ref="([^"]+)"\/>/g)];
+  assert.deepEqual(tags.map(match => match[1]), refs, "Selection must retain gallery usage rather than substitute its identical asset ID");
+  assert.match(selected, /尚未发送/); assert.equal(f.sent.length, 0);
+
+  // Use the real successful-send recorder and ordinary readback, with an in-memory store.
+  const rows: any[] = [];
+  f.messenger.storeSelf = (KoishiMessenger.prototype as any).storeSelf;
+  f.messenger.store = {
+    captureReceipt: () => undefined,
+    store: async (row: any) => { rows.push({ ...row, id: rows.length + 1 }); },
+    channelMessages: async () => rows,
+  };
+  f.messenger.names.identity = async () => ({ platform: "fixture", channelId: "private:peer", selfId: "self", accountIds: ["self"], displayName: "真实账号名", source: "account_name", text: "此处使用你的真实账号名。" });
+  f.messenger.resolveChannel = async () => ({ platform: "fixture", channelId: "private:peer", selfId: "self", isDirect: true });
+  f.messenger.notify = { channelStatusText: () => "通知已开启" };
+  f.messenger.muteHint = async () => "";
+  const sent = await f.messenger.send("fixture:private:peer", `甲${tags[0]![0]}乙${tags[1]![0]}丙${tags[2]![0]}丁`);
+  assert.match(sent, /^消息已发送/);
+  const emitted = f.sent.flat().filter(element => element.type === "img");
+  assert.deepEqual(emitted.map(element => element.attrs.sub_type ?? element.attrs.subType), [undefined, 1, undefined]);
+  assert.deepEqual(emitted.map(element => element.attrs.src), [dataUrl(png("CAT")), dataUrl(png("CAT")), dataUrl(png("CAT"))]);
+  assert.deepEqual(rows.map(row => row.content), [`甲${mediaPlaceholder(cat.id, "image", false)}乙`, mediaPlaceholder(cat.id, "image", true), `丙${mediaPlaceholder(cat.id, "image", false)}丁`]);
+  assert.deepEqual(rows.map(row => row.conversation.mediaCounts), [{ image: 1 }, { sticker: 1 }, { image: 1 }]);
+  assert.deepEqual(rows.map(row => row.conversation.hasText), [true, false, true]);
+  assert.ok(rows.every(row => row.senderOrigin === "tool" && row.senderOwned === true));
+  const reread = await f.messenger.channelMessages("fixture:private:peer", 10) as RichText;
+  assert.match(reread.text, /真实账号名.*已确认经聊天工具发送/s);
+  assert.match(reread.text, /附有图片×1.*仅含表情包×1.*未附文字.*附有图片×1/s);
+  assert.deepEqual(reread.parts!.filter(part => part.kind === "media").map(part => [part.ref.id, !!part.sticker]), [[cat.id, false], [cat.id, true], [cat.id, false]], "Readback keeps the actual use of each occurrence, not the asset's historical sticker flag");
+
+  const unusual = 'a\'"<cat>.png';
+  await fs.copyFile(cat.file, path.join(f.gallery.dirOf("照片"), unusual));
+  const unusualRef = `gallery:照片/${unusual}`;
+  await chooser.dispatchPickMedia({ arguments: { media: [unusualRef] } });
+  const safeReference = selected.match(/send\.media 引用 ("(?:\\.|[^"\\])*")/);
+  assert.ok(safeReference, "A filename unsupported by the inline grammar must be returned as a JSON string reference");
+  assert.equal(JSON.parse(safeReference[1]!), unusualRef);
+  assert.ok(!selected.includes('<media ref="gallery:'), "Selection must not emit malformed inline tags");
+  const before = f.sent.length;
+  await f.messenger.send("fixture:private:peer", "", [JSON.parse(safeReference[1]!), refs[1]]);
+  assert.deepEqual(f.sent.slice(before).flat().filter(element => element.type === "img").map(element => element.attrs.sub_type ?? element.attrs.subType), [undefined, 1], "Array references also preserve explicit classification and selection order");
+  await chooser.dispatchPickMedia({ arguments: { media: [String(cat.id)] } });
+  assert.ok(selected.includes(`<media ref="media:${cat.id}"/>`), "Bare numeric asset selections still canonicalize");
+  console.log("PASS selected gallery usage: shared bytes retain photo/sticker/photo semantics and text order, safe quoted filenames, confirmed-store/readback counts and unchanged asset references");
 }
 async function repeatedMediaBoundaries() {
   const f = await fixture(), [cat, dog] = f.refs as [MediaRef, MediaRef];
@@ -240,16 +355,16 @@ async function replyIdentity() {
   for (const value of invalid) assert.equal(normalizeMsgId(value), undefined, JSON.stringify(value));
   const sender = Object.create(BotAgent.prototype) as any;
   const errors: string[] = [], scheduled: any[][] = [];
-  sender.config = { bot: { sendBlocking: false } };
+  sender.config = { bot: { sendBlocking: false, strictToolLoop: false } };
   sender.channelArg = () => "fixture:private:peer";
   sender.pushEvent = (_source: string, message: string) => errors.push(message);
   sender.finishSend = (...args: any[]) => scheduled.push(args);
   for (const value of invalid) {
     sender.dispatchSend({ id: "invalid-reply", arguments: { msg: "必须保持引用目标", reply_to: value } });
-    assert.match(errors.at(-1)!, /消息没有发出/);
+    assert.match(errors.at(-1)!, /本次未发送.*reply_to/);
   }
   for (const args of [{ msg: "不要漏图", images: ["media:12"] }, { msg: "不要丢引用", replyTo: "12" }, { msg: "不要漏图", media: "media:12" }, { msg: "不要漏图", media: [{}] }]) {
-    sender.dispatchSend({ id: "invalid-send", arguments: args }); assert.match(errors.at(-1)!, /消息没有发出/);
+    sender.dispatchSend({ id: "invalid-send", arguments: args }); assert.match(errors.at(-1)!, /本次未发送|消息没有发出/);
   }
   assert.equal(scheduled.length, 0, "invalid references and old parameter aliases cannot degrade into an ordinary send");
   sender.dispatchSend({ id: "valid-reply", arguments: { msg: "完整引用", reply_to: "(msg:satori.message_A-9:opaque)" } });
@@ -272,5 +387,5 @@ async function replyIdentity() {
   assert.equal(f.sent.length, 2);
   console.log("PASS message/media namespace isolation, opaque platform reply IDs, canonical send parameters and identical inline-quote validation");
 }
-async function main() { try { await inboundAndCache(); await repeatedMediaBoundaries(); await galleryAndSend(); await replyIdentity(); } finally { await Promise.all(rootDirs.map(dir => fs.rm(dir, { recursive: true, force: true }))); } }
+async function main() { try { await inboundAndCache(); await repeatedMediaBoundaries(); await galleryAndSend(); await optionalGalleryWorkflow(); await selectedGalleryUsageSurvivesSending(); await replyIdentity(); } finally { await Promise.all(rootDirs.map(dir => fs.rm(dir, { recursive: true, force: true }))); } }
 void main().catch(error => { console.error(error); process.exitCode = 1; });

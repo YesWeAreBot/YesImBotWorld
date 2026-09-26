@@ -18,12 +18,15 @@ import type { CrossingConfig } from "../config.js";
 import type { WorldClock } from "../clock.js";
 import type { WorldAgent } from "../world/agent.js";
 import { debug } from "../webui/debug.js";
+import { collectOpportunities, type ActionOpportunity } from "../bot/opportunities.js";
+import { choiceRejection, resolveHumanChoice } from "../bot/choice.js";
 import {
   CROSSING_LIMITS,
   type CrossingSseMsg,
   type CrossingPerceptionEvent,
   type CrossingTaskKind,
   type CrossingTaskPayload,
+  type CrossingOpportunityMenu,
   type PlayerMode,
   type VisitorInfo,
 } from "./protocol.js";
@@ -55,6 +58,9 @@ interface VisitorSession extends VisitorInfo {
   perceptionUnsubscribe?: () => void;
   perceptionBinding?: object;
   perceptionReplay?: Map<string, CrossingPerceptionEvent>;
+  opportunities?: ActionOpportunity[];
+  opportunitySequence?: number;
+  opportunityRevision?: number;
 }
 
 interface SessionTask {
@@ -165,6 +171,15 @@ export class CrossingServer {
     if (event.eventId) {
       const replay = session.perceptionReplay ??= new Map();
       if (replay.has(event.eventId)) return;
+      if (!session.residentControl && (event.worldSequence === undefined || event.worldSequence >= (session.opportunitySequence ?? -1))) {
+        session.opportunities = collectOpportunities([{ kind: "event", event: {
+          id: event.eventId, source: "world", content, worldTime: event.worldTime ?? 0,
+        } }], ["act"]);
+        session.opportunitySequence = event.worldSequence ?? session.opportunitySequence;
+        session.opportunityRevision = (session.opportunityRevision ?? 0) + 1;
+        event.opportunities = structuredClone(session.opportunities);
+        event.opportunityRevision = session.opportunityRevision;
+      }
       replay.set(event.eventId, event);
       if (replay.size > 256) replay.delete(replay.keys().next().value!);
     }
@@ -489,15 +504,15 @@ export class CrossingServer {
     if (session.absenceTimer) clearTimeout(session.absenceTimer);
     session.absenceTimer = null;
     const timeLine = this.host.clock()?.timeLine() ?? "";
-    res.write(sseFrame({ type: "hello", worldName: this.worldName, timeLine, visitorId: session.id, ...this.timeUnits() }));
+    res.write(sseFrame({ type: "hello", worldName: this.worldName, timeLine, visitorId: session.id, ...this.timeUnits(), ...(!session.residentControl ? this.currentMenu(session) : {}) }));
     if (session.perceptionReplay?.size) {
       const replay = [...(session.perceptionReplay?.values() ?? [])];
       const cursor = String(req.headers["last-event-id"] ?? url.searchParams.get("lastEventId") ?? "");
       const index = cursor ? replay.findIndex(event => event.eventId === cursor) : -1;
-      for (const event of replay.slice(index + 1)) res.write(sseFrame(event));
+      for (const event of replay.slice(index + 1)) res.write(sseFrame(this.replayMenu(session, event)));
     }
     // 补发离线期间暂存的消息
-    for (const msg of session.outbox.splice(0)) res.write(sseFrame(msg));
+    for (const msg of session.outbox.splice(0)) res.write(sseFrame(this.replayMenu(session, msg)));
     // An in-flight operation may have committed feedback just before the previous
     // socket disappeared. Replaying stable indexes does not re-execute the action.
     for (const [taskId, task] of session.tasks) if (task.progress && !task.result) {
@@ -519,7 +534,7 @@ export class CrossingServer {
     if (!session || session.closed) return void sendJSON(res, 403, { error: "会话不存在或已结束" });
     const taskId = String(body.taskId ?? "");
     const kind = String(body.kind ?? "") as CrossingTaskKind;
-    if (!taskId || taskId.length > 64 || !["act", "wait", "checkTime", "query", "observe", "observeVirtualApp", "executeVirtualApp"].includes(kind)) {
+    if (!taskId || taskId.length > 64 || !["act", "choose", "wait", "checkTime", "query", "observe", "observeVirtualApp", "executeVirtualApp"].includes(kind)) {
       return void sendJSON(res, 400, { error: "taskId / kind 无效" });
     }
     if (!body.payload || typeof body.payload !== "object" || Array.isArray(body.payload)) {
@@ -527,7 +542,7 @@ export class CrossingServer {
     }
     const payload = body.payload as CrossingTaskPayload;
     try {
-      if (kind === "act") this.taskDuration(payload.durationWorldSeconds, payload.duration);
+      if (kind === "act" || kind === "choose") this.taskDuration(payload.durationWorldSeconds, payload.duration);
       if (kind === "wait") this.taskDuration(payload.waitWorldSeconds, payload.n);
     } catch (err) { return void sendJSON(res, 400, { error: String(err) }); }
     if (session.cancelledTaskIds.has(taskId)) return void sendJSON(res, 409, { error: "该 taskId 已在接收前取消" });
@@ -538,6 +553,12 @@ export class CrossingServer {
       sendJSON(res, 200, { ok: true, duplicate: true, ...this.timeUnits() });
       if (existing.result) this.push(session, existing.result);
       return;
+    }
+    if (kind === "choose") {
+      if (session.residentControl) return void sendJSON(res, 403, { error: "常驻角色请使用驾驶舱选择建议" });
+      if (session.pendingTasks) return void sendJSON(res, 409, { error: "已有操作尚未完成，请等待回执后重新选择。", code: "PLAYER_BUSY" });
+      try { this.resolvePlayerChoice(session, payload); }
+      catch (error) { return void sendJSON(res, 409, { error: (error as Error).message, code: choiceRejection(error).code }); }
     }
     if (session.pendingTasks >= CROSSING_LIMITS.maxPendingTasks) {
       return void sendJSON(res, 429, { error: "待处理任务过多，稍后再试" });
@@ -558,11 +579,42 @@ export class CrossingServer {
       .finally(() => { session.pendingTasks--; });
   }
 
+  private currentMenu(session: VisitorSession): CrossingOpportunityMenu {
+    return { opportunities: structuredClone(session.opportunities ?? []), opportunityRevision: session.opportunityRevision ?? 0,
+      ...(session.opportunitySequence !== undefined ? { worldSequence: session.opportunitySequence } : {}) };
+  }
+
+  private consumeMenu(session: VisitorSession): void {
+    if (!session.opportunities?.length) return;
+    session.opportunities = [];
+    session.opportunityRevision = (session.opportunityRevision ?? 0) + 1;
+    this.push(session, { type: "opportunities", ...this.currentMenu(session) });
+  }
+
+  /** hello already sent the authoritative current menu, even when the replay cursor is current. */
+  private replayMenu(session: VisitorSession, message: CrossingSseMsg): CrossingSseMsg {
+    if (session.residentControl) return message;
+    if (message.type === "opportunities") return { type: "opportunities", ...this.currentMenu(session) };
+    if (message.type !== "event" || !message.opportunities) return message;
+    const { opportunities: _options, opportunityRevision: _revision, ...perception } = message;
+    return perception;
+  }
+
   /** 新协议用世界秒，旧 duration/n 明确按主世界 TU 解读。 */
   private taskDuration(worldSeconds: unknown, legacyUnits: unknown): number {
     const value = Number(worldSeconds ?? legacyUnits ?? 0);
     if (!Number.isFinite(value) || value < 0) throw new Error("时长必须为有限非负数");
     return worldSeconds != null ? value / this.timeUnits().unitWorldSeconds : value;
+  }
+
+  private resolvePlayerChoice(session: VisitorSession, payload: CrossingTaskPayload) {
+    if (Object.keys(payload).some(key => !["selection", "text", "durationWorldSeconds"].includes(key))) throw new Error("选择建议不能覆盖动作、目标或工具；只接受 selection、text 与 durationWorldSeconds。");
+    if (payload.text !== undefined && (typeof payload.text !== "string" || payload.text.length > CROSSING_LIMITS.maxTaskChars)) throw new Error("正文长度超过限制或不是文本。");
+    if (payload.durationWorldSeconds !== undefined && (typeof payload.durationWorldSeconds !== "number" || !Number.isFinite(payload.durationWorldSeconds) || payload.durationWorldSeconds < 0)) throw new Error("耗时必须是有限非负世界秒数。");
+    const resolved = resolveHumanChoice(payload.selection, session.opportunities ?? [], payload.text,
+      payload.durationWorldSeconds === undefined ? undefined : this.taskDuration(payload.durationWorldSeconds, undefined));
+    if (resolved.call.name !== "act") throw new Error("独立角色只能选择自己的世界行动建议。");
+    return resolved;
   }
 
   private async handleCancel(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
@@ -604,12 +656,21 @@ export class CrossingServer {
     };
     let ok = false;
     if (session.residentControl) throw new Error("常驻角色的能力与观察请通过已授权的驾驶舱工具调用");
-    if (kind === "act") {
+    if (kind === "choose") {
+      const resolved = this.resolvePlayerChoice(session, payload);
+      this.consumeMenu(session);
+      const revision = session.opportunityRevision;
+      ok = await this.host.world.visitorAct(session, String(resolved.call.arguments.description), resolved.call.duration ?? 0, deliver, task.abort.signal, taskId,
+        typeof resolved.call.arguments.speech === "string" ? { speech: resolved.call.arguments.speech } : {},
+        phase => !session.closed && (phase === "finish" || session.opportunityRevision === revision));
+    } else if (kind === "act") {
+      this.consumeMenu(session);
       ok = await this.host.world.visitorAct(session, clip(payload.desc), this.taskDuration(payload.durationWorldSeconds, payload.duration), deliver, task.abort.signal, taskId, {
         ...(payload.speech ? { speech: clip(payload.speech) } : {}),
         ...(payload.target ? { target: clip(payload.target) } : {}),
       });
     } else if (kind === "wait") {
+      this.consumeMenu(session);
       ok = await this.host.world.visitorWait(session, this.taskDuration(payload.waitWorldSeconds, payload.n), deliver, task.abort.signal, taskId);
     } else if (kind === "checkTime") {
       ok = await this.host.world.visitorCheckTime(session, deliver);
@@ -619,7 +680,7 @@ export class CrossingServer {
         ...(payload.target ? { target: clip(payload.target) } : {}),
         ...(payload.modality ? { modality: clip(payload.modality) } : {}),
       });
-      parts.push(JSON.stringify(observation));
+      deliver(JSON.stringify(observation));
       ok = true;
     } else if (kind === "observeVirtualApp") {
       parts.push(JSON.stringify(await this.host.world.observeVirtualApp(clip(payload.task), "visitor:" + session.id)));

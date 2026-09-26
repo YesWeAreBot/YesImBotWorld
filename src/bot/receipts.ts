@@ -28,6 +28,7 @@ export class ReceiptInbox {
     const rich: RichText = typeof content === "string" ? { text: content } : content;
     const toEvent = (value: RichText, source: BotEvent["source"], ref?: string): BotEvent => ({
       id: `ev_receipt_${randomUUID()}`, source, content: value.text, worldTime,
+      ...(value.contextHint ? { contextHint: value.contextHint } : {}),
       ...(value.experience ? { experience: value.experience } : {}), ...(value.growthReferences ? { growthReferences: value.growthReferences } : {}),
       ...(ref ? { refToolCallId: ref } : {}), ...(value.originEventIds ? { originEventIds: value.originEventIds } : {}),
       ...(value.attachments ? { attachments: value.attachments } : {}), ...(value.parts ? { parts: value.parts } : {}), ...(value.statusEcho ? { statusEcho: value.statusEcho } : {}),

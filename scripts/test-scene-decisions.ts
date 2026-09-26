@@ -30,14 +30,11 @@ function scenePayload(id: string, sequence: number, opportunities?: NarrativeOpp
 }
 const events = (context: BotContext) => context.stream.flatMap(entry => entry.kind === "event" ? [entry.event] : []);
 const notices = (context: BotContext) => events(context).filter(event => event.source === "system" && event.content.startsWith(choicePrefix));
-async function journal(file: string): Promise<any[]> {
-  return (await fs.readFile(file, "utf8")).trim().split("\n").filter(Boolean).map(line => JSON.parse(line));
-}
 
 async function main() {
   const base = await fs.mkdtemp(path.join(os.tmpdir(), "scene-decisions-"));
   const files = new WorldFiles(base); await files.ensure();
-  const cfg = Config({ autoStart: false }); cfg.bot.growth.enabled = false; cfg.bot.regulation.enabled = true;
+  const cfg = Config({ autoStart: false }); cfg.bot.growth.enabled = false;
   Object.assign(cfg.bot, { maxWindowChars: 1_000_000, restCompressMinChars: 1_000_000, nativeToolCalls: false });
   const clock: any = { now: () => 10, timeLine: () => "T=10", realMsUntil: () => 0, unitWorldSeconds: 1, unitRealSeconds: 1, syncRealTime: true };
   let worldCalls = 0;
@@ -74,7 +71,7 @@ async function main() {
     await f.agent.drainMailbox();
     const actual = events(context).find(event => event.source === "tool" && event.experience?.worldPerception)!;
     assert.ok(actual); assert.match(actual.content, /opportunities/, "raw audit retains exactly what the world delivered");
-    assert.match(actual.contextText!, /本次操作：走到院门边/);
+    assert.doesNotMatch(actual.contextText!, /本次操作：|行动结果：已完成/, "completed scene itself is the feedback, without duplicate success framing");
     assert.match(actual.contextText!, /当前可知处境：院门内/);
     assert.doesNotMatch(actual.contextText!, /面包师问路|尚未整理|opportunities/, "the rendered factual perception excludes potential intentions");
     const generated = await context.toChatMessages("after result", false);
@@ -82,7 +79,7 @@ async function main() {
     const factMessage = generated.find(message => String(message.content).includes(`id="${actual.id}"`));
     assert.ok(factMessage); assert.doesNotMatch(String(factMessage.content), /面包师问路|尚未整理/);
     const suggestion = notices(context).at(-1)!;
-    assert.match(suggestion.content, /建议不是事实、命令或结果保证/);
+    assert.match(suggestion.content, /建议不代表已经行动或保证结果/);
     assert.ok(suggestion.content.includes(firstIntent)); assert.match(suggestion.content, /取舍组 去向/);
     assert.deepEqual(suggestion.originEventIds, []);
     assert.equal(f.agent.actionOpportunities().length, 2);
@@ -95,15 +92,10 @@ async function main() {
     assert.equal(savedFacts.observation.scene.situation, "院门内，双手空着，尚未离开院子。");
     assert.doesNotMatch(evidence[0].text, /opportunities|面包师问路|尚未整理/);
     assert.deepEqual(await f.agent.growth.recallEvidence({ eventIds: [suggestion.id], n: 10 }), []);
-    const regulation = await journal(path.join(base, "regulation.jsonl"));
-    const perceived = regulation.filter(record => record.type === "evidence");
-    assert.deepEqual(perceived.map(record => record.event.id), [actual.id]);
-    assert.doesNotMatch(perceived[0].event.content, /opportunities|面包师问路|尚未整理/);
-    assert.ok(!regulation.some(record => record.type === "decision" || record.type === "bind"), "suggestion delivery never appraises or rewards an unchosen act");
     const beforeDrain = context.stream.length, noticeCount = notices(context).length;
     await f.agent.drainMailbox(); await f.agent.drainMailbox();
     assert.equal(context.stream.length, beforeDrain); assert.equal(notices(context).length, noticeCount);
-    console.log("PASS actual action receipt reaches readable context, status/cockpit suggestions and fact-only growth/regulation evidence without synthetic rewards");
+    console.log("PASS actual action receipt reaches readable context, status/cockpit suggestions and fact-only growth evidence without imagined achievements");
 
     f.agent.tempBannedTools.add("act"); f.agent.refreshToolGate(); await f.agent.drainMailbox();
     assert.deepEqual(f.agent.status().opportunities, []); assert.deepEqual(f.agent.actionOpportunities("avatar"), []);
@@ -123,6 +115,11 @@ async function main() {
     assert.deepEqual((await restored.toChatMessages("after restart", false)).slice(0, stableMessages.length), stableMessages);
     assert.equal(notices(restored).length, stableNoticeCount, "restarting does not repeat an identical suggestion block");
     next.agent.pushEvent("world", JSON.stringify(scenePayload("scene-quiet", 3)), { originEventIds: ["scene-quiet"] });
+    await next.agent.drainMailbox();
+    assert.deepEqual(next.agent.actionOpportunities().map((item: any) => item.intent), [replacementIntent], "a perception without a menu update preserves still-valid suggestions");
+    assert.equal(notices(restored).length, stableNoticeCount, "an unrelated scene does not append an identical suggestion block");
+    assert.deepEqual((await restored.toChatMessages("after quiet scene", false)).slice(0, stableMessages.length), stableMessages, "retaining the current menu never rewrites the frozen request prefix");
+    next.agent.pushEvent("world", JSON.stringify(scenePayload("scene-menu-cleared", 4, [])), { originEventIds: ["scene-menu-cleared"] });
     await next.agent.drainMailbox();
     assert.deepEqual(next.agent.actionOpportunities(), []);
     assert.match(notices(restored).at(-1)!.content, /此前的建议已不再/);
@@ -171,8 +168,8 @@ async function main() {
       result.narrative = result.scene.text = "可见事实开头：风吹过树梢。" + "院墙上的光斑轻轻晃动，石阶边缘仍有昨夜留下的雨水。".repeat(280) + "可见事实结尾：你仍站在岔路口。";
       return result;
     };
-    precedingObservation = longScene("scene-before-long", 4);
-    nextObservation = longScene("scene-long", 5);
+    precedingObservation = longScene("scene-before-long", 5);
+    nextObservation = longScene("scene-long", 6);
     const frozenBeforeLong = await restored.toChatMessages("before long result", false);
     const longResult = await next.agent.injectExternalToolCall("act", { description: "走到岔路口停下" });
     assert.equal(longResult.ok, true); await next.agent.drainMailbox();
@@ -199,9 +196,6 @@ async function main() {
       }
     }
     assert.deepEqual(next.agent.actionOpportunities().filter((item: any) => item.source === "world").map((item: any) => item.intent), longOptions.map(item => item.intent));
-    const longRegulation = (await journal(path.join(base, "regulation.jsonl"))).filter(record => record.type === "evidence" && [longActual.id, longPreceding.id].includes(record.event.id));
-    assert.equal(longRegulation.length, 2);
-    assert.ok(longRegulation.every(record => !/候选未发生_|opportunities/.test(record.event.content)));
     const withLong = await restored.toChatMessages("long result", false);
     assert.deepEqual(withLong.slice(0, frozenBeforeLong.length), frozenBeforeLong);
     const reloadedContext = new BotContext(files, "newer fixed prompt"); await reloadedContext.load();

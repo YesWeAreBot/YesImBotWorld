@@ -5,6 +5,8 @@ import type { PlatformOpsConfig } from "../config.js";
 export interface BotToolDef {
   name: string;
   signature: string;
+  /** Short discovery text. The complete description is returned by help on demand. */
+  summary?: string;
   description: string;
   inputSchema?: Record<string, unknown>;
 }
@@ -23,12 +25,12 @@ export interface BotToolDef {
 export type ToolLayer = "core" | "chat" | "channel" | "group";
 
 const CHAT_LAYER = new Set([
-  "check_msg", "select_channel", "list_friends", "list_groups", "handle_request",
-  "user_info", "send_like", "delete_friend", "set_profile", "set_model_show", "ocr_image",
+  "check_msg", "select_channel", "list_friends", "list_groups", "handle_request", "channel_notify",
+  "user_info", "send_like", "delete_friend", "set_profile", "set_model_show", "ocr_image", "view_forward",
 ]);
 const CHANNEL_LAYER = new Set([
-  "send", "pick_media", "unsend", "react", "get_emoji_likes",
-  "forward_msgs", "view_forward", "exit_forward", "poke", "channel_notify",
+  "send", "unsend", "react", "get_emoji_likes",
+  "forward_msgs", "exit_forward", "poke",
   "read_channel",
 ]);
 const GROUP_LAYER = new Set([
@@ -45,76 +47,107 @@ export function toolLayer(name: string): ToolLayer {
   return "core";
 }
 
+const TOOL_SUMMARIES: Record<string, string> = {
+  think: "简短内心独白；不行动、发言或推进时间。",
+  wait: "暂停决策 n 个 TU，可被动静打断；不表示睡觉。",
+  act: "物理行动或观察，speech 为当面原话；不操作软件，以实际结果为准，未完不重复。",
+  rest: "暂停决策，默认 300 TU，可被打断；不是睡觉或等结果的必经步骤。",
+  observe_device: "看实际可及设备的界面；不拿起、开机或打开应用。",
+  reflect: "凭已感知事件整理认识；不创造经历，复杂证据要求见 help。",
+  recall_growth: "回顾认识或亲历证据；重读不算新经历。",
+  check_msg: "看最近会话；无本地记录时尝试少量历史预览。",
+  select_channel: "进入完整 id 指定的会话；新消息会呈现，补读用 read_channel。",
+  read_channel: "读最近 10 至 200 条消息；id 省略用当前会话，指定完整 id 则进入它。",
+  put_down_phone: "结束使用手机，关闭当前应用和频道关注；不等于免打扰。",
+  pick_up_phone: "拿起手机；不会自动打开应用或回到会话。",
+  travel: "去指定世界作客，按当地历法与规则行动；go_home 返回。",
+  go_home: "从异世界返回自己的世界。",
+  channel_notify: "设置频道通知或限时免打扰；mute_seconds 为世界秒，0 取消限时，不删除消息。",
+  phone_notifications: "查看通知、标记已读或清除卡片；通知权限在设置 App 调整。",
+  open_app: "打开应用；切换会关闭前一个应用，聊天先到消息列表。",
+  close_app: "关闭当前应用，其操作随之失效。",
+  open_computer: "打开独立电脑会话，取得其可用操作。",
+  close_computer: "结束电脑会话；远程连接断开不等于关闭主机。",
+  check_gallery: "看收藏分类或媒体；表情包按表达态度选用，不必例行收藏。",
+  check_media: "看已见媒体缓存；可直接发送，不必先收藏。",
+  view_media: "细看最多 6 项明确媒体引用；看图不等于发送。",
+  gallery_save: "收藏指定缓存媒体；备注是自己的用法，不证明发送者心意。",
+  gallery_move: "调整完整文件名指定的收藏分类或备注。",
+  gallery_remove: "移除完整文件名指定的收藏。",
+  send: "发送原话；id 缺省为当前频道。引用用 reply_to 或 <quote id=\"消息ID\"/>，同目标自动去重。media 尾部附图；确认发出后不重发。",
+  pick_media: "确认最多 9 项 media:N 或完整 gallery: 引用；不会发送，也非发送前必需。",
+  cancel: "取消指定 tc_ID 尚未提交的部分；不撤销已发生的结果。",
+};
+
+/** Keep application discovery compact, while retaining the supplied full help verbatim. */
+export function toolSummary(def: Pick<BotToolDef, "name" | "description" | "summary">): string {
+  if (def.summary?.trim()) return def.summary.trim();
+  const first = def.description.trim().split(/(?<=[。！？])|\n/u)[0]?.trim() ?? "";
+  return Array.from(first).length > 120 ? Array.from(first).slice(0, 117).join("") + "…" : first;
+}
+
 export const BOT_TOOLS: BotToolDef[] = [
+  {
+    name: "help",
+    signature: "help(tool?: string)",
+    description: "查看当前能力清单；指定 tool 名称可读该工具的完整用法、参数与限制。帮助只解释用法，不执行所查询的操作，也不会使不可用工具生效。",
+    summary: "查看当前能力；指定 tool 读详细用法，不执行操作。",
+  },
   {
     name: "think",
     signature: "think(thought: string)",
-    description: "留下一段简短的角色内心独白：可以回想、犹豫、猜测、整理打算，也可以只是想一想而不采取行动。刚经历的事情、牵挂的人或尚未决定的打算，都可能自然浮上心头；身体行动尚未返回也不妨碍想自己的事，但不必为了填满等待时间而强行独白。thought 为 1 至 1200 个 Unicode 字符的非空文本，写角色此刻的主观想法，不输出模型的隐藏推理过程。它立即在本地保留，duration 不推进时间或延后确认；不传给世界，不获取新信息、推进动作或改变身体，不发送给别人，也不触发内在调节评价。区分已知事实、回忆与猜测或设想；想到、希望或打算发生的事不等于已经发生，不能作为成长或奖励证据。不要求每次行动前都调用；没有新的实际感知或操作结果时，至多保留两段自主独白，然后本工具暂时不可用，不必改用其他工具重复相同想法。",
+    description: "想一想自己的经历、牵挂或打算。thought 是 1 至 1200 字符的简短内心独白，区分事实、回忆与猜测，不写模型的隐藏推理。不会推进时间、执行动作、获取新信息或发给别人，duration 无效。不必每次行动前思考；没有新感知或操作结果时最多连续两段，不用反复独白填满等待。",
     inputSchema: { type: "object", properties: { thought: { type: "string", minLength: 1, maxLength: 1200 } }, required: ["thought"], additionalProperties: false },
   },
   {
     name: "wait",
     signature: 'wait(n: number)',
-    description:
-      "等待 n 个 Time Unit。你会暂停思考，直到等待结束（返回当时可感知的观测，不补造期间经历）。收到重要通知可能会提前唤醒你。",
+    description: "等待 n 个 Time Unit（TU），暂停自主思考；重要通知可提前唤醒。结束时只获得当时的感知，不代表期间发生过其他经历。",
   },
   {
     name: "act",
     signature: 'act(description: string, target?: string, speech?: string, repeat?: boolean)',
-    description:
-      "在世界中做一件事，用自然语言描述。description 只写**行动本身**——简短、明确地说你" +
-      "要做什么（如「去厨房泡一杯咖啡」「走到窗边看看外面」），**不要写剧情**：不要描写环境、心情，" +
-      "也不要在行动里预设结果或替别人说话。主动观察、辨认或聆听也用 act 表达，普通感官信息和行动结果会自动送达，不必反复刷新场景。世界会返回连贯经过、他人的反应、可知处境，以及可能的行动建议；建议可忽略，不保证结果，始终允许自由行动。needs_input 表示已经推进到需要你作新决定的地方，整体目标尚未完成，请据此给出下一步意图，不要当作仍在后台自动执行。duration 给出预计耗时；先裁定当下进展，短动作可当下结束，确需持续的过程先交付开始感知并在到期后再结算，不必先空等 duration；开始感知不代表整体行动完成。target 可直接写对象的名字或足以辨认的自然语言描述，不需要 ID，也不要求行动前先观察。" +
-      "要在物理世界开口说话时，speech 写你自己决定说出的逐字原话；世界只负责传播和他人的反应，不替你生成台词。" +
-      "act 不读取聊天消息、软件界面或设备文件，也不执行收发消息、打开应用或设备命令；这些必须使用实际设备工具。拿起物件的身体动作不等于应用已打开或消息已读；不要把拿手机和读消息混成一个 act。需要切换手机持有状态时使用 pick_up_phone/put_down_phone。" +
-      "受理确认不代表动作已开始或完成；专注模式开启时待上一 act 返回后才能再 act，关闭时允许并行表达新的意图；独立设备操作与思考不受 act 专注设置影响。上一个相同的动作尚未返回时，重复的 act 会被拦截（结果会自动送达，无需再发起一次）；当前能力允许并行且确实要同时再做一遍时加 repeat: true。",
+    description: "在物理世界行动或主动观察。description 简短说明要做什么，不预设结果、描写剧情或替别人说话；target 可写对象名称或可辨认的描述，speech 是你决定当面说出的逐字原话。普通感知和行动结果会自动送达，不必反复观察。duration 是预计耗时，开始感知不等于完成；needs_input 表示已推进到新的决策点，要选择下一步。act 不读消息、操作软件或收发内容，请用设备工具；拿放手机用 pick_up_phone/put_down_phone。受理不证明已经开始，以后续感知为准。相同动作未返回时不要重复提交；若允许并行且确要再做一次才用 repeat: true。",
   },
   {
     name: "rest",
     signature: "rest(duration?: number)",
-    description:
-      "主动选择暂停自主思考一段时间，不是等待其他操作结果的必经步骤；已有 act 尚未返回时，仍可思考或处理独立设备操作。duration 以 TU 为单位，缺省或非正数使用 300 TU。有重要动静可提前恢复。到期和中断只记录计时，不表示睡过或醒来；身体的休息、睡姿等动作需要 act，身体状态以真实感知为准，需要主动检查时用 act 表达。记忆整理独立进行。",
+    description: "暂停自主思考，不是等待其他操作结果的必经步骤。duration 单位 TU，缺省或 0 为 300，不能为负数；重要动静可提前恢复。它不表示睡觉或醒来，身体休息用 act。",
   },
   {
     name: "observe_device",
     signature: 'observe_device(device: "phone" | "computer")',
-    description: "只读查看当前可及的手机或电脑界面，并开始留意它。不拿起手机、不打开应用、不启动电脑或建立远程连接；已放在身边的手机也可看，关机只能看到关闭状态。返回已有界面内容或已连接桌面的当前画面，应用操作随当前界面更新。这是随身/当前使用设备的感知入口；设备尚无空间位置与遮挡绑定，不能据此声称看见远处或被遮挡的屏幕。",
+    description: "查看实际可及的手机或电脑界面，并开始留意它；放下的手机在可见范围内也能看。不会拿起手机、打开应用、开机或连接远程桌面，关机只能看到关闭状态；设备不一定在身边，不能据此看见远处或被遮挡的屏幕。",
   },
   {
     name: "reflect",
     signature: 'reflect(kind: "relationship" | "commitment" | "preference" | "state" | "habit" | "trait", subject: string, statement: string, event_ids: string[], relation?: "support" | "counter" | "revise" | "retire", claim_id?: string, situation?: string, cues?: string[], subject_id?: string, behavior?: string, expires_at?: number)',
-    description: "主动整理或修正关系、承诺、偏好、临时状态、情境习惯和性格倾向。event_ids 引用至少一个实际感知事件。state/habit/trait 必须写 situation（适用情境），cues 写想起它的情境词；subject_id 只能使用已感知的稳定身份。聊天关系必须提供 subject_id，并有该对象确实发出的非本人消息；自己的旧话、通知和频道列表不能替代对方的行为证据。state 必须有最近两世界小时内实际身体处境或当前注意界面的证据，通知、频道列表、拿起手机不证明正在留意谁；expires_at 为未来 TU，省略时从支持证据的最新 observedAt 起算两世界小时，显式指定也最长到证据时刻加一天，回顾旧事不能为旧状态续命。habit/trait 必须给 behavior，逐字摘取所引用已完成自主 action 中共同出现的明确动作短语；其他 kind 不填写 behavior。habit 至少有3段实际支持同一 behavior 的独立自主完成选择并跨一个世界日，trait 至少6段、跨3种情境和七个世界日；不能用无关动作凑次数，也不能更换近义标题重复新建同一行为倾向。已有认识给 claim_id；support 补证、counter 反例、revise 修正、retire 停止沿用。重读、失败重试和被迫行为不证明自主习惯；没有实践机会不等于习惯消退。",
+    description: "整理或修正关系、承诺、偏好、临时状态、习惯或性格。event_ids 引用实际感知事件；已有认识给 claim_id，relation 可为 support 补证、counter 反例、revise 修正、retire 停止沿用。subject_id 只能用已感知身份；聊天关系必填，并须有对方的非本人消息作证，自己的话或通知不算。state/habit/trait 必填 situation，cues 是适用情境词。state 须有近两世界小时的身体或当前注意界面证据，拿手机或通知不证明关注某人；expires_at 是未来 TU，默认从最新证据起两世界小时，最长一天，不能用旧事续期。habit/trait 必填 behavior，逐字摘取证据中共同的已完成自主动作：habit 至少 3 次跨一个世界日，trait 至少 6 次跨 3 种情境及七个世界日。其他 kind 不填 behavior。失败、重读、被迫行为不能凑次数，不用近义标题重复新建；没机会实践不算习惯消退。",
   },
   {
     name: "recall_growth",
     signature: 'recall_growth(scope?: "claims" | "evidence" | "all", event_ids?: string[], kind?: "relationship" | "commitment" | "preference" | "state" | "habit" | "trait", subject?: string, keyword?: string, claim_id?: string, n?: number)',
-    description: "回顾已经记录的认识与亲历。scope 默认 claims：关系、承诺、偏好、临时状态、情境习惯、性格倾向及其修订依据（包括已到期或停止沿用的历史，请注意 active 与适用时段）；evidence：尚未整理或已归档的亲历，可用 event_ids 精确重读；all：两者。压缩后仍可找到原始事件 ID 并交给 reflect。keyword 与 n 两者通用，kind/subject/claim_id 仅筛选认识。主观认识可被修正，回忆本身不构成新证据。",
+    description: "回顾认识与亲历。scope 默认 claims（含过期、停止沿用的历史，注意 active 和适用时段）；evidence 查亲历，可用 event_ids 精确重读；all 查两者。keyword、n 通用，kind/subject/claim_id 只筛选认识。原始事件 ID 可用于 reflect，重读不算新经历。",
   },
   {
     name: "check_msg",
     signature: "check_msg(n: number)",
-    description: "刷新消息列表：列出最近活跃的 n 个频道及各自的最新一条消息。",
+    description: "查看最近有记录的 n 个频道及各自最新消息。本地无记录时，会在可用范围内预览少量群或好友及旧消息；旧记录不是新通知。感兴趣可 select_channel，也可用群/好友列表发现更多会话。",
   },
   {
     name: "select_channel",
     signature: 'select_channel(id: string)',
-    description:
-      '点进消息列表中的一个频道（id 格式为 "platform:channelId"）。进入频道页后能进行频道内的完整操作（发消息、撤回、贴表情等，进入时会看到可用操作）。' +
-      "此后的一段时间内你会持续留意这个频道，它的新消息会直接呈现在你眼前（发消息给某频道也有同样效果）。" +
-      "对刚来新消息的频道，也可以不进频道页、直接发消息快捷回复。已经在这个频道里时无需再次点进；想刷新/看更多消息用 read_channel。",
+    description: "进入会话，照抄列表中的完整频道 id。进入后可读历史、发消息及进行频道操作，接下来一段时间内的新消息会直接呈现；无需重复进入，补读用 read_channel。本地无记录时会尝试允许范围内的平台历史，读取失败不代表没人聊天。刚收到消息的频道也可直接 send 快捷回复。",
   },
   {
     name: "read_channel",
-    signature: "read_channel(n: number)",
-    description:
-      "读当前所在频道最近 n 条消息（n 至少 10，调大看更早的历史消息）。只看消息、不切换频道。",
+    signature: "read_channel(n: number, id?: string)",
+    description: "读取最近 n 条消息，n 为 10 至 200。id 省略时读取实际当前频道，没有当前频道则不能读取；不会自行改用最近通知的频道。指定 id 时照抄完整频道标识，先进入该频道再读取。本地为空且允许时尝试平台历史，不保证记录完整。",
   },
   {
     name: "put_down_phone",
     signature: "put_down_phone()",
-    description:
-      "把手机放到一边：关闭打开着的应用，不再留意任何频道。允许通知的频道有消息时，你仍只会感觉到手机震了一下" +
-      "（不呈现内容也不知道来自哪里）。这不会开启免打扰；要更改通知，先 pick_up_phone 拿起手机，再打开聊天应用、进入目标频道并用 channel_notify 设置。",
+    description: "结束使用手机，把它放到一边；当前应用会关闭，不再留意频道。这不是免打扰，允许通知的消息仍可能令设备发出信号，但是否感知取决于实际交付；仅有震动也不知道来源和内容。需要静音时，拿起手机、打开聊天应用、进入目标频道，用 channel_notify 设置。",
   },
   {
     name: "travel",
@@ -132,22 +165,22 @@ export const BOT_TOOLS: BotToolDef[] = [
   {
     name: "pick_up_phone",
     signature: "pick_up_phone()",
-    description: "把手机拿回手里：恢复正常的消息通知（不会自动打开应用）。",
+    description: "拿起手机，留意正常消息通知；不会自动打开应用或回到会话，聊天须先 open_app，必要时 select_channel。",
   },
   {
     name: "channel_notify",
-    signature: 'channel_notify(allow: boolean, id?: string)',
-    description:
-      "开启或关闭一个频道的消息通知（免打扰）。关闭后这个频道的新消息不再提醒你（消息仍会入库，翻记录可见）。" +
-      "id 缺省为当前频道。",
+    signature: 'channel_notify(allow?: boolean, id?: string, mute_seconds?: number)',
+    description: "聊天 App 的频道通知设置。allow 修改长期通知开关；仅填 mute_seconds>0 则限时免打扰，按世界秒计时，到期恢复原设置；mute_seconds=0 取消限时。id 省略为当前频道，否则照抄完整频道标识。消息和未读保留。",
+  },
+  {
+    name: "phone_notifications",
+    signature: 'phone_notifications(action?: "list" | "read" | "clear", id?: string)',
+    description: "通知中心。list 查看通知和未读数量；read 标记已读，不表示读过正文；clear 仅清通知卡片，保留未读。id 省略时处理全部会话。通知模式与各应用权限在手机设置 App 内调整，具体频道免打扰在聊天 App 内调整。",
   },
   {
     name: "open_app",
     signature: 'open_app(name: string)',
-    description:
-      "打开手机里的一个应用。应用的操作按需展开：打开聊天应用会看到消息列表，并解锁查看好友/群、进入频道等操作；" +
-      "打开其他应用会看到它提供的操作。展开的操作即刻可以像普通能力一样调用，" +
-      "一次只能打开一个应用，打开新的会自动关掉上一个（其操作随之失效）。",
+    description: "打开手机应用并获得它的操作；聊天应用先显示消息列表。一次只能开一个应用，切换会关闭前一个，其操作随之失效。",
   },
   {
     name: "close_app",
@@ -157,10 +190,7 @@ export const BOT_TOOLS: BotToolDef[] = [
   {
     name: "open_computer",
     signature: "open_computer()",
-    description:
-      "打开你自己的电脑：一台与手机平级的另一台设备，不是手机里的应用。打开后电脑上的工具会展开" +
-      "（取决于它的实现方式：终端/文件管理器，或远程桌面的屏幕/鼠标/键盘），" +
-      "关闭手机里的应用不影响电脑，反之亦然；用 close_computer 结束会话后这些工具随之失效。",
+    description: "打开电脑会话并获得终端/文件或远程桌面的操作。电脑与手机独立，关闭手机应用不影响电脑；close_computer 结束会话。",
   },
   {
     name: "close_computer",
@@ -170,40 +200,27 @@ export const BOT_TOOLS: BotToolDef[] = [
   {
     name: "check_gallery",
     signature: "check_gallery(category?: string)",
-    description:
-      "翻看你的收藏夹。收藏夹按分类存放：表情包、meme、截图、照片、未整理。不带参数看总览（各分类的数量），" +
-      "带 category 打开某一类，列出每项的内容和描述（挑中后用 pick_media 确认明确的媒体引用）。" +
-      "发图先来这里挑；「未整理」里是从外部导入、还没归类的东西，有空时看看（view_media）并用 gallery_move 整理。",
+    description: "翻看收藏夹，category 省略看分类总览，填写后看该类媒体及备注（表情包、meme、截图、照片、未整理）。先确定自己想表达的态度或接话方式，再选表情包。备注是自己的选用线索，不代表原图事实或原发送者意图；未整理不是待办，发图无需先收藏。",
   },
   {
     name: "check_media",
     signature: 'check_media(n?: number, type?: "image" | "audio" | "video")',
-    description:
-      "翻看媒体缓存：你在聊天里见过的图片、语音、视频都留在缓存里（只读，不能删改）。" +
-      "列出最近 n 项（默认 10）的编号、大小与内容摘要。用于翻找没存进收藏夹的东西；想留下的用 gallery_save 收藏。",
+    description: "查看聊天中见过的媒体缓存（只读），返回最近 n 项编号、大小、摘要，默认 10；type 可筛选类型。表情包按表达态度与适用语境选用，可直接发送，不必先收藏或解说画面。",
   },
   {
     name: "view_media",
     signature: 'view_media(media: string[])',
-    description:
-      '把几张图/几段媒体拿起来仔细看看。media 填媒体编号或收藏夹文件（如 ["media:12", "gallery:表情包/xx.png"]，最多 6 个）。' +
-      "**发图前拿不准内容时，先用它确认再发**——光凭文件名和一句摘要挑图很容易发错。整理「未整理」时也先用它看清内容。",
+    description: "细看最多 6 项媒体，media 填明确引用，如 [\"media:12\", \"gallery:表情包/xx.png\"]。现有线索不够时再看，不必每次发图都查看。表情包像 emoji 用来表态、接话，可能用途不等于原发送者意图；不需要点评画面或收藏。",
   },
   {
     name: "gallery_save",
     signature: 'gallery_save(media_id: string, category: string, description: string, name?: string)',
-    description:
-      '把缓存里的媒体存进你的收藏夹（比如看到喜欢的表情包就存下来）。media_id 为媒体编号（如 "media:12"）；' +
-      "category 必须是：表情包 / meme / 截图 / 照片；description 用你自己的话写清这是什么、什么梗/情绪、适合什么场合发" +
-      "——以后挑图全靠这段描述，别偷懒。name 可选，给它起个好记的文件名。",
+    description: "按需收藏缓存媒体，media_id 如 \"media:12\"，category 为表情包 / meme / 截图 / 照片，name 可选。description 写自己的选用备注（如表达态度、适用及易误读语境），不推断原发送者意图。备注不会发给别人；收藏不是发图前提，也无需宣告。",
   },
   {
     name: "gallery_move",
     signature: 'gallery_move(name: string, category: string, description?: string)',
-    description:
-      "把收藏夹里的文件移到某个分类，主要用来整理「未整理」里从外部导入的东西。" +
-      'name 为文件名（可带分类前缀，如 "未整理/xx.png"）；category 为目标分类（表情包 / meme / 截图 / 照片）。' +
-      "还没有描述的文件必须先 view_media 看清内容，再带上 description 一起移动。",
+    description: "调整收藏分类，name 照抄完整文件名（如 \"未整理/xx.png\"），category 为表情包 / meme / 截图 / 照片。description 可更新自己的选用备注，省略则保留；不代表原发送者意图。未整理无需清空，分类也不要求看图解说。",
   },
   {
     name: "gallery_remove",
@@ -213,19 +230,12 @@ export const BOT_TOOLS: BotToolDef[] = [
   {
     name: "send",
     signature: 'send(msg: string, id?: string, media?: string[], reply_to?: string, at_sender?: boolean, resend?: boolean, confirm_long?: boolean, insist?: boolean)',
-    description:
-      "发送消息。id 缺省为当前所在频道页；要发给别的频道就给出完整频道 id（格式 \"platform:channelId\"）。" +
-      '图文混排在 msg 原位置使用明确引用，如「先看这张 <media ref="media:12"/> 再看这张 <media ref="media:27"/>」。' +
-      "名称、摘要、原图属于同一个 media:N；不能把消息 msg:编号当成媒体编号。media 参数中的引用只在正文末尾追加，不填充槽位。reply_to 使用完整平台消息 ID（可能包含字母或符号），也可照抄 msg:ID；禁止从媒体引用或句子里抽数字。" +
-      "send 会尝试发送完整消息，仍受耗时、确认和频率限制；以发送回执为准。pick_media 只确认引用，不会自动发送。",
+    description: "发送你决定说的原话。id 省略为当前频道，其他频道照抄完整 id。发完仍可留在会话接着聊，不必每条消息后放下手机；有事离开或聊完再放下。图文混排在 msg 对应位置写 <media ref=\"media:12\"/>，名称、摘要、原图对应同一 media:N；media 参数只在正文末尾追加。reply_to 照抄完整消息 ID 或 msg:ID，不得从媒体编号或文字猜 ID；at_sender=false 可取消引用时提醒对方。当前支持时，@ 用 <at id=\"账号ID\"/>（裸打 @名字 不提醒），平台表情用 <face id=\"表情ID\"/>；引用也可在 msg 中用 <quote id=\"完整消息ID\"/>，标识照抄实际记录；name/text 只是引用预览。标签与 reply_to 同目标时合并一次引用，移除标签及其后空白；目标冲突则不发送。以发送回执为准，不因回显缺失重发；pick_media 不会发送。confirm_long/resend/insist 仅在对应提醒后，仍确有必要发送时使用。",
   },
   {
     name: "pick_media",
     signature: 'pick_media(media: string[])',
-    description:
-      '确认所选媒体的明确引用。media 填 media:N 或 gallery:分类/文件名，如 ["media:12", "gallery:表情包/xx.png"]，最多 9 项。' +
-      '返回可放入 send.msg 的 <media ref="media:N"/>，或在 send.media 末尾追加。此操作不会发送、创建待填槽草稿或自动触发 send。' +
-      "内容不确定时先用 view_media 查看对应原图；收藏夹同名文件要带完整分类。",
+    description: "确认最多 9 项媒体引用，media 填 media:N 或完整 gallery:分类/文件名。返回标签可按位置写进 send.msg，或用 send.media 末尾追加；文件名含引号时用后者。保留图库完整引用，不换成同资源的 media:N。选中不等于已发，以 send 回执为准。表情包按想表达的态度选择，不要求收藏或配画面解说；不确定内容或表意时再 view_media。",
   },
   {
     name: "unsend",
@@ -286,13 +296,13 @@ export const BOT_TOOLS: BotToolDef[] = [
   },
   {
     name: "list_friends",
-    signature: "list_friends()",
-    description: "翻看你在聊天平台上的好友列表：每个好友的名字与可直接用于 send 的频道 id。",
+    signature: "list_friends(cursor?: string, limit?: number, preview?: boolean)",
+    description: "分页查看好友、完整频道 id 和近期消息预览。limit 默认 5，范围 1—10；preview 默认 true，false 只看目录；cursor 用返回值翻页。预览是历史片段，不是新喊话；感兴趣再 select_channel，不必遍历全部。",
   },
   {
     name: "user_info",
     signature: 'user_info(user_id: string)',
-    description: "查看某个用户的公开资料（昵称、性别、年龄、签名等）。user_id 为对方的账号数字 id。",
+    description: "查看用户的公开资料（昵称、性别、年龄、签名等）。user_id 照抄消息或列表中的账号 ID。",
   },
   {
     name: "send_like",
@@ -302,7 +312,7 @@ export const BOT_TOOLS: BotToolDef[] = [
   {
     name: "delete_friend",
     signature: 'delete_friend(user_id: string)',
-    description: "删除一个好友。这是不可逆的绝交动作，请慎重。",
+    description: "删除好友，恢复好友关系需要重新添加。",
   },
   {
     name: "set_profile",
@@ -317,8 +327,8 @@ export const BOT_TOOLS: BotToolDef[] = [
   },
   {
     name: "list_groups",
-    signature: "list_groups()",
-    description: "查看你加入的群列表：群名、可用于 send 的频道 id、人数。",
+    signature: "list_groups(cursor?: string, limit?: number, preview?: boolean)",
+    description: "分页查看已加入的群、完整频道 id、人数和近期消息预览。limit 默认 5，范围 1—10；preview 默认 true，false 只看目录；cursor 用返回值翻页。预览是历史片段，不表示有人找你；感兴趣再 select_channel，不必遍历全部。",
   },
   {
     name: "group_info",
@@ -415,14 +425,14 @@ export const BOT_TOOLS: BotToolDef[] = [
   {
     name: "group_leave",
     signature: 'group_leave(id: string)',
-    description: "退出一个群聊。这是不可逆的动作，请慎重。",
+    description: "退出群聊，再加入可能需要邀请或批准。",
   },
   {
     name: "cancel",
     signature: "cancel(id: string)",
     description: '取消尚未提交的工具调用（如还没开始发送的消息）。已提交的操作不能保证撤销，真实结果仍会返回。id 是工具调用编号（形如 "tc_12"）。',
   },
-];
+].map(def => ({ ...def, summary: def.summary ?? TOOL_SUMMARIES[def.name] ?? toolSummary(def) }));
 
 /** 全部工具名（宽松解析用的允许列表上限） */
 export const BOT_TOOL_NAMES = BOT_TOOLS.map((t) => t.name);
@@ -542,13 +552,12 @@ export function availableTools(opts: {
         signature: def.name === "wait" ? "wait(n: number, confirm?: boolean)" : "rest(duration?: number, confirm?: boolean)",
         description:
           def.description +
-          "wait/rest 共用实际自主暂停的时长占比，被通知打断的部分也计入。近期暂停占比过高会先给出具体窗口反馈；" +
-          (def.name === "rest" ? "确实想暂停自主思考时" : "确需继续等待时") +
-          "，紧接着再调用同一工具并加 confirm: true，只确认该次。",
+          "近期 wait/rest 过多时会先要求确认；确需继续，紧接着用同一工具加 confirm: true 确认该次。",
+        summary: toolSummary(def) + "频繁暂停时须按提示 confirm。",
       };
     }
     if (def.name === "rest" && opts.disableWait) {
-      def = { ...def, description: def.description + "当前 wait 已关闭；rest 仍用于确有需要的休息，不要把它当成持续空等消息的替代。" };
+      def = { ...def, description: def.description + "wait 已关闭，不要用连续 rest 代替空等消息。", summary: toolSummary(def) + "不要连续空等消息。" };
     }
     // blockingAct 专注模式：上一个动作未完成前新的 act 会被拒绝（不可绕过）——只有开启时才在描述里说明
     if (def.name === "act" && opts.blockingAct) {
@@ -556,8 +565,8 @@ export function availableTools(opts: {
         ...def,
         description:
           def.description +
-          "开启 blockingAct（同时只能专注做一件事）时：上一个动作还没完成前，新的 act 会被直接拒绝，" +
-          "也不能用 repeat 绕过。受理不证明已经开始；实际进展以随后交付的感知和结果为准。这里只暂停新的 act，仍可思考或处理独立设备操作，不必因此调用 rest。",
+          "当前一次只能专注一个 act，须等结果后再行动，repeat 不能绕过。",
+        summary: toolSummary(def) + "当前一次只可有一个 act。",
       };
     }
     // open_app 的描述里列出已安装的应用
@@ -567,10 +576,11 @@ export function availableTools(opts: {
         description:
           def.description +
           `已安装的应用：${opts.apps.map((a) => `${a.name}（${a.description}）`).join("、")}。`,
+        summary: toolSummary(def) + `应用：${opts.apps.map(a => a.name).join("、")}。`,
       };
     }
     if (def.name === "send" && opts.ignoreSendDuration) {
-      def = { ...def, description: def.description + "当前配置忽略发送耗时：一旦满足发送条件就立即发送，duration 不会延后发送或提供取消窗口。" };
+      def = { ...def, description: def.description + "当前忽略发送耗时，duration 不会延后发送或留下取消窗口。", summary: toolSummary(def) + "忽略发送耗时，无打字取消窗口。" };
     }
     // travel 的描述里列出可去的世界
     if (def.name === "travel" && opts.crossingWorlds?.length) {
@@ -581,12 +591,58 @@ export function availableTools(opts: {
           `你能前往的世界：${opts.crossingWorlds
             .map((w) => `「${w.name}」${w.note?.trim() ? `（${w.note.trim()}）` : ""}`)
             .join("、")}。`,
+        summary: toolSummary(def) + `目的地：${opts.crossingWorlds.map(w => w.name).join("、")}。`,
       };
     }
     return def;
   });
 }
 
-export function renderToolsText(tools: BotToolDef[] = BOT_TOOLS): string {
-  return tools.map((t) => `- ${t.signature}\n  ${t.description}${t.inputSchema ? "\n  参数 JSON Schema（参数结构以此为准）：" + JSON.stringify(t.inputSchema) : ""}`).join("\n");
+/** Render schema types as a parameter signature, not a second block of JSON tutorials. */
+function schemaType(schema: unknown): string {
+  if (schema === true || schema === undefined) return "unknown";
+  if (schema === false) return "never";
+  if (!schema || typeof schema !== "object" || Array.isArray(schema)) return "unknown";
+  const s = schema as Record<string, unknown>;
+  let type: string;
+  if (Object.hasOwn(s, "const")) type = JSON.stringify(s.const);
+  else if (Array.isArray(s.enum)) type = s.enum.map(value => JSON.stringify(value)).join(" | ");
+  else if (Array.isArray(s.anyOf) || Array.isArray(s.oneOf)) type = ((s.anyOf ?? s.oneOf) as unknown[]).map(schemaType).join(" | ");
+  else if (s.type === "array") type = `Array<${schemaType(s.items)}>`;
+  else if (s.type === "object" || s.properties) {
+    type = `{ ${schemaParameters(s)}${s.additionalProperties === false ? "" : "; …"} }`;
+  } else type = Array.isArray(s.type) ? s.type.join(" | ") : typeof s.type === "string" ? s.type : "unknown";
+  // Keep validation constraints observable (including future schema extensions), but omit prose.
+  const covered = new Set(["type", "const", "enum", "anyOf", "oneOf", "items", "properties", "required", "additionalProperties", "description", "title", "examples", "$comment"]);
+  const constraints = Object.entries(s).filter(([key]) => !covered.has(key));
+  if (s.additionalProperties && typeof s.additionalProperties === "object") constraints.push(["additionalProperties", s.additionalProperties]);
+  return type + (constraints.length ? `[${constraints.map(([key, value]) => `${key}=${JSON.stringify(value)}`).join(", ")}]` : "");
+}
+
+function schemaParameters(schema: Record<string, unknown>): string {
+  const props = schema.properties && typeof schema.properties === "object" ? schema.properties as Record<string, unknown> : {};
+  const required = new Set(Array.isArray(schema.required) ? schema.required.filter(value => typeof value === "string") as string[] : []);
+  const names = [...new Set([...Object.keys(props), ...required])];
+  return names.map(name => `${name}${required.has(name) ? "" : "?"}: ${schemaType(props[name])}`).join(", ");
+}
+
+export function toolSignature(def: BotToolDef): string {
+  return def.inputSchema ? `${def.name}(${schemaParameters(def.inputSchema)})` : def.signature;
+}
+
+export function renderToolsText(tools: readonly BotToolDef[] = BOT_TOOLS): string {
+  return tools.map(def => {
+    const constraints = def.inputSchema && Object.fromEntries(Object.entries(def.inputSchema).filter(([key]) =>
+      !["type", "properties", "required", "description", "title", "examples", "$comment"].includes(key)));
+    return `- ${toolSignature(def)}\n  ${toolSummary(def)}${constraints && Object.keys(constraints).length ? "\n  参数限制：" + JSON.stringify(constraints) : ""}`;
+  }).join("\n");
+}
+
+/** Only explicit help or a relevant failed call should insert the complete tutorial. */
+export function renderToolHelp(def: BotToolDef): string {
+  return `${def.signature}\n${def.description}${def.inputSchema ? "\n参数 JSON Schema（参数结构以此为准）：" + JSON.stringify(def.inputSchema) : ""}`;
+}
+
+export function renderToolHelpIndex(defs: readonly BotToolDef[]): string {
+  return "当前可用能力（help(tool) 查看完整用法）：\n" + renderToolsText(defs);
 }
