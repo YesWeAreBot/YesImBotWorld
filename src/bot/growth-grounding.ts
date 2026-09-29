@@ -55,7 +55,9 @@ export function deriveGrowthScope(kind: GrowthKind, evidence: PerceivedEvidence[
 /** Legacy records remain auditable, but uncertain chat attribution cannot become automatic guidance. */
 export function growthNeedsReview(view: GrowthView): boolean {
   const current = [...view.records].reverse().find(record => record.relation !== "counter")!;
-  return (!current.scope || current.groundingVersion !== 1) && view.evidence.some(chatEvidence) ||
+  if (current.relation === "retire") return false;
+  return ["relationship", "commitment", "preference"].includes(view.kind) && (!current.insight || current.semanticVersion !== 1) ||
+    (!current.scope || current.groundingVersion !== 1) && view.evidence.some(chatEvidence) ||
     (view.kind === "habit" || view.kind === "trait") && (!current.behavior || current.groundingVersion !== 1);
 }
 

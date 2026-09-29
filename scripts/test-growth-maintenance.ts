@@ -50,6 +50,7 @@ async function fixture(baseURL: string, extra: Record<string, unknown> = {}) {
   async function events(prefix = "walk", count = 4) { for (let i = 1; i <= count; i++) await event(prefix + i, undefined, {}, at - 1 - (count - i) * 86400 / clock.unitWorldSeconds); }
   return { files, context, ledger, cfg, clock, runtime, event, events, advance: (worldStep = 10) => { at += worldStep; real += 1100; }, setTime: (value: number) => { at = value; } };
 }
+const insight = (eventId: string, quote: string, dimension: string, significance = "这段真实经历为以后类似情境下的选择提供有限依据，仍需根据当时情况判断。") => ({ dimension, significance, anchors: [{ eventId, quote }] });
 const habit = (ids = ["walk1", "walk2", "walk3"]): ReflectionInput => ({ kind: "habit", subject: "饭后散步", behavior: "散步", statement: "天气合适且没有别的约定时，晚饭后我喜欢沿河走一会儿。", situation: "晚饭后，天气适合出门且没有其他约定。", cues: ["晚饭后", "河边"], evidenceIds: ids });
 const authorUpdate = (id: string, definition: string): BotEvent => ({ id, source: "system", worldTime: 100000,
   content: "（角色定义已由世界管理者更新。以下是新的作者定义，从现在起据此行动；固定定义会在下次记忆整理时同步。）\n" + definition });
@@ -68,7 +69,8 @@ async function currentCounterAndInactiveReasons(baseURL: string) {
   assert.equal(fullHabit.records.slice(-4).some(record => record.relation === "counter"), false, "the unresolved counter must lie outside the recent-four shortcut");
   const temporary = await f.ledger.reflect({ kind: "state", subject: "散步后短暂疲倦", statement: "今天晚饭后散步回来暂时想歇一会儿。",
     situation: "晚饭后在河边散步归来，休息恢复以前。", expiresAt: 100001, evidenceIds: ["walk4"] }, 100000);
-  const preference = await f.ledger.reflect({ kind: "preference", subject: "晚饭后河边喝浓茶", statement: "曾经喜欢晚饭后在河边喝一杯浓茶。", evidenceIds: ["walk2"] }, 100000);
+  await f.event("tea-choice", "晚饭后我选择在河边喝浓茶，觉得比甜饮更合口味。", { action: "晚饭后在河边喝浓茶" });
+  const preference = await f.ledger.reflect({ kind: "preference", subject: "晚饭后河边喝浓茶", statement: "曾经喜欢晚饭后在河边喝一杯浓茶。", evidenceIds: ["tea-choice"], insight: insight("tea-choice", "晚饭后我选择在河边喝浓茶，觉得比甜饮更合口味。", "散步时的饮品选择") }, 100000);
   await f.event("stop-night-tea", "连续几次晚饭后喝浓茶影响睡觉，我决定以后散步时喝清水。", { action: "晚饭后散步改喝清水" });
   await f.ledger.reflect({ kind: "preference", subject: preference.view.subject, claimId: preference.view.claimId, relation: "retire",
     statement: "晚饭后喝浓茶影响睡眠，这个安排已经停止，散步时改喝清水。", evidenceIds: ["stop-night-tea"] }, 100000);
@@ -137,7 +139,7 @@ async function authorDefinitionsAndMetadataBudget(baseURL: string) {
   for (let i = 0; i < 8; i++) await dense.ledger.reflect({ kind: "relationship", subject: "朋友的完整称呼".repeat(20) + i,
     subjectId: subjects[i], statement: "河边喝茶时这位朋友愿意耐心倾听，但遇到争执仍需要沟通。".repeat(35),
     situation: "河边喝茶时与这位朋友相处。".repeat(20), cues: Array.from({ length: 12 }, (_, j) => "河边喝茶".repeat(18) + j),
-    evidenceIds: ["dense" + i] }, 100000);
+    evidenceIds: ["dense" + i], insight: insight("dense" + i, "一起在河边喝茶，谈论近日的心情。", "日常倾听" + i) }, 100000);
   const originalSnapshot = (await dense.ledger.snapshotReview({ at: 100000 }))!;
   let densePayload: any, hiddenEvidence: string | undefined;
   response = request => {
@@ -277,18 +279,18 @@ async function durableDeliveryAndRecall(baseURL: string) {
 async function strictStateAndBoundedInput(baseURL: string) {
   const f = await fixture(baseURL, { maxInputChars: 7000 });
   for (let i = 0; i < 4; i++) await f.event("long" + i, "晚饭后河边散步😀\\\"".repeat(2500));
-  response = () => ({ changes: [{ kind: "state", subject: "今天有些疲倦", statement: "今天想安静休息一会儿。", situation: "今天忙完之后，休息恢复以前。", evidenceIds: ["long1"] }] });
+  response = () => ({ changes: [{ kind: "preference", subject: "晚饭后的活动", statement: "最近愿意用饭后散步来放松。", evidenceIds: ["long1"], insight: insight("long1", "晚饭后河边散步", "放松方式") }] });
   f.runtime.tick(); await f.runtime.settled();
   const input = requests.at(-1), payload = JSON.parse(input.messages[1].content);
   assert.ok(input.messages.reduce((sum: number, message: any) => sum + message.content.length, 0) <= 7000);
   assert.ok(payload.evidence.every((evidence: any) => evidence.text.includes("截断") && evidence.text.length > 100));
   assert.ok(Math.max(...payload.evidence.map((evidence: any) => evidence.text.length)) - Math.min(...payload.evidence.map((evidence: any) => evidence.text.length)) <= 2, "long evidence receives an even budget without dropping later positions");
-  const state = (await f.ledger.recall())[0]!;
+  assert.equal((await f.ledger.recall())[0]!.kind, "preference", "bounded input can still ground a meaningful lasting insight");
+  const state = (await f.ledger.reflect({ kind: "state", subject: "今天有些疲倦", statement: "今天想安静休息一会儿。", situation: "今天忙完之后，休息恢复以前。", evidenceIds: ["long1"] }, 100000)).view;
   assert.equal(state.expiresAt, 100059, "default temporary state lasts two world hours from the supporting observation, not its later review");
   assert.equal((await f.ledger.recallEvidence({ eventIds: ["long1"] }))[0]!.text.length, "晚饭后河边散步😀\\\"".repeat(2500).length, "request truncation never changes ledger evidence");
   const cap = await fixture(baseURL); await cap.events();
-  response = () => ({ changes: [{ kind: "state", subject: "今天的心情", statement: "今天想先缓一缓。", situation: "忙碌之后", evidenceIds: ["walk4"], expiresAt: 99999999 }] });
-  cap.runtime.tick(); await cap.runtime.settled();
+  await cap.ledger.reflect({ kind: "state", subject: "今天的心情", statement: "今天想先缓一缓。", situation: "忙碌之后", evidenceIds: ["walk4"], expiresAt: 99999999 }, 100000);
   assert.equal((await cap.ledger.recall())[0]!.expiresAt, 100719, "state expiry cannot exceed one world day from its supporting observation");
   for (const bad of [{ changes: [], execute: "act" }, { changes: [{ ...habit(), privateThoughts: "unknown" }] }, { content: "{}", tool_calls: [{ id: "forbidden", type: "function", function: { name: "act", arguments: "{}" } }] }]) {
     const reject = await fixture(baseURL); await reject.events(); response = () => bad;
@@ -309,7 +311,7 @@ async function strictStateAndBoundedInput(baseURL: string) {
 async function relevantRecallAndCheckpoint(baseURL: string) {
   const f = await fixture(baseURL);
   await f.event("friend_a", "阿青把茶递过来，关心我今天的心情。", { agency: "observed", subjectIds: ["person:a"], situation: "和阿青交谈" });
-  await f.ledger.reflect({ kind: "relationship", subject: "阿青", subjectId: "person:a", statement: "阿青愿意照顾我的感受。", evidenceIds: ["friend_a"] }, 100000);
+  await f.ledger.reflect({ kind: "relationship", subject: "阿青", subjectId: "person:a", statement: "阿青愿意照顾我的感受。", evidenceIds: ["friend_a"], insight: insight("friend_a", "阿青把茶递过来，关心我今天的心情。", "情绪关怀") }, 100000);
   await f.event("friend_b", "阿南正在另一个频道讨论电影的配乐。", { agency: "observed", subjectIds: ["person:b"], situation: "和阿南交谈" });
   assert.deepEqual(await f.runtime.remember(), [], "the previous channel's identities cannot leak into the newest situation");
   await f.event("rain", "窗外下起了小雨。", { agency: "observed", subjectIds: [], situation: "听见窗外天气变化" });
@@ -338,12 +340,12 @@ async function partialAutomaticReview(baseURL: string) {
   response = request => {
     payload = JSON.parse(request.messages[1].content);
     return { changes: [habit(["friend1", "friend2", "walk3"]),
-      { kind: "relationship", subject: "朋友", subjectId: "person:friend", statement: "这次相处时，朋友愿意陪我聊聊。", evidenceIds: ["friend1"] },
+      { kind: "relationship", subject: "朋友", subjectId: "person:friend", statement: "这次相处时，朋友愿意陪我聊聊。", evidenceIds: ["friend1"], insight: insight("friend1", "朋友递来一杯热茶，陪我聊了一会儿。", "疲倦时的陪伴") },
       { kind: "state", subject: "当时的疲倦", statement: "当时暂时想歇歇。", situation: "散步回来", evidenceIds: ["walk3"], expiresAt: payload.time.nowTU },
-      { kind: "relationship", subject: "下次散步的约定", statement: "朋友提过下次一起散步，还需到时确认。", evidenceIds: ["friend2"] }] };
+      { kind: "relationship", subject: "下次散步的约定", statement: "朋友提过下次一起散步，还需到时确认。", evidenceIds: ["friend2"], insight: insight("friend2", "朋友说愿意下次一起去河边。", "一起散步的意愿") }] };
   };
   f.runtime.tick(); await f.runtime.settled();
-  assert.equal((await f.ledger.stats()).records, 2, "one unsupported habit and one expired state do not discard valid relationships");
+  assert.equal((await f.ledger.stats()).records, 2, "one unsupported habit and one forbidden routine state do not discard valid relationships");
   const audit = await f.ledger.reviewStatus();
   assert.deepEqual(audit.recent[0]!.rejected?.map(item => item.index), [0, 2]);
   assert.equal(audit.pending, 0);
@@ -362,12 +364,12 @@ async function durableValidationFeedback(baseURL: string) {
   const f = await fixture(baseURL); await f.events();
   response = request => {
     const payload = JSON.parse(request.messages[1].content);
-    return { changes: [{ kind: "state", subject: "散步后的片刻疲倦", statement: "散步回来暂时想歇歇。", situation: "散步后，休息恢复以前",
-      evidenceIds: ["walk1"], expiresAt: payload.time.nowTU }] };
+    return { changes: [{ kind: "preference", subject: "饭后放松", statement: "喜欢饭后散步放松。",
+      evidenceIds: ["walk1"], insight: insight("walk1", "根本没有出现在原文的引用", "放松方式") }] };
   };
   f.runtime.tick(); await f.runtime.settled(); f.runtime.stop();
   const rejected = await f.ledger.reviewStatus();
-  assert.equal((await f.ledger.stats()).records, 0); assert.match(rejected.recent[0]!.rejected![0]!.reason, /expiresAt/);
+  assert.equal((await f.ledger.stats()).records, 0); assert.match(rejected.recent[0]!.rejected![0]!.reason, /逐字/);
   f.advance();
   for (let i = 0; i < 4; i++) await f.event("correct" + i, "散步后暂时想休息，来访的朋友愿意坐下来陪我说说话。");
   const context = new BotContext(f.files); await context.load();
@@ -375,19 +377,19 @@ async function durableValidationFeedback(baseURL: string) {
   const runtime = new GrowthRuntime(ledger, f.cfg, f.clock, context, logger); runtimes.push(runtime);
   response = request => {
     const payload = JSON.parse(request.messages[1].content);
-    assert.ok(payload.validationFeedback.some((item: string) => item.includes("expiresAt")), "the restarted reviewer sees the exact previous time-validation correction");
+    assert.ok(payload.validationFeedback.some((item: string) => item.includes("逐字")), "the restarted reviewer sees the exact previous grounding correction");
     assert.ok(payload.validationFeedback.length <= 8 && payload.validationFeedback.every((item: string) => item.length <= 220));
     assert.match(request.messages[0].content, /validationFeedback.*不是新经历/);
-    assert.match(request.messages[0].content, /state 示例故意省略 expiresAt/);
-    assert.match(request.messages[0].content, /新建认识(?:故意)?省略 claimId/);
+    assert.match(request.messages[0].content, /不要新增 state/);
+    assert.match(request.messages[0].content, /新增认识.*必须省略 claimId/);
     return { changes: [
-      { kind: "state", subject: "这次散步后想休息", statement: "这次散步后暂时想歇一会儿。", situation: "散步后，休息恢复以前", evidenceIds: ["correct1"] },
-      { kind: "relationship", subject: "来访的朋友", statement: "这次相处时对方愿意陪我说话。", evidenceIds: ["correct2"] },
+      { kind: "preference", subject: "饭后放松", statement: "最近愿意通过饭后散步缓解忙碌。", evidenceIds: ["correct1"], insight: insight("correct1", "散步后暂时想休息", "放松方式") },
+      { kind: "relationship", subject: "来访的朋友", statement: "这次相处时对方愿意陪我说话。", evidenceIds: ["correct2"], insight: insight("correct2", "来访的朋友愿意坐下来陪我说说话。", "相处中的陪伴意愿") },
     ] };
   };
   runtime.tick(); await runtime.settled();
   const records = await ledger.recall(), correction = await ledger.reviewStatus();
-  assert.equal(records.length, 2); assert.equal(records.find(item => item.kind === "state")!.expiresAt, 100069);
+  assert.equal(records.length, 2); assert.deepEqual(records.map(item => item.kind).sort(), ["preference", "relationship"]);
   assert.equal(correction.lastOutcome, "completed"); assert.equal(correction.recent[0]!.rejected, undefined);
   assert.deepEqual(await context.toChatMessages("T111"), prefix, "program feedback stays outside the actor's append-only consciousness");
   assert.equal((await ledger.stats()).perceivedEvents, 8, "format diagnostics never become evidence");

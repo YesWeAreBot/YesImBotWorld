@@ -5,6 +5,7 @@ import path from "node:path";
 import { WorldFiles } from "../src/files.js";
 import { NarrativeWorld } from "../src/world/runtime.js";
 import { worldResolutionTool } from "../src/world/proposal.js";
+import { buildWorldTaskPrompt } from "../src/world/prompt.js";
 import { WORLD_PROMPT_DEFAULTS } from "../src/prompts.js";
 import type { ChatMessage, ChatResult } from "../src/llm/chat.js";
 import type { NarrativeObservation, NarrativeOpportunity } from "../src/world/narrative-types.js";
@@ -95,24 +96,38 @@ async function main() {
       await assert.rejects(runtime.observe("bot", { intent: "看看门边" }), pattern);
       assert.equal(calls, count + 3); assert.deepEqual(store.snapshot(), prior, "invalid auxiliary text cannot be partially committed");
     }
+    async function filtered(suggestions: unknown, expected: NarrativeOpportunity[] = []) {
+      const prior = store.snapshot(), count = calls;
+      handler = () => response({ perceptions: [{ actorId: "bot", text: "院门边一切如旧。", opportunities: suggestions }] });
+      const result = await runtime.observe("bot", { intent: "看看门边" });
+      assert.equal(calls, count + 1, "an invalid optional suggestion cannot cause scene regeneration");
+      assert.equal(result.narrative, "院门边一切如旧。", "filtering suggestions never rewrites otherwise valid perception prose");
+      assert.deepEqual(result.opportunities, expected, "invalid suggestions are removed whole; an explicit empty set clears old choices");
+      assert.deepEqual((await runtime.peek()).opportunities, expected);
+      assert.equal(store.snapshot().worldState, prior.worldState, "discarding a suggestion has no factual effect");
+      assert.deepEqual(store.readPerceptions("bot").at(-1)!.opportunities, expected, "only validated suggestions reach committed history");
+    }
     await rejected({ situation: "手机刚收到一条新消息。" }, /WORLD_DEVICE_BOUNDARY/);
-    await rejected({ opportunities: [{ label: "读通知", intent: "查看手机的通知" }] }, /WORLD_DEVICE_BOUNDARY/);
-    await rejected({ opportunities: [{ label: "去问问", intent: "回复群聊里刚刚发来的消息" }] }, /WORLD_DEVICE_BOUNDARY/);
-    await rejected({ opportunities: [{ label: "查看天气", intent: "打开浏览器查询实时天气" }] }, /WORLD_DEVICE_BOUNDARY/);
+    await filtered([{ label: "读通知", intent: "查看手机的通知" }]);
+    await filtered([{ label: "去问问", intent: "回复群聊里刚刚发来的消息" }]);
+    await filtered([{ label: "查看天气", intent: "打开浏览器查询实时天气" }]);
     const phoneAlarm = "伸手摸一下床头柜上的手机确认明早六点五十的闹钟已设好";
     for (const field of ["label", "intent", "exclusiveGroup"] as const) {
       for (const unsafe of ["拿起床头柜上的手机，随便刷点什么", phoneAlarm])
-        await rejected({ opportunities: [{ label: "在屋里活动", intent: "走到窗边", [field]: unsafe }] }, /WORLD_DEVICE_BOUNDARY/);
+        await filtered([{ label: "在屋里活动", intent: "走到窗边", [field]: unsafe }]);
     }
-    await rejected({ opportunities: [{ label: "随便刷点什么", intent: "拿起床头柜上的手机" }] }, /WORLD_DEVICE_BOUNDARY/);
-    await rejected({ opportunities: [{ label: "睡前再确认一次闹钟", intent: phoneAlarm }] }, /WORLD_DEVICE_BOUNDARY/);
-    await rejected({ opportunities: [{ label: "确认明早六点五十的闹钟已设好", intent: "伸手摸一下床头柜上的手机" }] }, /WORLD_DEVICE_BOUNDARY/);
+    await filtered([{ label: "随便刷点什么", intent: "拿起床头柜上的手机" }]);
+    await filtered([{ label: "睡前再确认一次闹钟", intent: phoneAlarm }]);
+    await filtered([{ label: "确认明早六点五十的闹钟已设好", intent: "伸手摸一下床头柜上的手机" }]);
     await rejected({ situation: "你摸了一下手机，确认明早六点五十的闹钟已设好。" }, /WORLD_DEVICE_BOUNDARY/);
     await rejected({ situation: "你握着手机，拇指在屏幕上划了六七分钟。" }, /WORLD_DEVICE_BOUNDARY/);
     await rejected({ situation: "当前日期：2001-01-01。" }, /WORLD_TIME_CONFLICT/);
-    await rejected({ opportunities: [{ label: "看看周围", intent: "今天是2001-01-01，出去散步" }] }, /WORLD_TIME_CONFLICT/);
-    await rejected({ opportunities: Array.from({ length: 5 }, () => ({ label: "看门", intent: "看看院门" })) }, /最多4项/);
-    await rejected({ opportunities: [{ label: "看门", intent: "看看院门", completed: true }] }, /最多4项/);
+    await filtered([{ label: "看看周围", intent: "今天是2001-01-01，出去散步" }]);
+    const fiveValid = Array.from({ length: 5 }, (_, i) => ({ label: `看看花盆${i + 1}`, intent: `看看院子里第${i + 1}个花盆` }));
+    await filtered(fiveValid, fiveValid.slice(0, 4));
+    await filtered([{ label: "看门", intent: "看看院门", completed: true }]);
+    const ordinaryChoice = { label: "整理花盆", intent: "把院子里的花盆摆整齐" };
+    await filtered([{ label: "读通知", intent: "查看手机的通知" }, ordinaryChoice], [ordinaryChoice]);
     const physicalClock = [{ label: "检查机械闹钟", intent: "放下手机，检查床头独立的机械闹钟是否已设好" }];
     handler = () => response({ perceptions: [{ actorId: "bot", text: "床头放着一只机械闹钟。", opportunities: physicalClock }] });
     const physicalView = await runtime.observe("bot", { intent: "看看房间" });
@@ -134,20 +149,23 @@ async function main() {
     await assert.rejects(runtime.evolve("一阵微风。"), /在场角色/);
     assert.throws(() => store.commit({ idempotencyKey: "bad-direct", source: "fixture", perceptions: [{ actorId: "bot", text: "门边安静。", opportunities: [{ label: "", intent: "看看院门" }] }] }), /有效文本/);
     assert.throws(() => store.commit({ idempotencyKey: "bad-receipt", source: "app_action", toolReceipt: { actorId: "bot", text: "已保存。", status: "completed", opportunities: [] } as any }), /不能附加/);
-    const schema = worldResolutionTool().function.parameters as any;
+    const schema = worldResolutionTool(false, false, { kind: "action", allowWorldPatch: true }).function.parameters as any;
     const choiceSchema = schema.properties.perceptions.items.properties.opportunities;
     assert.equal(choiceSchema.maxItems, 4);
     assert.equal(choiceSchema.minItems, undefined, "the schema does not force quiet scenes to invent choices");
     assert.ok(!schema.properties.perceptions.items.required.includes("opportunities"));
-    for (const guidance of [WORLD_PROMPT_DEFAULTS.narrativeSystem, choiceSchema.description]) {
-      assert.match(guidance, /有选择可做.*2至4/);
-      assert.match(guidance, /喝水.*休息.*收拾/);
-      assert.match(guidance, /不强迫.*(?:探索|冒险)/);
-      assert.match(guidance, /同义选项凑数/);
-      assert.match(guidance, /真实睡眠.*安静等待.*(?:省略|空数组)/);
-      assert.match(guidance, /(?:制造人物|制造新?事件)/);
-      assert.match(guidance, /手机.*闹钟.*(?:软件|工具)/);
-    }
+    const guidance = buildWorldTaskPrompt({ narrativeSystem: WORLD_PROMPT_DEFAULTS.narrativeSystem, worldDef: "", botDef: "", kind: "action", allowWorldPatch: true });
+    assert.match(guidance, /只在有新决定可做时给最多4个有区别/);
+    assert.match(guidance, /喝水.*休息.*收拾/);
+    assert.match(guidance, /不强迫冒险/);
+    assert.match(guidance, /不为凑选项制造事件或打断真实睡眠、安静等待/);
+    assert.match(guidance, /手机闹钟.*设备工具/);
+    assert.match(guidance, /不暗示已经选择或保证成功/);
+    assert.match(guidance, /省略保留仍有效旧建议，\[\]撤销，非空替换/);
+    assert.match(choiceSchema.description, /可省略.*最多4项.*不为凑数制造事件/);
+    assert.match(choiceSchema.description, /方向须有区别.*不暗示角色已选择或保证成功/);
+    assert.match(choiceSchema.description, /不含软件、通知或真人聊天操作/);
+    assert.match(choiceSchema.description, /省略保留有效旧建议，\[\]撤销，非空替换/);
     assert.equal(schema.properties.perceptions.items.properties.situation.maxLength, 1200);
     console.log("PASS app reads/writes cannot emit scene guidance; actor visibility and direct journal admission remain validated");
   } finally { await runtime.shutdown(); await reopened?.shutdown(); await fs.rm(base, { recursive: true, force: true }); }

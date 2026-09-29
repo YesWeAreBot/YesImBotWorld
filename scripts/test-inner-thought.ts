@@ -10,6 +10,7 @@ import { toNativeToolDefs } from "../src/bot/nativeTools.js";
 import { BOT_TOOLS, toolLayer } from "../src/bot/tools.js";
 import { WorldFiles } from "../src/files.js";
 import { BOT_PROMPT_DEFAULTS, WORLD_PROMPT_DEFAULTS, THOUGHT_RUNTIME_GUIDANCE } from "../src/prompts.js";
+import { buildWorldTaskPrompt } from "../src/world/prompt.js";
 import type { BotEvent, ParsedToolCall, ToolCallRecord } from "../src/types.js";
 
 async function main() {
@@ -53,8 +54,12 @@ async function main() {
     assert.match(BOT_PROMPT_DEFAULTS.constitution, /内心独白/);
     assert.match(THOUGHT_RUNTIME_GUIDANCE, /不强制每次行动前/);
     assert.match(WORLD_PROMPT_DEFAULTS.compressSystem, /当时的想法、回忆或猜测/);
-    assert.match(WORLD_PROMPT_DEFAULTS.narrativeSystem, /pendingActions.*phase=accepted只表示已受理.*phase=ongoing表示已有开始裁定.*不证明行动已经完成/);
-    assert.match(WORLD_PROMPT_DEFAULTS.narrativeSystem, /observe、evolve.*提前宣布成败/);
+    for (const kind of ["observe", "evolve"] as const) {
+      const prompt = buildWorldTaskPrompt({ narrativeSystem: WORLD_PROMPT_DEFAULTS.narrativeSystem, worldDef: "", botDef: "", kind });
+      assert.match(prompt, /pendingActions.*phase=accepted只表示已受理.*phase=ongoing表示已有开始裁定.*不证明行动已经完成/);
+      assert.match(prompt, /本次不得替它们推进过程或提前宣布成败/,
+        `${kind} retains the unfinished-action boundary after task prompt separation`);
+    }
     console.log("PASS inner thought: local-only protocol, no imagined growth, explicit provenance and replay isolation, subjective memory and pending-world-action boundaries.");
   } finally { await fs.rm(base, { recursive: true, force: true }); }
 }

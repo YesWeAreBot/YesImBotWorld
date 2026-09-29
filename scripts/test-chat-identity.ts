@@ -136,11 +136,13 @@ async function main() {
 
   const t = Math.floor(Date.now() / 1000) * 1000;
   await store.store({ ...base, channelId: "history", timestamp: new Date(t - 1000), messageId: "anchor" });
-  history = [{ time: t / 1000, message_id: "history-own", message_seq: 10, sender: { user_id: "100", card: "当时群名片", nickname: "账号昵称" }, message: "历史正文" },
+  history = [{ time: t / 1000, message_id: "history-own", message_seq: 10, sender: { user_id: "100", card: "当时群名片", nickname: "账号昵称", role: "admin", title: "以前的专属头衔", level: "7" }, message: "历史正文" },
     { time: t / 1000, message_id: "history-fallback", message_seq: 11, user_id: "peer", sender: { card: "", nickname: "真实回退昵称" }, message: "另一个正文" }];
   assert.equal(await (messenger as any).syncGroupHistory("onebot", "history", "100"), 2);
   assert.equal(rows.find(row => row.messageId === "history-own")!.username, "当时群名片");
   assert.equal(rows.find(row => row.messageId === "history-own")!.senderOrigin, "unknown");
+  assert.deepEqual(rows.find(row => row.messageId === "history-own")!.memberMetadata,
+    { role: "admin", specialTitle: "以前的专属头衔", level: "7" }, "history preserves the actual sender snapshot, not current member profile data");
   assert.equal(rows.find(row => row.messageId === "history-fallback")!.username, "真实回退昵称");
   assert.equal(rows.find(row => row.messageId === "history-fallback")!.userId, "peer");
 

@@ -30,7 +30,7 @@
       historySearch.addEventListener('input', function () { historyLimit = 50; renderLibrary(); });
       historyMore.type = 'button'; historyMore.addEventListener('click', function () { historyLimit += 50; renderLibrary(); });
       tabs.setAttribute('role', 'tablist'); tabs.setAttribute('aria-label', '浏览器视图');
-      screenshot.alt = '浏览器最近一次实际截图'; screenshot.draggable = false; screenshot.referrerPolicy = 'no-referrer';
+      screenshot.alt = '网页操作画面（不含手机与浏览器外壳）'; screenshot.draggable = false; screenshot.referrerPolicy = 'no-referrer';
       screenshot.tabIndex = 0;
       function ready(tool) { return !disposed && !busy && !!options.available(tool); }
       function execute(tool, args) {
@@ -59,7 +59,7 @@
           var atStart = entry.tool === 'go_back' && state.library && state.library.canGoBack === false;
           var atEnd = entry.tool === 'go_forward' && (!state.library || state.library.canGoForward !== true);
           entry.node.disabled = !ready(entry.tool) || !!atStart || atEnd;
-          entry.node.hidden = state.mode === 'virtual' && ['reload', 'scroll', 'save_screenshot', 'press_key'].indexOf(entry.tool) >= 0;
+          entry.node.hidden = state.mode === 'virtual' && (['reload', 'scroll', 'save_screenshot', 'press_key'].indexOf(entry.tool) >= 0 || entry.node.dataset.browserPurpose === 'control');
         });
         media.querySelectorAll('[data-browser-tool]').forEach(function (entry) { entry.disabled = entry.dataset.browserUnavailable === 'true' || !ready(entry.dataset.browserTool); });
         [[address, 'open_url'], [search, 'search']].forEach(function (entry) { var blocked = !ready(entry[1]); entry[0].disabled = blocked && document.activeElement !== entry[0]; entry[0].readOnly = blocked; });
@@ -117,8 +117,9 @@
       var scroll = node('div', 'browser-scroll-controls');
       button('↑ 上滚', 'scroll', function () { return { revision: state.revision, pixels: -Math.round((state.viewport && state.viewport.height || 600) * 0.65) }; }, scroll);
       button('↓ 下滚', 'scroll', function () { return { revision: state.revision, pixels: Math.round((state.viewport && state.viewport.height || 600) * 0.65) }; }, scroll);
-      button('继续阅读', 'scroll_down', version, scroll); button('重新截图', 'screenshot', {}, scroll);
-      button('保存截图', 'save_screenshot', version, scroll);
+      button('继续阅读', 'scroll_down', version, scroll);
+      button('刷新操作画面', 'screenshot', { purpose: 'control' }, scroll).dataset.browserPurpose = 'control';
+      button('保存带壳截图', 'screenshot', {}, scroll);
       button('Enter', 'press_key', function () { return { revision: state.revision, key: 'Enter' }; }, scroll);
       button('Esc', 'press_key', function () { return { revision: state.revision, key: 'Escape' }; }, scroll);
       pictureArea.appendChild(scroll); textArea.append(notice, article, media, actionTitle, actions); content.append(pictureArea, textArea);
@@ -245,7 +246,7 @@
           if (url) screenshot.src = url; else screenshot.removeAttribute('src');
         }
         screenshot.hidden = !current; pictureArea.classList.toggle('browser-no-frame', !current);
-        frameHint.textContent = localImage ? '正在查看页内图片，不可作为网页坐标操作。按 Esc 返回网页截图。' : frame ? '点按截图操作页面，也可以使用右侧的文字控件。此图是最近读取的实际画面。' : '目前没有截图，可使用文字、链接与页面控件继续浏览。';
+        frameHint.textContent = localImage ? '正在查看页内图片，不可作为网页坐标操作。按 Esc 返回网页截图。' : frame ? '这是用于点按的网页原始画面，不含外壳。要分享手机截屏，请点“保存带壳截图”。' : '目前没有操作画面，可使用文字、链接与页面控件继续浏览。';
         root.classList.toggle('browser-has-frame', !!current); updateDisabled();
       }
       function update() {

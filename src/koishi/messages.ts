@@ -1,6 +1,7 @@
 import type { Context } from "koishi";
 import { channelKey } from "./channels.js";
 import type { ConversationContext } from "./conversation.js";
+import type { GroupMemberMetadata } from "./group-metadata.js";
 import { orderBetween } from "./message-order.js";
 
 export interface MessageOrderTicket { observedAt: Date; key: Promise<string> }
@@ -51,6 +52,8 @@ export interface WorldMessageRow {
   isDirect?: boolean;
   /** 入站消息的会话类型、真实 @ / 引用对象与媒体形态；旧记录为未知。 */
   conversation?: ConversationContext | null;
+  /** Sender's observed group role/titles at this message, not today's profile. */
+  memberMetadata?: GroupMemberMetadata | null;
 }
 
 /**
@@ -93,6 +96,7 @@ export class MessageStore {
         messageId: { type: "string", length: 255, initial: "" },
         isDirect: { type: "boolean", nullable: true },
         conversation: { type: "json", nullable: true },
+        memberMetadata: { type: "json", nullable: true },
       },
       { autoInc: true, primary: "id" },
     );

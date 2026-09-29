@@ -60,9 +60,15 @@ async function initializationStagesCannotSurviveReset() {
       await assert.rejects(f.world.ensureWorld()); await assert.rejects(f.world.initialize("不得复活", "不得复活"));
       assert.equal(calls, callsAfterStop, "stopped entry points cannot resume implicitly");
       await f.files.reset(); f.world.resetSessionState(); f.world.resume();
-      await bounded(f.world.initialize("新角色", "新房间"));
+      let restarted = false;
+      const initialization = f.world.initialize("新角色", "新房间").then(() => { restarted = true; });
+      await tick(); await tick();
+      assert.equal(restarted, false, "a provider ignoring abort still owns the same endpoint until its request exits");
+      assert.equal(calls, callsAfterStop, "new-generation inference cannot overlap a retiring provider request");
+      late.resolve(response(blocked));
+      await bounded(initialization);
       const before = { meta: await f.files.readText(f.files.meta), clock: await f.files.readText(f.files.clock), shell: await f.files.readPhoneShell(), state: (await f.world.runtime.store()).snapshot(), calls };
-      late.resolve(response(blocked)); await tick(); await tick();
+      await tick(); await tick();
       assert.deepEqual({ meta: await f.files.readText(f.files.meta), clock: await f.files.readText(f.files.clock), shell: await f.files.readPhoneShell(), state: (await f.world.runtime.store()).snapshot(), calls }, before, `late ${blocked} response cannot write or start another phase in the new world`);
       assert.equal(f.world.residentBotName, "新角色");
     } finally { await f.world.shutdown(); }

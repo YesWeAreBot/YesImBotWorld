@@ -1,3 +1,4 @@
+import { worldInputText } from "./world-input-fixture.js";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
@@ -91,10 +92,10 @@ async function structuredMigration(root: string): Promise<void> {
     f.setInfer(async (messages, tools) => {
       assert.equal(tools[0]!.function.name, "resolve_world");
       const body = JSON.parse([...messages].reverse().find(message => message.role === "user")!.content as string);
-      assert.equal(body.time, 110, "the current clock remains authoritative; importing a future record cannot silently move the present");
-      assert.equal(body.timeAuthority.tu, 110); assert.equal(body.stateUpdatedAt, 123); assert.equal(body.stateAsOf.tu, 123);
-      assert.match(body.stateAheadOfClock, /晚于当前程序时钟/); assert.equal(body.elapsedWorldSeconds, 0, "a future imported snapshot cannot create negative elapsed time or an invented advance");
-      assert.match(body.worldState, /今天想吃什么/); assert.match(body.worldState, /NPC_PRIVATE_SECRET/, "World receives omniscient state while Bot never does");
+      assert.equal(body.timeAuthority.tu, 110, "the current clock remains authoritative; importing a future record cannot silently move the present");
+      assert.equal(body.timeAuthority.tu, 110); assert.equal(Object.hasOwn(body, "stateUpdatedAt"), false); assert.equal(body.stateAsOf.tu, 123);
+      assert.equal(body.stateAheadOfClock, true); assert.equal(body.elapsedWorldSeconds, 0, "a future imported snapshot cannot create negative elapsed time or an invented advance");
+      assert.match(worldInputText(body), /今天想吃什么/); assert.match(worldInputText(body), /NPC_PRIVATE_SECRET/, "World receives omniscient state while Bot never does");
       return result({ perceptions: [] });
     });
     await current.runtime.evolve("程序时钟尚未赶上迁移记录，没有可结算的正向流逝。"); assert.equal(f.requests(), 1);
@@ -106,7 +107,7 @@ async function structuredMigration(root: string): Promise<void> {
       const body = JSON.parse([...messages].reverse().find(message => message.role === "user")!.content as string);
       assert.equal(body.timeAuthority.tu, 124); assert.equal(body.stateAsOf.tu, 123); assert.equal(body.elapsedWorldSeconds, 1);
       assert.equal(body.stateAheadOfClock, undefined);
-      return result({ worldState: body.worldState + "\n现在店员告知今日面食需要等十分钟。", externalChanges: [{ id: "clerk", description: "店员补充说明今日面食的等待时间。" }], perceptions: [{ actorId: "bot", text: "店员补充道：“面要等十分钟，你可以先看看其他的。”", changeIds: ["clerk"] }] });
+      return result({ worldState: (await aligned.runtime.store()).snapshot().worldState + "\n现在店员告知今日面食需要等十分钟。", externalChanges: [{ id: "clerk", description: "店员补充说明今日面食的等待时间。" }], perceptions: [{ actorId: "bot", text: "店员补充道：“面要等十分钟，你可以先看看其他的。”", changeIds: ["clerk"] }] });
     });
     await aligned.runtime.evolve("店员继续说明等待时间。"); assert.equal(f.requests(), 2);
     const committed = (await aligned.runtime.store()).snapshot(), perception = await aligned.runtime.peek(); await aligned.runtime.shutdown();

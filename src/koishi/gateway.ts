@@ -17,6 +17,7 @@ import type { RequestStore } from "./requests.js";
 import { anonymousChatNoticeEvidence, chatMessageEvidence, conversationKind, conversationLabel, describeConversation, isStickerElement, type ConversationContext } from "./conversation.js";
 import { messageSequence } from "./message-order.js";
 import { firstName, formatMessageSender, isLegacySenderPlaceholder, sessionSenderName } from "./identity.js";
+import { sessionGroupMemberMetadata } from "./group-metadata.js";
 import { canUsePhone, canPerceivePhone } from "../phone-state.js";
 export { isStickerElement } from "./conversation.js";
 
@@ -394,6 +395,7 @@ export class Gateway {
   /** Called only for successful adapter receipts, never an attempted before-send. */
   private async handleConfirmedSelfSent(message: ConfirmedSelfMessage, ticket = this.store.captureLive()): Promise<void> {
     const { bot, channelId, messageId, session } = message;
+    const memberMetadata = session?.userId === bot.selfId ? sessionGroupMemberMetadata(session) : undefined;
     const platform = bot.platform ?? "unknown";
     const key = channelKey(platform, channelId, bot.selfId);
     if (messageId && await this.store.findByMessageId(platform, channelId, messageId, bot.selfId)) return;
@@ -416,6 +418,7 @@ export class Gateway {
       userId: bot.selfId, username: firstName(observedName, identity.displayName), content, timestamp: new Date(message.timestamp), timestampSource: message.timestampSource ?? "local-confirmed", platformSequence: message.platformSequence, self: true, senderOrigin: "external", senderOwned: true, messageId,
       isDirect: direct ?? channelId.startsWith("private:"),
       conversation,
+      memberMetadata,
     }, ticket);
     // Store all enabled modes, but expand media only when that mode actually exposes
     // the message. A put-down phone event must never smuggle images into awareness.
@@ -448,6 +451,7 @@ export class Gateway {
   private async handle(session: Session, ticket: MessageOrderTicket = this.captureSessionTicket(session), arrivalPermission?: boolean): Promise<void> {
     if (!session.content && !session.elements?.length) return;
     if (!consistentAccountSession(session)) return;
+    const memberMetadata = sessionGroupMemberMetadata(session);
     if (session.userId && session.bot && session.platform === session.bot.platform && String(session.userId) === String(session.selfId ?? session.bot.selfId)) {
       await this.handleSelfEcho(session, ticket);
       return;
@@ -484,6 +488,7 @@ export class Gateway {
       messageId: session.messageId ?? "",
       isDirect: session.isDirect,
       conversation,
+      memberMetadata,
     }, ticket);
 
     await this.notifyList.receive?.(key, saved, notifyOnArrival);
@@ -647,7 +652,7 @@ export class Gateway {
     const msgTag =
       `〔聊天记录 #${sender.id}〕` + (needsMsgIds(this.ops) && session.messageId ? ` (msg:${session.messageId})` : "") + "\n";
     const identity = await this.names.identity(key, { isDirect: session.isDirect, guildId: session.guildId });
-    const who = formatMessageSender(sender, identity);
+    const who = formatMessageSender(sender, identity, this.cfg.groupMetadata);
     const header = `你正留意着 ${await this.names.display(key)}，看到新消息（${conversationLabel(conversation, session.selfId ?? session.bot?.selfId)}）\n${identity.text}\n${msgTag}发送者：${who}\n消息正文：\n`;
     return prefixRichText(header, rendered, "\n〔该条消息结束〕");
   }
@@ -663,7 +668,7 @@ export class Gateway {
         const rendered = await this.renderer.render(content);
         const msgTag = `〔聊天记录 #${sender.id}〕` + (needsMsgIds(this.ops) && session.messageId ? ` (msg:${session.messageId})` : "") + "\n";
         const identity = await this.names.identity(key, { isDirect: session.isDirect, guildId: session.guildId });
-        const who = formatMessageSender(sender, identity);
+        const who = formatMessageSender(sender, identity, this.cfg.groupMetadata);
         const header = `${cue}：收到来自 ${await this.names.display(key)} 的消息（${conversationLabel(conversation, session.selfId ?? session.bot?.selfId)}）\n${identity.text}\n${msgTag}发送者：${who}\n消息正文：\n`;
         return prefixRichText(header, rendered, "\n〔该条消息结束〕");
       }

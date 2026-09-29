@@ -427,14 +427,19 @@ var PRIMARY = {
   world: ['baseURL', 'apiKey', 'model', 'stream'],
   clock: ['syncRealTime', 'epoch', 'realSecondsPerUnit', 'tingleEveryUnits', 'tingleMode', 'tingleMinUnits', 'tingleMaxUnits'],
   apps: ['chatAppName', 'botManagedNotifications', 'weatherEnabled', 'weatherDefaultCity', 'browserEnabled', 'browserHomeURL', 'browserSearchURL', 'browserSearchFallbackURLs', 'browserAutoScreenshot', 'clockEnabled', 'camera', 'assistant', 'phoneResolution', 'phoneShellImage', 'notesEnabled', 'computer'],
-  messaging: ['notifyChannels', 'botManagedNotifyChannels', 'notifyPolicy', 'wakeOnNotify', 'offlineHistory', 'typingCharsPerSec', 'sendDeferFactor']
+  messaging: ['notifyChannels', 'botManagedNotifyChannels', 'notifyPolicy', 'wakeOnNotify', 'offlineHistory', 'groupMetadata', 'typingCharsPerSec', 'sendDeferFactor']
 };
 var CFG_ICONS = {root:'sliders', bot:'cpu', world:'gauge', clock:'activity', platformOps:'phone', apps:'monitor', captioners:'image', tts:'film', media:'folder', webui:'sliders', messaging:'edit'};
 var GROWTH_FIELD_LABELS = { enabled:'自动整理与回忆', minEpisodes:'积累几段经历后整理', reviewIntervalMs:'整理间隔（现实毫秒）', reviewTimeoutMs:'等待与生成超时（毫秒）', maxInputChars:'每次整理的输入字符预算', recallCount:'每次最多唤起几条认识' };
 var BOT_FIELD_LABELS = { strictToolLoop:'等待工具结果', blockingAct:'非严格模式：等待上一行动', sendBlocking:'非严格模式：等待上一发送' };
 var AUXILIARY_LLM_FIELD_LABELS = {mode:'模型配置方式',baseURL:'模型端点',apiKey:'API 密钥',model:'模型名称',temperature:'采样温度',maxTokens:'最大输出 Token',disableThinking:'关闭思考模式',stream:'流式返回'};
 function isAuxiliaryLlmGroup(path){return path.length===3 && path[0]==='bot' && path[1]==='growth' && path[2]==='llm';}
-function cfgFieldName(path){ if(isAuxiliaryLlmGroup(path.slice(0,-1))) return AUXILIARY_LLM_FIELD_LABELS[path[path.length-1]] || path[path.length-1]; if(path.length===2&&path[0]==='bot')return BOT_FIELD_LABELS[path[1]] || path[1]; return path[0] === 'bot' && path[1] === 'growth' ? GROWTH_FIELD_LABELS[path[2]] || path[path.length-1] : path[path.length-1]; }
+function cfgFieldName(path){
+  if(path[0]==='messaging'&&path[1]==='groupMetadata')return path.length===2 ? '群身份与头衔' : {role:'群聊角色',specialTitle:'群授予头衔',levelTitle:'等级头衔'}[path[2]] || path[path.length-1];
+  if(isAuxiliaryLlmGroup(path.slice(0,-1))) return AUXILIARY_LLM_FIELD_LABELS[path[path.length-1]] || path[path.length-1];
+  if(path.length===2&&path[0]==='bot')return BOT_FIELD_LABELS[path[1]] || path[1];
+  return path[0] === 'bot' && path[1] === 'growth' ? GROWTH_FIELD_LABELS[path[2]] || path[path.length-1] : path[path.length-1];
+}
 function updateToolLoopPolicy(){
   document.querySelectorAll('[data-config-path="bot.blockingAct"],[data-config-path="bot.sendBlocking"]').forEach(function(input){ input.disabled=cfgCache?.bot?.strictToolLoop!==false; });
 }
@@ -1172,15 +1177,16 @@ function phoneShellPane(shellHtml, meta){
   var body = el('div', {cls:'body'});
   body.appendChild(el('p', {cls:'hint', text:'同一份 HTML 包含手机状态栏与浏览器工具栏，保留 {{screen}} 等占位符。已有外壳会跨世界重置与重新创世复用；手动重新设计只改变外观，不改剧情。'}));
   // 预览 iframe：用样本值替换占位符，展示外壳布局效果
-  var preview = el('iframe', {sandbox:'', referrerpolicy:'no-referrer', style:'width:100%;height:560px;border:1px solid var(--line);border-radius:10px;background:#fff'});
+  var preview = el('iframe', {sandbox:'', referrerpolicy:'no-referrer', title:'手机与浏览器外壳预览', style:'display:block;width:100%;max-width:420px;height:auto;aspect-ratio:5 / 8;margin:0 auto;border:1px solid var(--line);border-radius:10px;background:#fff'});
   function renderPreview(){
+    var w = meta.phone && meta.phone.width ? meta.phone.width : 800;
+    var h = meta.phone && meta.phone.height ? meta.phone.height : 1280;
+    preview.style.aspectRatio = w + ' / ' + h;
     var html = shellHtml || '';
     if(!html.trim()){
       preview.srcdoc = '<div style="font-family:sans-serif;color:#888;display:flex;align-items:center;justify-content:center;height:100%">' + (visitor ? '（尚未设置外壳，管理员可手动生成或编辑）' : '（尚未设置外壳，可用上方按钮生成，或在下方编辑 HTML）') + '</div>';
       return;
     }
-    var w = meta.phone && meta.phone.width ? meta.phone.width : 800;
-    var h = meta.phone && meta.phone.height ? meta.phone.height : 1280;
     var sample = html
       .replace(/\{\{\s*screen\s*\}\}/g, SCREEN_PLACEHOLDER)
       .replace(/\{\{\s*url\s*\}\}/g, 'https://example.com/')

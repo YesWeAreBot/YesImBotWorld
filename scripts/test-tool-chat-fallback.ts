@@ -68,7 +68,7 @@ async function main() {
     assert.ok(context.stream.some(entry => entry.kind === "event" && /现在新增可用/.test(entry.event.content) && /send\(/.test(entry.event.content)));
     assert.ok(context.stream.every(entry => entry.kind !== "event" || !entry.event.toolAvailability || !/原生 function 声明|正文 JSON/.test(entry.event.content)), "capability changes do not repeat the protocol preamble");
     await execute(body("read_channel", { n: 10 }));
-    await execute(body("send", { msg: "实际写出的回复" }));
+    await execute(body("send", { id: "onebot@fixture:channel", msg: "实际写出的回复" }));
     assert.deepEqual(sent, [{ channel: "onebot@fixture:channel", msg: "实际写出的回复" }]);
     assert.equal(worldCalls, 0, "new native declarations are unnecessary: the real tools execute directly without act or another model");
     assert.ok(requests.some(request => JSON.stringify(request.messages).includes("正文") && JSON.stringify(request.messages).includes("select_channel")), "fallback guidance reaches the real model request, not only a local notice");
@@ -86,7 +86,7 @@ async function main() {
       assert.equal(textParsed.name, name); assert.equal(nativeParsed.name, name);
       assert.deepEqual(textParsed.arguments, args); assert.deepEqual(nativeParsed.arguments, args);
       assert.equal(agent.currentToolNames().includes(name), false, "a navigable candidate is still subject to the actual execution gate");
-      if (name === "send") assert.match(await agent.prepareNavigation(textParsed, () => true), /缺少目标频道/,
+      if (name === "send") assert.match(await agent.prepareNavigation(textParsed, () => true), /send 需要明确的频道 id/,
         "closing the app cannot silently redirect a targetless send to the last chat or notification");
       assert.equal(agent.status().phoneUi.chatOpen, false, "parsing and rejected target resolution have no navigation side effect");
     }

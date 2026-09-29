@@ -1,3 +1,4 @@
+import { worldInputText } from "./world-input-fixture.js";
 /** Deterministic local clocks and fake inference only; never touches a running world. */
 import assert from "node:assert/strict";
 import { promises as fs } from "node:fs";
@@ -21,7 +22,7 @@ const custom: CustomCalendar = { kind: "custom", era: "星历", units: [{ name: 
 const response = (value: unknown): ChatResult => ({ content: "", toolCalls: [{ id: "local", type: "function", function: { name: "resolve_world", arguments: JSON.stringify(value) } }] });
 const inputOf = (messages: ChatMessage[]) => {
   const task = messages.filter(message => message.role === "user").map(message => JSON.parse(String(message.content)))
-    .find(value => typeof value.kind === "string" && Object.hasOwn(value, "worldState"));
+    .find(value => typeof value.kind === "string" && (Object.hasOwn(value, "worldState") || Object.hasOwn(value, "worldDocument")));
   assert.ok(task, "read the original world task rather than a later validation diagnostic");
   return task;
 };
@@ -77,9 +78,9 @@ async function main(): Promise<void> {
     const kinds: string[] = [];
     handler = async messages => {
       const input = inputOf(messages); kinds.push(input.kind);
-      assert.equal(input.time, input.timeAuthority.tu); assert.equal(input.timeLine, input.timeAuthority.timeLine);
+      assert.equal(Object.hasOwn(input, "time"), false); assert.equal(Object.hasOwn(input, "timeLine"), false);
       assert.equal(input.timeAuthority.date, "2026-09-19"); assert.equal(input.timeAuthority.utcOffset, "+08:00");
-      assert.match(messages[0]!.content as string, /程序时间边界/); assert.ok((messages[0]!.content as string).endsWith(WORLD_TIME_AUTHORITY));
+      assert.match(messages[0]!.content as string, /程序时间边界/); assert.ok((messages[0]!.content as string).includes(WORLD_TIME_AUTHORITY));
       if (input.kind === "initialize") return response(initial());
       return response({ perceptions: input.kind === "evolve" || input.kind === "leave" ? [] : [{ actorId: input.actorId, text: "窗外传来鸟鸣。" }], ...(input.kind === "action" ? { outcome: { status: "completed" } } : {}) });
     };
@@ -96,7 +97,7 @@ async function main(): Promise<void> {
     await store.commit({ idempotencyKey: "old-wrong-date", source: "migration", worldState: "当前日期：2018-01-02。房间安静。\n历史：2010年5月1日落成。", actors: { bot: { ...original.actors.bot!, state: "当前日期：2018-01-02。你站在窗边。" } }, perceptions: [{ actorId: "bot", text: "今天是2018-01-02。你站在窗边。" }] });
     const journal = await fs.readFile(f.files.narrativeJournal, "utf8");
     handler = async messages => {
-      const input = inputOf(messages); assert.doesNotMatch(input.worldState, /2018-01-02/); assert.match(input.worldState, /2010年5月1日/);
+      const input = inputOf(messages); assert.doesNotMatch(worldInputText(input), /2018-01-02/); assert.match(worldInputText(input), /2010年5月1日/);
       assert.doesNotMatch(JSON.stringify(input.actors), /2018-01-02/); assert.equal(input.stateAsOf.date, "2026-09-19");
       assert.ok(input.elapsedWorldSeconds >= 0); return response({ perceptions: [] });
     };
@@ -114,8 +115,8 @@ async function main(): Promise<void> {
         assert.equal(input.timeAuthority.date, "2026-09-19"); wall += 90_000;
         return response(initial("2026-09-19"));
       }
-      assert.equal(input.timeAuthority.date, "2026-09-20"); assert.doesNotMatch(input.worldState, /当前日期：2026-09-19/);
-      assert.match(input.worldState, /2010年5月1日/); return response({ perceptions: [] });
+      assert.equal(input.timeAuthority.date, "2026-09-20"); assert.doesNotMatch(worldInputText(input), /当前日期：2026-09-19/);
+      assert.match(worldInputText(input), /2010年5月1日/); return response({ perceptions: [] });
     });
     await midnightRuntime.ensure(); assert.equal(midnightCalls, 1, "crossing midnight does not trigger a false invalid-generation retry");
     await midnightRuntime.evolve("继续经过片刻。"); assert.equal(midnightCalls, 2); await midnightRuntime.shutdown();

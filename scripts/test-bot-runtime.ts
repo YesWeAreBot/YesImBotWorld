@@ -295,19 +295,19 @@ async function recoverInterruptedCompression() {
   assert.equal(await f.files.exists(`${f.files.base}/context-commit.json`), false);
 }
 async function observationProvenance() {
-  const observation = { actorId: "visitor:authenticated-session", observationId: "obs_remote", sourceEventIds: ["original_speech"], entities: [], utterances: [], worldSequence: 1, observedAt: 0 };
+  const observation = { narrative: "琴师主动提出可以每周教我练琴。", actorId: "visitor:authenticated-session", observationId: "obs_remote", sourceEventIds: ["original_speech"], entities: [], utterances: [], worldSequence: 1, observedAt: 0 };
   const f = await fixture();
   f.agent.pushEvent("world", JSON.stringify(observation));
   await f.agent.drainMailbox();
   const event = f.context.stream.find((e) => e.kind === "event") as any;
   assert.deepEqual(event.event.originEventIds, ["original_speech"]);
-  const reflection = await f.agent.growth.reflect({ kind: "relationship", subject: "NPC", statement: "他说了一句话", evidenceIds: [event.event.id] }, 1);
+  const reflection = await f.agent.growth.reflect({ kind: "relationship", subject: "NPC", statement: "琴师愿意指导我练琴", evidenceIds: [event.event.id], insight: { dimension: "练琴指导", significance: "以后练琴遇到难题有了可以求助的对象。", anchors: [{ eventId: event.event.id, quote: "琴师主动提出可以每周教我练琴" }] } }, 1);
   assert.deepEqual(reflection.view.records[0].rootEventIds, ["original_speech"]);
   // Re-reading the very same remote projection is not another social interaction.
   f.agent.pushEvent("world", JSON.stringify({ ...observation, observationId: "obs_remote_2" }));
   await f.agent.drainMailbox();
   const repeated = f.context.stream.at(-1) as any;
-  const update = await f.agent.growth.reflect({ kind: "relationship", subject: "NPC", statement: "他说了一句话", claimId: reflection.view.claimId, evidenceIds: [repeated.event.id] }, 2);
+  const update = await f.agent.growth.reflect({ kind: "relationship", subject: "NPC", statement: "琴师愿意指导我练琴", claimId: reflection.view.claimId, evidenceIds: [repeated.event.id], insight: { dimension: "练琴指导", significance: "以后练琴遇到难题有了可以求助的对象。", anchors: [{ eventId: repeated.event.id, quote: "琴师主动提出可以每周教我练琴" }] } }, 2);
   assert.equal(update.duplicate, true);
   let observed = 0;
   const f2 = await fixture({}, { resolveWait: async () => { observed++; return true; } });

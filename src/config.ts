@@ -31,8 +31,10 @@ export interface BotModelConfig {
   nativeToolCalls: boolean;
   disableWait: boolean;
   ignoreSendDuration: boolean;
-  /** Wait for each autonomous tool's actual result before requesting another decision. Missing legacy values also enable it. */
+  /** Wait for actual autonomous results, with an optional new-chat window during acts. Missing legacy values also enable it. */
   strictToolLoop?: boolean;
+  /** New chat may permit bounded independent device work while an autonomous act is pending. */
+  interruptibleWorldActions?: boolean;
   blockingAct: boolean;
   /** send 的阻塞：上一条还没完成回显前，拒绝新的发送 */
   sendBlocking: boolean;
@@ -147,7 +149,17 @@ export type NotifyPolicy = "count" | "channel" | "content";
 /** 非本插件产生的 Bot 账号消息（其他插件/指令输出等）的呈现方式 */
 export type ExternalSelfMessageMode = "off" | "simulate" | "event" | "silent";
 
+export type GroupMetadataPresentation = "inline" | "on_demand" | "hidden";
+/** The group role and winning title source have separate presentation policies. */
+export interface GroupMetadataConfig {
+  role: GroupMetadataPresentation;
+  specialTitle: GroupMetadataPresentation;
+  levelTitle: GroupMetadataPresentation;
+}
+
 export interface MessagingConfig {
+  /** Presentation only; never grants platform or plugin privileges. */
+  groupMetadata?: GroupMetadataConfig;
   notifyChannels: string[];
   botManagedNotifyChannels: boolean;
   notifyPolicy: NotifyPolicy;
@@ -471,7 +483,10 @@ export const Config: Schema<Config> = Schema.intersect([
         ),
       strictToolLoop: Schema.boolean()
         .default(true)
-        .description("等待工具结果（默认开启）：工具返回实际结果、失败或需要进一步决定的反馈后，才请求下一次 Bot 生成。等待期间世界、消息接收和人工操作继续运行。明确的后台任务以启动回执为本次结果。"),
+        .description("等待工具结果（默认开启）：工具返回实际结果、失败或需要进一步决定的反馈后继续。可按下面设置在等待世界动作时响应新聊天；设备操作仍等待真实回执。等待期间世界、消息接收和人工操作继续运行。"),
+      interruptibleWorldActions: Schema.boolean()
+        .default(true)
+        .description("等待世界动作时响应新聊天：实际收到允许唤醒的新聊天后，可处理少量独立设备操作；不提前发起依赖未返回结果的身体动作。没有新消息或实际设备进展时继续等待，wait/rest仍遵守通知规则。关闭后恢复完整的工具结果等待；仅在‘等待工具结果’开启时生效。模型端点是否并发仍由连接设置决定。"),
       blockingAct: Schema.boolean()
         .default(true)
         .description(
@@ -1152,6 +1167,23 @@ export const Config: Schema<Config> = Schema.intersect([
 
   Schema.object({
     messaging: Schema.object({
+      groupMetadata: Schema.object({
+        role: Schema.union([
+          Schema.const("inline").description("随消息展示"),
+          Schema.const("on_demand").description("查看成员资料时展示"),
+          Schema.const("hidden").description("不展示"),
+        ]).default("inline").description("群聊角色及无特殊头衔时的群主／管理员称号。角色决定身份标识颜色，不影响权限。"),
+        specialTitle: Schema.union([
+          Schema.const("inline").description("随消息展示"),
+          Schema.const("on_demand").description("查看成员资料时展示"),
+          Schema.const("hidden").description("不展示"),
+        ]).default("on_demand").description("特殊头衔文字：优先覆盖群主／管理员称号和等级头衔，群聊角色仍独立保留。隐藏时不会改为显示被覆盖的称号。"),
+        levelTitle: Schema.union([
+          Schema.const("inline").description("随消息展示"),
+          Schema.const("on_demand").description("查看成员资料时展示"),
+          Schema.const("hidden").description("不展示"),
+        ]).default("on_demand").description("普通成员没有特殊头衔时显示的等级头衔。只采用平台真实文字，不把等级数字当作头衔。"),
+      }).description("群聊角色与唯一头衔：先按平台优先级确定实际头衔，再按其来源设置呈现方式。Bot 按需查看需开启 member_info 能力；WebUI 可展开已保存资料。设置影响之后的查看，不改写既有上下文。"),
       notifyChannels: Schema.array(Schema.string())
         .default([])
         .description('Allow Notification 频道列表，格式 "platform:channelId"（如 "onebot:123456"）。"*" 表示所有频道'),

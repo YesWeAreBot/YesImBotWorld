@@ -1,3 +1,4 @@
+import { worldInputText } from "./world-input-fixture.js";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
@@ -54,7 +55,7 @@ async function main(): Promise<void> {
       const body = inputOf(messages); seen.push(body); activeModels++; maxModels = Math.max(maxModels, activeModels);
       try {
         if (seen.length === 1) return await new Promise<ChatResult>(resolve => { firstRelease = resolve; });
-        assert.match(body.worldState, /ORDERED_FIRST/); assert.equal(messages.length, 2, "the next adjudication receives current prose without a persistent World chat history");
+        assert.match(worldInputText(body), /ORDERED_FIRST/); assert.equal(messages.length, 2, "the next adjudication receives current prose without a persistent World chat history");
         return good("店员根据刚才的点单收下钱。", "ORDERED_SECOND：点单和付款都已完成。ADMIN_PRIVATE_SECRET 仍然存在。");
       } finally { activeModels--; }
     };

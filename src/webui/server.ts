@@ -24,6 +24,7 @@ import { normalizeCategory, UNSORTED_CATEGORY, sanitizeFileName } from "../media
 import type { MediaStore } from "../media/store.js";
 import { DEFAULT_PROMPTS, type Prompts, type PromptOverrides } from "../prompts.js";
 import type { WorldClock } from "../clock.js";
+import { resolvePhoneResolution } from "../phone.js";
 import type { ComputerExecResult, ComputerInspection } from "../computer.js";
 import { collectSecretPaths, introspect, validateConfig } from "./schema.js";
 import { debug, type DebugEntry } from "./debug.js";
@@ -34,6 +35,7 @@ import { PAGE_HTML } from "./page.js";
 import { VisitorStore, type VisitorSession, type VisitorGrant, type VisitorPreset, type PlayerProfile } from "./visitors.js";
 import type { PlayerMode } from "../crossing/protocol.js";
 import type { ManualToolResult } from "../bot/agent.js";
+import type { GrowthPageQuery, GrowthPage } from "../bot/growth.js";
 import type { DeviceSession, DeviceControlResult, DeviceOperationMode } from "./device.js";
 import type { BotIdentity } from "./avatar.js";
 import { CommandRequestError, WebCommandRunner } from "./commands.js";
@@ -110,7 +112,7 @@ export interface WebUIHost {
   /** 世界完整结构化真值，仅管理员可查看。 */
   getStructuredWorld?(): Promise<unknown>;
   /** 独立的成长记录，不包含置顶人设或内部上下文。 */
-  getGrowth?(): Promise<unknown>;
+  getGrowth?(query?: GrowthPageQuery): Promise<unknown>;
   getGrowthStatus?(): Promise<unknown>;
   prompts(): Prompts;
   savePromptsOverrides(overrides: PromptOverrides): Promise<void>;
@@ -869,7 +871,31 @@ export class WebUIServer {
     }
     if (pathname === "/api/bot/growth" && method === "GET") {
       if (!host.getGrowth) return void sendJSON(res, 503, { error: "成长记录尚未就绪" });
-      return void sendJSON(res, 200, { growth: await host.getGrowth() });
+      const query: GrowthPageQuery = {};
+      const kind = url.searchParams.get("kind"), lifecycle = url.searchParams.get("lifecycle");
+      if (kind !== null) {
+        if (!["long_term", "all", "relationship", "commitment", "preference", "state", "habit", "trait"].includes(kind)) return void sendJSON(res, 400, { error: "未知成长类型" });
+        query.kind = kind as GrowthPageQuery["kind"];
+      }
+      if (lifecycle !== null) {
+        if (!["active", "inactive", "all"].includes(lifecycle)) return void sendJSON(res, 400, { error: "未知认识状态" });
+        query.lifecycle = lifecycle as GrowthPageQuery["lifecycle"];
+      }
+      for (const key of ["offset", "limit"] as const) {
+        const raw = url.searchParams.get(key);
+        if (raw === null) continue;
+        const value = Number(raw);
+        if (!/^\d+$/.test(raw) || !Number.isSafeInteger(value) || value < (key === "limit" ? 1 : 0)) return void sendJSON(res, 400, { error: "分页参数必须是有效整数" });
+        query[key] = key === "limit" ? Math.min(100, value) : value;
+      }
+      const keyword = url.searchParams.get("keyword");
+      if (keyword !== null) query.keyword = keyword.slice(0, 1000);
+      const result = await host.getGrowth(query);
+      if (result && typeof result === "object" && "items" in result && Array.isArray(result.items)) {
+        const page = result as GrowthPage;
+        return void sendJSON(res, 200, { growth: page.items, page: { total: page.total, offset: page.offset, limit: page.limit, counts: page.counts } });
+      }
+      return void sendJSON(res, 200, { growth: result });
     }
     if (pathname === "/api/bot/growth/status") {
       if (access.kind !== "admin") return void sendJSON(res, 403, { error: "仅管理员可读取成长审阅与拒绝原因" });
@@ -997,6 +1023,7 @@ export class WebUIServer {
       // 打包端点：对访客按 grant 裁剪字段（user 输入的 botDef/worldDef 需 definitions 权限）
       const isVisitor = access.kind === "visitor";
       const can = (g: VisitorGrant) => !isVisitor || this.visitors.can(access.session, g);
+      const meta = can("world_status") ? await host.files.readMeta() : undefined;
       const payload: Record<string, unknown> = {
         botStatus: can("bot_status") ? await host.files.readBotStatus() : "",
         worldStatus: can("world_status") ? await host.files.readWorldStatus(isVisitor) : "",
@@ -1004,7 +1031,8 @@ export class WebUIServer {
         facts: can("facts") ? await readAllNews(host.files.facts) : [],
         botDef: can("definitions") ? await host.files.readText(host.files.botDef) : "",
         worldDef: can("definitions") ? await host.files.readText(host.files.worldDef) : "",
-        meta: can("world_status") ? await host.files.readMeta() : {},
+        meta: meta ?? {},
+        ...(meta ? { phoneResolution: resolvePhoneResolution(host.config.apps.phoneResolution, meta) } : {}),
         phoneShell: can("world_status") ? await host.files.readPhoneShell() : "",
         initialized: await host.isInitialized(),
       };

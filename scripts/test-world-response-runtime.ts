@@ -1,3 +1,4 @@
+import { worldInputText, assertWorldInputText } from "./world-input-fixture.js";
 /** Real runtime/store with deterministic inference; no production world or external services. */
 import assert from "node:assert/strict";
 import { promises as fs } from "node:fs";
@@ -38,7 +39,7 @@ async function jsonCommitsAndSemanticGuards() {
   const f = await fixture();
   try {
     const before = f.store.snapshot();
-    f.setHandler(async input => body({ worldState: input.worldState + "风吹落了一片树叶。", externalChanges: [cause], perceptions: [observed], nextIntervalTU: 60 }));
+    f.setHandler(async input => body({ worldState: f.store.snapshot().worldState + "风吹落了一片树叶。", externalChanges: [cause], perceptions: [observed], nextIntervalTU: 60 }));
     const result = await f.runtime.evolve("外部变化。", { heartbeat: true });
     assert.equal(result.status, "committed"); assert.equal(result.nextIntervalTU, 60); assert.equal(result.attempts, 1);
     assert.equal(result.perceptions, 1); assert.equal(result.sequence, before.sequence + 1);
@@ -97,10 +98,11 @@ async function malformedRepairsPreservePrefix() {
     assert.equal(result.status, "committed"); assert.equal(result.attempts, 3); assert.equal(f.requests.length, 3);
     checkRepairRequests(f.requests, marker);
     const request = JSON.parse(f.requests[0]![1]!.content as string);
-    assert.equal(request.worldState, longState, "a soft memory target never truncates existing world facts");
-    assert.equal(request.worldMemory.currentChars, longState.length);
+    assertWorldInputText(request, longState, "a soft memory target never truncates existing world facts");
+    assert.equal(Object.hasOwn(request.worldMemory, "currentChars"), false);
     assert.equal(request.worldMemory.targetChars, 6000); assert.ok(longState.length > request.worldMemory.targetChars);
-    assert.match(request.worldMemory.guidance, /软目标/); assert.match(request.worldMemory.guidance, /不硬截断/);
+    assert.equal(Object.hasOwn(request.worldMemory, "guidance"), false);
+    assert.match(String(f.requests[0]![0]!.content), /软目标/); assert.match(String(f.requests[0]![0]!.content), /不硬截断/);
     assert.equal(f.store.snapshot().worldState, longState, "repair/event-only round does not compact or silently rewrite memory");
     assert.match(String(f.requests[1]!.at(-1)!.content), /WORLD_RESPONSE_JSON/);
     assert.match(String(f.requests[2]!.at(-1)!.content), /perceptions\[0\]\.text/);
@@ -119,15 +121,15 @@ async function quietAndEventOnlyPersistence() {
     const f = await fixture({ worldState: initial });
     try {
       const saved = f.store.snapshot(), journal = await f.store.exportJournal();
-      f.setHandler(async input => body({ worldState: input.worldState, externalChanges: [], perceptions: [] }));
+      f.setHandler(async input => body({ worldState: worldInputText(input), externalChanges: [], perceptions: [] }));
       const quiet = await f.runtime.evolve("没有外部变化。", { heartbeat: true });
       assert.equal(quiet.status, "quiet"); assert.equal(quiet.attempts, 1); assert.equal(quiet.perceptions, 0);
       assert.deepEqual(f.store.snapshot(), saved); assert.equal(await f.store.exportJournal(), journal);
-      const seen = JSON.parse(f.requests[0]![1]!.content as string).worldState;
+      const seen = worldInputText(JSON.parse(f.requests[0]![1]!.content as string));
       assert.ok(!seen.includes("文件原文不可")); assert.ok(!seen.includes("手机收到")); assert.ok(!seen.includes("\n\n\n"));
       for (const provideState of [false, true]) {
         const before = f.store.snapshot();
-        f.setHandler(async input => body({ ...(provideState ? { worldState: input.worldState } : {}), externalChanges: [cause], perceptions: [] }));
+        f.setHandler(async input => body({ ...(provideState ? { worldState: worldInputText(input) } : {}), externalChanges: [cause], perceptions: [] }));
         const event = await f.runtime.evolve("仅有一阵风经过。", { heartbeat: true });
         assert.equal(event.status, "committed"); assert.equal(event.sequence, before.sequence + 1); assert.equal(event.perceptions, 0);
         assert.equal(f.store.snapshot().worldState, initial); assert.deepEqual(f.store.snapshot().actors, saved.actors);
@@ -145,7 +147,7 @@ async function committedEventHistoryAndDistinctClocks() {
   try {
     const initial = f.store.snapshot(); assert.equal(initial.stateUpdatedAt, 100);
     f.setNow(130);
-    f.setHandler(async input => body({ worldState: input.worldState, externalChanges: [first], perceptions: [] }));
+    f.setHandler(async input => body({ worldState: worldInputText(input), externalChanges: [first], perceptions: [] }));
     const firstResult = await f.runtime.evolve("短暂风声。", { heartbeat: true });
     assert.equal(firstResult.status, "committed");
     assert.equal(inputOfLast().evolutionSinceTU, 100); assert.equal(inputOfLast().elapsedWorldSeconds, 30);
@@ -160,7 +162,7 @@ async function committedEventHistoryAndDistinctClocks() {
     assert.equal(secondInput.evolutionSinceTU, 130); assert.equal(secondInput.elapsedWorldSeconds, 60);
     assert.equal(secondInput.elapsedEvolutionWorldSeconds, 30);
     assert.deepEqual(secondInput.recentEvolution, [{ sequence: firstResult.sequence, worldTime: 130, changes: [first] }]);
-    assert.match(secondInput.recentEvolutionScope, /已发生/); assert.match(secondInput.recentEvolutionScope, /不重复/);
+    assert.equal(Object.hasOwn(secondInput, "recentEvolutionScope"), false, "event scope belongs to the stable task rules");
     assert.equal(f.store.snapshot().worldState, initial.worldState); assert.equal(f.store.snapshot().stateUpdatedAt, 100);
     assert.equal(f.store.snapshot().effectiveAt, 160); assert.equal(f.store.lastEvolutionAt(), 160);
 
@@ -170,7 +172,7 @@ async function committedEventHistoryAndDistinctClocks() {
       f.setNow(now); const quiet = await f.runtime.evolve("没有新的外部变化。", { heartbeat: true });
       assert.equal(quiet.status, "quiet");
       const input = inputOfLast();
-      assert.equal(input.stateUpdatedAt, 100); assert.equal(input.elapsedWorldSeconds, now - 100);
+      assert.equal(input.stateAsOf.tu, 100); assert.equal(input.elapsedWorldSeconds, now - 100);
       assert.equal(input.evolutionSinceTU, 160); assert.equal(input.elapsedEvolutionWorldSeconds, now - 160,
         "quiet checks do not fabricate a new durable evolution timestamp");
       assert.deepEqual(input.recentEvolution, [

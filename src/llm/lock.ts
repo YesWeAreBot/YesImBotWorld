@@ -1,70 +1,130 @@
-/**
- * 同一推理端点（origin）上的互斥锁。
- *
- * 背景：当 Bot-LLM 与 World-LLM 配置成同一个 baseURL，而该端点是"同一时间只能
- * 驻留一个模型"的路由/换载层（llama-swap、按 model 字段切换的代理等）时，
- * 跨模型的并发请求会导致换载失败：World 的请求被无限排队（饿死），
- * 或换载把共享的推理进程杀死（表现为 other side closed → ECONNREFUSED）。
- *
- * 解法：按 baseURL 的 origin 维护 FIFO 队列——同端点的任务依次独占执行。
- * World-LLM 以"整个任务"（完整工具循环）为粒度持锁，一次任务只引发两次换载；
- * Bot-LLM 以单次生成请求为粒度持锁，在 World 任务之间照常插队推进。
- * 两个 LLM 的 baseURL 不同源时，各用各的队列，行为与从前完全一致。
- */
-
-const tails = new Map<string, Promise<unknown>>();
-
-/** 全局开关（由插件配置 serializeSameEndpoint 控制）：关闭后 withEndpointLock 直接执行、不排队 */
-let lockEnabled = true;
-
-export function setEndpointLockEnabled(on: boolean): void {
-  lockEnabled = on;
+/** One active request per endpoint origin; maintenance yields between requests. */
+export interface EndpointLockTiming {
+  phase: "started" | "finished";
+  queuedAt: number;
+  startedAt: number;
+  finishedAt?: number;
+  queueMs: number;
+  runMs?: number;
 }
 
+export interface EndpointLockOptions {
+  /** Existing callers are interactive; maintenance opts into the background lane. */
+  priority?: "interactive" | "background";
+  onTiming?: (sample: EndpointLockTiming) => void;
+}
+
+interface Job {
+  run: () => Promise<unknown>;
+  resolve: (value: unknown) => void;
+  reject: (error: unknown) => void;
+  signal?: AbortSignal;
+  options: EndpointLockOptions;
+  queuedAt: number;
+  queuedMono: number;
+  started: boolean;
+  cancelled: boolean;
+  detach: () => void;
+}
+interface Lane {
+  key: string;
+  active: boolean;
+  scheduled: boolean;
+  interactive: Job[];
+  background: Job[];
+  interactiveStreak: number;
+}
+
+const lanes = new Map<string, Lane>();
+const INTERACTIVE_BURST = 3;
+let lockEnabled = true;
+
+/** Disabling serialization affects new calls; already queued calls retain their order. */
+export function setEndpointLockEnabled(on: boolean): void { lockEnabled = on; }
+
 function originKey(baseURL: string): string {
+  try { return new URL(baseURL).origin; } catch { return baseURL; }
+}
+function abortError(): DOMException { return new DOMException("This operation was aborted", "AbortError"); }
+function timing(job: Job, sample: EndpointLockTiming): void {
+  try { job.options.onTiming?.(sample); } catch { /* Diagnostics cannot fail or retain the endpoint. */ }
+}
+function removeIdleLane(lane: Lane): void {
+  if (!lane.active && !lane.interactive.length && !lane.background.length && lanes.get(lane.key) === lane) lanes.delete(lane.key);
+}
+function schedule(lane: Lane): void {
+  if (lane.active || lane.scheduled) return;
+  lane.scheduled = true;
+  queueMicrotask(() => {
+    lane.scheduled = false;
+    if (lane.active) return;
+    // Same-priority FIFO. While both lanes have work, at most three real-time
+    // requests may overtake the oldest background request before it gets a turn.
+    const background = lane.background.length && (!lane.interactive.length || lane.interactiveStreak >= INTERACTIVE_BURST);
+    const job = (background ? lane.background : lane.interactive).shift();
+    if (!job) { removeIdleLane(lane); return; }
+    lane.interactiveStreak = background || !lane.background.length ? 0 : lane.interactiveStreak + 1;
+    lane.active = true;
+    void execute(job).finally(() => { lane.active = false; removeIdleLane(lane); schedule(lane); });
+  });
+}
+async function execute(job: Job): Promise<void> {
+  if (job.cancelled || job.signal?.aborted) { job.detach(); job.reject(abortError()); return; }
+  job.started = true;
+  const startedAt = Date.now(), startedMono = performance.now();
+  const sample: EndpointLockTiming = { phase: "started", queuedAt: job.queuedAt, startedAt, queueMs: Math.max(0, startedMono - job.queuedMono) };
+  timing(job, sample);
   try {
-    return new URL(baseURL).origin;
-  } catch {
-    return baseURL;
+    // An observer may synchronously stop the owning task when generation starts.
+    if (job.signal?.aborted) throw abortError();
+    job.resolve(await job.run());
+  } catch (error) { job.reject(error); }
+  finally {
+    job.detach();
+    timing(job, { ...sample, phase: "finished", finishedAt: Date.now(), runMs: Math.max(0, performance.now() - startedMono) });
   }
 }
 
 /**
- * 在 baseURL 对应端点的 FIFO 锁内执行 fn。
- * signal：排队等待期间被 abort 时，轮到自己后不再执行 fn、直接抛 AbortError
- * （锁的让渡仍然有序，不会让后来者与前面的持有者重叠）。
+ * Serialize one request. Abort rejects the caller promptly and removes queued work;
+ * an already-running fn keeps the lane until it settles, even if it ignores abort.
+ * Different origins stay independent. Never wrap a multi-request maintenance loop
+ * around this function: acquire separately at each model request instead.
  */
-export function withEndpointLock<T>(
-  baseURL: string,
-  fn: () => Promise<T>,
-  signal?: AbortSignal,
-): Promise<T> {
-  if (signal?.aborted) return Promise.reject(new DOMException("This operation was aborted", "AbortError"));
-  if (!lockEnabled) return fn();
-  const key = originKey(baseURL);
-  const tail = tails.get(key) ?? Promise.resolve();
-  const run = async (): Promise<T> => {
-    if (signal?.aborted) {
-      throw new DOMException("This operation was aborted", "AbortError");
-    }
-    return fn();
-  };
-  // 前一个持有者无论成败，锁都随之释放
-  const next = tail.then(run, run);
-  tails.set(
-    key,
-    next.then(
-      () => undefined,
-      () => undefined,
-    ),
-  );
-  if (!signal) return next;
-  // Abort the caller's wait immediately while retaining its place in the FIFO chain.
-  // The queued run still checks the signal and never invokes fn after cancellation.
+export function withEndpointLock<T>(baseURL: string, fn: () => Promise<T>, signal?: AbortSignal, options: EndpointLockOptions = {}): Promise<T> {
+  if (signal?.aborted) {
+    const at = Date.now();
+    try { options.onTiming?.({ phase: "finished", queuedAt: at, startedAt: at, finishedAt: at, queueMs: 0, runMs: 0 }); }
+    catch { /* Diagnostics cannot replace cancellation. */ }
+    return Promise.reject(abortError());
+  }
   return new Promise<T>((resolve, reject) => {
-    const abort = () => reject(new DOMException("This operation was aborted", "AbortError"));
-    signal.addEventListener("abort", abort, { once: true });
-    next.then(resolve, reject).finally(() => signal.removeEventListener("abort", abort));
-    if (signal.aborted) abort();
+    let lane: Lane | undefined;
+    const job: Job = { run: fn, resolve: value => resolve(value as T), reject, signal, options,
+      queuedAt: Date.now(), queuedMono: performance.now(), started: false, cancelled: false, detach: () => {} };
+    const abort = () => {
+      job.cancelled = true; reject(abortError());
+      if (!job.started) {
+        const finishedAt = Date.now();
+        timing(job, { phase: "finished", queuedAt: job.queuedAt, startedAt: finishedAt, finishedAt,
+          queueMs: Math.max(0, performance.now() - job.queuedMono), runMs: 0 });
+        job.detach();
+        if (lane) {
+          for (const queue of [lane.interactive, lane.background]) {
+            const index = queue.indexOf(job); if (index >= 0) queue.splice(index, 1);
+          }
+          removeIdleLane(lane);
+        }
+      }
+    };
+    job.detach = () => signal?.removeEventListener("abort", abort);
+    signal?.addEventListener("abort", abort, { once: true });
+    if (signal?.aborted) { abort(); return; }
+    if (!lockEnabled) { void execute(job); return; }
+    const key = originKey(baseURL);
+    lane = lanes.get(key);
+    if (!lane) { lane = { key, active: false, scheduled: false, interactive: [], background: [], interactiveStreak: 0 }; lanes.set(key, lane); }
+    (options.priority === "background" ? lane.background : lane.interactive).push(job);
+    schedule(lane);
   });
 }

@@ -7,6 +7,8 @@ import { appendJsonLine } from "../jsonl.js";
 import { projectObservedMessages } from "./perception-fragments.js";
 import { narrativeFactText } from "./narrative-facts.js";
 import { actionContains, chatEvidence, deriveGrowthScope, growthMatchesScope, growthNeedsReview, matchingBehavior, stateBasis, type GrowthMessageEvidence, type GrowthScope } from "./growth-grounding.js";
+import { selectLongitudinalEvidence } from "./growth-longitudinal.js";
+import { validateGrowthInsight, type GrowthInsight } from "./growth-semantics.js";
 
 export type GrowthKind = "relationship" | "commitment" | "preference" | "state" | "habit" | "trait";
 export type ReflectionRelation = "support" | "counter" | "revise" | "retire";
@@ -47,6 +49,8 @@ export interface GrowthRecord {
   scope?: GrowthScope;
   groundingVersion?: 1;
   behavior?: string;
+  insight?: GrowthInsight;
+  semanticVersion?: 1;
 }
 
 export interface GrowthView {
@@ -65,8 +69,10 @@ export interface GrowthView {
   stateTimingCorrection?: StateTimingCorrection;
   correction?: GrowthCorrection;
   needsReview?: boolean;
+  isolationReason?: string;
   scope?: GrowthScope;
   behavior?: string;
+  insight?: GrowthInsight;
   records: GrowthRecord[];
   evidence: PerceivedEvidence[];
 }
@@ -83,6 +89,23 @@ export interface ReflectionInput {
   subjectId?: string;
   expiresAt?: number;
   behavior?: string;
+  insight?: GrowthInsight;
+}
+
+export interface GrowthPageQuery {
+  kind?: GrowthKind | "long_term" | "all";
+  keyword?: string;
+  lifecycle?: "active" | "inactive" | "all";
+  offset?: number;
+  limit?: number;
+  at?: number;
+}
+export interface GrowthPage {
+  items: GrowthView[];
+  total: number;
+  offset: number;
+  limit: number;
+  counts: Record<GrowthKind, number>;
 }
 
 export interface GrowthReviewSnapshot {
@@ -102,6 +125,8 @@ export interface GrowthReviewSnapshot {
   /** A deferred interval has its own cursor; it must never move the current-experience cursor. */
   backlogId?: string;
   reviewEventIds?: string[];
+  /** Reassess the original sources of legacy claims without inventing a new experience. */
+  revalidation?: { claimId: string; recordId: string }[];
 }
 
 export interface GrowthReviewRejection { index: number; reason: string }
@@ -127,6 +152,7 @@ interface ReviewCommit {
   sampledEventIds?: string[];
   relatedEventIds?: string[];
   omittedEvidenceCount?: number;
+  revalidation?: { claimId: string; recordId: string }[];
 }
 
 interface ReviewDeferred {
@@ -185,7 +211,7 @@ export interface GrowthIsolation {
   claims: { claimId: string; recordId: string; subject: string; statement: string; reason: string }[];
 }
 interface ReviewBacklog extends ReviewDeferred { cursor: number }
-interface ReviewOptions { at: number; minimumEpisodes?: number; maxEpisodes?: number; maxEvidence?: number }
+interface ReviewOptions { at: number; minimumEpisodes?: number; maxEpisodes?: number; maxEvidence?: number; secondsPerTU?: number }
 
 interface ReviewRun {
   start: number;
@@ -499,8 +525,8 @@ export class GrowthLedger {
         .flatMap(view => {
           const record = [...view.records].reverse().find(item => item.relation !== "counter")!;
           return seen.has(record.id) ? [] : [{ claimId: view.claimId, recordId: record.id, subject: view.subject, statement: view.statement,
-            reason: view.kind === "habit" || view.kind === "trait" ? "旧倾向缺少可核验的共同自主动作与跨日依据；重复次数本身不证明稳定人格"
-              : "旧聊天认识缺少可核验的发送者或频道范围；不能按名字、当前界面或通知补猜归属" }];
+            reason: view.isolationReason ?? (view.kind === "habit" || view.kind === "trait" ? "旧倾向缺少可核验的共同自主动作与跨日依据；重复次数本身不证明稳定人格"
+              : "旧聊天认识缺少可核验的发送者或频道范围；不能按名字、当前界面或通知补猜归属") }];
         });
       // Bounded batches keep both durable audit and appended clarification readable.
       for (let offset = 0; offset < claims.length; offset += 8) {
@@ -576,6 +602,11 @@ export class GrowthLedger {
   /** Read only delivered evidence. The cursor advances exclusively with a complete committed review. */
   async snapshotReview(options: ReviewOptions): Promise<GrowthReviewSnapshot | null> {
     return this.serial(async () => {
+      // Share the existing review cadence: legacy audits must neither starve nor add model calls per action.
+      if (this.reviews.size % 4 === 3) {
+        const audit = this.snapshotRevalidationUnlocked(options);
+        if (audit) return audit;
+      }
       const current = this.snapshotReviewUnlocked(options, this.reviewCursor, this.reviewItems.length);
       if (current) return current;
       for (const backlog of this.reviewBacklogs.values()) {
@@ -583,8 +614,32 @@ export class GrowthLedger {
         const snapshot = this.snapshotReviewUnlocked({ ...options, minimumEpisodes: 1 }, backlog.cursor, backlog.throughCursor, backlog.id);
         if (snapshot) return snapshot;
       }
-      return null;
+      return this.snapshotRevalidationUnlocked(options);
     });
+  }
+
+  private snapshotRevalidationUnlocked(options: ReviewOptions): GrowthReviewSnapshot | null {
+    const at = finiteTime(options.at, "at");
+    const attempted = new Set([...this.reviews.values()].flatMap(review => review.revalidation?.map(item => item.recordId) ?? []));
+    const claims: GrowthView[] = [], evidence = new Map<string, PerceivedEvidence>();
+    for (const id of new Set(this.records.map(record => record.claimId))) {
+      const view = this.view(id, at)!;
+      const latest = [...view.records].reverse().find(record => record.relation !== "counter")!;
+      if (!view.active || !view.needsReview || view.kind === "state" || attempted.has(latest.id)) continue;
+      const sources = view.evidence.filter(item => latest.evidenceIds.includes(item.eventId) && item.observedAt <= at);
+      if (!sources.length || sources.length + evidence.size > boundedInteger(options.maxEvidence, 24, 1, 100)) continue;
+      claims.push(view);
+      for (const source of sources) evidence.set(source.eventId, source);
+      if (claims.length >= 2) break;
+    }
+    if (!claims.length) return null;
+    const snapshot: Omit<GrowthReviewSnapshot, "id"> = { actorId: this.actorId,
+      afterCursor: this.reviewCursor, throughCursor: this.reviewCursor,
+      revision: this.records.length + this.stateTimingCorrections.size + this.claimCorrections.size,
+      createdAt: at, episodeIds: [], coveredEventCount: 0, omittedEvidenceCount: 0, reviewEventIds: [],
+      claims, evidence: [...evidence.values()], revalidation: claims.map(view => ({ claimId: view.claimId,
+        recordId: [...view.records].reverse().find(record => record.relation !== "counter")!.id })) };
+    return structuredClone({ id: snapshotId(snapshot), ...snapshot });
   }
 
   private snapshotReviewUnlocked(options: ReviewOptions, cursor: number, limit: number, backlogId?: string): GrowthReviewSnapshot | null {
@@ -627,7 +682,7 @@ export class GrowthLedger {
         candidates.set(index, Math.max(candidates.get(index) ?? 0, 1));
       }
       const roles = [[run.samples.last, 4], [run.samples.failed, 7], [run.samples.imposed, 7],
-        [run.samples.choice, 6], [run.samples.first, 3], [Math.max(run.start, cursor), 3]] as const;
+        [run.samples.choice, 8], [run.samples.first, 3], [Math.max(run.start, cursor), 3]] as const;
       for (const [index, priority] of roles) if (index !== undefined && index >= cursor && index < throughCursor) {
         candidates.set(index, Math.max(candidates.get(index) ?? 0, priority));
       }
@@ -656,11 +711,10 @@ export class GrowthLedger {
         (e.experience?.episodeId && episodeIds.has(e.experience.episodeId) ? 30 : 0) +
         (e.experience?.subjectIds?.some(id => subjectIds.includes(id)) ? 15 : 0) +
         overlapScore(`${e.experience?.situation ?? ""} ${e.experience?.action ?? ""} ${e.text}`, queryText) }))
-      .filter(item => item.score >= 3)
       .sort((a, b) => b.score - a.score || b.evidence.observedAt - a.evidence.observedAt);
     // Repeated readings of a snapshot must not crowd original independent choices out of the review.
     const contextEpisodes = new Set<string>();
-    const relatedHistory = contextEvidence.filter(item => {
+    const relatedHistory = contextEvidence.filter(item => item.score >= 3).filter(item => {
       const key = item.evidence.experience?.episodeId ?? item.evidence.rootEventIds.join("\0");
       if (contextEpisodes.has(key)) return false;
       contextEpisodes.add(key); return true;
@@ -668,16 +722,38 @@ export class GrowthLedger {
     // Reserve a third of the request for related independent older experiences. Otherwise a
     // dense new batch can perpetually crowd out earlier no-change batches and prevent a sparse
     // habit from ever being recognized. Keep at least one representative of every fresh episode.
-    const historicalBudget = Math.min(relatedHistory.length, Math.floor(maxEvidence / 3), maxEvidence - representatives.size);
+    const historyCapacity = Math.min(Math.floor(maxEvidence / 3), maxEvidence - representatives.size);
+    const freshChoices = independentGrowthChoices([...representatives].sort((a, b) => a - b)
+      .map(index => this.evidence.get(this.reviewItems[index]!.eventId)!));
+    const longitudinal = selectLongitudinalEvidence({ fresh: freshChoices, historical: contextEvidence.map(item => item.evidence),
+      behaviors: this.records.flatMap(record => record.behavior ? [record.behavior] : []),
+      secondsPerTU: options.secondsPerTU, budget: historyCapacity, independentChoices: independentGrowthChoices });
+    const history = [...longitudinal, ...relatedHistory.map(item => item.evidence).filter(item => !longitudinal.some(chosen => chosen.eventId === item.eventId))];
+    const historicalBudget = Math.min(history.length, historyCapacity);
     const freshBudget = maxEvidence - historicalBudget;
     const finalSelected = new Set(representatives);
     for (const [index] of ranked) { if (finalSelected.size >= freshBudget) break; finalSelected.add(index); }
     const finalFresh = [...finalSelected].sort((a, b) => a - b).map(index => this.evidence.get(this.reviewItems[index]!.eventId)!);
-    const context = relatedHistory.slice(0, maxEvidence - finalFresh.length).map(item => item.evidence);
+    const context = history.slice(0, maxEvidence - finalFresh.length);
     const evidence = [...context, ...finalFresh];
     // Inactive claims remain available to a review so an expired state is not silently re-created.
     const visibleEvidence = new Set(evidence.map(item => item.eventId));
-    const claims = this.retrieveUnlocked({ text, subjectIds, at, n: 8 }, true).map(claim => {
+    const subjects = new Set(subjectIds);
+    const dimensions = new Set<string>();
+    const rankedClaims = [...new Set(this.records.map(record => record.claimId))].map(id => this.view(id, at)!)
+      .map(view => ({ view, score: relevance(view, queryText, subjects) }))
+      .filter(item => item.score >= 3)
+      .sort((a, b) => Number(a.view.kind === "state") - Number(b.view.kind === "state")
+        || b.score - a.score || semanticRecord(b.view).recordedAt - semanticRecord(a.view).recordedAt);
+    const representativesBySubject = rankedClaims.filter(({ view }) => {
+        const dimension = JSON.stringify([view.kind, view.subjectId, normalize(view.insight?.dimension ?? view.subject)]);
+        if (dimensions.has(dimension)) return false;
+        dimensions.add(dimension); return true;
+      });
+    const representedClaims = new Set(representativesBySubject.map(item => item.view.claimId));
+    const claims = [...representativesBySubject.filter(item => item.view.kind !== "state"),
+      ...rankedClaims.filter(item => item.view.kind !== "state" && !representedClaims.has(item.view.claimId)),
+      ...representativesBySubject.filter(item => item.view.kind === "state")].slice(0, 8).map(({ view: claim }) => {
       const counter = claim.status === "contested" ? [...claim.records].reverse().find(record => record.relation === "counter") : undefined;
       return { ...claim,
         // Later supporting records do not resolve a counterexample; keep its actual content
@@ -715,7 +791,8 @@ export class GrowthLedger {
       const backlog = snapshot.backlogId ? this.reviewBacklogs.get(snapshot.backlogId) : undefined;
       if (snapshot.actorId !== this.actorId || id !== snapshotId(unsigned) || (snapshot.backlogId && !backlog) ||
         snapshot.afterCursor !== (backlog?.cursor ?? this.reviewCursor) ||
-        snapshot.throughCursor <= snapshot.afterCursor || snapshot.throughCursor > (backlog?.throughCursor ?? this.reviewItems.length) ||
+        (snapshot.revalidation?.length ? snapshot.throughCursor !== snapshot.afterCursor || !!snapshot.backlogId
+          : snapshot.throughCursor <= snapshot.afterCursor) || snapshot.throughCursor > (backlog?.throughCursor ?? this.reviewItems.length) ||
         snapshot.revision !== this.records.length + this.stateTimingCorrections.size + this.claimCorrections.size || at < snapshot.createdAt) {
         throw new Error("成长整理快照已失效；请重新读取经历与当前认识，游标未前移");
       }
@@ -737,6 +814,11 @@ export class GrowthLedger {
         try {
           const input = prepare ? prepare(raw) : raw as ReflectionInput;
           if (input.claimId && !allowedClaims.has(input.claimId)) throw new Error(`认识 ${input.claimId} 未包含在本次整理快照中`);
+          if (input.kind === "state" && input.relation !== "retire") throw new Error("自动成长不记录临时处境或行动流水账；这些内容保留在原始经历中");
+          if (snapshot.revalidation?.length) {
+            if (!input.claimId || !snapshot.revalidation.some(item => item.claimId === input.claimId) ||
+              !["revise", "retire"].includes(input.relation ?? "support")) throw new Error("旧认识核对只能 revise 或 retire 本次指定的认识，不能把重读当新成长");
+          } else if (!input.evidenceIds.some(id => batchIds.has(id))) throw new Error("整理须引用本批实际经历，不能只重读旧证据反复新增认识");
           const proposed = this.propose(input, at, staged, shownEvidenceIds ? shown : allowed, secondsPerTU);
           if (proposed.record) { proposed.record.origin = "automatic"; staged.push(proposed.record); changes.push(proposed.record); }
         } catch (error) {
@@ -747,6 +829,7 @@ export class GrowthLedger {
       const commit: ReviewCommit = { type: "review_committed", actorId: this.actorId, id,
         afterCursor: snapshot.afterCursor, throughCursor: snapshot.throughCursor, at, records: changes,
         ...(snapshot.backlogId ? { backlogId: snapshot.backlogId } : {}), ...(rejected.length ? { rejected } : {}),
+        ...(snapshot.revalidation?.length ? { revalidation: snapshot.revalidation } : {}),
         sampledEventIds, relatedEventIds: [...shown].filter(id => !batchIds.has(id)),
         omittedEvidenceCount: snapshot.coveredEventCount - sampledEventIds.length };
       signal?.throwIfAborted();
@@ -787,7 +870,7 @@ export class GrowthLedger {
     const text = normalize(query.text);
     const subjects = new Set(query.subjectIds ?? []);
     return [...new Set(this.records.map(record => record.claimId))].map(id => this.view(id, query.at)!)
-      .filter(view => includeInactive || view.active)
+      .filter(view => includeInactive || view.active && view.kind !== "state")
       .filter(view => includeInactive || growthMatchesScope(view, query.channelKeys ?? [], subjects))
       .map(view => ({ view, score: relevance(view, text, subjects) }))
       .filter(item => item.score >= 3)
@@ -806,7 +889,7 @@ export class GrowthLedger {
       finiteTime(at, "at");
       const limit = boundedInteger(maxChars, 2400, 100, 12_000);
       const views = [...new Set(this.records.map(record => record.claimId))].map(id => this.view(id, at)!)
-        .filter(view => view.active && !view.needsReview).sort((a, b) => semanticRecord(b).recordedAt - semanticRecord(a).recordedAt);
+        .filter(view => view.active && !view.needsReview && view.kind !== "state").sort((a, b) => semanticRecord(b).recordedAt - semanticRecord(a).recordedAt);
       const lines: string[] = [];
       let size = 0;
       for (const view of views) {
@@ -874,6 +957,9 @@ export class GrowthLedger {
     const behavior = input.behavior === undefined ? latest?.behavior : requiredText(input.behavior, "behavior", 200);
     if (input.behavior !== undefined && input.kind !== "habit" && input.kind !== "trait") throw new Error("behavior 仅用于习惯或性格倾向的实际动作依据");
     const scope = relation === "retire" || relation === "counter" ? latest?.scope : deriveGrowthScope(input.kind, evidence, subjectId);
+    const positive = relation === "support" || relation === "revise";
+    const insight = positive && (["relationship", "commitment", "preference"].includes(input.kind) || input.insight)
+      ? validateGrowthInsight({ ...input, subjectId }, evidence) : latest?.insight;
     if (latest?.scope?.domain === "chat" && scope?.domain === "chat" && input.kind === "state" && latest.scope.channelKey !== scope.channelKey) throw new Error("不能把一个频道的注意状态续接到另一个频道");
     let expiresAt = input.expiresAt === undefined ? latest?.expiresAt : finiteTime(input.expiresAt, "expiresAt（expires_at）");
     let stateTiming: GrowthRecord["stateTiming"];
@@ -891,10 +977,20 @@ export class GrowthLedger {
     const roots = [...new Set(evidence.flatMap((e) => e.rootEventIds))];
     const used = new Set(prior.flatMap((r) => r.rootEventIds));
     const fresh = roots.filter((id) => !used.has(id));
-    if (prior.length && !fresh.length) return { claimId: prior[0]!.claimId };
+    const revalidating = latest && latest.relation !== "retire" && !this.claimCorrections.has(latest.id) &&
+      this.view(latest.claimId, at, records)?.needsReview && (relation === "revise" || relation === "retire");
+    if (prior.length && !fresh.length && !revalidating) return { claimId: prior[0]!.claimId };
     if (!input.claimId) {
       const existing = records.find((r) => r.kind === input.kind && r.subject === subject && r.statement === statement && r.subjectId === subjectId);
       if (existing) throw new Error(`已有相同认识 ${existing.claimId}，请引用 claim_id 更新证据`);
+      if (insight) {
+        const sameDimension = [...new Set(records.map(record => record.claimId))].map(id => this.view(id, at, records)!)
+          .find(view => view.kind === input.kind && view.subjectId === subjectId &&
+            (subjectId || input.kind === "preference" || input.kind === "commitment" || view.subject === subject) &&
+            normalize(view.insight?.dimension ?? "") === normalize(insight.dimension) &&
+            view.scope?.domain === scope?.domain && (view.scope?.domain !== "chat" || scope?.domain === "chat" && view.scope.channelKey === scope.channelKey));
+        if (sameDimension) throw new Error(`已有同一认识维度 ${sameDimension.claimId}；请沿用 claimId 修订，不要换标题重复新建`);
+      }
       if (behavior && (input.kind === "habit" || input.kind === "trait")) {
         const sameBehavior = matchingBehavior(records, input.kind, behavior, subjectId);
         if (sameBehavior) throw new Error(`已有同一行为的认识 ${sameBehavior.claimId}，不能换个近义标题再次强化；请核对原有情境、例外并修订`);
@@ -916,10 +1012,10 @@ export class GrowthLedger {
       const unit = Number.isFinite(secondsPerTU) && secondsPerTU > 0 ? secondsPerTU : 1;
       const elapsed = (Math.max(...relevantChoices.map(item => item.observedAt)) - Math.min(...relevantChoices.map(item => item.observedAt))) * unit;
       if (elapsed < (input.kind === "trait" ? 7 : 1) * 86400) throw new Error(`${input.kind} 的支持经历尚未跨越${input.kind === "trait" ? "七个" : "一个"}世界日；连续循环只能说明当时行为，不能靠多次调用立刻固化人格`);
-      if (!evidence.some(e => voluntary.includes(e) && e.rootEventIds.some(id => fresh.includes(id)))) {
+      if (!revalidating && !evidence.some(e => voluntary.includes(e) && e.rootEventIds.some(id => fresh.includes(id)))) {
         throw new Error("支持或修订行为倾向须有本次新增的自主完成选择；未知、被迫或失败经历可作为反证，但不能证明新的自愿习惯");
       }
-      if (!evidence.some(e => voluntary.includes(e) && actionContains(e, behavior) && e.rootEventIds.some(id => fresh.includes(id)))) throw new Error("补充行为依据必须含新增的同一 behavior 实践；无关的新经历不能重复强化原有习惯");
+      if (!revalidating && !evidence.some(e => voluntary.includes(e) && actionContains(e, behavior) && e.rootEventIds.some(id => fresh.includes(id)))) throw new Error("补充行为依据必须含新增的同一 behavior 实践；无关的新经历不能重复强化原有习惯");
       if (input.kind === "trait" && new Set(relevantChoices.map(e => normalize(e.experience!.situation ?? "")).filter(Boolean)).size < 3) {
         throw new Error("性格倾向至少须有 3 种不同情境的自主经历；单一关系或场景应保留为局部认识");
       }
@@ -934,6 +1030,7 @@ export class GrowthLedger {
       ...(cues ? { cues } : {}), ...(expiresAt !== undefined ? { expiresAt } : {}),
       ...(stateTiming ? { stateTiming } : {}),
       ...(scope ? { scope } : {}), ...(behavior ? { behavior } : {}), groundingVersion: 1,
+      ...(insight ? { insight, semanticVersion: 1 as const } : {}),
     };
     return { claimId: record.claimId, record };
   }
@@ -942,7 +1039,7 @@ export class GrowthLedger {
     return Math.max(0, this.records.at(-1)?.recordedAt ?? 0, ...[...this.evidence.values()].slice(-1).map(e => e.observedAt));
   }
 
-  private view(claimId: string, at = this.currentAt(), allRecords = this.records): GrowthView | undefined {
+  private view(claimId: string, at = this.currentAt(), allRecords = this.records, clone = true): GrowthView | undefined {
     const records = allRecords.filter((r) => r.claimId === claimId);
     const first = records[0];
     if (!first) return undefined;
@@ -966,11 +1063,44 @@ export class GrowthLedger {
       ...(expiresAt !== undefined ? { expiresAt } : {}), ...(stateTimingCorrection ? { stateTimingCorrection } : {}),
       ...(correction ? { correction } : {}),
       ...(latest.scope ? { scope: latest.scope } : {}), ...(latest.behavior ? { behavior: latest.behavior } : {}),
+      ...(latest.insight ? { insight: latest.insight } : {}),
       records,
       evidence: [...ids].flatMap((id) => this.evidence.get(id) ? [this.evidence.get(id)!] : []),
     };
-    if (growthNeedsReview(view)) view.needsReview = true;
-    return structuredClone(view);
+    if (growthNeedsReview(view)) {
+      view.needsReview = true;
+      view.isolationReason = (latest.semanticVersion !== 1 || !latest.insight) && ["relationship", "commitment", "preference"].includes(view.kind)
+        ? "旧认识尚未核对其长期意义与支持原文；暂不作为已确认的关系、承诺或偏好沿用"
+        : view.kind === "habit" || view.kind === "trait" ? "缺少可核验的共同自主动作与跨日依据"
+          : "缺少可核验的发送者或频道范围";
+    }
+    return clone ? structuredClone(view) : view;
+  }
+
+  /** Filter the complete ledger before pagination; recent routine states cannot hide older insights. */
+  async queryPage(query: GrowthPageQuery = {}): Promise<GrowthPage> {
+    return this.serial(async () => {
+      const at = query.at === undefined ? this.currentAt() : finiteTime(query.at, "at");
+      const keyword = query.keyword?.trim().toLowerCase();
+      const lifecycle = query.lifecycle ?? "active", kind = query.kind ?? "long_term";
+      const limit = boundedInteger(query.limit, 30, 1, 100);
+      const counts: Record<GrowthKind, number> = { relationship: 0, commitment: 0, preference: 0, state: 0, habit: 0, trait: 0 };
+      const grouped = new Map<string, GrowthRecord[]>();
+      for (const record of this.records) {
+        const records = grouped.get(record.claimId) ?? [];
+        records.push(record); grouped.set(record.claimId, records);
+      }
+      const candidates = [...grouped].map(([id, records]) => this.view(id, at, records, false)!)
+        .filter(view => lifecycle === "all" || (view.active && !view.needsReview) === (lifecycle === "active"))
+        .filter(view => !keyword || [view.subject, view.statement, view.subjectId, view.situation,
+          view.insight?.dimension, view.insight?.significance, view.isolationReason, ...(view.cues ?? []), ...view.records.map(record => record.statement)].join(" ").toLowerCase().includes(keyword));
+      for (const view of candidates) counts[view.kind]++;
+      const filtered = candidates.filter(view => kind === "all" || (kind === "long_term" ? view.kind !== "state" : view.kind === kind))
+        .sort((a, b) => semanticRecord(b).recordedAt - semanticRecord(a).recordedAt || a.claimId.localeCompare(b.claimId));
+      const total = filtered.length;
+      const offset = Math.min(boundedInteger(query.offset, 0, 0, Number.MAX_SAFE_INTEGER), Math.max(0, Math.floor((total - 1) / limit) * limit));
+      return structuredClone({ items: filtered.slice(offset, offset + limit), total, offset, limit, counts });
+    });
   }
 
   async recall(query: { kind?: GrowthKind; subject?: string; keyword?: string; claimId?: string; n?: number; at?: number; active?: boolean } = {}): Promise<GrowthView[]> {
@@ -1110,7 +1240,7 @@ export function growthViewText(view: GrowthView): string {
   const labels: Record<GrowthKind, string> = { relationship: "关系认识", commitment: "承诺", preference: "偏好", state: "临时状态", habit: "情境习惯", trait: "性格倾向" };
   const counter = view.status === "contested" ? [...view.records].reverse().find(record => record.relation === "counter") : undefined;
   const withdrawn = view.inactiveReason === "corrected" || !!view.correction;
-  const status = withdrawn ? "【已撤回，不作为当前事实或行动依据】" : view.needsReview ? "【待复核，已隔离，不作为当前事实或行动依据】" : "";
+  const status = withdrawn ? "【已撤回，不作为当前事实或行动依据】" : view.inactiveReason === "retired" ? "【已停止沿用】" : view.needsReview ? "【待复核，已隔离，不作为当前事实或行动依据】" : "";
   return status + `${labels[view.kind]}：${view.subject}${view.subjectId ? `〔${growthIdentityText(view.subjectId)}〕` : ""}${view.situation ? `（${view.situation}）` : ""}。${view.statement}` +
     (view.kind === "state" && view.expiresAt !== undefined ? `（${withdrawn || view.needsReview ? "原记录期限为世界时刻" : "仅适用于世界时刻"} ${view.expiresAt} 之前。）` : "") +
     (counter ? ` 存在反例，尚不能一概而论：${counter.statement}` : "") +

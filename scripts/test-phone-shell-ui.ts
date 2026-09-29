@@ -22,7 +22,7 @@ function fixture(content: string, visitor = false) {
       calls.push({ method, url, body }); const task = deferred(); pending.push(task); return task.promise;
     },
     el(tag: string, attrs: any = {}, children: any[] = []) {
-      const node: any = { tag, attrs, children: [], value: "", textContent: attrs.text || "", disabled: false, readOnly: false,
+      const node: any = { tag, attrs, style: {}, children: [], value: "", textContent: attrs.text || "", disabled: false, readOnly: false,
         appendChild(child: any) { this.children.push(child); },
         focus() { throw new Error("Async refresh must not steal focus"); },
       };
@@ -45,6 +45,8 @@ async function interactions() {
   const generate = f.button("让 World LLM 重新设计"), preview = f.button("刷新预览"), undo = f.button("撤销修改"), save = f.button("保存外壳");
   assert.ok(generate); assert.equal(save.disabled, true);
   assert.match(f.preview.srcdoc, /800×1280/);
+  assert.equal(f.preview.style.aspectRatio, '800 / 1280', 'preview preserves the actual phone aspect ratio');
+  assert.doesNotMatch(f.preview.attrs.style, /height:560px/);
   const before = f.preview.srcdoc, nodeCount = f.nodes.length;
   f.document.activeElement = f.area;
   f.edit("draft <b>custom</b>");
@@ -68,6 +70,7 @@ async function interactions() {
   assert.equal(f.area.value, generated); assert.equal(f.area.readOnly, false);
   assert.equal(f.meta.phone.width, 960); assert.equal(f.meta.phone.height, 1440);
   assert.match(f.preview.srcdoc, /960×1440/); assert.match(f.preview.srcdoc, /new/);
+  assert.equal(f.preview.style.aspectRatio, '960 / 1440');
   assert.match(f.status.textContent, /新外壳已保存/);
   assert.equal(f.nodes.length, nodeCount); assert.equal(f.document.activeElement, f.area);
 

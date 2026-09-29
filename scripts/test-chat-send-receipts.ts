@@ -140,7 +140,7 @@ async function agentReceipts(base: string) {
     f.platform.sendMessage = original;
     assert.match(await perform(make("没有平台回执")), /上次发送结果未知，可能已送达；本次未重发/); assert.equal(f.submitted.length, 4);
     f.cfg.platformOps.reply = true;
-    f.messenger.store.findByMessageId = async () => null;
+    f.messenger.store.findByMessageId = async () => ({ messageId: "another-message", userId: "peer", username: "朋友", content: "可被引用的原文" });
     assert.match(await perform(make(over, { confirm_long: true, reply_to: "another-message", at_sender: false, resend: true })), /消息已发送/);
     assert.equal(f.submitted.length, 5, "explicit resend may deliberately repeat a previously confirmed message");
     assert.match(sendBusyMessage([make("仍在处理")])!, /可能已经提交到平台/);

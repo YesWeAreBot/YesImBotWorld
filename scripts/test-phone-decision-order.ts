@@ -21,6 +21,7 @@ const clock: any = { now: () => 10, timeLine: () => "T=10", unitRealSeconds: 1, 
   realMsUntil: (at: number) => at > 10 ? 60_000 : 0 };
 
 async function fixture(first: ParsedToolCall, options: { down?: boolean; channel?: boolean; sendGate?: Promise<void>;
+  generationGate?: Promise<void>;
   ignoreSendDuration?: boolean; second?: (context: BotContext) => ParsedToolCall } = {}) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "phone-decision-order-")); dirs.push(dir);
   const files = new WorldFiles(dir); await files.ensure();
@@ -28,15 +29,16 @@ async function fixture(first: ParsedToolCall, options: { down?: boolean; channel
   const cfg = Config({ autoStart: false });
   Object.assign(cfg.bot, { minIntervalMs: 0, maxWindowChars: 1_000_000, spillMinChars: 0, ignoreSendDuration: options.ignoreSendDuration ?? true });
   cfg.bot.growth.enabled = false; cfg.messaging.sendEcho = false;
-  const defs = BOT_TOOLS.filter(tool => ["pick_up_phone", "put_down_phone", "open_app", "close_app", "send", "select_channel", "think", "cancel"].includes(tool.name));
+  const defs = BOT_TOOLS.filter(tool => ["pick_up_phone", "put_down_phone", "open_app", "close_app", "send", "select_channel", "read_channel", "think", "cancel"].includes(tool.name));
   const phone = { down: options.down ?? false }, apps = new AppManager("chat", [], new Set(defs.map(tool => tool.name)), logger);
   let sends = 0, completedSends = 0;
+  const sentTo: string[] = [];
   const navigation: string[] = [];
   const messenger: any = {
     resolveKey: async (key: string) => { navigation.push(`resolve:${key}`); return { key, isPrivate: true }; },
     recentChannels: async () => { navigation.push("chat-home"); return { text: "fixture channel list" }; },
     channelMessages: async () => { navigation.push("channel"); return { text: "fixture messages" }; }, putDownPhone: async () => "已停止留意频道，通知设置不变。",
-    sendReceipt: async () => { sends++; await options.sendGate; completedSends++; return { text: "fixture platform confirmed message", status: "sent", messageIds: ["fixture-message"] }; },
+    sendReceipt: async (id: string) => { sends++; sentTo.push(id); await options.sendGate; completedSends++; return { text: "fixture platform confirmed message", status: "sent", messageIds: ["fixture-message"] }; },
   };
   const bot: any = new BotAgent(cfg, clock, files, context, {} as any, messenger, apps, null, null, phone, logger, defs);
   agents.push(bot);
@@ -47,13 +49,38 @@ async function fixture(first: ParsedToolCall, options: { down?: boolean; channel
     setToolNames() {}, setToolDefs() {},
     generate: async () => {
       requests.push(structuredClone(await context.toChatMessages("T=10", false)));
-      if (requests.length === 1) return first;
+      if (requests.length === 1) { await options.generationGate; return first; }
       if (requests.length === 2 && options.second) return options.second(context);
       bot.setManualPaused(true);
       return { name: "think", arguments: { thought: "下一步已经看到了真实结果。" } };
     },
   };
-  return { bot, context, phone, requests, navigation, sends: () => sends, completedSends: () => completedSends };
+  return { bot, context, phone, requests, navigation, sentTo, sends: () => sends, completedSends: () => completedSends };
+}
+
+async function generationCannotRetargetImplicitRead() {
+  const peer = "onebot@fixture:private:peer", other = "onebot@fixture:private:other";
+  for (const explicit of [false, true]) {
+    const generating = gate();
+    const f = await fixture({ name: explicit ? "send" : "read_channel", arguments: { ...(explicit ? { id: peer, msg: "reply to peer" } : {}) } },
+      { channel: true, generationGate: generating.promise });
+    f.bot.start(); await until(() => f.requests.length === 1);
+    await f.bot.enterChannel(other, true);
+    generating.resolve(); await until(() => f.requests.length === 2); await f.bot.stop();
+    assert.deepEqual(f.sentTo, explicit ? [peer] : [], "a changed screen cannot silently replace the recipient used by an in-flight decision");
+    if (!explicit) assert.ok(JSON.stringify(f.requests[1]).includes("当前会话已改变"));
+  }
+  // The append is asynchronous too; changing focus during persistence must not
+  // bypass the generation check just because the model has already finished.
+  const f = await fixture({ name: "read_channel", arguments: {} }, { channel: true });
+  const append = f.context.appendToolCall.bind(f.context);
+  f.context.appendToolCall = async call => {
+    await append(call);
+    if (call.name === "read_channel") await f.bot.enterChannel(other, true);
+  };
+  f.bot.start(); await until(() => f.requests.length === 2); await f.bot.stop();
+  assert.deepEqual(f.sentTo, []);
+  assert.ok(JSON.stringify(f.requests[1]).includes("当前会话已改变"));
 }
 
 async function pickupReceiptPrecedesNextDecision() {
@@ -69,7 +96,7 @@ async function pickupReceiptPrecedesNextDecision() {
 }
 
 async function futureTypingRemainsCancellable() {
-  const f = await fixture({ name: "send", arguments: { msg: "A complete fixture message which is still being typed." }, duration: 3 }, {
+  const f = await fixture({ name: "send", arguments: { id: "onebot@fixture:private:peer", msg: "A complete fixture message which is still being typed." }, duration: 3 }, {
     channel: true, ignoreSendDuration: false,
     second: context => {
       const send = context.stream.find(entry => entry.kind === "tool_call" && entry.call.name === "send");
@@ -85,7 +112,7 @@ async function futureTypingRemainsCancellable() {
 }
 
 async function takeoverCancellationIsVisibleAfterHandback() {
-  const f = await fixture({ name: "send", arguments: { msg: "Another complete fixture message still being typed." }, duration: 3 },
+  const f = await fixture({ name: "send", arguments: { id: "onebot@fixture:private:peer", msg: "Another complete fixture message still being typed." }, duration: 3 },
     { channel: true, ignoreSendDuration: false });
   f.bot.config.bot.strictToolLoop = false; // Exercise legacy typing-time generation; strict mode is covered separately.
   f.bot.start(); await until(() => f.requests.length === 2);
@@ -115,7 +142,7 @@ async function takeoverCancellationIsVisibleAfterHandback() {
 
 async function sendMustFinishBeforeNextDecision() {
   const sending = gate();
-  const f = await fixture({ name: "send", arguments: { msg: "fixture hello" } }, { channel: true, sendGate: sending.promise });
+  const f = await fixture({ name: "send", arguments: { id: "onebot@fixture:private:peer", msg: "fixture hello" } }, { channel: true, sendGate: sending.promise });
   f.bot.start(); await until(() => f.sends() === 1);
   await sleep(20);
   assert.equal(f.requests.length, 1, "no put-down or other next decision is generated before platform confirmation");
@@ -132,14 +159,14 @@ async function missingSendTargetStillRejected() {
   const originalUi = structuredClone(f.bot.phoneUi);
   f.bot.start(); await until(() => f.requests.length === 2); await f.bot.stop();
   assert.equal(f.sends(), 0);
-  assert.ok(JSON.stringify(f.requests[1]).includes("缺少目标频道"));
+  assert.ok(JSON.stringify(f.requests[1]).includes("send 需要明确的频道 id"));
   assert.deepEqual(f.navigation, [], "missing recipients must be rejected before navigating or resolving the recent notification");
   assert.deepEqual(f.bot.phoneUi, originalUi, "rejection does not silently change the current app/channel");
 }
 
 async function takeoverDoesNotWaitForOrUndoCommittedSend() {
   const sending = gate();
-  const f = await fixture({ name: "send", arguments: { msg: "already submitted" } }, { channel: true, sendGate: sending.promise });
+  const f = await fixture({ name: "send", arguments: { id: "onebot@fixture:private:peer", msg: "already submitted" } }, { channel: true, sendGate: sending.promise });
   f.bot.start(); await until(() => f.sends() === 1);
   const control = await Promise.race([f.bot.acquireManualControl(), sleep(500).then(() => { throw new Error("takeover blocked behind a committed device result"); })]);
   assert.equal(control.busy, true);
@@ -153,7 +180,7 @@ async function takeoverDoesNotWaitForOrUndoCommittedSend() {
 
 async function stoppingPreservesInFlightSend() {
   const sending = gate();
-  const f = await fixture({ name: "send", arguments: { msg: "submitted before stop" } }, { channel: true, sendGate: sending.promise });
+  const f = await fixture({ name: "send", arguments: { id: "onebot@fixture:private:peer", msg: "submitted before stop" } }, { channel: true, sendGate: sending.promise });
   f.bot.start(); await until(() => f.sends() === 1);
   await Promise.race([f.bot.stop(), sleep(500).then(() => { throw new Error("stop blocked on the device decision barrier"); })]);
   assert.equal(f.completedSends(), 0); assert.equal(f.bot.scheduler.pendingCount, 1);
@@ -184,6 +211,7 @@ async function schedulerWaitsForOneCallOnly() {
 async function main() {
   try {
     await pickupReceiptPrecedesNextDecision(); await sendMustFinishBeforeNextDecision(); await missingSendTargetStillRejected();
+    await generationCannotRetargetImplicitRead();
     await futureTypingRemainsCancellable(); await takeoverCancellationIsVisibleAfterHandback();
     await takeoverDoesNotWaitForOrUndoCommittedSend(); await stoppingPreservesInFlightSend(); await schedulerWaitsForOneCallOnly();
     console.log("PASS phone decision order: actual pickup/send receipts before next inference, unchanged target guards, nonblocking takeover and per-call settlement");

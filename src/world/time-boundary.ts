@@ -1,6 +1,6 @@
 import type { ClockAuthority } from "../clock.js";
 
-export const WORLD_TIME_AUTHORITY = "程序时间边界（不可由世界定义或旧状态覆盖）：timeAuthority 是本轮唯一的当前时刻，time 是同一次采样的 TU；1 TU 的世界秒数、历法、时区与 UTC 偏移均由程序给出。source=wall_clock 时当前日期来自现实服务器时钟，不能自行创设另一个今天；source=world_calendar 时使用作者定义与配置确定并持久化的历法，不能改成现实今天。realWorld 只描述世界/设备性质，不决定时间同步。stateAsOf 是旧状态成立时刻，不是现在；按 elapsedWorldSeconds 推进已经授权的自然过程，不能为配合旧叙述移动时钟或跳到动作计划的未来。初始化、观察、行动、到离场与演化均遵守这条边界。过去事件、人物记忆、文件原文、引文和假设中的日期保持原样，它们不是当前日期。时间资料属于引擎裁定上下文，不意味着角色无需钟表就知道精确日期时间。";
+export const WORLD_TIME_AUTHORITY = "程序时间边界（不可由世界定义或旧状态覆盖）：timeAuthority 是本轮唯一的当前时刻，其 tu 是同一次采样的世界计时；1 TU 的世界秒数、历法、时区与 UTC 偏移均由程序给出。source=wall_clock 时当前日期来自现实服务器时钟，不能自行创设另一个今天；source=world_calendar 时使用作者定义与配置确定并持久化的历法，不能改成现实今天。realWorld 只描述世界/设备性质，不决定时间同步。stateAsOf 是旧状态成立时刻，不是现在；按 elapsedWorldSeconds 推进已经授权的自然过程，不能为配合旧叙述移动时钟或跳到动作计划的未来。初始化、观察、行动、到离场与演化均遵守这条边界。过去事件、人物记忆、文件原文、引文和假设中的日期保持原样，它们不是当前日期。时间资料属于引擎裁定上下文，不意味着角色无需钟表就知道精确日期时间。";
 
 export interface CurrentTimeConflict { start: number; end: number; actual: string; expected: string }
 const datePattern = "(?:\\d{4}-\\d{1,2}-\\d{1,2}|\\d{4}/\\d{1,2}/\\d{1,2}|\\d{4}年\\d{1,2}月\\d{1,2}日)";

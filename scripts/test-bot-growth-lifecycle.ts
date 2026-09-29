@@ -10,6 +10,7 @@ import { BotAgent } from "../src/bot/agent.js";
 import { BotContext } from "../src/bot/context.js";
 import type { BotEvent } from "../src/types.js";
 
+const insight = { dimension: "饭后散步", significance: "河边活动带来平静，饭后想放松时可优先考虑散步。", anchors: [{ eventId: "old-event", quote: "晚饭后在河边散步，感到平静。" }] };
 const logger = { info() {}, warn() {}, error() {} } as any;
 const deferred = <T = void>() => {
   let resolve!: (value: T) => void;
@@ -89,7 +90,7 @@ async function explicitReflectionIsJoined() {
     return append(line);
   };
   const call = { id: "explicit-reflection", role: "agent" as const, name: "reflect", issuedAt: 100000, expectedAt: 100000,
-    arguments: { kind: "preference", subject: "饭后散步", statement: "我喜欢饭后在河边散步。", event_ids: ["old-event"] } };
+    arguments: { kind: "preference", subject: "饭后散步", statement: "我喜欢饭后在河边散步。", event_ids: ["old-event"], insight } };
   await f.context.appendToolCall(call); await f.agent.dispatch(call); await bounded(entered.promise);
   let stopped = false; const stopping = f.agent.stop().then(() => { stopped = true; });
   await turn(); assert.equal(stopped, false, "a committed reflect tool owns a local journal write too");
@@ -113,7 +114,7 @@ async function uncooperativeInferenceDoesNotBlockStop() {
 
 async function outboxDeliveryIsJoined() {
   const f = await fixture(), entered = deferred(), release = deferred();
-  f.runtime.infer = async () => ({ content: JSON.stringify({ changes: [{ kind: "preference", subject: "饭后散步", statement: "我喜欢饭后在河边散步。", evidenceIds: ["old-event"] }] }), toolCalls: [] });
+  f.runtime.infer = async () => ({ content: JSON.stringify({ changes: [{ kind: "preference", subject: "饭后散步", statement: "我喜欢饭后在河边散步。", evidenceIds: ["old-event"], insight }] }), toolCalls: [] });
   f.runtime.tick(undefined, true); await bounded(f.runtime.settled());
   assert.equal((await f.ledger.pendingReviews()).length, 1);
   const append = f.context.appendEvent.bind(f.context);

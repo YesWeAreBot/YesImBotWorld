@@ -204,7 +204,15 @@ var Studio = (function () {
     function error(holder, e, retry) { holder.replaceChildren(el('div', { cls: 'studio-error' }, [el('strong', { text: '暂时无法读取这部分内容' }), el('p', { text: e.message || String(e) }), retry ? button('重新加载', 'refresh', retry) : null])); }
     function section(name, note, action) { return el('div', { cls: 'studio-section-title' }, [el('h3', { text: name }), action || el('small', { text: note || '' })]); }
     function fetchWorld() { return api('GET', '/api/world/state').then(function (r) { cache.world = r.state; return r.state; }); }
-    function fetchGrowth() { return api('GET', '/api/bot/growth').then(function (r) { cache.growth = r.growth || []; return cache.growth; }); }
+    function fetchGrowth() { return api('GET', '/api/bot/growth?kind=all&lifecycle=all&limit=50').then(function (r) { cache.growth = r.growth || []; return cache.growth; }); }
+    function fetchGrowthPage(query) {
+        var params = new URLSearchParams();
+        Object.entries(query || {}).forEach(function (entry) { if (entry[1] !== undefined && entry[1] !== '') params.set(entry[0], String(entry[1])); });
+        return api('GET', '/api/bot/growth?' + params.toString()).then(function (response) {
+            var items = Array.isArray(response.growth) ? response.growth : [];
+            return Object.assign({ total: items.length, offset: 0, limit: 30, counts: {} }, response.page || {}, { items: items });
+        });
+    }
     function inspectActor(id) { selectedActor = id; navigate('world'); }
     function commandPalette() {
         var input = el('input', { cls: 'studio-search-input', placeholder: '搜索页面与角色…', 'aria-label': '搜索页面与角色' });
@@ -292,7 +300,7 @@ var Studio = (function () {
                 return;
             refreshing = true;
             var worldPromise = isVisitor() ? Promise.resolve(null) : fetchWorld().catch(function () { return null; });
-            var growthPromise = can('growth') ? fetchGrowth().catch(function () { return []; }) : Promise.resolve([]);
+            var growthPromise = can('growth') ? fetchGrowthPage({ kind: 'long_term', lifecycle: 'active', limit: 1 }).catch(function () { return null; }) : Promise.resolve(null);
             var overviewPromise = refreshOverview(false).then(function (o) { if (alive) updateWelcome(o); return o; });
             Promise.all([overviewPromise, worldPromise, growthPromise]).then(function (result) { if (alive)
                 draw(result[0], result[1], result[2]); }).catch(function (e) { if (alive)
@@ -314,7 +322,7 @@ var Studio = (function () {
             bodyHost.appendChild(el('div', { cls: 'studio-kpi-row' }, [
                 kpi('世界角色', snapshot ? actors.length : '—', snapshot ? '以文字记录当前处境与未完的故事' : '完整世界仅管理员可见', 'world'),
                 kpi('正在行动', snapshot ? running.length : o.worldQueue, snapshot ? '已开始、尚未结束的动作' : '等待世界裁定的任务', 'activity'),
-                kpi('角色认识', can('growth') ? growth.length : '—', growth.filter(function (g) { return g.status === 'contested'; }).length + ' 条认识存在反证', 'growth'),
+                kpi('长期认识', growth ? growth.total : '—', growth ? [['relationship','关系'],['commitment','承诺'],['preference','偏好'],['habit','习惯'],['trait','性格']].map(function (item) { return item[1] + ' ' + (growth.counts[item[0]] || 0); }).join(' · ') : can('growth') ? '暂时无法读取当前有效的认识' : '未开放角色成长数据', 'growth'),
                 kpi('世界版本', snapshot ? '#' + snapshot.sequence : '—', '每次提交留下可追溯记录', 'layers')
             ]));
             var left = el('div', { cls: 'studio-stack' }), right = el('div', { cls: 'studio-stack' });
@@ -387,7 +395,9 @@ var Studio = (function () {
             RESIDENT_BOT_NAME = s.meta?.botName || RESIDENT_BOT_NAME;
             content.replaceChildren();
             var tabs = el('div', { cls: 'tabs' }), panes = el('div');
-            var defs = [['botdef', '角色定义', 'definitions', function () { return statePane('botdef', '角色定义', s.botDef, '/api/definitions/bot'); }], ['worlddef', '世界规则', 'definitions', function () { return statePane('worlddef', '世界规则', s.worldDef, '/api/definitions/world'); }], ['news', '世界新闻', 'news', function () { return jsonlPane('世界新闻', '已保存的世界记录', s.news, '/api/state/news', '新增记录…'); }], ['facts', '记忆记录', 'facts', function () { return jsonlPane('记忆记录', '旧资料与补充记忆；基于观测的成长记录请前往「角色与成长」。', s.facts || [], '/api/state/facts', '新增记录…', { sortable: true, pinnable: true }); }], ['shell', '手机与浏览器外壳', 'world_status', function () { return phoneShellPane(s.phoneShell || '', s.meta || {}); }]].filter(function (d) { return !isVisitor() || visitorCanSee([d[2]]); });
+            // Resolve only the preview dimensions; keep the persisted meta record intact.
+            var shellMeta = Object.assign({}, s.meta || {}, s.phoneResolution ? { phone: s.phoneResolution } : {});
+            var defs = [['botdef', '角色定义', 'definitions', function () { return statePane('botdef', '角色定义', s.botDef, '/api/definitions/bot'); }], ['worlddef', '世界规则', 'definitions', function () { return statePane('worlddef', '世界规则', s.worldDef, '/api/definitions/world'); }], ['news', '世界新闻', 'news', function () { return jsonlPane('世界新闻', '已保存的世界记录', s.news, '/api/state/news', '新增记录…'); }], ['facts', '记忆记录', 'facts', function () { return jsonlPane('记忆记录', '旧资料与补充记忆；基于观测的成长记录请前往「角色与成长」。', s.facts || [], '/api/state/facts', '新增记录…', { sortable: true, pinnable: true }); }], ['shell', '手机与浏览器外壳', 'world_status', function () { return phoneShellPane(s.phoneShell || '', shellMeta); }]].filter(function (d) { return !isVisitor() || visitorCanSee([d[2]]); });
             defs.forEach(function (d, i) { var b = button(d[1], null, function () { Array.from(tabs.children).forEach(function (t) { t.classList.toggle('active', t === b); }); Array.from(panes.children).forEach(function (p, j) { p.classList.toggle('hidden', j !== i); }); }); b.classList.toggle('active', i === 0); tabs.appendChild(b); var pane = el('div', { cls: i ? 'hidden' : '' }, [d[3]()]); panes.appendChild(pane); });
             content.append(tabs, panes);
             if (!defs.length)
@@ -481,5 +491,5 @@ var Studio = (function () {
             dispatch('studio:refresh', { channel: 'visibility' });
         } });
     }
-    return { register: register, navigate: navigate, start: start, can: can, title: title, button: button, empty: empty, error: error, section: section, fetchWorld: fetchWorld, fetchGrowth: fetchGrowth, cache: cache, inspectActor: inspectActor, takeSelectedActor: function () { var id = selectedActor; selectedActor = null; return id; }, avatar: avatar, botAvatar: botAvatar };
+    return { register: register, navigate: navigate, start: start, can: can, title: title, button: button, empty: empty, error: error, section: section, fetchWorld: fetchWorld, fetchGrowth: fetchGrowth, fetchGrowthPage: fetchGrowthPage, cache: cache, inspectActor: inspectActor, takeSelectedActor: function () { var id = selectedActor; selectedActor = null; return id; }, avatar: avatar, botAvatar: botAvatar };
 })();

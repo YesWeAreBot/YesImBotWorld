@@ -174,6 +174,20 @@ export default async function smokeCockpit({ evaluate, wait, assert, navigate, p
     await run(()=>{const panel=window.__cockpitSmoke.opportunityPanel;panel.querySelector('[data-cockpit-confirm-send]').checked=true;panel.querySelector('.cockpit-form').requestSubmit();});
     assert(await run(()=>window.__cockpitSmoke.opportunityCalls.length===1&&window.__cockpitSmoke.opportunityCalls[0].args.msg==='我自己编辑的邀请'),'Only an explicit confirmed submission executes the edited message');
     await run(()=>document.querySelector('[data-cockpit-test]').remove());
+    // A required destination is a visible picker, never the device's implicit channel.
+    await run(()=>{
+      const data={synced:true,unitWorldSeconds:2,tools:[{name:'send',requiresSendConfirmation:true,inputSchema:{type:'object',properties:{id:{type:'string'},msg:{type:'string'}},required:['msg']}}],deviceSession:{chat:{channelKey:'fixture:a',channels:[{key:'fixture:a',name:'甲群'},{key:'fixture:b',name:'乙群'}]}}};
+      const panel=WorldCockpit.mount(data,{values:{send:{msg:'明确发送目标的正文'}}},{call:(name,args)=>window.__cockpitSmoke.explicitSendCalls.push({name,args})});
+      window.__cockpitSmoke.explicitSendCalls=[];window.__cockpitSmoke.explicitSendPanel=panel;window.__cockpitSmoke.explicitSendData=data;
+      panel.dataset.cockpitTest='1';document.querySelector('main').appendChild(panel);
+      data.tools[0].inputSchema.required=['id','msg'];panel.update(data);
+    });
+    assert(await run(()=>window.__cockpitSmoke.explicitSendPanel.querySelector('.cockpit-submit').disabled),'A newly required destination cannot be bypassed with a stale tool form');
+    await run(()=>{const panel=window.__cockpitSmoke.explicitSendPanel;panel.select('send');panel.querySelector('[data-cockpit-confirm-send]').checked=true;panel.querySelector('form').requestSubmit();});
+    assert(await run(()=>{const panel=window.__cockpitSmoke.explicitSendPanel;return panel.querySelector('.cockpit-primary-fields [data-cockpit-field="send:id"]').tagName==='SELECT'&&window.__cockpitSmoke.explicitSendCalls.length===0&&panel.querySelector('.journey-error').textContent.includes('不能为空');}),'The new required schema promotes destination to the primary picker and blocks an empty selection');
+    await run(()=>{const panel=window.__cockpitSmoke.explicitSendPanel,input=panel.querySelector('[data-cockpit-field="send:id"]');input.value=JSON.stringify('fixture:b');input.dispatchEvent(new Event('change',{bubbles:true}));window.__cockpitSmoke.explicitSendData.deviceSession.chat.channelKey='fixture:a';panel.update(window.__cockpitSmoke.explicitSendData);panel.querySelector('form').requestSubmit();});
+    assert(await run(()=>window.__cockpitSmoke.explicitSendCalls.length===1&&window.__cockpitSmoke.explicitSendCalls[0].args.id==='fixture:b'),'Human send uses the selected explicit destination despite the device selecting another conversation');
+    await run(()=>document.querySelector('[data-cockpit-test]').remove());
     await run(()=>{
       const data={synced:true,unitWorldSeconds:2,tools:[{name:'think',inputSchema:{type:'object',properties:{thought:{type:'string'}},required:['thought']}}]};
       const panel=WorldCockpit.mount(data,{}, {call:(name,args,duration)=>window.__cockpitSmoke.thoughtSubmission={name,args,duration}});panel.dataset.cockpitTest='1';document.querySelector('main').appendChild(panel);

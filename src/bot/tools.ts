@@ -16,7 +16,7 @@ export interface BotToolDef {
  *
  * - core：常驻（世界/身体动作 + 收藏夹 + 手机的物理动作），进置顶工具列表；
  * - chat：打开聊天应用后可用（消息列表、好友/群、账号设置）；
- * - channel：进入某个频道页后可用（发消息、撤回、贴表情……id 缺省为当前频道）；
+ * - channel：进入某个频道页后可用（send 必须显式 id，其他允许省略的操作用当前频道）；
  * - group：进入的频道是群聊时，在 channel 层之上追加（群信息与群管理）。
  *
  * 非 core 层的工具不进置顶列表，在打开应用/进入频道时以事件展开用法，
@@ -26,7 +26,7 @@ export type ToolLayer = "core" | "chat" | "channel" | "group";
 
 const CHAT_LAYER = new Set([
   "check_msg", "select_channel", "list_friends", "list_groups", "handle_request", "channel_notify",
-  "user_info", "send_like", "delete_friend", "set_profile", "set_model_show", "ocr_image", "view_forward",
+  "user_info", "view_avatar", "send_like", "delete_friend", "set_profile", "set_model_show", "ocr_image", "view_forward",
 ]);
 const CHANNEL_LAYER = new Set([
   "send", "unsend", "react", "get_emoji_likes",
@@ -71,10 +71,11 @@ const TOOL_SUMMARIES: Record<string, string> = {
   check_gallery: "看收藏分类或媒体；表情包按表达态度选用，不必例行收藏。",
   check_media: "看已见媒体缓存；可直接发送，不必先收藏。",
   view_media: "细看最多 6 项明确媒体引用；看图不等于发送。",
+  view_avatar: "按需查看指定账号在频道中的头像；不发送消息。",
   gallery_save: "收藏指定缓存媒体；备注是自己的用法，不证明发送者心意。",
   gallery_move: "调整完整文件名指定的收藏分类或备注。",
   gallery_remove: "移除完整文件名指定的收藏。",
-  send: "发送原话；id 缺省为当前频道。引用用 reply_to 或 <quote id=\"消息ID\"/>，同目标自动去重。media 尾部附图；确认发出后不重发。",
+  send: "发送原话；每次明确填写目标频道 id，从对应消息或频道列表照抄。引用用 reply_to 或 <quote id=\"消息ID\"/>，同目标自动去重。media 尾部附图；确认发出后不重发。",
   pick_media: "确认最多 9 项 media:N 或完整 gallery: 引用；不会发送，也非发送前必需。",
   cancel: "取消指定 tc_ID 尚未提交的部分；不撤销已发生的结果。",
 };
@@ -121,8 +122,8 @@ export const BOT_TOOLS: BotToolDef[] = [
   },
   {
     name: "reflect",
-    signature: 'reflect(kind: "relationship" | "commitment" | "preference" | "state" | "habit" | "trait", subject: string, statement: string, event_ids: string[], relation?: "support" | "counter" | "revise" | "retire", claim_id?: string, situation?: string, cues?: string[], subject_id?: string, behavior?: string, expires_at?: number)',
-    description: "整理或修正关系、承诺、偏好、临时状态、习惯或性格。event_ids 引用实际感知事件；已有认识给 claim_id，relation 可为 support 补证、counter 反例、revise 修正、retire 停止沿用。subject_id 只能用已感知身份；聊天关系必填，并须有对方的非本人消息作证，自己的话或通知不算。state/habit/trait 必填 situation，cues 是适用情境词。state 须有近两世界小时的身体或当前注意界面证据，拿手机或通知不证明关注某人；expires_at 是未来 TU，默认从最新证据起两世界小时，最长一天，不能用旧事续期。habit/trait 必填 behavior，逐字摘取证据中共同的已完成自主动作：habit 至少 3 次跨一个世界日，trait 至少 6 次跨 3 种情境及七个世界日。其他 kind 不填 behavior。失败、重读、被迫行为不能凑次数，不用近义标题重复新建；没机会实践不算习惯消退。",
+    signature: 'reflect(kind: "relationship" | "commitment" | "preference" | "state" | "habit" | "trait", subject: string, statement: string, event_ids: string[], relation?: "support" | "counter" | "revise" | "retire", claim_id?: string, situation?: string, cues?: string[], subject_id?: string, behavior?: string, expires_at?: number, insight?: object)',
+    description: "整理或修正关系、承诺、偏好、临时状态、习惯或性格。event_ids 引用实际感知事件；已有认识给 claim_id，relation 可为 support 补证、counter 反例、revise 修正、retire 停止沿用。subject_id 只能用已感知身份；聊天关系必填，并须有对方的非本人消息作证，自己的话或通知不算。state/habit/trait 必填 situation，cues 是适用情境词。state 须有近两世界小时的身体或当前注意界面证据，拿手机或通知不证明关注某人；expires_at 是未来 TU，默认从最新证据起两世界小时，最长一天，不能用旧事续期。habit/trait 必填 behavior，逐字摘取证据中共同的已完成自主动作：habit 至少 3 次跨一个世界日，trait 至少 6 次跨 3 种情境及七个世界日。relationship/commitment/preference 的 support/revise 必填 insight={dimension:稳定认识维度,significance:对以后理解或选择的意义,anchors:[{eventId,quote:证据原文}]}。日常经过、网页选项不等于偏好或承诺。其他 kind 不填 behavior。失败、重读、被迫行为不能凑次数，不用近义标题重复新建；没机会实践不算习惯消退。",
   },
   {
     name: "recall_growth",
@@ -229,8 +230,8 @@ export const BOT_TOOLS: BotToolDef[] = [
   },
   {
     name: "send",
-    signature: 'send(msg: string, id?: string, media?: string[], reply_to?: string, at_sender?: boolean, resend?: boolean, confirm_long?: boolean, insist?: boolean)',
-    description: "发送你决定说的原话。id 省略为当前频道，其他频道照抄完整 id。发完仍可留在会话接着聊，不必每条消息后放下手机；有事离开或聊完再放下。图文混排在 msg 对应位置写 <media ref=\"media:12\"/>，名称、摘要、原图对应同一 media:N；media 参数只在正文末尾追加。reply_to 照抄完整消息 ID 或 msg:ID，不得从媒体编号或文字猜 ID；at_sender=false 可取消引用时提醒对方。当前支持时，@ 用 <at id=\"账号ID\"/>（裸打 @名字 不提醒），平台表情用 <face id=\"表情ID\"/>；引用也可在 msg 中用 <quote id=\"完整消息ID\"/>，标识照抄实际记录；name/text 只是引用预览。标签与 reply_to 同目标时合并一次引用，移除标签及其后空白；目标冲突则不发送。以发送回执为准，不因回显缺失重发；pick_media 不会发送。confirm_long/resend/insist 仅在对应提醒后，仍确有必要发送时使用。",
+    signature: 'send(msg: string, id: string, media?: string[], reply_to?: string, at_sender?: boolean, resend?: boolean, confirm_long?: boolean, insist?: boolean)',
+    description: "发送你决定说的原话。每次都必须填写目标频道 id，从要回复的消息所属频道或频道列表照抄完整 id；即使已在该会话也不能省略，不把消息 ID 或用户 ID 当作频道 ID。需要时会自动进入指定频道，无需先单独切群。发完仍可留在会话接着聊，不必每条消息后放下手机；有事离开或聊完再放下。图文混排在 msg 对应位置写 <media ref=\"media:12\"/>，名称、摘要、原图对应同一 media:N；media 参数只在正文末尾追加。reply_to 从目标频道对应正文末尾照抄完整消息 ID；它引用那条原文，不是泛指那个人，不从媒体编号或文字猜 ID；at_sender=false 可取消引用时提醒对方。当前支持时，@ 用 <at id=\"账号ID\"/>（裸打 @名字 不提醒），平台表情用 <face id=\"表情ID\"/>；引用也可在 msg 中用 <quote id=\"完整消息ID\"/>，标识照抄实际记录；name/text 只是引用预览。标签与 reply_to 同目标时合并一次引用，移除标签及其后空白；目标冲突则不发送。以发送回执为准，不因回显缺失重发；pick_media 不会发送。confirm_long/resend/insist 仅在对应提醒后，仍确有必要发送时使用。",
   },
   {
     name: "pick_media",
@@ -303,6 +304,12 @@ export const BOT_TOOLS: BotToolDef[] = [
     name: "user_info",
     signature: 'user_info(user_id: string)',
     description: "查看用户的公开资料（昵称、性别、年龄、签名等）。user_id 照抄消息或列表中的账号 ID。",
+  },
+  {
+    name: "view_avatar",
+    signature: 'view_avatar(id: string, user_id: string)',
+    description: "按需查看一个人的头像。id 照抄完整频道 id，user_id 照抄消息中的账号 ID；优先展示平台提供的群内头像，否则明确展示账号头像。头像不是聊天消息，不代表本人外貌或当前态度。私聊遵循用户资料权限，群聊遵循成员资料权限。",
+    inputSchema: { type: "object", properties: { id: { type: "string", minLength: 1 }, user_id: { type: "string", minLength: 1 } }, required: ["id", "user_id"], additionalProperties: false },
   },
   {
     name: "send_like",
@@ -491,6 +498,8 @@ export function availableTools(opts: {
         return opts.ops.listFriends;
       case "user_info":
         return opts.ops.userInfo;
+      case "view_avatar":
+        return opts.ops.userInfo || opts.ops.memberInfo;
       case "send_like":
         return opts.ops.sendLike;
       case "delete_friend":

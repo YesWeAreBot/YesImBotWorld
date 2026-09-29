@@ -1,10 +1,106 @@
 import type { ChatToolDef } from "../llm/chat.js";
+import { worldPatchSchema } from "./document.js";
+
+/** Request-owned rules also accompany custom narrative prose prompts. */
+export const WORLD_INCREMENTAL_AUTHORITY = `worldDocument是同一份自然语言记忆的分段视图，revision和段落id只是本轮编辑地址，不是实体或角色可知事实。长期事实变化时优先worldPatch:{revision,edits}：照抄本轮revision，replace替换指定整段，delete删除失效段，append按顺序追加新段；每个原文id最多修改一次，未改文字保留。无变化省略补丁；需要整体重写时可回退完整worldState，二者不能同时输出。保留有效事实、秘密、NPC目标和未完过程，已无关细节留在历史；worldMemory.targetChars是软目标，不硬截断。补丁先还原成完整候选，与角色状态、来源、感知全部校验并同笔保存后才发生；不输出编辑地址作剧情，不为整理捏造事件。`;
+
+export interface WorldResolutionOptions {
+  kind?: string;
+  allowWorldPatch?: boolean;
+  allowOngoing?: boolean;
+  allowPhoneState?: boolean;
+  speech?: "start" | "finish" | false;
+  repair?: boolean;
+}
+
+type ProposalSchema = Record<string, unknown> & { properties?: Record<string, ProposalSchema>; required?: string[] };
+
+/** Build a task-specific contract without sharing mutable schemas across requests.
+ * Omitting opts retains the historical public schema for embedders and old callers.
+ */
+export function worldResolutionTool(initializing = false, evolving = false, opts?: WorldResolutionOptions): ChatToolDef {
+  const tool = legacyWorldResolutionTool(initializing || opts?.kind === "initialize", evolving || opts?.kind === "evolve");
+  if (!opts) return tool;
+  const parameters = tool.function.parameters as ProposalSchema;
+  const properties = parameters.properties!;
+  const init = initializing || opts.kind === "initialize";
+  const evolution = !init && (evolving || opts.kind === "evolve");
+  const app = opts.kind === "app_action" || opts.kind === "app_observe";
+  const action = opts.kind === "action" || opts.kind === "app_action";
+  const perception = properties.perceptions!.items as ProposalSchema;
+  // Descriptions are part of the model input too: removing a property while keeping
+  // unrelated task instructions in the remaining fields defeats specialization.
+  tool.function.description = app
+    ? opts.kind === "app_observe" ? "返回请求角色的私有虚构应用读取结果，不写状态或执行操作。" : "提交授权虚构应用操作的完整状态与私有回执，不操作真实平台。"
+    : evolution ? "提交外部世界经过、实际来源及角色可感知的部分。" : init ? "建立初始自然语言世界、角色状态与最初感知。" : "提交本次物理世界裁定及实际感知，无变化的状态字段省略。";
+  properties.perceptions!.description = app ? "仅请求actorId的一份私有应用输出，由设备流程决定实际交付。" : "按actorId分别给实际感知；不复制全知状态，无接收者感知时可为空。";
+  perception.properties!.text!.description = app ? "应用实际可提供的内容，保留精确原文，不附身体剧情。" : "本角色实际感知的经过、环境细节与NPC回应；足够理解进展即可，不重抄状态或行动建议。";
+  if (perception.properties!.situation) perception.properties!.situation!.description = "可省略；只补正文未清楚表达的必要可知处境，不重复整段剧情或泄露秘密。";
+  if (perception.properties!.opportunities) perception.properties!.opportunities!.description = "可省略，只有新的实际选择才更新，最多4项，不为凑数制造事件。物理尝试方向须有区别，不暗示角色已选择或保证成功。省略保留有效旧建议，[]撤销，非空替换；不含软件、通知或真人聊天操作。";
+  properties.worldState!.description = app ? "授权应用操作后的完整世界及文件原文，无变化返回原文；不能只声明写入成功。" : init ? "初始完整自然语言世界记忆，包含有效事实、秘密、NPC目标与未完过程。" : "更新后的完整自然语言世界记忆，保留仍有效的事实、秘密、NPC目标与未完过程；无长期变化省略，既有设备原文仅逐字保留。";
+  if (properties.actorStates) properties.actorStates.description = init ? "常驻角色的初始客观身体与处境全文。" : "可省略；仅客观身体或处境变化的角色提供state全文，不写主观意图或重复感知。";
+  if (properties.externalChanges) properties.externalChanges.description = "本轮实际外部原因的局部id及经过；可以只记日志，持续事实变化再更新世界记忆，不替受控角色决定或结算行动。";
+  if (properties.actorEffects) properties.actorEffects.description = "可省略；实际外因改变身体或处境时，给受影响角色state全文并引用本轮changeIds，不代替角色作决定。";
+  properties.phoneState!.description = "可省略；本次真实物理原因改变手机条件时提供完整状态，不生成通知、软件操作或拿放动作，缺省不表示恢复正常。";
+  if (app) {
+    delete perception.properties!.situation;
+    delete perception.properties!.opportunities;
+    delete properties.actorStates;
+  }
+  if (app || opts.allowPhoneState === false) {
+    delete properties.phoneState;
+    delete properties.phoneChangeIds;
+  }
+  if (opts.kind === "app_observe") delete properties.worldState;
+  if (init || evolution || opts.kind && !action) delete properties.outcome;
+  if (action && !init && !evolution) parameters.required = [...parameters.required!, "outcome"];
+  if (opts.kind === "app_action") parameters.required = [...parameters.required!, "worldState"];
+  const outcome = properties.outcome;
+  if (outcome) {
+    const fields = outcome.properties!;
+    fields.status!.enum = ["completed", "failed", "needs_input", ...(opts.allowOngoing && !app && opts.speech !== "finish" ? ["ongoing"] : [])];
+    fields.status!.description = app ? "授权应用操作已完成、受阻或需要新的输入。" : "当下已完成、实际受阻或到达新的自主决定点；仅声明ongoing时可报告持续过程开始，不能预写未来完成。";
+    if (opts.speech === "start" && !app) {
+      outcome.required = [...outcome.required!, "speechSpoken"];
+      fields.speechSpoken!.description = "本次是否实际说出请求speech；true时行动者感知须逐字保留，并给实际听众感知。";
+    } else delete fields.speechSpoken;
+  }
+  if (opts.allowWorldPatch && !init && !app) {
+    properties.worldPatch = structuredClone(worldPatchSchema);
+    properties.worldState!.description = "仅当需要整体重写或无法用本轮段落补丁表达时使用的全文回退；通常优先worldPatch，无变化两者都省略。" + properties.worldState!.description;
+    parameters.not = { required: ["worldState", "worldPatch"] };
+  }
+  if (opts.repair) {
+    const required = [...parameters.required!];
+    const set: ProposalSchema = { type: "object", additionalProperties: false, minProperties: 1, maxProperties: 32,
+      properties: structuredClone(properties), ...(parameters.not ? { not: structuredClone(parameters.not) } : {}) };
+    properties.repair = { type: "object", additionalProperties: false, minProperties: 1,
+      description: "仅修正当前未提交草稿。set按整个顶层字段替换，不作嵌套合并；remove移除草稿中的错误字段，也可移除未声明的字段名。不得与完整提案同时提交，修正后仍须完整验证。",
+      properties: {
+        set,
+        remove: { type: "array", minItems: 1, maxItems: 32, uniqueItems: true, items: { type: "string", minLength: 1, maxLength: 80,
+          not: { enum: ["__proto__", "constructor", "prototype", "repair"] } } },
+      },
+    };
+    delete parameters.required;
+    parameters.oneOf = [
+      { required, not: { required: ["repair"] } },
+      { required: ["repair"], maxProperties: 1 },
+    ];
+  }
+  return tool;
+}
+
+/** Exposes the same contract for repair construction and protocol inspection. */
+export function worldResolutionSchema(initializing = false, evolving = false, opts?: WorldResolutionOptions): Record<string, unknown> {
+  return worldResolutionTool(initializing, evolving, opts).function.parameters;
+}
 
 /** Kept outside editable prose prompts: this operation cannot become a second actor loop. */
-export const WORLD_EVOLUTION_AUTHORITY = `本次kind=evolve从evolutionSinceTU承接已提交演化，elapsedEvolutionWorldSeconds是此后经过的世界秒数，不能从旧状态文本时间重演已经发生的历史。仅裁定外部世界：天气、环境、NPC以及远处事件可以按真实经过发展。输入的受控角色是观察者，不是本轮行动者；其状态默认保持，不能用心跳替其安排动作、转移注意、作决定，不能把经过一段时间续写成困倦、入睡或醒来，也不能推进或完成pendingActions。睡眠等持续行动只由对应action裁定。可以描述本轮外部物理原因实际造成的身体影响，例如雨水淋湿衣服、他人碰撞或强光到达感官；实际原因、空间和感知条件必须成立，不因为要唤醒/提醒角色而制造原因。externalChanges记录本轮外部经过及局部id并存入事件日志；只有影响后续的长期事实变化才更新worldState全文，短暂变化无需重抄世界状态；actorStates/outcome在本任务不可写。真正的身体变化只经actorEffects提交并引用changeIds，只更新原因造成的客观影响；没有影响就保留原状态。perceptions必须引用本轮变化的changeIds，且仅投递接收者实际感知到的部分；远处事件及未被注意的经过只保存于世界记录，仍影响后续的事实与秘密写入worldState，不能把全知原因告诉角色。phoneState也须用phoneChangeIds引用实际外部物理原因。每份perceptions必须有text正文，situation不能替代text。安静时perceptions:[]并省略worldState，不为给反馈或选项制造事件，不用无变化的旧场景重复催促。承接NPC正在做的事情、环境过程与已确定的日程，不把每轮都写成一次新的风吹或虫鸣。可用nextIntervalTU建议下次检查的间隔，依据下一处外部进展可能发生的时间，不跳过这段时间或提前实现它。`;
+export const WORLD_EVOLUTION_AUTHORITY = `kind=evolve只发展外部世界：从evolutionSinceTU承接已提交经过，以elapsedEvolutionWorldSeconds判断NPC、天气、环境或远处事件的进展。输入的受控角色不是本轮行动者；默认保持状态，不能替其决定、转移注意、困倦/入睡/醒来或结算pendingActions。实际外因如雨水、碰撞可以影响身体，但不能为唤醒角色制造原因。externalChanges登记本轮原因的局部id和真实经过；actorEffects仅在客观身体或处境受影响时给完整state及changeIds，不能写actorStates或outcome。每份perceptions必须有text并引用本轮changeIds，只投递接收者实际感知的部分，远处秘密不泄露。短暂经过可只存原因日志，持续事实变化才更新世界记忆。没有外部变化时perceptions:[]并省略状态，不重演近期已发生的事件，不为选项打断安静。nextIntervalTU仅建议下一次检查间隔，不推进当前时间或授权未来事件。`;
 
 /** Only delivery addresses and execution status are structured; world content is prose. */
-export function worldResolutionTool(initializing = false, evolving = false): ChatToolDef {
+function legacyWorldResolutionTool(initializing = false, evolving = false): ChatToolDef {
   const prose = { type: "string", minLength: 1, maxLength: 200_000 };
   const changeIds = { type: "array", minItems: 1, maxItems: 100, uniqueItems: true, items: { type: "string", minLength: 1, maxLength: 80 }, description: "引用本次externalChanges中的id；不能引用旧事件、角色自己的等待/睡眠或尚未完成的行动作为外部原因。" };
   return { type: "function", function: { name: "resolve_world",

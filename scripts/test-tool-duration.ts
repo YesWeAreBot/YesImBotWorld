@@ -115,14 +115,14 @@ async function actualActionTiming() {
       const id = `bot:${call.id}`;
       await eventually(() => receipts.some(receipt => receipt.action.id === id && receipt.action.phase === "ongoing"));
       assert.equal(store.snapshot().actions[id]!.expectedEnd, before + duration);
-      const start = worldRequests.find(request => request.action.id === id && request.actionPhase === "start");
+      const start = worldRequests.find(request => request.action.expectedEnd === before + duration && request.actionPhase === "start");
       assert.equal(start.action.expectedEnd, before + duration, "the normalized duration reaches the actual World request");
       now = before + duration - 1; await sleep(8);
       assert.equal(store.snapshot().actions[id]!.status, "pending", "a real ongoing action cannot finish before its intended world time");
       now = before + duration;
       await eventually(() => !agent.scheduler.isPending(call.id)); await agent.drainMailbox();
       assert.equal(store.snapshot().actions[id]!.status, "completed");
-      assert.equal(worldRequests.find(request => request.action.id === id && request.actionPhase === "finish").time, now);
+      assert.equal(worldRequests.find(request => request.action.expectedEnd === before + duration && request.actionPhase === "finish").timeAuthority.tu, now);
     }
     assert.equal(requests, 2, "two protocol fixtures use exactly two Bot requests, without extra inference");
     const parse = (name: string, args: Record<string, unknown>, duration?: number) => validateToolCall({ name, arguments: args, duration }, names);

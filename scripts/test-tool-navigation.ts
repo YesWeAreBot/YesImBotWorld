@@ -37,7 +37,7 @@ async function purePlans() {
   assert.deepEqual(await plan("send", { id: PRIVATE, msg: "另一条消息" }, state({ chatOpen: true, channelKey: GROUP, channelIsGroup: true })), {
     steps: [step("select_channel", { id: PRIVATE })],
   }, "an explicit recipient must override the currently visible channel");
-  assert.deepEqual(await plan("send", { msg: "在当前会话继续" }, state({ chatOpen: true, channelKey: PRIVATE })), { steps: [] });
+  assert.deepEqual(await plan("read_channel", {}, state({ chatOpen: true, channelKey: PRIVATE })), { steps: [] });
   assert.deepEqual(await plan("send", { id: PRIVATE, msg: "明确的同一会话" }, state({ chatOpen: true, channelKey: PRIVATE })), { steps: [] });
   const beforeMissing = resolved.length;
   const missing = await plan("send", { msg: "没有指定给谁" }, state({ phone: { down: true }, channelKey: PRIVATE }));
@@ -172,7 +172,7 @@ async function runtimeNavigation() {
     assert.deepEqual(f.requests[1]!.messages.slice(0, f.requests[0]!.messages.length), f.requests[0]!.messages);
     assert.ok(f.context.stream.some(entry => entry.kind === "event" && entry.event.content.includes("适配器确认已发送")));
   }
-  const current = await runtimeFixture(call("send", { msg: "就在这里回复" }), { channel: PRIVATE });
+  const current = await runtimeFixture(call("send", { id: PRIVATE, msg: "就在这里回复" }), { channel: PRIVATE });
   current.agent.start(); await until(() => current.requests.length === 2); await current.agent.stop();
   assert.deepEqual(current.calls(), ["send"]); assert.equal(current.chatOpens(), 0); assert.equal(current.channelReads(), 0); assert.equal(current.sends.length, 1, JSON.stringify(current.context.stream.filter(entry => entry.kind === "event")));
 
@@ -259,7 +259,7 @@ async function physicalChangesCancelOnlyUnsubmittedPhoneTasks() {
     ["damaged", { reachable: true, location: "眼前", usable: false, perceptible: true }],
   ] as const) {
     let deadlineReached = false;
-    const f = await runtimeFixture({ ...call("send", { msg: "A complete fixture message which is still being typed and must not survive losing the phone." }), duration: 3 }, {
+    const f = await runtimeFixture({ ...call("send", { id: PRIVATE, msg: "A complete fixture message which is still being typed and must not survive losing the phone." }), duration: 3 }, {
       channel: PRIVATE, ignoreSendDuration: false, holdNextGeneration: true,
       realMsUntil: at => at > 10 && !deadlineReached ? 20 : 0,
     });
@@ -285,7 +285,7 @@ async function physicalChangesCancelOnlyUnsubmittedPhoneTasks() {
 
   let finishSend!: () => void;
   const sendGate = new Promise<void>(resolve => { finishSend = resolve; });
-  const committed = await runtimeFixture(call("send", { msg: "提交给平台后仍应保留真实回执。" }), { channel: PRIVATE, sendGate });
+  const committed = await runtimeFixture(call("send", { id: PRIVATE, msg: "提交给平台后仍应保留真实回执。" }), { channel: PRIVATE, sendGate });
   committed.agent.start(); await until(() => committed.sends.length === 1);
   const sending = committed.agent.scheduler.pending().find((task: any) => task.name === "send");
   assert.ok(sending?.committed);

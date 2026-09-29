@@ -107,7 +107,8 @@ export class WorldAgent {
   }
   private async maintenanceComplete(messages: ChatMessage[], signal: AbortSignal): Promise<ChatResult> {
     signal.throwIfAborted();
-    const result = await abortable(this.client.complete(messages, { signal }), signal);
+    const result = await withEndpointLock(this.cfg.baseURL,
+      () => this.client.complete(messages, { signal }), signal, { priority: "background" });
     signal.throwIfAborted();
     return result;
   }
@@ -362,29 +363,28 @@ export class WorldAgent {
       stream: cfg.stream,
       label: "World",
     });
-    this.runtime = new NarrativeWorld(files, clock, (messages, tools, signal) => withEndpointLock(cfg.baseURL, () => {
-      const pending = this.client.complete(messages, { tools, signal, toolChoice: { type: "function", function: { name: "resolve_world" } } });
-      return signal ? abortable(pending, signal) : pending;
-    }, signal), prompts, { heartbeatTimeoutMs: cfg.heartbeatTimeoutMs });
+    // The lock owns the provider promise, not an abortable wrapper. Reset may settle
+    // its caller promptly; only a provider ignoring cancellation can keep later
+    // same-origin inference queued until its request ends or times out.
+    this.runtime = new NarrativeWorld(files, clock, (messages, tools, signal, options) => withEndpointLock(cfg.baseURL,
+      () => this.client.complete(messages, { tools, signal, toolChoice: { type: "function", function: { name: "resolve_world" } } }),
+      signal, { priority: options?.background ? "background" : "interactive", onTiming: options?.onEndpointTiming }), prompts, { heartbeatTimeoutMs: cfg.heartbeatTimeoutMs });
     this.runtime.phoneAuthorityProvider = () => this.remote === null;
   }
 
   /**
-   * 串行化执行，避免并发写状态文件。
-   * 同时以"整个任务"为粒度持有推理端点锁：当 World-LLM 与 Bot-LLM 共用一个
-   * 只能驻留单模型的端点（llama-swap 等换载层）时，任务期间 Bot 的生成请求
-   * 排队等待，避免跨模型并发把请求饿死或把推理进程搞崩；不同源时无影响。
-   */
-  /**
    * 维护任务入队。priority 越大越靠前，同优先级保持先后顺序。
+   * 保留维护任务的文件写入及分段依赖顺序，只在单次模型请求期间占用端点。
    * 所有阶段使用入队时的取消信号；停止后不能借用下一轮的信号继续。
    */
   private enqueue<T>(fn: (signal: AbortSignal) => Promise<T>, priority = 0, cancelKey?: string, signal = this.maintenanceAbort.signal): Promise<T> {
     if (signal.aborted) return Promise.reject(signal.reason);
     this.pending++;
-    return new Promise<T>((resolve, reject) => {
-      const wrapped = () =>
-        withEndpointLock(this.cfg.baseURL, () => this.trackMaintenance(() => fn(signal), signal), signal).finally(() => this.pending--);
+    return abortable(new Promise<T>((resolve, reject) => {
+      const wrapped = async () => {
+        try { return await this.trackMaintenance(() => fn(signal), signal); }
+        finally { this.pending--; }
+      };
       const entry = {
         fn: wrapped as () => Promise<unknown>,
         priority,
@@ -401,7 +401,7 @@ export class WorldAgent {
         this.queue.push(entry);
       }
       if (!this.draining) this.drainTask = this.drain();
-    });
+    }), signal);
   }
 
   /**
@@ -723,10 +723,10 @@ export class WorldAgent {
 
   /** Independent appearance maintenance: the service supplies its lifecycle signal,
    * so a paused/uncreated world stays paused and no narrative/context is touched.
-   * Track the worker inside the endpoint lock: shutdown must join any started write
-   * even if cancellation has already released the endpoint-lock waiter. */
+   * The maintenance queue keeps read/generate/compare/write serialized; the endpoint
+   * is owned only by the model request. Shutdown still joins already-started writes. */
   async regeneratePhoneShell(signal: AbortSignal): Promise<{ content: string; phone: PhoneResolution }> {
-    return withEndpointLock(this.cfg.baseURL, () => this.trackMaintenance(async () => {
+    return this.enqueue(async () => {
       const { botDef, worldDef } = await this.files.readDefinitions();
       signal.throwIfAborted();
       if (!botDef.trim() || !worldDef.trim() || botDef.includes("（尚未编写）") || worldDef.includes("（尚未编写）")) {
@@ -736,7 +736,7 @@ export class WorldAgent {
       signal.throwIfAborted();
       const content = await this.generateAndSavePhoneShell(botDef, worldDef, phone, signal);
       return { content, phone };
-    }, signal), signal);
+    }, 0, undefined, signal);
   }
 
   private async generateAndSavePhoneShell(botDef: string, worldDef: string, res: PhoneResolution, signal: AbortSignal): Promise<string> {

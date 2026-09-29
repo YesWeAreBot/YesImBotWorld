@@ -32,15 +32,15 @@ async function staleAndFresh(base: string) {
   const prefix = await context.toChatMessages("T" + NOW);
   const runtime = new GrowthRuntime(ledger, cfg, { now: () => NOW, unitWorldSeconds: 1 }, context, logger, {
     infer: async messages => {
-      assert.match(messages[0]!.content as string, /observedAt.*不从整理时刻重新计时/);
+      assert.match(messages[0]!.content as string, /不要新增 state/);
       return { content: JSON.stringify({ changes: [state, { ...state, subject: "准备很久的午睡", expiresAt: NOW + 7200 },
-        { kind: "relationship", subject: "泡茶的朋友", statement: "当时朋友愿意照顾我的休息。", evidenceIds: ["nap3"] }] }), toolCalls: [] };
+        { kind: "relationship", subject: "泡茶的朋友", statement: "当时朋友愿意照顾我的休息。", evidenceIds: ["nap3"], insight: { dimension: "忙碌时的照应", significance: "忙完时朋友愿意准备茶点，可以在疲倦时向其表达休息需要。", anchors: [{ eventId: "nap3", quote: "午后忙完，朋友准备了茶，稍后想休息。" }] } }] }), toolCalls: [] };
     },
   });
   runtime.tick(); await runtime.settled();
   const status = await ledger.reviewStatus(), views = await ledger.recall({ at: NOW });
   assert.equal(status.recent[0]!.rejected?.length, 2);
-  assert.ok(status.recent[0]!.rejected!.every(item => /最近两世界小时.*旧经历/.test(item.reason)));
+  assert.ok(status.recent[0]!.rejected!.every(item => /自动成长不记录临时处境/.test(item.reason)));
   assert.deepEqual(views.map(view => view.kind), ["relationship"], "stale state siblings do not discard a legitimate lasting relationship");
   assert.equal(status.pending, 0); assert.equal((await ledger.recallEvidence({ n: 50 })).length, 4);
   assert.deepEqual(await context.toChatMessages("T" + NOW), prefix, "validation does not rewrite or extend the actor prefix");
@@ -169,14 +169,15 @@ async function historicalWorldReceipts(base: string) {
     assert.equal(evidence?.experience.worldEpoch, "old-world-stage", "review packing keeps source boundaries even when the old result arrived recently");
     return { content: JSON.stringify({ changes: [
       { kind: "state", subject: "正在茶铺喝茶", statement: "现在还在茶铺里。", situation: "旧世界茶铺内", evidenceIds: [late.id] },
-      { kind: "relationship", subject: "旧世界的店员", statement: "店员曾经给我递过一杯热茶。", evidenceIds: [late.id] },
+      { kind: "relationship", subject: "旧世界的店员", statement: "那家旧茶铺的店员愿意为来客提供服务。", evidenceIds: [late.id], insight: { dimension: "茶铺服务的初步印象", significance: "如果再次回到同一世界茶铺，可以据此尝试向店员点茶。", anchors: [{ eventId: late.id, quote: "店员给你递了一杯热茶" }] } },
     ] }), toolCalls: [] };
   } });
   runtime.tick(undefined, true); await runtime.settled();
   assert.equal(calls, 1);
   const status = await reloaded.reviewStatus();
   assert.equal(status.recent[0]?.rejected?.length, 1);
-  assert.match(status.recent[0]!.rejected![0]!.reason, /先前世界的历史回执不证明当前处境/);
+  assert.match(status.recent[0]!.rejected![0]!.reason, /自动成长不记录临时处境/);
+  await assert.rejects(reloaded.reflect({ kind: "state", subject: "当前茶铺", statement: "我还在茶铺里。", situation: "茶铺内", evidenceIds: [late.id] }, NOW), /先前世界的历史回执不证明当前处境/);
   assert.deepEqual((await reloaded.recall({ at: NOW })).map(view => view.kind), ["relationship"], "historical experiences remain valid evidence without restoring their old physical situation");
   assert.deepEqual(await context.toChatMessages("after historical review"), prefix, "review provenance does not rewrite the actor's frozen prefix");
   assert.match(COMPRESSION_SOURCE_GUIDANCE, /先前世界的操作结果.*不代表当前世界处境/);

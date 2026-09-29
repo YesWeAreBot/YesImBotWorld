@@ -295,9 +295,9 @@ async function decisionMemory() {
     const files = new WorldFiles(base); await files.ensure();
     const context = new BotContext(files); await context.load();
     const ledger = new GrowthLedger(base), cfg = Config({ autoStart: false }).bot;
-    const experienced: BotEvent = { id: "experienced-clay", source: "world", worldTime: 1, content: "你在陶艺课上慢慢捏好一个杯子，很喜欢专心做手工的过程。", originEventIds: ["actual-clay"] };
+    const experienced: BotEvent = { id: "experienced-clay", source: "world", worldTime: 1, content: "你在陶艺课上慢慢捏好一个杯子，很喜欢专心做手工的过程。", originEventIds: ["actual-clay"], experience: { agency: "self", outcome: "completed", opportunity: true, action: "捏好一个杯子", episodeId: "clay-class" } };
     await context.appendEvent(experienced); await ledger.perceive(experienced);
-    await ledger.reflect({ kind: "preference", subject: "陶艺", statement: "我喜欢安静地捏陶器。", cues: ["陶艺", "捏杯子"], evidenceIds: [experienced.id] }, 2);
+    await ledger.reflect({ kind: "preference", subject: "陶艺", statement: "我喜欢安静地捏陶器。", cues: ["陶艺", "捏杯子"], evidenceIds: [experienced.id], insight: { dimension: "专心手工", significance: "空闲想放松时可以选择不受打扰的手工活动。", anchors: [{ eventId: experienced.id, quote: "很喜欢专心做手工的过程" }] } }, 2);
     await context.applyCompression({ historySummary: "以前体验过手工活动。", memoryDigest: "旧经历已归档。" }, 3);
     const current = scene("crossroads", 4, [choice], { contextText: undefined });
     await context.appendEvent(current); await ledger.perceive(current);

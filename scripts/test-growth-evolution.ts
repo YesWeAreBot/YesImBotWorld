@@ -12,6 +12,7 @@ const choice = (episodeId: string, situation = "晚饭结束后在家门口", ex
 const event = (id: string, at: number, experience?: ExperienceMetadata, content = "晚饭后主动去河边散步，回来觉得轻松。"): BotEvent => ({
   id, worldTime: at, source: "world", content, ...(experience ? { experience } : {}),
 });
+const insight = (eventId: string, quote: string, dimension = "同行时的支持") => ({ dimension, significance: "这段真实经历支持在类似情境下再次尝试，但不能直接推定始终如此。", anchors: [{ eventId, quote }] });
 const habit = (evidenceIds: string[]): ReflectionInput => ({ kind: "habit", subject: "饭后散步", behavior: "沿河散步", situation: "晚饭结束后",
   cues: ["晚饭", "河边", "饭后"], statement: "最近晚饭后常去河边散步；天气不好或有人相约时，也会选择别的安排。", evidenceIds });
 
@@ -62,7 +63,8 @@ async function main() {
     await assert.rejects(ledger.reflect({ ...state, expiresAt: 18 }, 18), /expiresAt/);
     await assert.rejects(ledger.reflect({ ...state, situation: undefined, expiresAt: 20 }, 18), /situation/);
     const temporary = await ledger.reflect({ ...state, expiresAt: 20 }, 18);
-    assert.equal((await ledger.retrieve({ text: "想起刚才的争吵。", at: 19 }))[0]?.claimId, temporary.view.claimId);
+    assert.equal((await ledger.recall({ claimId: temporary.view.claimId, at: 19 }))[0]?.active, true);
+    assert.deepEqual(await ledger.retrieve({ text: "想起刚才的争吵。", at: 19 }), [], "manual temporary states remain auditable without entering long-term recall");
     assert.deepEqual(await ledger.retrieve({ text: "想起刚才的争吵。", at: 20 }), []);
     assert.equal((await ledger.recall({ claimId: temporary.view.claimId, at: 20 }))[0]?.inactiveReason, "expired");
     assert.doesNotMatch(await ledger.summary(20), /暂时不太想说话/);
@@ -86,8 +88,8 @@ async function main() {
     const evolved = await broad.reflect({ ...traits, evidenceIds: [...traits.evidenceIds.slice(0, 4), "home", "outing"] }, 8);
     assert.equal(evolved.view.kind, "trait"); assert.equal(evolved.view.status, "tentative");
     await broad.perceive(event("friend", 9, { agency: "observed", subjectIds: ["onebot:123"] }, "青哥愿意帮我准备出游用品。"));
-    await assert.rejects(broad.reflect({ kind: "relationship", subject: "青哥", subjectId: "onebot:456", statement: "愿意在出游前帮忙准备。", evidenceIds: ["friend"] }, 9), /实际感知过的身份/);
-    const friendship = await broad.reflect({ kind: "relationship", subject: "青哥", subjectId: "onebot:123", statement: "愿意在出游前帮忙准备。", evidenceIds: ["friend"] }, 9);
+    await assert.rejects(broad.reflect({ kind: "relationship", subject: "青哥", subjectId: "onebot:456", statement: "愿意在出游前帮忙准备。", evidenceIds: ["friend"], insight: insight("friend", "青哥愿意帮我准备出游用品。") }, 9), /实际感知过的身份/);
+    const friendship = await broad.reflect({ kind: "relationship", subject: "青哥", subjectId: "onebot:123", statement: "愿意在出游前帮忙准备。", evidenceIds: ["friend"], insight: insight("friend", "青哥愿意帮我准备出游用品。") }, 9);
     assert.equal((await broad.retrieve({ text: "阿青说早上好", subjectIds: ["onebot:123"], at: 10 }))[0]?.claimId, friendship.view.claimId,
       "a stable identity retrieves a relationship even when the nickname changes");
     assert.ok(!(await broad.retrieve({ text: "另一位朋友愿意帮我准备出游用品。", subjectIds: ["onebot:456"], at: 10 }))
@@ -95,7 +97,7 @@ async function main() {
     assert.ok(!(await broad.retrieve({ text: "青哥愿意帮我准备出游用品。", subjectIds: ["onebot:456"], at: 10 }))
       .some(view => view.claimId === friendship.view.claimId), "even an identical nickname cannot override a different stable identity");
     await broad.perceive(event("namesake", 10, { agency: "observed", subjectIds: ['chat-user:["onebot","456"]'] , chat: { channelKey: "fixture@self:group", kind: "message", senderId: 'chat-user:["onebot","456"]', senderOwn: false } }, "另一位也叫青哥的人愿意帮我准备出游用品。"));
-    const namesake = await broad.reflect({ kind: "relationship", subject: "青哥", subjectId: 'chat-user:["onebot","456"]', statement: friendship.view.statement, evidenceIds: ["namesake"] }, 10);
+    const namesake = await broad.reflect({ kind: "relationship", subject: "青哥", subjectId: 'chat-user:["onebot","456"]', statement: friendship.view.statement, evidenceIds: ["namesake"], insight: insight("namesake", "另一位也叫青哥的人愿意帮我准备出游用品。") }, 10);
     assert.notEqual(namesake.view.claimId, friendship.view.claimId, "same words about different people are separate claims");
     assert.match(growthViewText(namesake.view), /onebot 账号 456/);
     assert.match(await broad.summary(10), /onebot 账号 456/);
@@ -118,10 +120,10 @@ async function main() {
     assert.ok(snap); assert.equal(snap.episodeIds.length, 4);
     assert.ok(snap.evidence.every(e => e.experience?.agency === "self"));
     const valid = habit(["review1", "review2", "review3"]);
-    await assert.rejects(reviewed.commitReview(snap, [valid, { ...state, evidenceIds: ["unseen"], expiresAt: 30 }], 4), /未感知/);
+    await assert.rejects(reviewed.commitReview(snap, [valid, { kind: "preference", subject: "河边", statement: "喜欢河边的安静。", evidenceIds: ["review4", "unseen"], insight: insight("unseen", "晚饭后主动去河边散步，回来觉得轻松。", "放松方式") }], 4), /未感知/);
     assert.equal((await reviewed.stats()).records, 0, "one invalid proposal rolls back every record in a batch");
     assert.equal((await reviewed.snapshotReview({ at: 4 }))?.id, snap.id, "failed review does not advance the cursor");
-    await assert.rejects(reviewed.commitReview(snap, [{ ...state, evidenceIds: ["review4"], expiresAt: 5 }], 5), /expiresAt/,
+    await assert.rejects(reviewed.reflect({ ...state, evidenceIds: ["review4"], expiresAt: 5 }, 5), /expiresAt/,
       "a temporary state that expired while the model was working is rejected without consuming evidence");
     assert.equal((await reviewed.snapshotReview({ at: 4 }))?.id, snap.id);
 
@@ -136,7 +138,7 @@ async function main() {
     finally { fs.appendFile = originalAppend; }
     assert.equal((await reviewed.stats()).records, 0);
     assert.equal((await new FixtureLedger(path.dirname(reviewed.file)).snapshotReview({ at: 4 }))?.id, snap.id);
-    const committed = await reviewed.commitReview(snap, [valid, { kind: "preference", subject: "河边", statement: "最近觉得河边很放松。", evidenceIds: ["review4"] }], 4);
+    const committed = await reviewed.commitReview(snap, [valid, { kind: "preference", subject: "河边", statement: "最近觉得河边很放松。", evidenceIds: ["review4"], insight: insight("review4", "晚饭后主动去河边散步，回来觉得轻松。", "放松方式") }], 4);
     assert.equal(committed.records.length, 2); assert.ok(committed.records.every(record => record.origin === "automatic"));
     assert.equal((await reviewed.pendingReviews()).length, 1);
     assert.equal((await reviewed.commitReview(snap, [valid], 4)).duplicate, true);
@@ -160,7 +162,7 @@ async function main() {
     assert.deepEqual(await resumed.pendingReviews(), [], "no-change creates no synthetic growth event");
     for (let i = 9; i <= 12; i++) await resumed.perceive(event(`review${i}`, i, choice(`review${i}`)));
     const stale = (await resumed.snapshotReview({ at: 12 }))!;
-    await resumed.reflect({ kind: "preference", subject: "晚饭", statement: "喜欢饭后稍作休息。", evidenceIds: ["review12"] }, 12);
+    await resumed.reflect({ kind: "preference", subject: "晚饭", statement: "最近愿意饭后沿河走走来放松。", evidenceIds: ["review12"], insight: insight("review12", "晚饭后主动去河边散步，回来觉得轻松。", "饭后安排") }, 12);
     await assert.rejects(resumed.commitReview(stale, [], 12), /快照已失效/);
     assert.equal((await resumed.snapshotReview({ at: 12 }))?.afterCursor, stale.afterCursor, "concurrent manual reflection invalidates review without losing pending experiences");
     const current = (await resumed.snapshotReview({ at: 12 }))!;

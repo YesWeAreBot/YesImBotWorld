@@ -61,18 +61,28 @@ async function main() {
       await context.appendToolCall(call as never); await bot.dispatch(call); return call.id;
     }
     bot.scheduler.schedule({ id: "pending-wait", role: "agent", name: "wait", arguments: {}, issuedAt: 1, expectedAt: 60 }, { executeAt: "expected", run: async () => "wait receipt" });
+    let independentActExecutions = 0;
+    bot.scheduler.schedule({ id: "pending-act", role: "agent", name: "act", arguments: { description: "等待院门打开" }, issuedAt: 1, expectedAt: 60 }, {
+      executeAt: "expected", run: async () => { independentActExecutions++; return "院门已经打开。"; },
+    });
     bot.waiting = { callId: "pending-wait", kind: "wait", startedTU: 1 };
     assert.equal((await stealth("open_app", { name: "notes" })).ok, true);
     assert.equal(bot.manualMode, false); assert.equal(opens, 1);
     assert.equal(bot.scheduler.isPending("pending-wait"), true); assert.equal(bot.waiting.callId, "pending-wait");
+    assert.equal(bot.scheduler.isPending("pending-act"), true);
     assert.equal(context.stream.length, 0, "stealth is never represented as Bot's own tool call");
     assert.equal(bot.mailbox.length, 0); assert.equal(peeks, 0, "unattended device does not capture or disclose content");
     bot.refreshToolGate();
     assert.equal(declared.includes("read_note"), false, "unrelated refresh cannot leak a hidden app through model tool declarations");
     assert.ok(declared.includes("open_app"), "Bot retains its previously known device entry point");
     assert.ok(bot.manualTools().some((tool: any) => tool.name === "read_note"), "admin sees the actual active device schema");
-    bot.pushEvent("koishi", "手机震了一下"); assert.equal(bot.mailbox.length, 1);
-    assert.equal(bot.mailbox[0].content, "手机震了一下", "normal notifications keep their existing perception route");
+    bot.pushEvent("koishi", "手机震了一下"); assert.equal(bot.mailbox.length, 2);
+    assert.equal(bot.mailbox.filter((event: any) => event.source === "koishi" && event.content === "手机震了一下").length, 1, "the normal notification body keeps its route without duplication");
+    const interruption = bot.mailbox.filter((event: any) => event.source === "system" && event.refToolCallId === "pending-wait");
+    assert.equal(interruption.length, 1); assert.match(interruption[0].content, /计时中断/);
+    assert.equal(bot.waiting, null); assert.equal(bot.scheduler.isPending("pending-wait"), false, "a real notification interrupts the character's pause");
+    assert.equal(bot.scheduler.isPending("pending-act"), true, "interrupting the pause must not cancel independent world work");
+    assert.equal(independentActExecutions, 0, "a notification cannot execute a scheduled world action prematurely");
     bot.mailbox = [];
 
     const look = await autonomous("observe_device", { device: "phone" }); await until(() => !bot.scheduler.isPending(look));
@@ -96,7 +106,10 @@ async function main() {
     assert.match(screen[0].content, /当前可见界面.*QQ/);
     assert.match(screen[0].content, /actual visible screen/);
     assert.doesNotMatch(screen[0].content, /管理员|偷偷|人类|黑客|你打开了|疑惑|感到/);
-    assert.equal(bot.scheduler.isPending("pending-wait"), true, "visible changes do not cancel unrelated autonomous tasks");
+    assert.equal(bot.scheduler.isPending("pending-act"), true, "visible changes do not cancel unrelated autonomous world tasks");
+    assert.equal(independentActExecutions, 0);
+    assert.equal(bot.scheduler.pending().find((task: any) => task.id === "pending-act").committed, false, "protection is not merely caused by an irreversible commit");
+    assert.equal(bot.scheduler.cancel("pending-act"), "cancelled", "explicit fixture cleanup releases the still-cancellable independent action");
     const pickUp = await autonomous("pick_up_phone"); await until(() => !bot.scheduler.isPending(pickUp));
     const putDown = await autonomous("put_down_phone"); await until(() => !bot.scheduler.isPending(putDown));
     bot.mailbox = []; const priorPeeks = peeks;
@@ -131,10 +144,10 @@ async function main() {
     assert.equal(bot.mailbox.length, 0, "failed hidden operations cannot become a Bot action receipt"); fail = false;
 
     await stealth("open_app", { name: "chat" }); await stealth("select_channel", { id: "onebot@fixture:channel" });
-    assert.equal((await stealth("send", { msg: "explicit fixture message" })).ok, false); assert.equal(sends, 0);
-    assert.equal((await stealth("send", { msg: "explicit fixture message" }, true)).ok, true); assert.equal(sends, 1);
+    assert.equal((await stealth("send", { id: "onebot@fixture:channel", msg: "explicit fixture message" })).ok, false); assert.equal(sends, 0);
+    assert.equal((await stealth("send", { id: "onebot@fixture:channel", msg: "explicit fixture message" }, true)).ok, true); assert.equal(sends, 1);
     assert.equal(bot.manualMode, false);
-    assert.equal((await stealth("send", { msg: "unfinished <img>" }, true)).ok, false);
+    assert.equal((await stealth("send", { id: "onebot@fixture:channel", msg: "unfinished <img>" }, true)).ok, false);
 
     const downForBackground = await autonomous("put_down_phone"); await until(() => !bot.scheduler.isPending(downForBackground));
     bot.mailbox = [];

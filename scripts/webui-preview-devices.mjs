@@ -48,7 +48,7 @@ export function createDeviceFixture(options = {}) {
     const core = [tool('open_app','打开应用',{name:string('应用 ID')},['name']),tool('close_app','关闭当前应用'),tool('pick_up_phone','拿起手机'),tool('put_down_phone','放下手机'),tool('open_computer','打开预览电脑',{},[],'action','computer'),tool('close_computer','关闭预览电脑',{},[],'action','computer')];
     if (computerOn) core.push(tool('run_command','开发样本：仅回显文本，不运行真实命令',{command:string('命令文本')},['command'],'action','computer'));
     const byApp = {
-      chat:[tool('check_msg','查看消息列表',{n:number('数量')},[],'read'),tool('select_channel','进入会话',{id:string('频道 key')},['id'],'read'),tool('read_channel','读取消息',{n:number('数量')},[],'read'),...(channelKey?[tool('send','向本地内存发送消息',{msg:string('消息'),id:string('频道')},['msg'],'send')]:[])],
+      chat:[tool('check_msg','查看消息列表',{n:number('数量')},[],'read'),tool('select_channel','进入会话',{id:string('频道 key')},['id'],'read'),tool('read_channel','读取消息',{n:number('数量')},[],'read'),...(channelKey?[tool('send','向本地内存发送消息',{msg:string('消息'),id:string('频道')},['msg','id'],'send')]:[])],
       weather:[tool('query_weather','查询开发天气样本',{city:string('城市或地区')},[],'read')],
       browser:[tool('search','搜索开发样本',{query:string('搜索词'),provider:{type:'integer',minimum:0}},['query'],'read'),tool('open_url','打开开发样本文档',{url:string('网址')},['url'],'read'),tool('open_link','打开编号链接',{n:number('链接编号')},['n'],'read'),tool('home','返回开发主页'),tool('go_back','返回'),tool('reload','刷新缓存样本'),tool('read_page','重新读取缓存页面',{},[],'read'),tool('scroll_down','下一屏'),tool('screenshot','截图：开发预览不生成截图')],
       notes:[tool('list_notes','列出笔记',{},[],'read'),tool('view_note','查看笔记',{title:string('标题')},['title'],'read'),tool('write_note','写笔记',{title:string('标题'),content:string('正文')},['title','content']),tool('edit_note','修改笔记',{title:string('原标题'),new_title:string('新标题'),content:string('正文')},['title']),tool('delete_note','删除笔记',{title:string('标题')},['title'])],
@@ -102,7 +102,8 @@ export function createDeviceFixture(options = {}) {
         case 'select_channel':if(!channels.some(c=>c.key===args.id))return {ok:false,text:'会话不存在。'};channelKey=args.id;return result('已打开本地会话。',name);
         case 'read_channel':return result('已读取内存消息。',name);
         case 'send': {
-          const key=args.id || channelKey;if(!channels.some(c=>c.key===key))return {ok:false,text:'请选择会话。'};
+          if(typeof args.id!=='string'||!args.id.trim()||Object.hasOwn(args,'channel'))return {ok:false,text:'send 需要明确填写频道 id。'};
+          const key=args.id.trim();if(!channels.some(c=>c.key===key))return {ok:false,text:'请选择会话。'};
           if(!String(args.msg || '').trim())return {ok:false,text:'消息为空。'};
           messages.push({id:nextId,messageId:'fixture-'+nextId++,channelKey:key,userId:'preview-bot',username:'预览 Bot',content:String(args.msg),timestamp:new Date().toISOString(),self:true});return result('已添加到本地内存，未发送到外部平台。',name);
         }

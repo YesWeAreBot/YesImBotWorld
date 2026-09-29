@@ -1,3 +1,4 @@
+import { worldInputText } from "./world-input-fixture.js";
 import assert from "node:assert/strict";
 import { promises as fs } from "node:fs";
 import os from "node:os";
@@ -37,18 +38,18 @@ async function immediateFeedbackAndConcurrentStages() {
   const f = await fixture(), opening = deferred<ChatResult>();
   const receipts: any[] = [], duplicateReceipts: any[] = [], visitorReceipts: any[] = [], gates: string[] = [];
   f.handler(async request => {
-    if (request.kind === "evolve") return response({ worldState: request.worldState + "窗外吹来一阵风。", externalChanges: [{ id: "wind", description: "窗外吹来一阵风。" }], perceptions: [] });
+    if (request.kind === "evolve") return response({ worldState: f.store.snapshot().worldState + "窗外吹来一阵风。", externalChanges: [{ id: "wind", description: "窗外吹来一阵风。" }], perceptions: [] });
     if (request.actorId === "bot" && request.actionPhase === "start") return opening.promise;
-    if (request.actionPhase === "start") return response({ worldState: request.worldState + "访客开始擦拭书桌，尚未擦完。", perceptions: [{ actorId: request.actorId, text: "你拿起布，开始擦拭桌角。" }], outcome: { status: "ongoing" } });
-    assert.equal(request.actionPhase, "finish"); assert.ok(request.time >= request.action.expectedEnd);
-    assert.match(request.worldState, /访客开始擦拭/);
-    return response({ worldState: request.worldState + (request.actorId === "bot" ? "花盆已经浇好。" : "桌面已擦干净。"),
+    if (request.actionPhase === "start") return response({ worldState: f.store.snapshot().worldState + "访客开始擦拭书桌，尚未擦完。", perceptions: [{ actorId: request.actorId, text: "你拿起布，开始擦拭桌角。" }], outcome: { status: "ongoing" } });
+    assert.equal(request.actionPhase, "finish"); assert.ok(request.timeAuthority.tu >= request.action.expectedEnd);
+    assert.match(worldInputText(request), /访客开始擦拭/);
+    return response({ worldState: f.store.snapshot().worldState + (request.actorId === "bot" ? "花盆已经浇好。" : "桌面已擦干净。"),
       perceptions: [{ actorId: request.actorId, text: request.actorId === "bot" ? "水已经渗进土里，你放下水壶。" : "你擦完桌面，放下抹布。" }], outcome: { status: "completed" } });
   });
   try {
     const call = f.call("water"), work = f.runtime.act("bot", call, async text => { receipts.push(JSON.parse(text)); }, undefined, phase => { gates.push(phase); return true; });
     await eventually(() => f.requests.length === 1);
-    assert.equal(f.requests[0].actionPhase, "start"); assert.equal(f.requests[0].time, 100);
+    assert.equal(f.requests[0].actionPhase, "start"); assert.equal(f.requests[0].timeAuthority.tu, 100);
     assert.equal(f.store.snapshot().actions["bot:water"]!.phase, "accepted"); assert.equal(f.store.readPerceptions("bot", 0, "bot:water").length, 0);
     await f.runtime.evolve("定期心跳", { heartbeat: true }); assert.equal(f.requests.length, 1);
     opening.resolve(response({ worldState: "小澈开始缓缓浇水，花盆尚未浇好。", perceptions: [{ actorId: "bot", text: "你提起水壶，细细的水流刚落进花盆。" }], outcome: { status: "ongoing" } }));
@@ -69,7 +70,7 @@ async function immediateFeedbackAndConcurrentStages() {
     assert.notEqual(receipts[0].scene.eventId, receipts[1].scene.eventId); assert.deepEqual(duplicateReceipts, receipts);
     assert.ok(gates.includes("start") && gates.includes("finish"));
     assert.equal(f.store.snapshot().actions["visitor:a:wipe"]!.status, "pending");
-    assert.match(f.requests.filter(request => request.actorId === "bot").at(-1).worldState, /窗外吹来/);
+    assert.match(worldInputText(f.requests.filter(request => request.actorId === "bot").at(-1)), /窗外吹来/);
     f.setNow(450); assert.equal(await visitor, true);
     const beforeHeartbeat = f.requests.length; await f.runtime.evolve("动作后心跳", { heartbeat: true }); assert.equal(f.requests.length, beforeHeartbeat + 1);
     const saved = f.store.readPerceptions("bot", 0, "bot:water"); await f.store.reload(); assert.deepEqual(f.store.readPerceptions("bot", 0, "bot:water"), saved);

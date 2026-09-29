@@ -95,7 +95,7 @@ async function reflectionCheckpoint() {
     return append(file, data, options);
   }) as typeof fs.appendFile;
   f.agent.waiting = { callId: "sleeping", kind: "nap" }; let woke = false; f.agent.wakeFn = () => { woke = true; };
-  for (let i = 0; i < 24; i++) f.agent.pushEvent("koishi", `新经历 ${i}`);
+  for (let i = 0; i < 24; i++) f.agent.pushEvent("koishi", `新经历 ${i}`, { wake: false });
   await assert.rejects(f.agent.drainMailbox(), /reflection checkpoint failed/);
   const cues = (ctx: BotContext) => ctx.stream.filter(entry => entry.kind === "event" && entry.event.id.startsWith("ev_growth_review_"));
   assert.equal(cues(f.context).length, 1); assert.equal(f.agent.waiting.callId, "sleeping"); assert.equal(woke, false);

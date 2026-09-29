@@ -29,7 +29,7 @@ async function fixture(first: ParsedToolCall = act, strict: boolean | undefined 
   const files = new WorldFiles(dir); await files.ensure();
   const context = new BotContext(files, "frozen tool block"); await context.load();
   const cfg = Config({ autoStart: false }); cfg.bot.growth.enabled = false;
-  Object.assign(cfg.bot, { strictToolLoop: strict, nativeToolCalls: false, minIntervalMs: 0, retryDelayMs: 1,
+  Object.assign(cfg.bot, { strictToolLoop: strict, interruptibleWorldActions: false, nativeToolCalls: false, minIntervalMs: 0, retryDelayMs: 1,
     maxWindowChars: 1e6, restCompressMinChars: 1e6, spillMinChars: 0, waitRateThreshold: 0 });
   cfg.messaging.sendEcho = false;
   const started = Date.now(), clock: any = { now: () => (Date.now() - started) / 1000,

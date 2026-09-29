@@ -76,9 +76,9 @@ async function semantics(dir: string) {
     await f.service.botToolCall("select_channel", { id: "onebot@fixture:target" }, 0, "avatar-token");
     cockpit = await f.service.playerCockpit("avatar-token");
     assert.equal(cockpit.tools.find((tool: any) => tool.name === "send").requiresSendConfirmation, true);
-    assert.equal((await f.service.botToolCall("send", { msg: "fixture" }, 0, "avatar-token")).ok, false);
+    assert.equal((await f.service.botToolCall("send", { id: "onebot@fixture:target", msg: "fixture" }, 0, "avatar-token")).ok, false);
     assert.equal(f.counts().sent, 0);
-    assert.equal((await f.service.botToolCall("send", { msg: "fixture" }, 0, "avatar-token", true)).ok, true);
+    assert.equal((await f.service.botToolCall("send", { id: "onebot@fixture:target", msg: "fixture" }, 0, "avatar-token", true)).ok, true);
     assert.equal(f.counts().sent, 1);
     assert.ok(f.context.stream.some((entry: any) => entry.kind === "tool_call" && entry.call.name === "send" && entry.call.control?.mode === "avatar"));
     const entries = f.context.stream.filter((entry: any) => entry.kind === "tool_call");

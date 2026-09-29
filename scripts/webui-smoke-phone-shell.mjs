@@ -27,6 +27,7 @@ export default async function smokePhoneShell({ evaluate, wait, assert, navigate
       await evaluate(`__shellGenerate.click(); __shellResolve({ok:true,content:'<html><body>新外壳 {{width}}×{{height}}<img src="{{screen}}"></body></html>',phone:{width:720,height:1440}});`);
       await wait("__shellSource.value.includes('新外壳')");
       assert.ok(await evaluate(`__shellGenerate.textContent.includes('重新设计') && __shellPane.querySelector('iframe').srcdoc.includes('720×1440') && __shellPane.querySelector('iframe').getAttribute('sandbox') === ''`), 'Generated design updates source and isolated preview without recreating the pane');
+      assert.ok(await evaluate(`(() => { var frame = __shellPane.querySelector('iframe'); return Math.abs(frame.clientWidth / frame.clientHeight - 0.5) < 0.01; })()`), 'Shell preview preserves the phone aspect ratio on desktop and touch widths');
       assert.ok(await evaluate('document.documentElement.scrollWidth <= innerWidth'), 'Completed shell preview stays within viewport');
     }
     assert.equal(await evaluate('__shellRequests'), 4, 'Each deliberate click generates exactly once');

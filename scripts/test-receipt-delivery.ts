@@ -114,7 +114,7 @@ async function pendingOnlyAtDecisionBoundary() {
   assert.ok(JSON.stringify(await fast.messages()).includes("水杯已经放在桌上"));
 
   const typing = await fixture({ typing: true }); typing.bot.running = true;
-  const send = typing.call("future-typing", "send", { msg: "这是一条还在输入的完整消息，稍后会真正提交到平台。" }, 0.3);
+  const send = typing.call("future-typing", "send", { id: "fixture@self:peer", msg: "这是一条还在输入的完整消息，稍后会真正提交到平台。" }, 0.3);
   await typing.context.appendToolCall(send); typing.bot.dispatchSend(send);
   await typing.bot.drainMailbox(true); await typing.bot.drainMailbox(true);
   const typingNotices = () => typing.events().filter(event => event.toolProgress === "pending" && event.refToolCallId === send.id);
@@ -137,7 +137,7 @@ async function platformOutcomesRemainVisible() {
   for (let i = 0; i < outcomes.length; i++) {
     const receipt = outcomes[i]!;
     const f = await fixture({ receipt, echo: true }); f.bot.running = true;
-    const send = f.call(`platform-${i}`, "send", { msg: "这句话只提交一次。" });
+    const send = f.call(`platform-${i}`, "send", { id: "fixture@self:peer", msg: "这句话只提交一次。" });
     await f.context.appendToolCall(send); f.bot.dispatchSend(send);
     await f.bot.scheduler.whenIdle(); await f.bot.drainMailbox(true);
     assert.equal(f.sends(), 1);

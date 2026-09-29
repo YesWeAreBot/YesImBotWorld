@@ -1,3 +1,4 @@
+import { worldInputText } from "./world-input-fixture.js";
 /** Heartbeats develop the outside world, not a second autonomous turn for its controlled actors. */
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
@@ -44,7 +45,7 @@ async function outsideWorldAndLegitimateEffects() {
   const f = await fixture();
   try {
     const before = f.store.snapshot();
-    f.setHandler(async request => response({ externalChanges: [{ id: "road", description: "北方小镇的工人修好了一段路。" }], worldState: request.worldState + "北方小镇新修好了一段路。", perceptions: [] }));
+    f.setHandler(async request => response({ externalChanges: [{ id: "road", description: "北方小镇的工人修好了一段路。" }], worldState: f.store.snapshot().worldState + "北方小镇新修好了一段路。", perceptions: [] }));
     await f.runtime.evolve("世界继续运转。", { heartbeat: true });
     assert.match(f.store.snapshot().worldState, /新修好/); assert.deepEqual(f.store.snapshot().actors, before.actors);
     assert.equal(f.store.readPerceptions("bot").length, 0); assert.equal(f.store.readPerceptions("visitor:a").length, 0);
@@ -56,7 +57,7 @@ async function outsideWorldAndLegitimateEffects() {
     await f.runtime.evolve("没有新变化。", { heartbeat: true });
     assert.deepEqual(f.store.snapshot(), quiet); assert.equal(await f.store.exportJournal(), journal);
 
-    f.setHandler(async request => response({ externalChanges: [{ id: "rain", description: "院子里下起雨，雨水落在长椅和小澈衣服上。" }], worldState: request.worldState + "院子下起雨，长椅和小澈的衣服被打湿。",
+    f.setHandler(async request => response({ externalChanges: [{ id: "rain", description: "院子里下起雨，雨水落在长椅和小澈衣服上。" }], worldState: f.store.snapshot().worldState + "院子下起雨，长椅和小澈的衣服被打湿。",
       actorEffects: [{ actorId: "bot", changeIds: ["rain"], state: "坐在院子的长椅上，雨水打湿了衣服，皮肤感到凉意。" }],
       perceptions: [{ actorId: "bot", changeIds: ["rain"], text: "雨点落在你的衣服上，凉意透过湿布料。", opportunities: [{ label: "去屋檐下", intent: "走到屋檐下避雨" }, { label: "喝口水", intent: "喝一口身旁杯子里的水" }] }] }));
     await f.runtime.evolve("院子里的天气变化。");
@@ -130,7 +131,7 @@ async function invalidActorWritesAndMissingCauses() {
       if (input.source !== "evolve") return commit(input, options);
       (f.runtime as any).heartbeatController.abort(Error("恰好有动作开始")); throw diskError;
     }) as typeof f.store.commit;
-    f.setHandler(async request => response({ worldState: request.worldState + "下起了雨。", externalChanges: [{ id: "rain", description: "院子下起了雨。" }], perceptions: [] }));
+    f.setHandler(async request => response({ worldState: f.store.snapshot().worldState + "下起了雨。", externalChanges: [{ id: "rain", description: "院子下起了雨。" }], perceptions: [] }));
     await assert.rejects(f.runtime.evolve("新的心跳。", { heartbeat: true }), error => error === diskError, "heartbeat preemption must not swallow a real storage error");
     f.store.commit = commit;
     console.log("PASS actor/outcome write rejection, absent or stale causes, source identity checks, repair atomicity and unchanged device boundaries");
@@ -145,11 +146,11 @@ async function longActionsLeaveRoomForOutsideLife() {
     if (request.kind === "evolve") {
       assert.equal(request.pendingActions[0].phase, "ongoing");
       if (slowHeartbeat) { heartbeatEntered.resolve(signal!); return lateHeartbeat.promise; }
-      return response({ worldState: request.worldState + "北方小镇的修路工完成了一段路。", externalChanges: [{ id: "road", description: "远处修路工完成了一段路。" }], perceptions: [] });
+      return response({ worldState: f.store.snapshot().worldState + "北方小镇的修路工完成了一段路。", externalChanges: [{ id: "road", description: "远处修路工完成了一段路。" }], perceptions: [] });
     }
-    if (request.actionPhase === "start") return response({ worldState: request.worldState + "小澈在长椅上开始画院子。", actorStates: [{ actorId: "bot", state: "在长椅上画画，画面尚未完成。" }], perceptions: [{ actorId: "bot", text: "你开始勾画院子的轮廓。" }], outcome: { status: "ongoing" } });
-    assert.equal(request.actionPhase, "finish"); assert.match(request.worldState, /修路工完成/);
-    return response({ worldState: request.worldState + "小澈画完院子的速写。", actorStates: [{ actorId: "bot", state: "坐在长椅上，手中速写刚完成。" }], perceptions: [{ actorId: "bot", text: "你画完了院子的速写。" }], outcome: { status: "completed" } });
+    if (request.actionPhase === "start") return response({ worldState: f.store.snapshot().worldState + "小澈在长椅上开始画院子。", actorStates: [{ actorId: "bot", state: "在长椅上画画，画面尚未完成。" }], perceptions: [{ actorId: "bot", text: "你开始勾画院子的轮廓。" }], outcome: { status: "ongoing" } });
+    assert.equal(request.actionPhase, "finish"); assert.match(worldInputText(request), /修路工完成/);
+    return response({ worldState: f.store.snapshot().worldState + "小澈画完院子的速写。", actorStates: [{ actorId: "bot", state: "坐在长椅上，手中速写刚完成。" }], perceptions: [{ actorId: "bot", text: "你画完了院子的速写。" }], outcome: { status: "completed" } });
   });
   try {
     const receipts: any[] = [], action = f.runtime.act("bot", f.call("draw"), text => { receipts.push(JSON.parse(text)); });

@@ -18,6 +18,14 @@ export interface NavigationState {
 
 export type NavigationPlan = { steps: ParsedToolCall[]; error?: undefined } | { steps: []; error: string };
 
+/** Sending must bind an explicit target, even with an old cached tool schema. */
+export function sendTargetError(args: Record<string, unknown>): string | undefined {
+  if (!Object.hasOwn(args, "id") || typeof args.id !== "string" || !args.id.trim()) {
+    return "本次未发送：send 需要明确的频道 id（非空字符串）。";
+  }
+  if (Object.hasOwn(args, "channel")) return "本次未发送：send 的目标只用 id，不使用 channel。";
+}
+
 /** Plan only reversible interface navigation. Missing identities and physical obstacles are
  * not guessed; every returned step must actually execute and deliver its own receipt.
  */
@@ -26,6 +34,8 @@ export async function planToolNavigation(
   resolveChannel: (id: string) => Promise<{ key: string; isPrivate: boolean } | { error: string }>,
 ): Promise<NavigationPlan> {
   const steps: ParsedToolCall[] = [];
+  const targetError = call.name === "send" ? sendTargetError(call.arguments) : undefined;
+  if (targetError) return { steps: [], error: targetError };
   const add = (name: string, args: Record<string, unknown> = {}) => steps.push({ name, arguments: args, duration: 0 });
   if (!state.device || ["pick_up_phone", "put_down_phone", "observe_device", "close_computer", "close_app"].includes(call.name)) return { steps };
   if (state.device === "computer") {

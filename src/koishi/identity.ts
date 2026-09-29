@@ -1,4 +1,7 @@
 import type { Session } from "koishi";
+import type { GroupMetadataConfig } from "../config.js";
+import type { GroupMemberMetadata } from "./group-metadata.js";
+import { senderMetadataTag } from "./sender-tags.js";
 
 export interface ChannelIdentity {
   platform: string;
@@ -8,10 +11,12 @@ export interface ChannelIdentity {
   accountIds: string[];
   displayName: string;
   source: "group_card" | "account_name" | "unknown";
+  /** Recent platform profile observation, reused only for newly confirmed sends. */
+  memberMetadata?: GroupMemberMetadata;
   text: string;
 }
 
-type Sender = { platform: string; selfId?: string; userId: string; username?: string; senderOrigin?: string | null; senderOwned?: boolean | null };
+type Sender = { platform: string; selfId?: string; userId: string; username?: string; senderOrigin?: string | null; senderOwned?: boolean | null; isDirect?: boolean; memberMetadata?: GroupMemberMetadata | null };
 
 export function firstName(...values: unknown[]): string {
   for (const value of values) if (typeof value === "string" && value.trim()) return value.trim();
@@ -48,7 +53,7 @@ export function messageAccountRelation(row: Sender, identity?: Pick<ChannelIdent
 }
 
 /** self is a legacy account flag, never proof of the role's voluntary authorship. */
-export function formatMessageSender(row: Sender, identity?: Pick<ChannelIdentity, "platform" | "selfId" | "accountIds">): string {
+export function formatMessageSender(row: Sender, identity?: Pick<ChannelIdentity, "platform" | "selfId" | "accountIds">, presentation?: GroupMetadataConfig): string {
   const relation = messageAccountRelation(row, identity);
   const legacyPlaceholder = ["current", "connected", "historical"].includes(relation) && isLegacySenderPlaceholder(row);
   const name = !legacyPlaceholder && firstName(row.username) ? row.username! : "昵称未记录";
@@ -60,5 +65,6 @@ export function formatMessageSender(row: Sender, identity?: Pick<ChannelIdentity
       : row.senderOrigin === "external" ? "；本次由账号外部消息捕获，不能认定为你自主发送"
         : "；具体操作者未知，不能仅凭账号认定为你自主发送"
     : "";
-  return `${name}（平台 ${JSON.stringify(row.platform)}；账号 ${JSON.stringify(row.userId || "未知")}；${ownership}${origin}）`;
+  const metadata = row.isDirect ? "" : senderMetadataTag(row.memberMetadata, presentation, "inline", row.userId);
+  return `${name}（平台 ${JSON.stringify(row.platform)}；账号 ${JSON.stringify(row.userId || "未知")}；${ownership}${origin}）${metadata ? ` ${metadata}` : ""}`;
 }

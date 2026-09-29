@@ -307,3 +307,17 @@
   .growth-kind-filters button,.growth-lifecycle-filters button,.growth-evidence-chips button { min-height:42px; }
   .growth-identity summary { min-height:42px; }
 }
+
+.growth-kind-filters button::after { content:attr(data-count); margin-left:6px; opacity:.7; font-variant-numeric:tabular-nums; }
+.growth-pagination { display:flex; align-items:center; gap:10px; flex-wrap:wrap; width:100%; min-width:0; }
+.growth-page-status { flex:1; min-width:100px; color:var(--fg-dim); font-size:12px; text-align:center; }
+.growth-pagination button { min-height:42px; flex-shrink:0; }
+
+.growth-insight { margin:18px 0; padding:16px; border:1px solid var(--line); border-radius:12px; background:var(--panel2); min-width:0; }
+.growth-insight h3 { margin:14px 0 7px; font-size:12px; color:var(--fg-dim); }
+.growth-insight h3:first-child { margin-top:0; }
+.growth-insight p { margin:0; font-size:13px; line-height:1.8; white-space:pre-wrap; overflow-wrap:anywhere; }
+.growth-insight-anchors { display:grid; gap:8px; min-width:0; }
+.growth-insight-anchor { display:block; width:100%; min-width:0; min-height:44px; padding:10px 12px; text-align:left; white-space:normal; overflow-wrap:anywhere; background:var(--surface); }
+.growth-insight-quote { display:block; padding-left:10px; border-left:2px solid var(--accent); white-space:pre-wrap; line-height:1.7; }
+.growth-insight-anchor small { display:block; margin-top:7px; font-size:10px; color:var(--fg-dim); }

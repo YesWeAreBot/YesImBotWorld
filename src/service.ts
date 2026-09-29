@@ -1,5 +1,5 @@
 import { registerWorldCommands } from "./commands.js";
-import { GrowthLedger } from "./bot/growth.js";
+import { GrowthLedger, type GrowthPageQuery } from "./bot/growth.js";
 import { BotIdentityResolver } from "./webui/avatar.js";
 import { callStore } from "./webui/calls.js";
 import { promises as fs } from "node:fs";
@@ -36,7 +36,7 @@ import { CrossingServer } from "./crossing/server.js";
 import { WorldFiles } from "./files.js";
 import { resolvePhoneResolution } from "./phone.js";
 import { applyPhonePhysicalState, canPerceivePhone, canUsePhone, phonePhysicalState, phonePhysicalSummary } from "./phone-state.js";
-import { CHAT_RUNTIME_GUIDANCE, INITIATIVE_GUIDANCE, GROWTH_RUNTIME_GUIDANCE, GROWTH_MANUAL_GUIDANCE, Prompts, type PromptOverrides } from "./prompts.js";
+import { CHAT_RUNTIME_GUIDANCE, CHAT_MEMBER_GUIDANCE, INITIATIVE_GUIDANCE, GROWTH_RUNTIME_GUIDANCE, GROWTH_MANUAL_GUIDANCE, Prompts, type PromptOverrides } from "./prompts.js";
 import { WebUIServer, type BotStatusSummary, type DevicesInfo, type NoteEntry, type WebUIHost } from "./webui/server.js";
 import { FocusManager } from "./koishi/focus.js";
 import { Gateway, prefixRichText } from "./koishi/gateway.js";
@@ -332,7 +332,7 @@ export class WorldService extends Service<Config> {
             const msgTag = msgId && needsMsgIds(config.platformOps) ? `(msg:${msgId}) ` : "";
             recipient.pushEvent(
               "koishi",
-              prefixRichText(`${identity.text}\n你注意到自己的账号在 ${display} 发出了一条消息，但你没有操作发送。可能来自其他设备或应用，具体原因尚不清楚。${sender ? `\n${formatMessageSender(sender, identity)}\n` : ""}消息正文开始：\n${msgTag}`, content, "\n消息正文结束。"),
+              prefixRichText(`${identity.text}\n你注意到自己的账号在 ${display} 发出了一条消息，但你没有操作发送。可能来自其他设备或应用，具体原因尚不清楚。${sender ? `\n${formatMessageSender(sender, identity, this.config.messaging.groupMetadata)}\n` : ""}消息正文开始：\n${msgTag}`, content, "\n消息正文结束。"),
               { wake: this.notifyMgr.vibrates(key) && config.messaging.wakeOnNotify },
             );
           } catch (error) { this.logger.warn("外发消息通知失败: %s", error); }
@@ -755,7 +755,7 @@ export class WorldService extends Service<Config> {
               const address = conversationLabel(row.conversation, channel.selfId);
               // Render only stored message content: names/IDs cannot forge internal media markers.
               const rendered = await this.renderer.render(storedQuoteContent(row));
-              parts.push({ kind: "text", text: `〔聊天记录 #${row.id} · ${formatMessageTime(row)}${row.messageId ? ` (msg:${row.messageId})` : ""}〕\n发送者：${formatMessageSender(row, identity)}；${address}\n消息正文：\n` });
+              parts.push({ kind: "text", text: `〔聊天记录 #${row.id} · ${formatMessageTime(row)}${row.messageId ? ` (msg:${row.messageId})` : ""}〕\n发送者：${formatMessageSender(row, identity, this.config.messaging.groupMetadata)}；${address}\n消息正文：\n` });
               parts.push(...(rendered.parts?.length ? rendered.parts : [{ kind: "text" as const, text: rendered.text }]), { kind: "text", text: "\n〔该条消息结束〕\n" });
               const observed = chatMessageEvidence(row, channel.selfId);
               for (let index = firstPart; index < parts.length; index++) parts[index] = {
@@ -800,6 +800,9 @@ export class WorldService extends Service<Config> {
     await this.world.restorePerceptions("bot", content => recipient.pushEvent("world", content), knownWorldSources);
     if (!this.botContext.stream.some(entry => entry.kind === "event" && entry.event.source === "system" && entry.event.content === CHAT_RUNTIME_GUIDANCE)) {
       this.bot.pushEvent("system", CHAT_RUNTIME_GUIDANCE);
+    }
+    if (!this.botContext.stream.some(entry => entry.kind === "event" && entry.event.source === "system" && entry.event.content === CHAT_MEMBER_GUIDANCE)) {
+      this.bot.pushEvent("system", CHAT_MEMBER_GUIDANCE);
     }
     if (!this.botContext.stream.some(entry => entry.kind === "event" && entry.event.source === "system" && entry.event.content === INITIATIVE_GUIDANCE)) {
       this.bot.pushEvent("system", INITIATIVE_GUIDANCE);
@@ -1290,7 +1293,7 @@ export class WorldService extends Service<Config> {
       computerView: this.computerDevice?.view() ?? null,
       notifications: { ...this.notifyMgr.snapshot(known.map(row => row.key), apps.map(app => app.id)),
         ...(this.clock ? { calendarKind: this.clock.syncRealTime ? "gregorian" as const : this.clock.calendar.kind } : {}) },
-      chat: { channelKey: channel, channels: known.map(row => ({ ...row, ...(latest.has(row.key) ? { latest: latest.get(row.key) } : {}) })), messages },
+      chat: { channelKey: channel, channels: known.map(row => ({ ...row, ...(latest.has(row.key) ? { latest: latest.get(row.key) } : {}) })), messages, memberPresentation: this.config.messaging.groupMetadata },
     };
   }
 
@@ -1495,7 +1498,7 @@ export class WorldService extends Service<Config> {
     return this.transitions().read(() => this.world.runtime.inspect());
   }
 
-  async getGrowth(): Promise<unknown> { return new GrowthLedger(this.files.base).recall({ n: 50, at: this.clock?.now() }); }
+  async getGrowth(query: GrowthPageQuery = {}): Promise<unknown> { return new GrowthLedger(this.files.base).queryPage({ ...query, at: this.clock?.now() }); }
   async getGrowthStatus(): Promise<unknown> { return new GrowthLedger(this.files.base).reviewStatus(); }
 
   getClock() {

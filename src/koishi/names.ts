@@ -2,6 +2,7 @@ import type { Context } from "koishi";
 import type { MessageStore } from "./messages.js";
 import { parseChannelKey } from "./channels.js";
 import { firstName, type ChannelIdentity } from "./identity.js";
+import { extractGroupMemberMetadata } from "./group-metadata.js";
 
 /**
  * 频道显示名解析：把 "platform:channelId" 渲染成对 Bot 友好的形式——
@@ -29,13 +30,16 @@ export class ChannelNameResolver {
     const bot = selfId ? this.bot(platform, selfId) : undefined;
     const direct = options.isDirect ?? (await this.lookupIsDirect(platform, channelId, selfId)) ?? channelId.startsWith("private:");
     let displayName = "", source: ChannelIdentity["source"] = "unknown";
+    let memberMetadata: ChannelIdentity["memberMetadata"];
     if (bot && !direct) {
       try {
         const member = await bot.getGuildMember?.(options.guildId || channelId, selfId!);
+        if (member?.user?.id != null && String(member.user.id) !== selfId) throw new Error("群成员资料账号不匹配");
+        memberMetadata = extractGroupMemberMetadata(undefined, member);
         displayName = firstName(member?.nick, member?.name);
         source = displayName ? "group_card" : "unknown";
         if (!displayName) { displayName = firstName(member?.user?.nick, member?.user?.name); if (displayName) source = "account_name"; }
-      } catch { /* Unsupported member lookup is not evidence of a group nickname. */ }
+      } catch { /* Unsupported or mismatched profile is not evidence of our group identity. */ }
     }
     if (!displayName && bot) {
       try { const user = await bot.getUser?.(selfId!); displayName = firstName(user?.nick, user?.name); } catch { /* Unknown is honest. */ }
@@ -46,7 +50,7 @@ export class ChannelNameResolver {
       : source === "account_name" ? `当前账号昵称为 ${JSON.stringify(displayName)}${direct ? "" : "；群名片未取得"}`
         : direct ? "当前昵称未知" : "当前群名片和昵称未知";
     const text = `本会话使用你的账号：平台 ${JSON.stringify(platform)}，账号 ${JSON.stringify(selfId || "未确定")}；${label}。记录中的署名保留当时取得的名称；昵称变化不会改变账号身份，账号身份也不证明消息由你自主发送。`;
-    const value: ChannelIdentity = { platform, channelId, selfId, accountIds, displayName, source, text };
+    const value: ChannelIdentity = { platform, channelId, selfId, accountIds, displayName, source, text, ...(memberMetadata ? { memberMetadata } : {}) };
     this.identityCache.set(cacheKey, { value, at: Date.now() });
     while (this.identityCache.size > 256) this.identityCache.delete(this.identityCache.keys().next().value!);
     return value;

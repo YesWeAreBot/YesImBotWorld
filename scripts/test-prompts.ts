@@ -8,6 +8,8 @@ import { Config } from "../src/config.js";
 import { Prompts, BOT_PROMPT_DEFAULTS, WORLD_PROMPT_DEFAULTS, THOUGHT_RUNTIME_GUIDANCE, SCENE_CHOICE_GUIDANCE, CHAT_CONTINUITY_GUIDANCE, INITIATIVE_GUIDANCE, TOOL_HELP_GUIDANCE, SLEEP_AND_DEVICE_GUIDANCE } from "../src/prompts.js";
 import { WorldFiles } from "../src/files.js";
 import { WorldAgent } from "../src/world/agent.js";
+import { buildWorldTaskPrompt } from "../src/world/prompt.js";
+import { worldResolutionTool } from "../src/world/proposal.js";
 import { ChatBackend } from "../src/bot/backend.js";
 import { BotContext } from "../src/bot/context.js";
 import { availableTools, renderToolsText, renderToolHelp, toolLayer } from "../src/bot/tools.js";
@@ -49,7 +51,10 @@ async function main() {
     for (const version of ["A", "B"]) {
       prompts.setOverrides({ bot: { constitutionHead: version }, world: { narrativeSystem: "裁定-" + version, presentationSystem: "呈现-" + version } });
       await world.runtime.evolve("无事发生"); await world.query("天气查询");
-      assert.ok(seen.at(-2).messages[0].content.startsWith("裁定-" + version));
+      const system = seen.at(-2).messages[0].content as string;
+      assert.equal(system.split("裁定-" + version).length - 1, 1, "live owner prose is retained verbatim once inside the stable task prompt");
+      assert.match(system, /本次任务：evolve/);
+      assert.match(system, /真人聊天由实际平台独占/);
       assert.deepEqual(seen.at(-2).options.tools.map((t: any) => t.function.name), ["resolve_world"]);
       assert.deepEqual(seen.at(-2).options.toolChoice, { type: "function", function: { name: "resolve_world" } });
       assert.equal(seen.at(-1).messages[0].content, "呈现-" + version);
@@ -164,8 +169,10 @@ async function main() {
     assert.doesNotMatch(SLEEP_AND_DEVICE_GUIDANCE, /[八8]点|20[:：]00|禁止睡觉/);
     assert.ok(BOT_PROMPT_DEFAULTS.constitution.includes(TOOL_HELP_GUIDANCE));
     assert.ok(BOT_PROMPT_DEFAULTS.constitution.includes(SLEEP_AND_DEVICE_GUIDANCE));
-    assert.match(WORLD_PROMPT_DEFAULTS.narrativeSystem, /角色提出睡觉是尝试入睡，不保证立刻睡着/);
-    assert.match(WORLD_PROMPT_DEFAULTS.narrativeSystem, /不能为了交付通知补造手机震动/);
+    const physicalPrompt = buildWorldTaskPrompt({ narrativeSystem: WORLD_PROMPT_DEFAULTS.narrativeSystem, worldDef: "", botDef: "", kind: "action", actionPhase: "start", allowOngoing: true });
+    assert.match(physicalPrompt, /角色提出睡觉是尝试入睡，不保证立刻睡着/);
+    assert.match(physicalPrompt, /睡眠与疲劳以历法、习惯、实际经过和身体状况为依据/);
+    assert.match(physicalPrompt, /不能为了交付通知补造手机震动/);
     const notifications = toolDefs.find(t => t.name === "phone_notifications")!;
     assert.ok(notifications, "notification reading remains available when policy editing is locked");
     assert.match(notifications.summary!, /设置 App/);
@@ -193,8 +200,13 @@ async function main() {
       assert.doesNotMatch(format, /立即执行.*延迟|执行再延迟/);
       assert.match(format, /发送按当前耗时配置执行/);
     }
-    assert.match(WORLD_PROMPT_DEFAULTS.narrativeSystem, /actionPhase=start.*expectedEnd仍在未来.*ongoing/);
-    assert.match(WORLD_PROMPT_DEFAULTS.narrativeSystem, /actionPhase=finish.*不能再次ongoing/);
+    assert.match(physicalPrompt, /本次任务：action，阶段：start/);
+    assert.match(physicalPrompt, /expectedEnd仍在未来.*ongoing/);
+    const finishPrompt = buildWorldTaskPrompt({ narrativeSystem: WORLD_PROMPT_DEFAULTS.narrativeSystem, worldDef: "", botDef: "", kind: "action", actionPhase: "finish" });
+    assert.match(finishPrompt, /本次任务：action，阶段：finish/);
+    assert.match(finishPrompt, /不能再延期为ongoing/);
+    assert.deepEqual((worldResolutionTool(false, false, { kind: "action", allowOngoing: true }).function.parameters as any).properties.outcome.properties.status.enum, ["completed", "failed", "needs_input", "ongoing"]);
+    assert.deepEqual((worldResolutionTool(false, false, { kind: "action", allowOngoing: false }).function.parameters as any).properties.outcome.properties.status.enum, ["completed", "failed", "needs_input"]);
     assert.doesNotMatch(BOT_PROMPT_DEFAULTS.outputFormatNative + BOT_PROMPT_DEFAULTS.outputFormatText, /act\s*在?到期后裁定/);
     console.log("PASS prompts: live runtime overrides, real defaults/reset API, save failure isolation, legacy backup, read-only app boundaries and exact action arguments");
   } finally { await world?.runtime.shutdown(); await fs.rm(dir, { recursive: true, force: true }); }

@@ -35,6 +35,46 @@
     function empty(title, detail, name) { return el('div', { cls: 'device-empty' }, [glyph(name || 'phone', 'device-empty-icon'), el('strong', { text: title }), el('p', { text: detail })]); }
     function timeLabel(value) { if (!value)
         return ''; var date = new Date(typeof value === 'number' && value < 1e12 ? value * 1000 : value); return Number.isNaN(date.valueOf()) ? String(value) : date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }); }
+    function chatMemberPresentation(data) {
+        data = data || {};
+        var role = ['owner', 'admin', 'member'].includes(data.role) ? data.role : undefined;
+        var special = typeof data.specialTitle === 'string' ? data.specialTitle : '';
+        var level = typeof data.levelTitle === 'string' ? data.levelTitle : '';
+        // Platform title precedence is resolved before visibility. Hiding a granted
+        // title must never resurrect the role/level text that it replaced.
+        if (special.trim()) return { role: role, title: special, source: 'specialTitle' };
+        if (typeof data.specialTitle !== 'string') return { role: role };
+        if (role === 'owner' || role === 'admin') return { role: role, title: role === 'owner' ? '群主' : '管理员', source: 'role' };
+        if (role === 'member' && level.trim()) return { role: role, title: level, source: 'levelTitle' };
+        return { role: role };
+    }
+    function chatMemberHeader(msg, presentation, expanded, onToggle) {
+        var meta = el('div', { cls: 'app-message-meta' }), data = chatMemberPresentation(msg.memberMetadata), choices = Object.assign({ role: 'inline', specialTitle: 'on_demand', levelTitle: 'on_demand' }, presentation || {}), deferred = [];
+        var role = { owner: '群主', admin: '管理员', member: '群成员' }[data.role];
+        var showRole = !!role && choices.role === 'inline';
+        var titleMode = data.source && choices[data.source], showTitle = !!data.title && titleMode === 'inline';
+        var roleClass = showRole && data.role !== 'member' ? ' app-member-role-' + data.role : '';
+        if (showTitle) {
+            meta.appendChild(el('span', { cls: 'app-member-badge app-member-badge-title' + roleClass, text: data.title, title: '头衔', 'aria-label': '头衔：' + data.title + (showRole ? '；群身份：' + role : '') }));
+        } else if (showRole && data.role !== 'member') {
+            // The identity remains recognizable without displaying a second title.
+            meta.appendChild(el('span', { cls: 'app-member-role-indicator' + roleClass, role: 'img', title: '群身份：' + role, 'aria-label': '群身份：' + role }));
+        }
+        if (role && choices.role === 'on_demand' && data.source !== 'role') deferred.push({ label: '群身份', value: role });
+        if (data.title && titleMode === 'on_demand') deferred.push({ label: data.source === 'role' ? '群身份与头衔' : '头衔', value: data.title });
+        // Never concatenate platform metadata into the member's actual display name.
+        meta.appendChild(el('span', { cls: 'app-message-name', text: msg.username || msg.userId || '' }));
+        if (msg.timestamp) meta.appendChild(el('time', { text: timeLabel(msg.timestamp) }));
+        if (deferred.length) {
+            var details = el('details', { cls: 'app-member-details' }, [el('summary', { text: '成员资料', 'aria-label': '查看 ' + (msg.username || msg.userId || '成员') + ' 的群资料' })]);
+            var body = el('dl', { cls: 'app-member-details-body' });
+            deferred.forEach(function (field) { body.append(el('dt', { text: field.label }), el('dd', { text: field.value })); });
+            details.appendChild(body); details.open = !!expanded;
+            if (onToggle) details.addEventListener('toggle', function () { onToggle(details.open); });
+            meta.appendChild(details);
+        }
+        return meta;
+    }
     function appKind(app) { var id = (app && app.id || '').toLowerCase(); if (app && app.kind === 'chat')
         id = 'chat'; if (['chat', 'koishi', 'qq', 'wechat', 'messages'].indexOf(id) >= 0)
         return 'chat'; if (id === 'newsfeed')
@@ -52,7 +92,7 @@
         var screenWidth = 0, screenHeight = 0, pointer = null, remoteReady = false, terminalEntries = [], history = [], historyIndex = 0, remoteQueue = Promise.resolve(), remotePending = 0, inputEpoch = 0;
         var root = el('section', { cls: 'device-studio' }), header = el('div', { cls: 'device-heading' }), control = el('div', { cls: 'device-control' }), workspace = el('div', { cls: 'device-workspace' }), status = el('div', { cls: 'device-live-status', 'aria-live': 'polite' });
         var appPanel = null, phoneBody = null, appBody = null, remoteImage = null, remoteStatus = null, terminalLog = null, viewKey = '', lastChat = '';
-        var notificationsOpen = false, lastNotifications = '', chatNotifyView = null;
+        var notificationsOpen = false, lastNotifications = '', chatNotifyView = null, memberDetailsOpen = new Set();
         container.appendChild(root);
         header.appendChild(el('div', {}, [el('span', { cls: 'device-eyebrow', text: 'DEVICE STUDIO' }), el('h1', { text: '设备' }), el('p', { text: '拿起手机，或在电脑前坐一会儿。' })]));
         var switches = el('div', { cls: 'device-switch', 'role': 'tablist', 'aria-label': '设备切换' });
@@ -422,15 +462,18 @@
             msg.value = drafts[draftKey] || '';
             msg.addEventListener('input', function () { drafts[msg.dataset.channel || draftKey] = msg.value; });
             var send = mutation(button('发送', async function () {
-                var text = msg.value.trim(), channel = session.chat && session.chat.channelKey;
+                var submitted = msg.value, text = submitted.trim(), channel = session.chat && session.chat.channelKey;
                 if (!text || !channel)
                     return;
                 try {
                     var r = await perform('send', { msg: text, id: channel }, { confirmSend: true });
                     if (!live)
                         return;
-                    msg.value = '';
-                    drafts['chat:' + channel] = '';
+                    var sentDraftKey = 'chat:' + channel;
+                    if (drafts[sentDraftKey] === submitted) drafts[sentDraftKey] = '';
+                    // Shared device focus may change while the send is pending.
+                    // Only clear the exact draft that was actually submitted.
+                    if (msg.dataset.channel === sentDraftKey && msg.value === submitted) msg.value = '';
                     lastChat = '';
                     updateChat();
                     toast(r.text || '消息已发送', 'ok');
@@ -449,7 +492,7 @@
             if (!appBody)
                 return;
             var chat = session.chat || {}, channels = chat.channels || [], messages = chat.messages || [];
-            var hash = JSON.stringify([chat.channelKey, channels, messages, session.notifications]);
+            var hash = JSON.stringify([chat.channelKey, channels, messages, chat.memberPresentation, session.notifications]);
             if (hash === lastChat) {
                 chatNotifyView?.update();
                 return;
@@ -505,7 +548,11 @@
                 stream.appendChild(empty('会话从这里开始', '从上方选择一个已知会话。', 'chat'));
             else if (!messages.length)
                 stream.appendChild(empty('这里暂时没有消息', '点击“更多消息”读取实际历史。', 'chat'));
-            messages.forEach(function (msg) { stream.appendChild(el('article', { cls: 'app-message' + (msg.self ? ' app-message-self' : '') }, [el('div', { cls: 'app-message-meta', text: [msg.username || msg.userId, timeLabel(msg.timestamp)].filter(Boolean).join(' · ') }), el('div', { cls: 'app-message-bubble', text: textOf(msg.content) })])); });
+            messages.forEach(function (msg) {
+                var memberKey = JSON.stringify([chat.channelKey, msg.id || msg.messageId || [msg.userId, msg.timestamp]]);
+                var header = chatMemberHeader(msg, chat.memberPresentation, memberDetailsOpen.has(memberKey), function (open) { if (open) memberDetailsOpen.add(memberKey); else memberDetailsOpen.delete(memberKey); });
+                stream.appendChild(el('article', { cls: 'app-message' + (msg.self ? ' app-message-self' : '') }, [header, el('div', { cls: 'app-message-bubble', text: textOf(msg.content) })]));
+            });
             if (wasBottom)
                 stream.scrollTop = stream.scrollHeight;
             var compose = appBody.querySelector('.app-chat-compose');

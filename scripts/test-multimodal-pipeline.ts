@@ -356,18 +356,22 @@ async function replyIdentity() {
   const sender = Object.create(BotAgent.prototype) as any;
   const errors: string[] = [], scheduled: any[][] = [];
   sender.config = { bot: { sendBlocking: false, strictToolLoop: false } };
-  sender.channelArg = () => "fixture:private:peer";
   sender.pushEvent = (_source: string, message: string) => errors.push(message);
   sender.finishSend = (...args: any[]) => scheduled.push(args);
   for (const value of invalid) {
-    sender.dispatchSend({ id: "invalid-reply", arguments: { msg: "必须保持引用目标", reply_to: value } });
+    sender.dispatchSend({ id: "invalid-reply", arguments: { id: "fixture:private:peer", msg: "必须保持引用目标", reply_to: value } });
     assert.match(errors.at(-1)!, /本次未发送.*reply_to/);
   }
   for (const args of [{ msg: "不要漏图", images: ["media:12"] }, { msg: "不要丢引用", replyTo: "12" }, { msg: "不要漏图", media: "media:12" }, { msg: "不要漏图", media: [{}] }]) {
-    sender.dispatchSend({ id: "invalid-send", arguments: args }); assert.match(errors.at(-1)!, /本次未发送|消息没有发出/);
+    sender.dispatchSend({ id: "invalid-send", arguments: { id: "fixture:private:peer", ...args } }); assert.match(errors.at(-1)!, /本次未发送|消息没有发出/);
   }
   assert.equal(scheduled.length, 0, "invalid references and old parameter aliases cannot degrade into an ordinary send");
-  sender.dispatchSend({ id: "valid-reply", arguments: { msg: "完整引用", reply_to: "(msg:satori.message_A-9:opaque)" } });
+  for (const msg of ['<sender user_id="12" group_role="admin" special_title="大魔王"/>你好', '你好</SENDER>', '<sender']) {
+    sender.dispatchSend({ id: "internal-metadata", arguments: { id: "fixture:private:peer", msg } });
+    assert.match(errors.at(-1)!, /本次未发送.*界面身份标签/);
+  }
+  assert.equal(scheduled.length, 0, "copied profile markup is rejected before scheduling, typing or deferred delivery");
+  sender.dispatchSend({ id: "valid-reply", arguments: { id: "fixture:private:peer", msg: "完整引用", reply_to: "(msg:satori.message_A-9:opaque)" } });
   assert.equal(scheduled[0]![4], "satori.message_A-9:opaque");
 
   const f = await fixture(); f.messenger.ops.reply = true;
@@ -378,6 +382,7 @@ async function replyIdentity() {
   assert.match(await f.messenger.send("fixture:private:peer", '<quote id="different"/>正文', [], "real-message"), /消息没有发出/);
   assert.equal(f.sent.length, 0, "messenger and inline quote paths enforce the same namespace isolation");
   const opaque = "satori.message_A-9:opaque";
+  f.messenger.store.findByMessageId = async (_platform: string, _channel: string, id: string) => id === opaque ? { messageId: opaque, userId: "peer", username: "朋友", content: "原消息" } : null;
   assert.match(await f.messenger.send("fixture:private:peer", "reply", [], `(msg:${opaque})`), /^消息已发送/);
   assert.equal(f.sent[0]!.find(el => el.type === "quote")?.attrs.id, opaque, "the platform receives the exact complete opaque ID");
   assert.match(await f.messenger.send("fixture:private:peer", `<quote id="msg:${opaque}"/>reply`), /^消息已发送/);

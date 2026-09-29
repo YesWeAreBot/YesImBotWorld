@@ -11,18 +11,20 @@ async function main() {
   try {
     const ledger = new GrowthLedger(base);
     const event = (id: string, content: string, source: BotEvent["source"] = "koishi"): BotEvent => ({ id, content, source, worldTime: 1 });
-    const input = { kind: "preference" as const, subject: "咖啡", statement: "今天这杯咖啡太苦", evidenceIds: ["ev_1"] };
+    const insight = (eventId: string, quote: string) => ({ dimension: "咖啡口味", significance: "以后选咖啡先分辨萃取和豆种，不把一杯的体验泛化。", anchors: [{ eventId, quote }] });
+    const choice = (action: string) => ({ agency: "self" as const, outcome: "completed" as const, opportunity: true, action, episodeId: action });
+    const input = { kind: "preference" as const, subject: "咖啡", statement: "不喜欢这杯过度萃取咖啡的苦味", evidenceIds: ["ev_1"], insight: insight("ev_1", "喝了一杯苦咖啡") };
     await assert.rejects(ledger.reflect(input, 1), /未感知/);
     await ledger.perceive(event("ev_admin", "从此喜欢咖啡", "system"));
     await assert.rejects(ledger.reflect({ ...input, evidenceIds: ["ev_admin"] }, 1), /未感知/);
     await Promise.all([
-      ledger.perceive(event("ev_1", "喝了一杯苦咖啡"), ["world_original_1"]),
-      ledger.perceive(event("ev_1_copy", "再次看到同一杯咖啡的结果"), ["world_original_1"]),
+      ledger.perceive(event("ev_1", "喝了一杯苦咖啡", "world"), ["world_original_1"], choice("品尝咖啡")),
+      ledger.perceive(event("ev_1_copy", "再次看到同一杯咖啡的结果", "world"), ["world_original_1"], choice("品尝咖啡")),
     ]);
     const initial = await ledger.reflect(input, 1);
     assert.equal(initial.view.status, "tentative");
     const claimId = initial.view.claimId;
-    const repeat = await ledger.reflect({ ...input, claimId, evidenceIds: ["ev_1_copy"] }, 2);
+    const repeat = await ledger.reflect({ ...input, claimId, evidenceIds: ["ev_1_copy"], insight: insight("ev_1_copy", "同一杯咖啡") }, 2);
     assert.equal(repeat.duplicate, true);
     assert.equal(repeat.view.records.length, 1);
     await assert.rejects(ledger.reflect(input, 2), /已有相同认识/);
@@ -30,8 +32,8 @@ async function main() {
     const counter = await ledger.reflect({ ...input, claimId, relation: "counter", statement: "并非每杯咖啡都不好喝", evidenceIds: ["ev_2"] }, 3);
     assert.equal(counter.view.status, "contested");
     assert.equal(counter.view.statement, input.statement);
-    await ledger.perceive(event("ev_3", "主动选择另一种咖啡豆"), ["world_original_3"]);
-    const revision = await ledger.reflect({ ...input, claimId, relation: "revise", statement: "不喜欢那杯过度萃取的咖啡，还愿意尝试其他咖啡", evidenceIds: ["ev_3"] }, 4);
+    await ledger.perceive(event("ev_3", "主动选择另一种咖啡豆", "world"), ["world_original_3"], choice("尝试另一种咖啡豆"));
+    const revision = await ledger.reflect({ ...input, claimId, relation: "revise", statement: "不喜欢那杯过度萃取的咖啡，还愿意尝试其他咖啡", evidenceIds: ["ev_3"], insight: insight("ev_3", "主动选择另一种咖啡豆") }, 4);
     assert.equal(revision.view.records.length, 3);
     assert.equal(revision.view.records[2]!.previousId, counter.view.records[1]!.id);
     assert.equal(revision.view.status, "tentative");
@@ -53,7 +55,7 @@ async function main() {
     const recoveredBase = path.join(base, "interrupted");
     const recovered = new GrowthLedger(recoveredBase);
     const delivered: StreamEntry[] = [
-      { kind: "event", event: { ...event("ev_delivered", "一次实际聊天"), originEventIds: ["chat_original"] } },
+      { kind: "event", event: { ...event("ev_delivered", "琴师答应每周带我练琴，愿意讲解卡住的地方。", "world"), originEventIds: ["chat_original"] } },
       { kind: "tool_call", call: { id: "tc_recall", role: "agent", name: "recall_growth", arguments: {}, issuedAt: 1, expectedAt: 1 } },
       { kind: "event", event: { ...event("ev_recall", "重复读到旧认识", "tool"), refToolCallId: "tc_recall" } },
       { kind: "event", event: { ...event("ev_empty_roots", "压缩摘要", "tool"), originEventIds: [] } },
@@ -62,7 +64,7 @@ async function main() {
     await recovered.restorePerceptions(delivered);
     await recovered.restorePerceptions(delivered);
     assert.deepEqual((await recovered.recallEvidence()).map(e => e.eventId), ["ev_delivered"]);
-    const repairedReflection = await recovered.reflect({ kind: "relationship", subject: "对话者", statement: "我们聊过一次", evidenceIds: ["ev_delivered"] }, 2);
+    const repairedReflection = await recovered.reflect({ kind: "relationship", subject: "对话者", statement: "我可以在练琴遇到困难时向琴师求助", evidenceIds: ["ev_delivered"], insight: { dimension: "练琴指导", significance: "有明确的求助邀请，今后遇到难题可以向对方请教。", anchors: [{ eventId: "ev_delivered", quote: "愿意讲解卡住的地方" }] } }, 2);
     assert.deepEqual(repairedReflection.view.records[0]!.rootEventIds, ["chat_original"]);
 
     const invitations = new GrowthLedger(path.join(base, "invitations"));

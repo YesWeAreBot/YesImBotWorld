@@ -101,7 +101,7 @@ function shellIsolation() {
   const sandbox: any = {
     SCREEN_PLACEHOLDER: "data:image/png;base64,AA==", isVisitor: () => true,
     el(tag: string, attrs: unknown) {
-      const node = { tag, attrs, appendChild() {}, srcdoc: "" };
+      const node = { tag, attrs, style: {}, appendChild() {}, srcdoc: "" };
       elements.push(node);
       return node;
     },

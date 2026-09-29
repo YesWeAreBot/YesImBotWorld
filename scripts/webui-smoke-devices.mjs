@@ -60,6 +60,41 @@ export async function smokeDevices({ evaluate, wait, assert, navigate }) {
   await click('.app-chat-channel:first-child');
   await wait("document.querySelector('.app-chat-compose').value==='保留在第一个会话里的草稿'");
 
+  // A send captures its explicit destination even if shared device focus moves
+  // before the receipt. Neither another channel's draft nor newly typed text is cleared.
+  await evaluate(`window.__deviceSendRace={original:api,calls:[],release:null};
+    api=function(method,path,body){const state=window.__deviceSendRace;
+      if(method==='POST'&&path==='/api/device/tool'&&body.name==='send'){
+        state.calls.push(structuredClone(body));return new Promise((resolve,reject)=>{state.release=()=>state.original(method,path,body).then(resolve,reject);});
+      }return state.original.apply(this,arguments);};`);
+  try {
+    await click('.app-chat-channel:nth-child(2)');
+    await wait("document.querySelector('.app-chat-title').textContent.includes('空白会话')");
+    await fill('.app-chat-compose', '第二个会话的新草稿');
+    await click('.app-chat-channel:first-child');
+    await wait("document.querySelector('.app-chat-title').textContent.includes('本地工作室')");
+    await fill('.app-chat-compose', '发送到第一个会话的正文');
+    await click('.app-chat-send');
+    await wait('!!window.__deviceSendRace.release');
+    await evaluate(`(async()=>{const state=window.__deviceSendRace,session=await state.original('GET','/api/device/session');state.first=session.chat.channels[0].key;state.second=session.chat.channels[1].key;
+      await state.original('POST','/api/device/tool',{name:'select_channel',args:{id:state.second},mode:'stealth'});})()`);
+    await evaluate('window.__deviceSendRace.release();window.__deviceSendRace.release=null;');
+    await wait("!document.querySelector('.app-chat-send').disabled&&document.querySelector('.app-chat-compose').dataset.channel==='chat:'+window.__deviceSendRace.second");
+    await check("window.__deviceSendRace.calls[0].args.id===window.__deviceSendRace.first&&document.querySelector('.app-chat-compose').value==='第二个会话的新草稿'", 'Sending keeps its explicit recipient and cannot clear the newly displayed channel draft');
+    await click('.app-chat-channel:first-child');
+    await wait("document.querySelector('.app-chat-compose').dataset.channel==='chat:'+window.__deviceSendRace.first");
+    await check("document.querySelector('.app-chat-compose').value===''", 'Only the successfully submitted original channel draft is cleared');
+    await fill('.app-chat-compose', '原先提交的正文');
+    await click('.app-chat-send');
+    await wait('!!window.__deviceSendRace.release');
+    await fill('.app-chat-compose', '等待回执时写下的新正文');
+    await evaluate('window.__deviceSendRace.release();window.__deviceSendRace.release=null;');
+    await wait("!document.querySelector('.app-chat-send').disabled");
+    await check("window.__deviceSendRace.calls[1].args.id===window.__deviceSendRace.first&&document.querySelector('.app-chat-compose').value==='等待回执时写下的新正文'", 'A late send receipt also preserves new text written in the original channel');
+  } finally {
+    await evaluate('api=window.__deviceSendRace.original;delete window.__deviceSendRace;');
+  }
+
   await openApp('天气', 'weather');
   const city = `样本城市 ${stamp}`;
   await fill('.app-weather input', city);

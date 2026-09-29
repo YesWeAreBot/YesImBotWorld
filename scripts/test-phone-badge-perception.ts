@@ -88,10 +88,10 @@ async function fixture(base: string) {
       userId: "private-sender", username: "秘密发送者", timestamp: Date.now(), isDirect: false, messageId: "private-message-" + id,
       elements: [h.text("秘密正文 " + id)] });
   }
-  function waiting() {
-    bot.scheduler.schedule({ id: "pending-badge-wait", role: "agent", name: "wait", arguments: {}, issuedAt: 1, expectedAt: 60 },
+  function waiting(id = "pending-badge-wait") {
+    bot.scheduler.schedule({ id, role: "agent", name: "wait", arguments: {}, issuedAt: 1, expectedAt: 60 },
       { executeAt: "expected", run: async () => "wait receipt" });
-    bot.waiting = { callId: "pending-badge-wait", kind: "wait", startedTU: 1 };
+    bot.waiting = { callId: id, kind: "wait", startedTU: 1 };
   }
   return { phone, notify, bot, context, received, autonomous, incoming, waiting, peeks: () => peeks,
     setScreen(value: RichText | null) { screen = value; },
@@ -124,19 +124,22 @@ async function quietModes(base: string) {
       assert.equal(f.bot.waiting.callId, "pending-badge-wait");
       const before = f.notify.snapshot();
       assertBadge(await f.autonomous("pick_up_phone"), 3);
+      assert.equal(f.bot.scheduler.isPending("pending-badge-wait"), false, "the real pickup result interrupts the previous pause, independently of notification permissions");
       assert.equal(f.phone.down, false);
       assert.deepEqual(f.notify.snapshot(), before, "picking up reveals a count without marking any message read");
       assertBadge(await f.autonomous("observe_device", { device: "phone" }), 3);
       assert.deepEqual(f.notify.snapshot(), before, "reobserving the desktop does not clear unread or notification records");
       assert.equal(f.received.length, 0, "an explicit observation is not an unsolicited gateway notification");
       if (mode !== "silent") {
+        f.waiting("pending-held-badge-wait");
         const mailboxLength = f.bot.mailbox.length, streamLength = f.context.stream.length;
         await f.incoming("a", "arrived-while-held");
         assert.equal(f.notify.snapshot().unread, 4);
         assert.equal(f.received.length, 0, "off/DND badge changes remain passive even on an attended desktop");
         assert.equal(f.bot.mailbox.length, mailboxLength); assert.equal(f.context.stream.length, streamLength);
-        assert.equal(f.bot.scheduler.isPending("pending-badge-wait"), true);
+        assert.equal(f.bot.scheduler.isPending("pending-held-badge-wait"), true, "passive unread changes cannot interrupt a new pause on an attended phone");
         assertBadge(await f.autonomous("observe_device", { device: "phone" }), 4);
+        assert.equal(f.bot.scheduler.isPending("pending-held-badge-wait"), false, "an explicitly requested observation result can interrupt the pause");
         assert.equal(f.notify.snapshot().unread, 4);
       }
       assert.doesNotMatch((await f.autonomous("put_down_phone")).text, badge);

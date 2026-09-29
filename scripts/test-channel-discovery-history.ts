@@ -29,6 +29,8 @@ async function fixture() {
   (bot as any).internal = { _request: async (action: string, params: Record<string, unknown>) => {
     calls.push({ action, params });
     if (action === "get_group_list") return [{ group_id: "900", group_name: "天文讨论", member_count: 30 }];
+    if (action === "get_group_info" && ["900", "901"].includes(String(params.group_id))) return { group_id: params.group_id };
+    if (action === "get_stranger_info" && String(params.user_id) === "234") return { user_id: 234 };
     if (action.endsWith("msg_history")) return response(action, params);
     return {};
   } };

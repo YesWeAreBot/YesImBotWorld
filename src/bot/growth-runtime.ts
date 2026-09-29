@@ -8,7 +8,8 @@ import { richPartsText } from "../media/presentation.js";
 import { sliceText } from "../text.js";
 import type { BotEvent } from "../types.js";
 import type { BotContext } from "./context.js";
-import { GrowthLedger, growthViewText, independentGrowthChoices, semanticRecord, type GrowthReviewSnapshot, type GrowthView, type ReflectionInput } from "./growth.js";
+import { GrowthLedger, growthViewText, independentGrowthChoices, semanticRecord, type GrowthReviewSnapshot, type GrowthView, type ReflectionInput, type PerceivedEvidence } from "./growth.js";
+import { validateGrowthInsight } from "./growth-semantics.js";
 import { verifiedOpportunityQueries, type ActionOpportunity } from "./opportunities.js";
 import { narrativeFactText } from "./narrative-facts.js";
 
@@ -29,16 +30,18 @@ experience.worldEpoch标识经历所属的世界阶段；historicalWorld=true是
 chatAccounts 说明当前自用账号；历史归属以当时记录为准，不能用今天连接的账号倒推过去，记录时未登记或未知也不等于一定属于别人。群名片、账号昵称和角色姓名可以不同；以平台及账号辨别发送者，不能把已确认自用账号的旧消息当成别人的话或新反馈。账号归属和自主行动分别判断，观察到自己账号的消息也不证明是本人自主发送；不能按同名合并他人或转发作者。
 表情包和平台表情是会话中的表意行为。只能按前后交流及实际指向形成有依据的认识；素材的画面、字幕、可能用途或收藏备注不证明发送者实际经历、情绪、偏好、承诺或关系变化。猫图不证明喜欢猫，哭脸不证明难过。同一消息重复回读不增加使用次数；真实连发也不能脱离语境认定为催促、亲近或习惯，语义不明时不据此新增认识。
 多数经历不必产生新结论，允许并优先诚实返回 {"changes":[]}。不为填满类别创造结论，不把整理结果、回忆、重复阅读当新经历。角色的内心独白、猜测和设想不是外界事实，也不是已完成的自主行为；不能据此确认他人行为、承诺兑现、身体变化或奖励。相同 episodeId 或共同来源的工具步骤只是一件事；一句决心或计划不是已经养成的行为。
-区分六种 kind：relationship 关系认识；commitment 实际承诺及兑现变化；preference 偏好；state 临时状态；habit 情境习惯；trait 性格倾向。
-state 只描述当前短期处境，写清 situation 与结束条件，不直接归纳成性格。身体处境必须有 source=world 或 experience.worldPerception 的实际感知；注意界面必须有 experience.chat.kind=attention 的事实，且只在其 channelKey 对应频道有效。频道列表、通知、拿起手机或发送成功都不证明正在留意某人，更不证明对方想聊天。不能由这些资料创造意图。必须引用最近两世界小时内实际支持该状态的经历，不能混入无关的新经历为旧状态续命。通常省略 expiresAt，程序从支持证据的最新 observedAt 起计算两世界小时有效期，不从整理时刻重新计时；如明确填写，它必须晚于 time.nowTU，最长到支持证据时刻加一天。它是未来的世界 TU 时刻，不是现实时间戳。
+只整理五类长期认识：relationship 具体关系认识；commitment 真实承诺及履约变化；preference 本人的偏好；habit 情境习惯；trait 性格倾向。不要新增 state：拿手机、洗漱、发呆、回复一句话、某时的身体或界面状态留在原始经历里，不写成成长。旧 state 只允许 retire。
+relationship 要说明对具体人物的信任、边界、期待或相处方式发生了什么认识变化；聊过天、问了个问题、对方也在场不是关系变化。不能由一次寒暄推断亲密或他人的内心。commitment 必须有实际承诺、明确履约或撤回；讨论某话题或说“哦 那个测试”不是承诺。记录他人承诺须用 subjectId 指定实际承诺者，自己的承诺可省略。preference 须由明确表达或有意义的自主选择支持；看见菜单/网页问卷/选项不等于选过，导航到网页不证明赞同网页观点，一次随手行为也不必成为偏好。
+对 relationship/commitment/preference 的 support 或 revise，必须提供 insight：dimension 是稳定可复用的认识维度（如“技术求助的信任”，不要写事件标题或日期）；significance 说明这条认识为何影响以后理解或选择，不能只是复述经过；anchors 是1至4条 {eventId,quote}，quote 逐字摘取本次实际展示的证据正文、messages.text 或 experience.action（2至500字）。锚须证明主张本身，不能用真实编号替无关结论背书。自己偏好或承诺要引用已核验的自主表达/选择；发送回执里引用的别人原话不是自己说的话。counter/retire 不要求新的 insight。
 habit 必须说明什么 situation 下倾向做什么及例外，至少引用 3 次不同经历中的自主完成选择且跨至少一个世界日；trait 需至少 6 次自主完成选择、跨七个世界日并覆盖 3 种不同情境。两类都必须提供 behavior：这些实际 action 里逐字共有的明确动作短语（至少2字），不能拿无关行为凑次数。频繁循环不是人格形成，短期表现留在原始经历即可。重复发生相同动作也不要求补证；只有适用范围、例外、反例或认识改变时才值得再次整理。同一行为已有认识不能更换近义标题反复新建。
 agency=self 且 outcome=completed、opportunity=true 的经历才能证明自愿行为。behavioralEvidence 是程序核验过的本次可计数自主选择；其中不足 3 次时不能新建 habit，不足 6 次时不能新建 trait。既有倾向的补证还可以依赖其已经核验的旧支持证据。没有 experience 的旧材料归属未知，不能从正文猜测自主性。被迫行动(imposed)、看见别人行动(observed)、未知归属(unknown)、失败或送达未知都不能证明自己的习惯；体验到身体不由自主行动可以成为当时感受的证据。没有重复某个行为，只有确实有机会选择时才可能构成反例；没有观察到机会不等于放弃习惯。
 优先补充或修订已有认识，避免同义重复。聊天 relationship 必须填 subjectId，且有该 senderId 实际发出的 senderOwn=false 消息。messages 是程序按已交付消息片段划分的证据；自己的旧话不能变成对方邀请、回应或意愿，混合快照的 subjectIds 列表不能证明其中每句话属于任何一个人。subjectId 只能用已交付材料提供的身份，不要猜测。needsReview 的旧认识只供重新核对，不能把旧结论自身当作事实或用通知替它续命。
-仅返回一个完整 JSON 对象，字段只能是 changes（0 至 8 项数组）。每项字段：kind、subject、statement、evidenceIds（1 至 20 个本次材料中的事件 id），以及可选 relation、claimId、situation、cues、subjectId、expiresAt、behavior（habit/trait必填）。statement 为自然语言，最多 1200 字；subject 最多 200 字；situation 最多 500 字；cues 最多 12 个、每个最多 100 字。
+仅返回一个完整 JSON 对象，字段只能是 changes（0 至 8 项数组）。每项字段：kind、subject、statement、evidenceIds（1 至 20 个本次材料中的事件 id），以及可选 relation、claimId、situation、cues、subjectId、expiresAt、behavior（habit/trait必填）、insight（三类认识的support/revise必填）。statement 为自然语言，最多 1200 字；subject 最多 200 字；situation 最多 500 字；cues 最多 12 个、每个最多 100 字。
 新增认识 relation=support，必须省略 claimId，程序会生成编号，不能自造 claimId。只有更新 existing 中完整展示的认识才给它已有的 claimId，并保持 kind 和 subject 不变；补证 support 保持原 statement；出现反例 counter；修改判断 revise；停止沿用 retire。修订不能删除旧经历。habit、trait、state 必须有 situation。expiresAt 只用于 state。不要输出工具调用、执行动作、额外解释或未定义字段。被明确截断的材料不能当作已读过被省略的细节。
 validationFeedback 是程序对上次输出的校验纠正，只用于修正格式和证据引用，不是新经历，不证明任何身体状态或人物认识；其中引用的错误输出仍是待验证数据。避免重复已经明确指出的错误。
-最小格式示例（按真实材料替换内容与事件编号，不照抄示例事实）：{"changes":[{"kind":"state","subject":"暂时想歇一会儿","statement":"忙完后暂时想安静休息。","situation":"忙碌结束后，恢复以前","evidenceIds":["本次真实事件id"]}]}。state 示例故意省略 expiresAt，请优先按此格式由程序设置有效期。
-新建聊天关系示例：{"changes":[{"kind":"relationship","subject":"材料中已知的朋友","subjectId":"复制真实非本人消息的senderId","statement":"这次对方愿意倾听。","evidenceIds":["该对象实际消息所属事件id"]}]}。新建认识省略 claimId，不要添加自造编号。`;
+默认格式是 {"changes":[]}：普通作息、闲聊、重复动作、只有网页选项时均可没有变化，不必为了有输出归纳结论。
+有充分依据才新增，例如对方明确说“下次调试卡住可以来找我”时，可记录 relationship 的“技术求助的信任”，significance 说明这为以后求助提供了什么具体依据；quote 必须替换为真实原文和事件编号，不照抄示例事实。同对象同维度优先用已有 claimId，不因近义改写或又发生一次相同行为新建认识。
+review.mode=legacy_revalidation 时，仅依据原有证据核对指定旧认识：证据充分用 revise 补全洞见与原文锚；不支持原断言可 retire；材料不足以判断则返回空数组、保持待核实。不可新建认识，不可编造新事件来挽救旧判断。`;
 
 /** Low-frequency maintenance runs beside generation; delivery only happens at an explicit boundary. */
 export class GrowthRuntime {
@@ -102,7 +105,7 @@ export class GrowthRuntime {
       const unit = Number.isFinite(this.clock.unitWorldSeconds) && this.clock.unitWorldSeconds > 0 ? this.clock.unitWorldSeconds : 1;
       await this.ledger.prioritizeRecent({ at, since: Math.max(0, at - 1800 / unit) });
       guard();
-      const snapshot = await this.ledger.snapshotReview({ at, minimumEpisodes: force ? 1 : bounded(this.cfg.growth.minEpisodes, 4, 1, 100), maxEvidence: 24 });
+      const snapshot = await this.ledger.snapshotReview({ at, minimumEpisodes: force ? 1 : bounded(this.cfg.growth.minEpisodes, 4, 1, 100), maxEvidence: 24, secondsPerTU: this.clock.unitWorldSeconds });
       guard();
       if (!snapshot) return;
       reviewId = snapshot.id;
@@ -122,7 +125,7 @@ export class GrowthRuntime {
         request = reviewMessages(snapshot, definition, this.clock.unitWorldSeconds,
           bounded(this.cfg.growth.maxInputChars, 24_000, 4000, 200_000), feedback, this.context.accountsProvider?.() ?? "");
         return this.infer ? this.infer(request.messages, controller.signal) : client.complete(request.messages, { signal: controller.signal });
-      }, controller.signal);
+      }, controller.signal, { priority: "background" });
       guard();
       if (deliveredAuthorDefinition(this.context) !== definition) throw new Error("人物的作者定义在本次整理期间已更新，旧定义下的结果未采用；原经历未被消费");
       const changes = parseChanges(result);
@@ -131,6 +134,16 @@ export class GrowthRuntime {
         const change = parseChange(raw);
         if (!Array.isArray(change.evidenceIds) || change.evidenceIds.some(id => !request!.evidenceIds.has(id))) {
           throw new Error("整理结果引用了本次请求未展示的证据；省略的材料不能作为已读证据");
+        }
+        if (change.insight && (!Array.isArray(change.insight.anchors) || change.insight.anchors.some(anchor =>
+          !anchor || typeof anchor.quote !== "string" || !anchor.quote.trim() ||
+          !request!.shownAnchorTexts.get(anchor.eventId)?.some(text => text.includes(anchor.quote))))) {
+          throw new Error("洞见锚必须逐字引用本次实际展示的原文，不能引用截断后未见的内容");
+        }
+        // Verify attribution against the exact displayed fragments too. A quote visible
+        // from B cannot justify an unseen, truncated occurrence in A's original message.
+        if (change.insight && change.relation !== "counter" && change.relation !== "retire") {
+          validateGrowthInsight(change, request!.visibleEvidence.filter(item => change.evidenceIds.includes(item.eventId)));
         }
         if (change.subjectId && !request!.subjectIds.has(change.subjectId)) throw new Error("整理结果引用了本次请求未展示的身份");
         if (change.kind === "relationship" && change.relation !== "retire" && change.relation !== "counter" && change.evidenceIds.some(id => request!.chatEvidenceIds.has(id)) &&
@@ -182,13 +195,27 @@ export class GrowthRuntime {
       if (!current()) return delivered;
       await this.correctStateTiming(current);
       if (!current()) return delivered;
-      for (const result of await this.ledger.pendingReviews(50)) {
+      for (const isolation of await this.ledger.pendingIsolations(1)) {
         if (!current()) return delivered;
-        const views = result.views.filter(view => view.active && !view.needsReview && (view.kind !== "state" || (view.expiresAt ?? 0) > this.clock.now()))
-          .filter(view => view.kind === "state" || result.records.some(record => record.claimId === view.claimId && (!record.previousId || record.relation !== "support")));
+        const event: BotEvent = { id: `ev_${isolation.id}`, source: "system", originEventIds: [], worldTime: isolation.at,
+          content: "（旧回顾待复核：缺少可信发送者/频道范围、共同动作与跨日依据，或尚未核实长期意义与支持原文的旧认识，暂不作为当前事实或行动依据，包含旧摘要内相关判断。看见网页选项不等于已经选择，聊过某话题也不等于承诺。不要据此认定某人刚发话、找你聊天或自己必须重复某行为。以下索引只指列出的旧版本；已经核验并交付或写入摘要的新修订不受影响，不得因迟到的旧通知再次撤销新修订。已发出的消息和真实经历仍保留；隔离不证明结论全部相反，后台会按原始证据核对。）\n" +
+            isolation.claims.map(claim => `待复核 ${claim.claimId}｜旧版本 ${claim.recordId}｜${boundedText(claim.subject, 80)}\n旧判断摘录（不是事实确认）：${boundedText(claim.statement, 140)}\n原因：${boundedText(claim.reason, 120)}。`).join("\n") };
+        const exists = this.context.stream.some(entry => entry.kind === "event" && entry.event.id === event.id);
+        await this.context.appendEvent(event);
+        if (!current()) return delivered;
+        await this.ledger.ackIsolation(isolation.id);
+        if (!exists) delivered.push(event);
+      }
+      // A later isolation batch must not revoke an already delivered correction.
+      // Keep migration notices bounded, and defer newer reviews until their older notices drain.
+      const reviews = (await this.ledger.pendingIsolations(1)).length ? [] : await this.ledger.pendingReviews(50);
+      for (const result of reviews) {
+        if (!current()) return delivered;
+        const views = result.views.filter(view => !view.needsReview && view.kind !== "state" && (view.active || view.inactiveReason === "retired"))
+          .filter(view => result.records.some(record => record.claimId === view.claimId && (!record.previousId || record.relation !== "support")));
         if (!views.length) { await this.ledger.ackReview(result.id); continue; }
         const event: GrowthMemoryEvent = { id: `ev_growth_${result.id}`, source: "system", originEventIds: [], worldTime: result.at,
-          content: "回顾此前的经历，你整理出了这些认识。它们保留当时的适用范围与疑问，可以随着新经历改变；这段回顾本身不是一件新发生的事。\n" + views.map(growthViewText).join("\n"),
+          content: "回顾此前的经历，你整理或更正了这些认识。已停止沿用的判断不再指导行为，其余认识保留适用范围与疑问；这段回顾本身不是一件新发生的事。\n" + views.map(growthViewText).join("\n"),
           growthReferences: references(views) };
         const exists = this.context.stream.some(entry => entry.kind === "event" && entry.event.id === event.id);
         // Even an existing journal entry must finish its pinned/counter checkpoint before acknowledgement.
@@ -217,17 +244,6 @@ export class GrowthRuntime {
         await this.ledger.ackCorrection(correction.id);
         if (!exists) delivered.push(event);
       }
-      for (const isolation of await this.ledger.pendingIsolations(1)) {
-        if (!current()) return delivered;
-        const event: BotEvent = { id: `ev_${isolation.id}`, source: "system", originEventIds: [], worldTime: isolation.at,
-          content: "（旧回顾待复核：所有缺少可信发送者/频道范围或共同动作与跨日依据的旧认识，从现在起暂不作为当前事实或行动依据，包含旧摘要内相关判断，不限于下面这一批。不要据此认定某人刚发话、找你聊天、触发通知或自己必须重复某行为。已发出的消息和真实经历仍然保留。这里只澄清旧认识的适用性，不是新经历，也不证明这些判断全部相反。以下仅列本批待复核索引；完整原文及依据仍在审计记录，后续批次会继续交付。）\n" +
-            isolation.claims.map(claim => `待复核 ${claim.claimId}｜${boundedText(claim.subject, 80)}\n旧判断摘录（不是事实确认）：${boundedText(claim.statement, 140)}\n原因：${boundedText(claim.reason, 120)}。`).join("\n") };
-        const exists = this.context.stream.some(entry => entry.kind === "event" && entry.event.id === event.id);
-        await this.context.appendEvent(event);
-        if (!current()) return delivered;
-        await this.ledger.ackIsolation(isolation.id);
-        if (!exists) delivered.push(event);
-      }
       return delivered;
     });
   }
@@ -235,9 +251,10 @@ export class GrowthRuntime {
   /** Retrieve from what was actually delivered, never from a live world snapshot or hidden device audit. */
   remember(events?: BotEvent[], opportunities: readonly ActionOpportunity[] = []): Promise<BotEvent[]> {
     const epoch = this.epoch;
-    const current = () => !this.stopped && epoch === this.epoch;
+      const current = () => !this.stopped && epoch === this.epoch;
     return this.serial(async () => {
       if (!current()) return [];
+      if ((await this.ledger.pendingIsolations(1)).length) return [];
       if (this.recallPending) {
         const event = this.recallPending;
         await this.context.appendEvent(event);
@@ -327,7 +344,8 @@ function deliveredAuthorDefinition(context: BotContext): string {
 }
 
 interface ReviewRequest { messages: ChatMessage[]; evidenceIds: Set<string>; subjectIds: Set<string>; editableClaims: Set<string>;
-  chatEvidenceIds: Set<string>; messageSubjects: Map<string, Set<string>> }
+  chatEvidenceIds: Set<string>; messageSubjects: Map<string, Set<string>>; shownAnchorTexts: Map<string, string[]>;
+  visibleEvidence: PerceivedEvidence[] }
 function reviewMessages(snapshot: GrowthReviewSnapshot, definition: string, secondsPerTU: number, maxChars: number, validationFeedback: string[] = [], chatAccounts = ""): ReviewRequest {
   const unit = Number.isFinite(secondsPerTU) && secondsPerTU > 0 ? secondsPerTU : 1;
   if (REVIEW_SYSTEM.length + JSON.stringify({ characterDefinition: definition }).length >= maxChars) {
@@ -348,7 +366,8 @@ function reviewMessages(snapshot: GrowthReviewSnapshot, definition: string, seco
     chatAccounts,
     time: { nowTU: snapshot.createdAt, secondsPerTU: unit, twoHoursLaterTU: snapshot.createdAt + 7200 / unit, oneDayLaterTU: snapshot.createdAt + 86400 / unit },
     validationFeedback: feedback.slice(0, feedbackCount),
-    review: { mode: snapshot.backlogId ? "historical_backlog" : "current_experiences",
+    review: { mode: snapshot.revalidation?.length ? "legacy_revalidation" : snapshot.backlogId ? "historical_backlog" : "current_experiences",
+      revalidation: snapshot.revalidation,
       note: "batch 为本次待审材料，related 为相关已交付材料；材料可能来自不同时间，以 at 和 ageWorldSeconds 判断先后，旧材料不能当作刚发生。" },
     behavioralEvidence: { independentChoiceEventIds: independentGrowthChoices(sample(count)).map(item => item.eventId),
       note: "只列本次完整展示的、经程序核验可计数的独立自主选择代表事件；同一经历的其他步骤不能重复计数。" },
@@ -358,8 +377,8 @@ function reviewMessages(snapshot: GrowthReviewSnapshot, definition: string, seco
     // Hard author constraints may occur anywhere, so this field is never truncated.
     characterDefinition: definition,
     existing: snapshot.claims.slice(0, visibleClaims).map((view, index) => ({ claimId: view.claimId, kind: view.kind, subject: view.subject, subjectId: view.subjectId,
-      scope: view.scope, behavior: view.behavior, needsReview: view.needsReview,
-      ...(index < fullClaims ? { statement: view.statement, situation: view.situation, active: view.active, status: view.status,
+      scope: view.scope, behavior: view.behavior, needsReview: view.needsReview, dimension: view.insight?.dimension,
+      ...(index < fullClaims ? { statement: view.statement, insight: view.insight, situation: view.situation, active: view.active, status: view.status,
         currentCounter: view.status === "contested" ? [...view.records].reverse().find(record => record.relation === "counter")?.statement : undefined,
         inactiveReason: view.inactiveReason, correction: view.correction?.reason,
         expiresAt: view.expiresAt, cues: compact ? undefined : view.cues?.slice(0, 6), omittedHistoryRecords: view.records.length }
@@ -403,8 +422,16 @@ function reviewMessages(snapshot: GrowthReviewSnapshot, definition: string, seco
     const messages = evidence.messages ?? (evidence.experience?.chat?.kind === "message" ? [{ chat: evidence.experience.chat }] : []);
     return [evidence.id, new Set(messages.flatMap(message => message.chat.senderOwn === false && message.chat.senderId ? [message.chat.senderId] : []))];
   }));
+  const originals = new Map(snapshot.evidence.map(item => [item.eventId, item]));
+  const visibleEvidence: PerceivedEvidence[] = payload.evidence.map(item => ({ ...originals.get(item.id)!, text: item.text,
+    ...(item.experience ? { experience: { ...originals.get(item.id)!.experience!, action: item.experience.action,
+      situation: item.experience.situation, subjectIds: item.experience.subjectIds } } : {}),
+    messages: item.messages?.map((message, index) => ({ chat: message.chat, text: message.text,
+      rootEventIds: originals.get(item.id)!.messages?.slice(-messageCount)[index]?.rootEventIds ?? originals.get(item.id)!.rootEventIds })) }));
   return { messages: [{ role: "system", content: REVIEW_SYSTEM }, { role: "user", content: JSON.stringify(payload) }],
+    visibleEvidence,
     evidenceIds: new Set(payload.evidence.map(evidence => evidence.id)),
+    shownAnchorTexts: new Map(payload.evidence.map(evidence => [evidence.id, [evidence.text, evidence.experience?.action ?? "", ...(evidence.messages?.map(message => message.text) ?? [])]])),
     subjectIds: new Set([...payload.evidence.flatMap(evidence => evidence.experience?.subjectIds ?? []),
       ...payload.existing.flatMap(view => view.subjectId ? [view.subjectId] : [])]),
     editableClaims: new Set(snapshot.claims.slice(0, fullClaims).map(view => view.claimId)), messageSubjects,
@@ -424,7 +451,7 @@ function parseChanges(result: ChatResult): unknown[] {
 }
 
 function parseChange(change: unknown): ReflectionInput {
-  const allowed = new Set(["kind", "subject", "statement", "evidenceIds", "relation", "claimId", "situation", "cues", "subjectId", "expiresAt", "behavior"]);
+  const allowed = new Set(["kind", "subject", "statement", "evidenceIds", "relation", "claimId", "situation", "cues", "subjectId", "expiresAt", "behavior", "insight"]);
   if (!change || typeof change !== "object" || Array.isArray(change) || Object.keys(change).some(key => !allowed.has(key))) throw new Error("成长整理包含无效认识或未定义字段");
   return { ...change } as ReflectionInput;
 }

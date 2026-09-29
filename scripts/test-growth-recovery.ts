@@ -37,7 +37,7 @@ async function main() {
     assert.equal(independentGrowthChoices(current.evidence).length, 1, "unknown legacy agency and repeated steps cannot supply missing habit evidence");
     const proposals: ReflectionInput[] = [
       { kind: "habit", subject: "喝茶", situation: "朋友来访", statement: "朋友来时习惯一起喝茶。", evidenceIds: ["recent0", "recent1", "recent2"] },
-      { kind: "relationship", subject: "来访的朋友", statement: "这次朋友愿意一起喝茶。", evidenceIds: ["recent0"] },
+      { kind: "relationship", subject: "来访的朋友", statement: "这次朋友愿意一起喝茶。", evidenceIds: ["recent0"], insight: { dimension: "来访时的相处意愿", significance: "对方愿意留下喝茶，下次相见可以尝试邀请对方坐坐。", anchors: [{ eventId: "recent0", quote: "朋友来访，一起喝了杯茶。" }] } },
     ];
     (ledger as any).append = async () => { throw Error("review disk failure"); };
     await assert.rejects(ledger.commitAutomaticReview(current, proposals, 10_010, prepare), /review disk failure/);

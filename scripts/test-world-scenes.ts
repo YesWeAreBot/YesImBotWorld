@@ -1,3 +1,4 @@
+import { worldInputText, assertWorldInputText } from "./world-input-fixture.js";
 import assert from "node:assert/strict";
 import { promises as fs, readFileSync } from "node:fs";
 import os from "node:os";
@@ -15,7 +16,7 @@ type Resolution = {
   perceptions: { actorId: string; text: string }[];
   outcome?: { status: "completed" | "failed" | "needs_input"; reason?: string; speechSpoken?: boolean };
 };
-type Request = { kind: string; task: string; stateVersion: number; worldState: string; actors: { id: string; state: string; perception: string }[]; pendingActions: { id: string; intent: string }[] };
+type Request = { kind: string; task: string; action: { intent: string; target: string; speech: string }; worldState: string; actors: { id: string; state: string; perception: string }[]; pendingActions: { id: string; intent: string }[] };
 type Receipt = { observation: NarrativeObservation; action: { id: string; intent: string; status: string }; scene: NonNullable<NarrativeObservation["scene"]> };
 const result = (input: Resolution): ChatResult => ({ content: "", toolCalls: [{ id: "scene-resolution", type: "function", function: { name: "resolve_world", arguments: JSON.stringify(input) } }] });
 const response = (text: string, worldState?: string, state?: string, outcome?: Resolution["outcome"]): Resolution => ({ perceptions: [{ actorId: "bot", text }], ...(worldState ? { worldState } : {}), ...(state ? { actorStates: [{ actorId: "bot", state }] } : {}), ...(outcome ? { outcome } : {}) });
@@ -75,7 +76,7 @@ async function main() {
   };
   try {
     expect("initialize", { ...response(initialScene, initialState, initialBody), botName: "小澈" }, request => {
-      assert.equal(request.worldState, ""); assert.match(request.task, /创世/);
+      assertWorldInputText(request, ""); assert.match(request.task, /创世/);
     });
     await runtime.ensure("小澈是一个会自己决定行动的常驻角色。", "日常生活世界，NPC 依处境自然回应，不读取他人的秘密。");
     const store = await runtime.store();
@@ -85,9 +86,9 @@ async function main() {
 
     now++;
     expect("action", response(arrivalScene, arrivedState, arrivedBody, { status: "needs_input", reason: "PRIVATE_REASON：仍有后台秘密，不能送给角色。" }), request => {
-      assert.equal(request.worldState, initialState); assert.equal(request.actors[0]!.state, initialBody);
-      assert.match(request.task, /去吃饭/); assert.match(request.task, /街角的餐厅/);
-      assert.ok(request.pendingActions.some(action => action.id === "bot:go-eat"));
+      assertWorldInputText(request, initialState); assert.equal(request.actors[0]!.state, initialBody);
+      assert.match(request.action.intent, /去吃饭/); assert.match(request.action.target, /街角的餐厅/);
+      assert.ok(!request.pendingActions.some(action => action.id === "bot:go-eat"), "the current request is supplied once");
     });
     const eating = call("go-eat", "去吃饭", undefined, "街角的餐厅");
     assert.equal(await runtime.act("bot", eating, deliver), true);
@@ -108,11 +109,11 @@ async function main() {
 
     now++;
     expect("observe", response(menuScene, menuState), request => {
-      assert.equal(request.worldState, arrivedState);
+      assertWorldInputText(request, arrivedState);
       assert.equal(request.actors[0]!.perception, arrivalScene);
       assert.match(request.task, /看看可见餐牌/); assert.match(request.task, /柜台上的餐牌/);
       assert.match(request.task, /不能代为行动/);
-      assert.doesNotMatch(request.worldState, /清汤面 18 元/, "unestablished menu details are not pretended to have existed in prior state");
+      assert.doesNotMatch(worldInputText(request), /清汤面 18 元/, "unestablished menu details are not pretended to have existed in prior state");
     });
     const menu = await runtime.observe("bot", { intent: "看看可见餐牌", target: "柜台上的餐牌", modality: "sight" });
     assert.equal(menu.narrative, menuScene); assert.equal(menu.scene!.text, menuScene);
@@ -121,8 +122,8 @@ async function main() {
     const beforeReread = await fs.readFile(files.narrativeJournal, "utf8"), versionBeforeReread = store.snapshot().sequence;
     now++;
     expect("observe", response(menuScene), request => {
-      assert.equal(request.worldState, menuState); assert.equal(request.actors[0]!.perception, menuScene);
-      assert.match(request.worldState, /清汤面 18 元，米饭套餐 22 元/);
+      assertWorldInputText(request, menuState); assert.equal(request.actors[0]!.perception, menuScene);
+      assert.match(worldInputText(request), /清汤面 18 元，米饭套餐 22 元/);
     });
     const menuAgain = await runtime.observe("bot", { intent: "再确认一下菜单和等待时间" });
     assert.deepEqual(menuAgain, menu, "re-reading identical known facts preserves the original scene and provenance");
@@ -133,8 +134,8 @@ async function main() {
     let speechAttempts = 0;
     infer = async messages => {
       const request = input(messages, "action", speechAttempts === 0);
-      assert.equal(request.worldState, menuState);
-      assert.match(request.task, /请给我一碗清汤面，不要葱，谢谢。/);
+      assertWorldInputText(request, menuState);
+      assert.match(request.action.speech, /请给我一碗清汤面，不要葱，谢谢。/);
       speechAttempts++;
       if (speechAttempts === 1) return result(response("你告诉店员要一份面条。店员说好。", "INVALID_PROPOSAL_STATE", undefined, { status: "needs_input", speechSpoken: true }));
       assert.equal(speechAttempts, 2);
@@ -151,10 +152,10 @@ async function main() {
 
     now++;
     expect("action", response(finishedScene, finishedState, finishedBody, { status: "completed" }), request => {
-      assert.equal(request.worldState, orderState);
+      assertWorldInputText(request, orderState);
       assert.equal(request.actors[0]!.perception, orderScene);
-      assert.match(request.worldState, /不要葱/); assert.match(request.task, /等面端上来后吃饭/);
-      assert.equal(request.pendingActions.length, 1, "the earlier decision boundary has already released the action slot");
+      assert.match(worldInputText(request), /不要葱/); assert.match(request.action.intent, /等面端上来后吃饭/);
+      assert.equal(request.pendingActions.length, 0, "the earlier decision released its slot and the current request is not duplicated");
     });
     assert.equal(await runtime.act("bot", call("finish-meal", "找位置坐下，等面端上来后吃饭"), deliver), true);
     assert.equal(receipts.at(-1)!.action.status, "completed");
@@ -173,7 +174,7 @@ async function main() {
     const futureWords = "再来一份米饭套餐。";
     const notSpoken = "你暂时没有开口，桌上仍是刚吃完的空碗。店员还在招呼另一桌客人。";
     expect("action", response(notSpoken, undefined, undefined, { status: "completed", speechSpoken: false }), request => {
-      assert.equal(request.worldState, finishedState); assert.match(request.task, /暂时不开口/);
+      assertWorldInputText(request, finishedState); assert.match(request.action.intent, /暂时不开口/);
     });
     assert.equal(await runtime.act("bot", call("hold-words", "先看看店员是否忙，暂时不开口", futureWords), deliver), true);
     assert.equal(receipts.at(-1)!.scene.text, notSpoken);

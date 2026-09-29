@@ -41,6 +41,7 @@ async function fixture() {
   (bot as any).internal = { _request: async (action: string, params: any) => {
     calls.push({ action, params });
     if (action === "get_forward_msg") return { messages: forwards };
+    if (action === "get_group_info" && ["history-room", "verified-room"].includes(String(params.group_id))) return { group_id: params.group_id };
     if (action.endsWith("msg_history")) return { messages: history };
     return {};
   } };
@@ -88,6 +89,7 @@ async function agentQuoteGuards() {
     return context.stream.flatMap(entry => entry.kind === "event" && entry.event.refToolCallId === call.id ? [entry.event.content] : []).join("\n");
   }
   try {
+    await f.inbound(PRIVATE, "original", "原消息");
     const copied = `<quote id="original" name="朋友" text="${"很长的引用预览".repeat(30)}"/> \n 正文`;
     assert.match(await perform(copied, "original"), /消息已发送/, "quote metadata and discarded whitespace cannot trigger the body-length guard");
     assert.equal(f.sent.length, 1); assert.equal(texts(f.sent[0]!.elements), "正文");
@@ -151,13 +153,14 @@ async function outgoingAndReadback() {
 async function quoteAndMediaOrder() {
   const f = await fixture();
   try {
+    await f.inbound(PRIVATE, "original", "原消息");
     const photo = await f.media.ingest(dataUrl("PHOTO"), "image"), sticker = await f.media.ingest(dataUrl("STICKER"), "image", undefined, undefined, true);
     assert.ok(photo && sticker);
     const result = await f.messenger.sendReceipt(key(PRIVATE), `${quote("original")} \n甲<media ref="media:${sticker}"/>乙<media ref="media:${photo}"/>丙`, [], "original");
     assert.equal(result.status, "sent", result.text); assert.equal(f.sent.length, 3);
     const parts = f.sent.flatMap(item => item.elements).map(element => element.type === "text" ? element.attrs.content : element.type === "quote" ? "QUOTE" : element.type === "img" ? (element.attrs.sub_type ?? element.attrs.subType) ? "STICKER" : "PHOTO" : element.type);
     assert.deepEqual(parts, ["QUOTE", "甲", "STICKER", "乙", "PHOTO", "丙"], "quote processing preserves text/sticker/photo positions and batch ordering");
-    assert.deepEqual((await f.rows()).map(row => row.content), [quote("original") + "甲", mediaPlaceholder(sticker, "image", true), "乙" + mediaPlaceholder(photo, "image", false) + "丙"]);
+    assert.deepEqual((await f.rows()).filter(row => row.self).map(row => row.content), [quote("original") + "甲", mediaPlaceholder(sticker, "image", true), "乙" + mediaPlaceholder(photo, "image", false) + "丙"]);
     const read = await f.messenger.channelMessages(key(PRIVATE), 100, { intro: "echo" });
     assert.deepEqual(read.parts.filter((part: any) => part.kind === "media").map((part: any) => [part.ref.id, !!part.sticker]), [[sticker, true], [photo, false]]);
     const before = f.sent.length;
@@ -200,8 +203,40 @@ async function legacyProjectionAndPlatformHistory() {
     assert.doesNotMatch(history.text, /\[引用了一条消息\]/);
   } finally { await f.close(); }
 }
+async function scopedTargets() {
+  const f = await fixture();
+  try {
+    await f.inbound(GROUP, "actual-group-message", "这一条是群里的原消息");
+    await f.inbound(PRIVATE, "actual-private-message", "私聊消息");
+    const before = f.sent.length;
+    for (const atSender of [true, false]) {
+      assert.equal((await f.messenger.sendReceipt(key(PRIVATE), "禁止跨频道引用", [], "actual-group-message", atSender)).status, "blocked");
+      assert.equal((await f.messenger.sendReceipt(key(GROUP), "禁止虚构引用", [], "msg_id_for_maimai_video", atSender)).status, "blocked");
+    }
+    await f.store.store({ platform: "onebot", selfId: "different-account", channelId: GROUP, guildId: GROUP,
+      userId: PEER, username: "朋友", messageId: "other-account-only", content: "另一个登录账号取得的消息", timestamp: new Date(), self: false, isDirect: false });
+    assert.equal((await f.messenger.sendReceipt(key(GROUP), "禁止跨账号引用", [], "other-account-only")).status, "blocked");
+    assert.equal((await f.messenger.sendReceipt(key("1234567890"), "不能把不存在的群号交给平台", [], undefined)).status, "blocked");
+    f.cfg.messaging.offlineHistory = true;
+    const historyBefore = f.calls.filter(call => call.action.endsWith("msg_history")).length;
+    assert.match((await f.messenger.channelMessages(key("1234567890"), 10)).text, /尚未得到平台确认/);
+    assert.equal(f.calls.filter(call => call.action.endsWith("msg_history")).length, historyBefore, "unverified room IDs cannot create misleading history rows");
+    assert.equal(f.sent.length, before, "invalid target/quote checks precede all platform sends");
+    const sent = await f.messenger.sendReceipt(key(GROUP), "真实引用", [], "actual-group-message", false);
+    assert.equal(sent.status, "sent"); assert.match(sent.text, /原消息.*这一条是群里的原消息/);
+    assert.equal((await f.rows(GROUP)).at(-1)?.conversation?.reply?.userId, PEER, "own quote readback retains actual original sender identity");
+    const read = await f.messenger.channelMessages(key(GROUP), 10, { intro: "echo" });
+    assert.match(read.text, /这一条是群里的原消息\n〔该条消息结束〕 回复此条：reply_to="actual-group-message"/);
+    assert.equal((await f.messenger.sendReceipt(key("verified-room"), "真实新频道允许发送")).status, "sent", "matching platform channel lookup can bootstrap a conversation with no local history");
+    f.setHistory([{ message_id: "wrong-room-history", group_id: "different-room", time: 1750000001, sender: { user_id: PEER }, message: "不属于请求群的历史" },
+      { message_id: "wrong-account-history", self_id: "different-account", time: 1750000001, sender: { user_id: PEER }, message: "不属于请求账号的历史" }]);
+    await f.messenger.channelMessages(key("history-room"), 10);
+    assert.equal(await f.store.findByMessageId("onebot", "history-room", "wrong-room-history", SELF), null);
+    assert.equal(await f.store.findByMessageId("onebot", "history-room", "wrong-account-history", SELF), null);
+  } finally { await f.close(); }
+}
 async function main() {
-  await outgoingAndReadback(); await quoteAndMediaOrder(); await legacyProjectionAndPlatformHistory(); await agentQuoteGuards();
+  await outgoingAndReadback(); await quoteAndMediaOrder(); await legacyProjectionAndPlatformHistory(); await agentQuoteGuards(); await scopedTargets();
   console.log("PASS quote roundtrip: copyable Koishi tags, parameter/tag deduplication, quoted attributes, opaque IDs, mention semantics, stored/readback/history/forward consistency, legacy read-only projection and ordered multimodal batches");
 }
 main().catch(error => { console.error(error); process.exitCode = 1; });

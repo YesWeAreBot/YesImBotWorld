@@ -13,6 +13,8 @@ async function main() {
   config.webui = { ...config.webui, host: "127.0.0.1", port: 0, token: "fixture-admin-token" };
   const files = new WorldFiles(directory);
   await files.ensure();
+  config.apps.phoneResolution = "720x1440";
+  await files.writeMeta({ phone: { width: 800, height: 1280 } });
   const original = "<main>original shell</main>";
   const generated = "<main>generated shell</main>";
   await files.writePhoneShell(original);
@@ -26,6 +28,7 @@ async function main() {
     config, configSchema: Config, files, webuiDir: path.join(directory, "webui"),
     regeneratePhoneShell: async () => { generationCalls++; return generate(); },
     savePhoneShell: async (content: string) => { saved.push(content); await save(content); },
+    isInitialized: async () => true,
   };
   const server: any = new WebUIServer(host);
   const lifecycle: string[] = [];
@@ -50,6 +53,10 @@ async function main() {
     }
 
     assert.deepEqual(await request("GET"), { status: 200, body: { content: original } });
+    const state = await fetch(base + "/api/state", { headers: { authorization: "Bearer fixture-admin-token" } }).then(response => response.json()) as any;
+    assert.deepEqual(state.phoneResolution, { width: 720, height: 1440 }, "shell preview receives the actual configured resolution");
+    assert.deepEqual(state.meta.phone, { width: 800, height: 1280 }, "display resolution does not rewrite historical metadata");
+    assert.deepEqual((await files.readMeta()).phone, { width: 800, height: 1280 });
     assert.equal((await request("POST", "/generate", null)).status, 401);
     assert.equal((await request("PUT", "", null, { content: "unauthenticated" })).status, 401);
     for (const preset of ["viewer", "player", "operator", "custom"] as const) {

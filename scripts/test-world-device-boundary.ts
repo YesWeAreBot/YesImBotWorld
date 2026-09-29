@@ -1,3 +1,4 @@
+import { worldInputText } from "./world-input-fixture.js";
 /** Offline fixtures only: no live world, model, platform or device connection. */
 import assert from "node:assert/strict";
 import { promises as fs } from "node:fs";
@@ -17,7 +18,7 @@ const clock = { now: () => 10, realMsUntil: () => 0, syncRealTime: true } as unk
 const bad = "手机的 QQ 聊天窗口显示 Touch Night 发来的消息：“碧姬梗和论文英文名”。你已回复成功。";
 const worldTask = (messages: ChatMessage[]) => {
   const task = messages.filter(message => message.role === "user").map(message => JSON.parse(String(message.content)))
-    .find(value => typeof value.kind === "string" && Object.hasOwn(value, "worldState"));
+    .find(value => typeof value.kind === "string" && (Object.hasOwn(value, "worldState") || Object.hasOwn(value, "worldDocument")));
   assert.ok(task, "world input remains in the initial task; retry users only carry diagnostics");
   return task;
 };
@@ -127,9 +128,10 @@ async function main(): Promise<void> {
     try {
       f.infer(async () => resolution({ ...initial(), perceptions: [{ actorId: "bot", text: "手机放在床头柜上。",
         opportunities: [{ label: "在屋里活动", intent: "走到窗边", [field]: casualRequests[0] }] }] }));
-      await assert.rejects(f.runtime.ensure(), /WORLD_DEVICE_BOUNDARY/);
-      assert.equal((await f.runtime.store()).snapshot().initialized, false);
-      assert.equal(f.calls(), 3);
+      await f.runtime.ensure();
+      assert.equal((await f.runtime.store()).snapshot().initialized, true);
+      assert.deepEqual((await f.runtime.peek()).opportunities, []);
+      assert.equal(f.calls(), 1, "invalid optional suggestion is dropped without replaying valid facts");
     } finally { await f.close(); }
   }
 
@@ -171,7 +173,8 @@ async function main(): Promise<void> {
     let attempts = 0;
     f.infer(async messages => {
       const body = worldTask(messages);
-      assert.equal(body.deviceAuthority.platformChat, "external_tools_only");
+      assert.equal(Object.hasOwn(body, "deviceAuthority"), false);
+      assert.match(String(messages[0]!.content), /实际平台独占/);
       if (!attempts++) return resolution({ perceptions: [{ actorId: "bot", text: bad }] });
       return resolution({ worldState: original.worldState + "\n\n窗户被风吹开了一条缝。", externalChanges: [{ id: "wind", description: "风把窗户吹开了一条缝。" }], perceptions: [{ actorId: "bot", text: "窗边吹来一阵风。", changeIds: ["wind"] }] });
     });
@@ -193,7 +196,7 @@ async function main(): Promise<void> {
     assert.ok(!(await f.runtime.perceptionsSince("bot")).some(p => p.narrative.includes("碧姬")));
     f.infer(async messages => {
       const body = worldTask(messages);
-      assert.doesNotMatch(JSON.stringify(body), /碧姬|英文名/); assert.match(body.worldState, /屋内依然安静/);
+      assert.doesNotMatch(JSON.stringify(body), /碧姬|英文名/); assert.match(worldInputText(body), /屋内依然安静/);
       return resolution({ perceptions: [] });
     });
     await f.runtime.evolve("平静经过片刻。");
@@ -214,8 +217,9 @@ async function main(): Promise<void> {
     assert.ok(projectWorldDeviceContext(world, { virtualApp: true }).endsWith(file), "the first file heading and all subsequent arbitrary file bodies are retained byte-for-byte");
     virtual.infer(async messages => {
       const body = worldTask(messages);
-      assert.doesNotMatch(body.worldState, /note\.txt|second\.txt|必须保留|伪造尾部/);
-      assert.match(body.retainedDeviceRecords, /程序原样保留/);
+      assert.doesNotMatch(worldInputText(body), /note\.txt|second\.txt|必须保留|伪造尾部/);
+      assert.equal(body.retainedDeviceRecords, true);
+      assert.match(String(messages[0]!.content), /程序.*原样/);
       return resolution({ worldState: "阳光照着书桌。\n\n浏览器页面显示既有公告。", externalChanges: [{ id: "sun", description: "太阳升高，阳光照进书房。" }], perceptions: [{ actorId: "bot", text: "阳光照着桌面。", changeIds: ["sun"] }] });
     });
     await virtual.runtime.evolve("天光渐亮。"); assert.match(store.snapshot().worldState, /必须保留的任意文件正文/);

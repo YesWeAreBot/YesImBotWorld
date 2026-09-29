@@ -14,6 +14,7 @@ import type { WorldAgent } from "../world/agent.js";
 import type { NotifyManager } from "../koishi/notify.js";
 import { normalizeMsgId } from "../koishi/markers.js";
 import { resolveOutgoingQuote } from "../koishi/quotes.js";
+import { senderTagError } from "../koishi/sender-tags.js";
 import { debug } from "../webui/debug.js";
 import { createBackend, type BotBackend } from "./backend.js";
 import type { BotContext } from "./context.js";
@@ -23,12 +24,13 @@ import { GrowthLedger, type GrowthKind, type ReflectionOpportunity, type Reflect
 import { GrowthRuntime } from "./growth-runtime.js";
 import { ReceiptInbox } from "./receipts.js";
 import { DeliberationBudget, thoughtError } from "./deliberation.js";
+import { WorldActionInterleave, worldActionReceiptKey } from "./world-action-interleave.js";
 import { collectOpportunities, currentWorldEpoch, type ActionOpportunity } from "./opportunities.js";
 import { choiceRejection, type ChoiceSelection } from "./choice.js";
 import { conversationMaterialReminder } from "./conversation-material.js";
 import { ToolCapabilityAnnouncements } from "./tool-capabilities.js";
-import { planToolNavigation } from "./navigation.js";
-import { canReachPhone, canUsePhone, canPerceivePhone, phonePhysicalState, phoneUnavailableReason } from "../phone-state.js";
+import { planToolNavigation, sendTargetError } from "./navigation.js";
+import { canReachPhone, canUsePhone, canPerceivePhone, phonePhysicalState, phoneUnavailableReason, setPhoneDown, withPhoneExecutionLock } from "../phone-state.js";
 import { spillNarrativeText } from "./narrative-spill.js";
 import type { WorldObservation } from "../world/state.js";
 import { typingSlackTU } from "./typing.js";
@@ -112,6 +114,7 @@ export interface MessengerApi {
   handleRequest(requestId: string, approve: boolean, reason?: string): Promise<string>;
   listFriends(options?: { cursor?: string; limit?: number; preview?: boolean }): Promise<string | RichText>;
   userInfo(userId: string): Promise<string>;
+  viewAvatar(id: string, userId: string): Promise<RichText>;
   sendLike(userId: string, times: number): Promise<string>;
   deleteFriend(userId: string): Promise<string>;
   setProfile(opts: { nickname?: string; signature?: string; avatar?: string }): Promise<string>;
@@ -151,6 +154,13 @@ interface MailboxItem {
   attachments?: MediaRef[];
   parts?: RichTextPart[];
   refToolCallId?: string;
+  /** Retain interruption intent until delivery, including events received during inference. */
+  wake?: boolean;
+  /** Scheduler truth used only for live decision admission, never model-authored. */
+  toolResultOk?: boolean;
+  toolResultKey?: string;
+  /** A readback is perceived input, but cannot create a fresh external wake budget. */
+  toolObservation?: boolean;
   worldTime: number;
   /** act 结果后的当前状态回显，随事件注入（见 BotEvent.statusEcho） */
   statusEcho?: string;
@@ -167,7 +177,7 @@ interface MailboxItem {
  * 阻塞规则：上下文修改（事件注入、压缩）只发生在两次生成之间 ——
  * 事件先进 mailbox，在下一次生成开始前统一追加。
  *
- * 默认在工具真实返回后继续生成；显式关闭严格循环时才允许操作与后续决策并行。
+ * 默认等待真实结果；等待世界动作时，新的聊天可开启有界的独立设备操作。
  */
 
 /** 延期发送意图：duration 明显超过打字时间的 send，不自动发出，到点询问 Bot 是否要发 */
@@ -209,9 +219,13 @@ export class BotAgent {
   private abort: AbortController | null = null;
   private waiting: { callId: string; kind?: "wait" | "rest"; startedTU?: number; worldCalls?: string[] } | null = null;
   private wakeFn: (() => void) | null = null;
+  /** Wakes mailbox maintenance without releasing the pending tool's generation gate. */
+  private toolResultWakeFn: (() => void) | null = null;
   private deliberation: DeliberationBudget;
   private awaitingToolRetry = false;
   private awaitingToolResult: string | null = null;
+  private readonly worldActionInterleave = new WorldActionInterleave();
+  private phoneExecutionEpoch = 0;
   private thoughtGuidanceDelivered = false;
   private expressionGuidanceDelivered = false;
   private opportunityStamp: string | undefined;
@@ -390,12 +404,15 @@ export class BotAgent {
             this.externalToolResults.get(ref)?.resolve({ ok: outcome?.ok ?? true, text: toPlainText(content), ...(typeof content === "string" ? {} : { content }) });
             this.externalToolResults.delete(ref);
           }
-          void this.receipts.save({ ...(typeof content === "string" ? { text: content } : content), precedingObservations, followingObservations }, this.clock.now(), ref)
+          void this.receipts.save({ ...(typeof content === "string" ? { text: content } : content), precedingObservations, followingObservations }, this.clock.now(), ref,
+            this.isWakeableToolResult(performed?.name, typeof content === "string" ? {} : content))
             .catch(error => this.logger.error("停止后的工具回执保存失败：%s", error));
           return;
         }
         // 结果溢出治理（spill/prune）：超阈值的结果先裁剪为 head/tail 预览 + 全文落盘，
         // 再进入上下文——防止超大结果反复占据窗口、加剧退化。
+        const toolResultKey = outcome?.ok && performed && this.independentWorldScope() &&
+          (this.classifyDevice(performed.name) || performed.name === "observe_device") ? worldActionReceiptKey(performed, content) : undefined;
         const gated = this.spillResult(content, ref);
         // 手动驾驶（管理员代理）工具结果回传：真正执行结果在此交付，回传给发起方
         if (ref) {
@@ -405,10 +422,10 @@ export class BotAgent {
             pending.resolve({ ok: outcome?.ok ?? true, text: toPlainText(gated), ...(typeof gated === "string" ? {} : { content: gated }) });
           }
         }
-        for (const observation of precedingObservations) this.pushEvent(observation.source ?? "world", this.spillResult(observation));
-        this.pushEvent("tool", gated, { ref, wake: !!ref && this.waiting?.worldCalls?.includes(ref) });
+        for (const observation of precedingObservations) this.pushEvent(observation.source ?? "world", this.spillResult(observation), { toolObservation: true });
+        this.pushEvent("tool", gated, { ref, toolResultOk: outcome?.ok, toolResultKey, wake: this.isWakeableToolResult(performed?.name, typeof gated === "string" ? {} : gated) });
         for (const observation of followingObservations) {
-          this.pushEvent(observation.source ?? "koishi", this.spillResult(observation));
+          this.pushEvent(observation.source ?? "koishi", this.spillResult(observation), { toolObservation: true });
         }
         if (ref) this.puppetCalls.delete(ref);
         this.refreshToolGate();
@@ -472,8 +489,13 @@ export class BotAgent {
         default: return true;
       }
     };
+    const independentWorld = autonomous && this.independentWorldScope();
     // 打破死循环：临时禁用被判定为「反复调用」的工具（下次压缩后自然恢复）
     return [...new Set(names)].filter((n) => (includeBanned || !this.tempBannedTools.has(n)) && meaningful(n) &&
+      // beforeStart validates the original act after scheduling it. It may execute
+      // itself, but meaningful() above still excludes any second pending act.
+      (!independentWorld || this.independentWorldTool(n) ||
+        n === "act" && !!excludeCallId && this.operationCalls.get(excludeCallId)?.name === "act") &&
       (this.classifyDevice(n) !== "phone" || ["pick_up_phone", "put_down_phone"].includes(n) ||
         phonePhysicalState(this.phone).usable && (!autonomous || canReachPhone(this.phone))));
   }
@@ -553,6 +575,18 @@ export class BotAgent {
     return explicit || this.phoneUi.channelKey;
   }
 
+  /** A default target belongs to the screen seen when deciding, not a screen
+   * another operator opened while generation or navigation was in flight. */
+  private channelDecisionError(call: ParsedToolCall, channelAtDecision: string | null): string | undefined {
+    if (call.name === "send") return sendTargetError(call.arguments);
+    const layer = toolLayer(call.name);
+    if (call.name === "exit_forward" || layer !== "channel" && layer !== "group" || Object.hasOwn(call.arguments, "id") || Object.hasOwn(call.arguments, "channel")) return;
+    if (!channelAtDecision) return "缺少目标频道：尚未确认当前会话，请填写 id。";
+    if (this.concealedDevices.has("phone") || !this.phoneUi.chatOpen || this.phoneUi.channelKey !== channelAtDecision) {
+      return "本次未执行：决定期间当前会话已改变，请确认目标频道 id。";
+    }
+  }
+
   /**
    * 进入（或切换到）一个频道页：更新当前频道、按频道类型解锁操作。
    * 工具集有变化时（首次进频道 / 群私切换）以事件展开可用操作。
@@ -575,8 +609,9 @@ export class BotAgent {
     if (this.running || this.loopPromise) return;
     this.running = true;
     this.retired = false;
+    for (const entry of this.context.stream) if (entry.kind === "event") this.worldActionInterleave.external(entry.event, false);
     this.growthRuntime.resume();
-    this.receipts.activate(() => { this.receiptsPending = true; this.wakeFn?.(); });
+    this.receipts.activate(() => { this.receiptsPending = true; this.wakeFn?.(); this.toolResultWakeFn?.(); });
     this.wakeTimeLine = this.clock.timeLine();
     this.abort = new AbortController();
     this.loopPromise = this.runLoop().catch((err) => {
@@ -588,6 +623,8 @@ export class BotAgent {
   }
 
   async stop(): Promise<void> {
+    this.phoneExecutionEpoch++;
+    this.worldActionInterleave.reset();
     this.growthRuntime.stop();
     this.retired = true;
     this.perceptionListeners.clear();
@@ -762,7 +799,7 @@ export class BotAgent {
   pushEvent(
     source: EventSource,
     content: string | RichText,
-    opts: { ref?: string; wake?: boolean; originEventIds?: string[] } = {},
+    opts: { ref?: string; wake?: boolean; originEventIds?: string[]; toolResultOk?: boolean; toolResultKey?: string; toolObservation?: boolean } = {},
   ): void {
     let rich = this.puppetReceipt(content, opts.ref);
     if (source === "system" && rich.experience?.worldTransition) this.generationAbort?.abort();
@@ -777,25 +814,60 @@ export class BotAgent {
       if (pending && pending.systemText === null) pending.systemText = rich.text;
     }
     if ((opts.ref && this.stealthCalls.has(opts.ref)) || (this.deviceExecution.getStore()?.stealth && (source === "system" || source === "tool"))) return;
-    const isWaitResult = this.waiting !== null && opts.ref === this.waiting.callId;
-    // 唤醒规则：等待中的工具结果必定唤醒；wake 事件可以提前唤醒 wait（等待本来就是"直到有事发生"）。
-    // 工具不可用的重试退避不与角色 wait/rest 混为一谈。
-    const shouldWake = this.waiting !== null && (isWaitResult || opts.wake === true || puppetResult);
+    // Explicit quiet delivery (notification permissions) wins over source defaults.
+    const wake = opts.wake ?? (!rich.experience?.internalThought && !rich.experience?.historicalWorld &&
+      (source === "world" || source === "koishi" || rich.experience?.worldTransition !== undefined));
+    this.interruptPause(source, { ...rich, originEventIds: opts.originEventIds ?? rich.originEventIds }, opts.ref, wake, puppetResult);
 
-    if (shouldWake && !isWaitResult) {
+    this.mailbox.push({
+      source,
+      wake: wake || puppetResult,
+      toolResultOk: opts.toolResultOk,
+      toolResultKey: opts.toolResultKey,
+      toolObservation: opts.toolObservation,
+      contextHint: rich.contextHint,
+      experience: rich.experience,
+      growthReferences: rich.growthReferences,
+      originEventIds: opts.originEventIds ?? rich.originEventIds ?? (source === "world" ? observationOrigins(rich.text) : undefined),
+      content: rich.text,
+      attachments: rich.attachments?.length ? rich.attachments : undefined,
+      parts: rich.parts,
+      refToolCallId: opts.ref,
+      worldTime: this.clock.now(),
+      statusEcho: rich.statusEcho,
+    });
+    this.logger.info(
+      "[event:%s]%s %s%s",
+      source,
+      opts.ref ? ` (${opts.ref})` : "",
+      truncate(rich.text, 120),
+      rich.attachments?.length ? ` [+${rich.attachments.length} 附件]` : "",
+    );
+
+    // Result waiting is a scheduler state, independent of the character's wait/rest timer.
+    if (this.awaitingToolRetry && source !== "system" && !rich.experience?.internalThought) this.wakeFn?.();
+    this.signalMailbox();
+  }
+
+  /** Pause interruption is separate from inference/compaction cancellation. */
+  private interruptPause(source: EventSource, rich: RichText, ref: string | undefined, wake: boolean, puppetResult = false): void {
+    if (!this.waiting) return;
+    const isWaitResult = ref === this.waiting.callId;
+    if (!isWaitResult && !wake && !puppetResult) return;
+    if (!isWaitResult) {
       // Interrupt the timer, without turning a scheduling transition into bodily sleep.
-      const { callId, kind, startedTU } = this.waiting!;
+      const { callId, startedTU } = this.waiting!;
       const timer = this.scheduler.pending().find(task => task.id === callId);
       const cancellation = this.scheduler.cancel(callId);
       if (cancellation === "cancelled") this.operationCalls.delete(callId);
       const elapsed = Math.max(0, this.clock.now() - (startedTU ?? timer?.issuedAt ?? this.clock.now()));
-      const roots = opts.originEventIds ?? rich.originEventIds;
+      const roots = rich.originEventIds;
       const chat = rich.experience?.chat;
       const anonymousNotice = !chat && !!roots?.some(root => root.startsWith("chat-notice:"));
       const cause = chat?.kind === "notice"
         ? `收到频道 ${chat.channelKey} 的新通知；发送者和消息正文尚未读取`
         : chat?.kind === "message"
-        ? `频道 ${chat.channelKey} 的新消息已交付，具体内容以随后事件为准`
+        ? `频道 ${chat.channelKey} 的新消息已交付，具体内容以对应事件为准`
         : anonymousNotice
         ? "收到新的手机通知信号；通知来源的频道、发送者和内容尚未确认"
         : puppetResult ? "外部操纵的结果到达"
@@ -820,33 +892,22 @@ export class BotAgent {
       });
     }
 
-    this.mailbox.push({
-      source,
-      contextHint: rich.contextHint,
-      experience: rich.experience,
-      growthReferences: rich.growthReferences,
-      originEventIds: opts.originEventIds ?? rich.originEventIds ?? (source === "world" ? observationOrigins(rich.text) : undefined),
-      content: rich.text,
-      attachments: rich.attachments?.length ? rich.attachments : undefined,
-      parts: rich.parts,
-      refToolCallId: opts.ref,
-      worldTime: this.clock.now(),
-      statusEcho: rich.statusEcho,
-    });
-    this.logger.info(
-      "[event:%s]%s %s%s",
-      source,
-      opts.ref ? ` (${opts.ref})` : "",
-      truncate(rich.text, 120),
-      rich.attachments?.length ? ` [+${rich.attachments.length} 附件]` : "",
-    );
+    if (isWaitResult) this.finishPause(this.waiting.callId);
+    this.waiting = null;
+    this.wakeFn?.();
+  }
 
-    if (shouldWake) {
-      this.waiting = null;
-      this.wakeFn?.();
-    }
-    // Result waiting is a scheduler state, independent of the character's wait/rest timer.
-    if (this.awaitingToolRetry && source !== "system" && !rich.experience?.internalThought) this.wakeFn?.();
+  private isWakeableToolResult(name: string | undefined, rich: Pick<RichText, "experience">): boolean {
+    return !rich.experience?.internalThought && !rich.experience?.historicalWorld &&
+      !["wait", "rest", "think", "reflect", "recall_growth", "recall", "help"].includes(name ?? "");
+  }
+
+  /** A passive signal still becomes a durable perception. Only explicit wake rules
+   * cancel wait/rest; seeing mailbox activity never completes a pending operation. */
+  private signalMailbox(): void {
+    if (!this.running) return;
+    this.toolResultWakeFn?.();
+    if (this.waiting) this.wakeFn?.();
   }
 
   /** Text and ordered multimodal parts carry the same agency attribution, including after restart. */
@@ -934,6 +995,7 @@ export class BotAgent {
     const suffix = "\n〔已发送消息结束〕";
     this.mailbox.push({
       source: args ? "tool" : "koishi",
+      wake: true,
       originEventIds: rich.originEventIds,
       experience: { ...rich.experience, agency: "self", action: args ? sliceText(`send ${args.msg}`, 0, 1200) : "发出消息", outcome: "completed", opportunity: true },
       content: prefix + rich.text + suffix,
@@ -943,6 +1005,7 @@ export class BotAgent {
       ...(args ? { asToolCall: { name: "send", arguments: { id: channelKey, ...args } } } : {}),
     });
     this.logger.info("[external-send:simulate] %s %s", channelKey, truncate(rich.text, 100));
+    this.signalMailbox();
     // 账号自己发出了一条消息：打断对该频道的延期发送意图
     this.noteDeferredSelfSent(channelKey);
   }
@@ -957,6 +1020,8 @@ export class BotAgent {
   setManualPaused(paused: boolean): void {
     if (this.manualPaused === paused) return;
     this.manualPaused = paused;
+    if (paused) this.phoneExecutionEpoch++;
+    if (paused) this.worldActionInterleave.pause();
     this.wakeFn?.();
     if (paused) this.generationAbort?.abort();
     this.logger.info("Bot-LLM 手动驾驶%s", paused ? "接管（暂停自主生成）" : "交还（恢复自主生成）");
@@ -1218,6 +1283,41 @@ export class BotAgent {
 
   private get strictToolLoop(): boolean { return this.config.bot.strictToolLoop !== false; }
 
+  /** Scope changes with the pending action, not with every message/decision credit.
+   * Capability announcements therefore stay stable throughout independent work. */
+  private independentWorldScope(): boolean {
+    const ids = this.strictToolLoop && this.config.bot.interruptibleWorldActions !== false
+      ? (this.scheduler?.pending() ?? []).filter(task => {
+        const call = this.operationCalls.get(task.id);
+        return task.name === "act" && call?.role === "agent" && !call.control && !this.stealthCalls.has(task.id);
+      }).map(task => task.id) : [];
+    this.worldActionInterleave.sync(ids);
+    return ids.length > 0;
+  }
+
+  private independentWorldTool(name: string): boolean {
+    return !!this.classifyDevice(name) || ["observe_device", "help", "think", "reflect", "recall_growth", "recall", "wait", "rest", "cancel"].includes(name);
+  }
+
+  private perceiveIndependentWork(event: BotEvent, wake: boolean, call?: ToolCallRecord, succeeded = false, key?: string): void {
+    if (!this.running) return;
+    const eligible = !this.manualPaused && this.independentWorldScope();
+    // Remember quiet/previously received roots too. Replaying an old message after
+    // a new action or handback must not be mistaken for a new outside event.
+    this.worldActionInterleave.external(event, eligible && wake);
+    if (!eligible) return;
+    if (call && (this.classifyDevice(call.name) || call.name === "observe_device")) this.worldActionInterleave.receipt(event, call, succeeded, key);
+  }
+
+  private pauseIndependentWork(call: ToolCallRecord): void {
+    if (["wait", "rest"].includes(call.name) && this.waiting?.callId === call.id) this.worldActionInterleave.pause();
+  }
+
+  private blockingAutonomousResults(): string[] {
+    const independent = this.independentWorldScope() && !this.waiting && this.worldActionInterleave.canDecide;
+    return this.autonomousPendingResults().filter(id => !independent || this.operationCalls.get(id)?.name !== "act");
+  }
+
   /** Human/stealth operations and background app jobs do not own the model's decision turn. */
   private autonomousPendingResults(): string[] {
     return this.scheduler.pending().flatMap(task => {
@@ -1229,17 +1329,39 @@ export class BotAgent {
   }
 
   private async waitForToolResults(): Promise<void> {
-    const ids = this.autonomousPendingResults();
+    const ids = this.blockingAutonomousResults();
     if (!ids.length || !this.running || this.manualPaused) return;
     // Separate from the finished model request, so handback cannot reuse an aborted signal.
     this.generationAbort = new AbortController();
     const signal = AbortSignal.any([this.abort!.signal, this.generationAbort.signal]);
+    await this.settleToolsWithPerceptions(ids, signal, true);
+  }
+
+  /** One serialized mailbox consumer, including legacy device waits and navigation.
+   * The model has finished its request; only new context entries may be appended. */
+  private async settleToolsWithPerceptions(ids: string[], signal?: AbortSignal, allowIndependentWork = false): Promise<void> {
     this.awaitingToolResult = ids[0]!;
-    try { await abortable(Promise.all(ids.map(id => this.scheduler.whenSettled(id))), signal); }
-    catch (error) { if (!signal.aborted) throw error; }
-    finally { this.awaitingToolResult = null; }
-    // Receipts are delivered to the mailbox before whenSettled resolves. The next loop
-    // drains them durably, along with incoming messages, before constructing any request.
+    let settled = false;
+    let awaken: (() => void) | null = null;
+    // Register completion once, not once per incoming notification. A stopped wait
+    // cannot wake a later lifetime through this local callback.
+    void Promise.all(ids.map(id => this.scheduler.whenSettled(id))).then(() => { settled = true; awaken?.(); });
+    try {
+      while (!settled && this.running && !this.manualPaused && !signal?.aborted) {
+        if (allowIndependentWork && !this.blockingAutonomousResults().length) break;
+        await abortable(new Promise<void>(resolve => {
+          awaken = this.toolResultWakeFn = resolve;
+          // Arrival can precede registration or occur while the last batch is saved.
+          if (this.mailbox.length || this.receiptsPending) resolve();
+        }), signal);
+        awaken = this.toolResultWakeFn = null;
+        if (!signal?.aborted && this.running) await this.drainMailbox(false);
+      }
+    }
+    catch (error) { if (!signal?.aborted) throw error; }
+    finally { awaken = this.toolResultWakeFn = null; this.awaitingToolResult = null; }
+    // A new chat may admit independent device work; it never settles the World action.
+    // Navigation and device receipt waits cannot take this exit.
   }
 
   private async runLoop(): Promise<void> {
@@ -1263,7 +1385,7 @@ export class BotAgent {
 
         // A pending receipt is a scheduling concern, not another model decision.
         // This also covers returning from manual control while a committed operation is unfinished.
-        if (this.strictToolLoop && this.autonomousPendingResults().length) {
+        if (this.strictToolLoop && this.blockingAutonomousResults().length) {
           await this.waitForToolResults();
           continue;
         }
@@ -1290,9 +1412,12 @@ export class BotAgent {
         this.refreshToolGate();
         await this.drainMailbox();
         if (!this.running || this.manualPaused || this.waiting || this.compressionRequested) continue;
-        if (this.strictToolLoop && this.autonomousPendingResults().length) continue;
+        if (this.strictToolLoop && this.blockingAutonomousResults().length) continue;
 
         let parsed: ParsedToolCall;
+        const channelAtDecision = this.phoneUi.chatOpen && !this.concealedDevices.has("phone") ? this.phoneUi.channelKey : null;
+        const independentWorldDecision = this.independentWorldScope();
+        if (independentWorldDecision) this.worldActionInterleave.consume();
         const decisionCurrent = () => this.running && !this.manualPaused && !this.generationAbort?.signal.aborted;
         try {
           this.generationAbort = new AbortController();
@@ -1388,12 +1513,17 @@ export class BotAgent {
         }
 
         if (!decisionCurrent()) continue;
-        const navigationError = await this.prepareNavigation(parsed, decisionCurrent);
+        // The original World result may arrive during inference. A decision made
+        // without that result still cannot use it to justify another physical act.
+        const navigationError = this.channelDecisionError(parsed, channelAtDecision) ?? (independentWorldDecision && !this.independentWorldTool(parsed.name)
+          ? "世界动作的实际结果尚未进入本次决定；此时只能处理独立设备操作、思考或等待，没有执行后续身体动作。"
+          : await this.prepareNavigation(parsed, decisionCurrent));
         if (!decisionCurrent()) continue;
         const call = this.finalize(parsed);
         await this.context.appendToolCall(call);
-        if (navigationError) {
-          this.pushEvent("system", navigationError, { ref: call.id });
+        const channelError = this.channelDecisionError(parsed, channelAtDecision);
+        if (navigationError || channelError) {
+          this.pushEvent("system", navigationError ?? channelError!, { ref: call.id });
           this.pendingToolHelp.add(call.name);
           continue;
         }
@@ -1419,6 +1549,7 @@ export class BotAgent {
         const dispatch = this.dispatch(call);
         this.autonomousDispatch = dispatch;
         try { await dispatch; } finally { if (this.autonomousDispatch === dispatch) this.autonomousDispatch = null; }
+        if (independentWorldDecision) this.pauseIndependentWork(call);
         // A screen interaction is one decision step. Its receipt must enter the next
         // request before deciding what to touch next; other actors still own their
         // individual queue slots, and world actions retain their concurrency setting.
@@ -1427,7 +1558,7 @@ export class BotAgent {
         const futureSend = call.name === "send" && call.expectedAt > this.clock.now();
         if (!this.strictToolLoop && decisionCurrent() && !futureSend && (call.name === "observe_device" || this.classifyDevice(call.name))) {
           const signal = AbortSignal.any([this.abort!.signal, this.generationAbort!.signal]);
-          try { await abortable(this.scheduler.whenSettled(call.id), signal); }
+          try { await this.settleToolsWithPerceptions([call.id], signal); }
           catch (error) { if (!decisionCurrent()) continue; throw error; }
         }
       } catch (err) {
@@ -1476,19 +1607,29 @@ export class BotAgent {
     }
     await this.receipts.ready();
     this.receiptsPending = false;
-    if (this.running) await this.receipts.drain(async (event) => {
+    if (this.running) await this.receipts.drain(async (event, receiptWake) => {
+      const fresh = !this.context.stream.some(entry => entry.kind === "event" && entry.event.id === event.id);
       // If a process died after append but before removing the inbox file, replay the same ID once.
       await this.context.appendEvent(event);
       this.publishPerception(event);
       await this.growth.perceive(event, event.originEventIds ?? [event.id]);
       const origin = this.context.stream.find(entry => entry.kind === "tool_call" && entry.call.id === event.refToolCallId);
+      if (fresh && event.source !== "system" && !event.experience?.historicalWorld && !event.experience?.internalThought) {
+        const wake = receiptWake ?? (event.source !== "tool" || this.isWakeableToolResult(origin?.kind === "tool_call" ? origin.call.name : undefined, event));
+        this.interruptPause(event.source, { ...event, text: event.content }, event.refToolCallId, wake);
+      }
       if (this.deliberation.perceive(event, origin?.kind === "tool_call" ? origin.call : undefined)) this.parseFailures = 0;
+      // Recovered receipts retain their truth but cannot renew a new lifetime's
+      // independent-action allowance.
       debug.emit("bot.event", `[tool receipt] ${event.id}`, { ...event, recovered: true });
     });
     if (!this.mailbox.length) { await this.offerReflection(announceCapabilities); return; }
     const count = this.mailbox.length;
     for (let index = 0; index < count; index++) {
       const item = this.mailbox[0]!;
+      // An event may have arrived while the model was still choosing this pause.
+      // Recheck its original wake policy at delivery without changing old context.
+      this.interruptPause(item.source, { ...item, text: item.content }, item.refToolCallId, item.wake === true);
       // 伪装的工具调用（externalSelfMessages = simulate）：以 Bot 的口吻追加进流
       if (item.asToolCall) {
         const call = item.toolCallRecord ??= {
@@ -1536,6 +1677,7 @@ export class BotAgent {
         throw err;
       });
       if (this.deliberation.perceive(event, originCall?.kind === "tool_call" ? originCall.call : undefined)) this.parseFailures = 0;
+      this.perceiveIndependentWork(event, item.wake === true && !item.toolObservation, originCall?.kind === "tool_call" ? originCall.call : undefined, item.toolResultOk === true, item.toolResultKey);
       this.noteProgress(event);
       const resultLabel = event.refToolCallId
         ? `[${event.source} ← ${event.refToolCallId}] ${event.id}`
@@ -1612,10 +1754,10 @@ export class BotAgent {
   }
 
   private async sleepUntilWoken(): Promise<void> {
-    if (!this.waiting || !this.running || this.receiptsPending) return;
+    if (!this.waiting || !this.running || this.receiptsPending || this.mailbox.length) return;
     await new Promise<void>((resolve) => {
       this.wakeFn = resolve;
-      if (!this.waiting || !this.running || this.receiptsPending) resolve();
+      if (!this.waiting || !this.running || this.receiptsPending || this.mailbox.length) resolve();
     });
     this.wakeFn = null;
   }
@@ -1760,7 +1902,7 @@ export class BotAgent {
       try {
         await this.dispatch(call);
         const signal = this.generationAbort && this.abort ? AbortSignal.any([this.abort.signal, this.generationAbort.signal]) : this.abort?.signal;
-        await abortable(this.scheduler.whenSettled(call.id), signal);
+        await this.settleToolsWithPerceptions([call.id], signal);
         succeeded = this.navigationOutcomes.get(call.id) === true;
       } catch (error) { if (!current()) return "操作已中止。"; throw error; }
       finally { this.navigationOutcomes.delete(call.id); }
@@ -1816,7 +1958,7 @@ export class BotAgent {
         "system",
         `（${call.name} 的目标参数格式不对：不存在 ${misused.join(" / ")} 这种参数。` +
           `频道一律用 id 参数指定，格式为 "平台:频道id"，直接从 check_msg 列表或消息通知里照抄完整的频道 id 即可；` +
-          `已在目标频道页内时可省略 id。什么都没有发生，请改正后重试。）`,
+          (call.name === "send" ? "send 每次必须填写 id，本次未发送。）" : "已在目标频道页内时可省略 id。什么都没有发生，请改正后重试。）"),
         { ref: call.id },
       );
       return;
@@ -1858,6 +2000,7 @@ export class BotAgent {
             claimId: typeof a.claim_id === "string" ? a.claim_id : undefined,
             situation: a.situation as string | undefined, cues: a.cues as string[] | undefined,
             behavior: a.behavior as string | undefined,
+            insight: a.insight as import("./growth-semantics.js").GrowthInsight | undefined,
             subjectId: a.subject_id as string | undefined,
             expiresAt: a.expires_at as number | undefined,
           }, now, unit);
@@ -2024,22 +2167,40 @@ export class BotAgent {
         return this.dispatchPickMedia(call);
       case "put_down_phone":
         return this.dispatchLocal(call, async () => {
+          const epoch = this.phoneExecutionEpoch;
+          // Closing an app can perform slow IO. Let World commit during that work,
+          // then recheck ownership before changing local posture under the short lock.
           const closedApp = await this.apps?.closeCurrent();
-          this.phoneUi = { chatOpen: false, channelKey: null, channelIsGroup: false, forwardStack: [] };
-          this.phone.down = true;
-          this.refreshToolGate();
-          this.interruptAllDeferred("你已放下手机");
-          await this.messenger.putDownPhone();
-          return `手机已放下${closedApp ? `，「${closedApp}」已关闭` : ""}。`;
+          try {
+            await withPhoneExecutionLock(this.phone, () => {
+              this.checkPhoneExecution(call, epoch);
+              this.phoneUi = { chatOpen: false, channelKey: null, channelIsGroup: false, forwardStack: [] };
+              setPhoneDown(this.phone, true);
+              this.refreshToolGate();
+              this.interruptAllDeferred("你已放下手机");
+            });
+          } catch (error) {
+            if (closedApp) throw new Error(`「${closedApp}」已关闭；${(error as Error).message}`);
+            throw error;
+          }
+          const receipt = `手机已放下${closedApp ? `，「${closedApp}」已关闭` : ""}。`;
+          try { await this.messenger.putDownPhone(); }
+          catch (error) { return receipt + `\n（频道关注更新失败：${(error as Error).message}；已完成的放下动作保留。）`; }
+          return receipt;
         });
       case "pick_up_phone":
         return this.dispatchLocal(call, async () => {
-          if (!this.phone.down) return "（手机本来就在你手里。）";
-          this.phone.down = false;
-          const screen = this.phoneUi.chatOpen
-            ? this.phoneUi.channelKey ? `${this.config.apps?.chatAppName || "QQ"} 频道 ${this.phoneUi.channelKey}` : `${this.config.apps?.chatAppName || "QQ"} 的消息列表，尚未选择频道`
-            : this.apps?.currentName ? `「${this.apps.currentName}」` : "手机桌面";
-          return `已拿起手机。当前显示：${phonePhysicalState(this.phone).usable ? screen : "设备无法正常使用"}。` + this.phoneDesktopBadge();
+          const epoch = this.phoneExecutionEpoch;
+          return withPhoneExecutionLock(this.phone, () => {
+            this.checkPhoneExecution(call, epoch);
+            if (!canReachPhone(this.phone)) throw new Error(phoneUnavailableReason(this.phone));
+            if (!this.phone.down) return "（手机本来就在你手里。）";
+            setPhoneDown(this.phone, false);
+            const screen = this.phoneUi.chatOpen
+              ? this.phoneUi.channelKey ? `${this.config.apps?.chatAppName || "QQ"} 频道 ${this.phoneUi.channelKey}` : `${this.config.apps?.chatAppName || "QQ"} 的消息列表，尚未选择频道`
+              : this.apps?.currentName ? `「${this.apps.currentName}」` : "手机桌面";
+            return `已拿起手机。当前显示：${phonePhysicalState(this.phone).usable ? screen : "设备无法正常使用"}。` + this.phoneDesktopBadge();
+          });
         });
       case "channel_notify": {
         const allowRaw = call.arguments.allow;
@@ -2221,6 +2382,15 @@ export class BotAgent {
           return;
         }
         return this.dispatchLocal(call, async () => this.messenger.userInfo(userId));
+      }
+      case "view_avatar": {
+        const id = typeof call.arguments.id === "string" ? call.arguments.id.trim() : "";
+        const userId = typeof call.arguments.user_id === "string" ? call.arguments.user_id.trim() : "";
+        if (!id || !userId) {
+          this.pushEvent("system", "view_avatar 需要完整频道 id 和 user_id。", { ref: call.id });
+          return;
+        }
+        return this.dispatchLocal(call, async () => this.messenger.viewAvatar(id, userId));
       }
       case "send_like": {
         const userId = String(call.arguments.user_id ?? call.arguments.userId ?? call.arguments.id ?? "");
@@ -2589,7 +2759,7 @@ export class BotAgent {
           // A committed beginning is an experience now, not proof of the eventual outcome.
           for (const part of parts.splice(0)) this.pushEvent("world", part);
           const rich = this.puppetReceipt(this.describeExperience(result, call), call.id);
-          if (this.retired) await this.receipts.save(rich, this.clock.now(), call.id);
+          if (this.retired) await this.receipts.save(rich, this.clock.now(), call.id, this.isWakeableToolResult(call.name, rich));
           else this.pushEvent("tool", this.spillResult(rich, call.id + "-start"), { ref: call.id, wake: true });
         }, task.signal, phase => {
           if (task.cancelled() || (call.control && (this.residentControl?.sessionId !== call.control.sessionId || this.residentControl.mode !== call.control.mode))) return false;
@@ -2694,6 +2864,18 @@ export class BotAgent {
       this.growthToolWrites.add(result);
       try { return await result; } finally { this.growthToolWrites.delete(result); }
     } });
+  }
+
+  /** A queued local posture change has not happened yet, even if its device task
+   * already began. Revalidate after waiting for a World commit or app close. */
+  private checkPhoneExecution(call: ToolCallRecord, epoch: number): void {
+    if (!this.running || this.retired) throw new Error("设备所属世界已停止，手机持有操作没有执行。");
+    if (call.control && (this.residentClosing || this.residentControl?.sessionId !== call.control.sessionId || this.residentControl.mode !== call.control.mode)) {
+      throw new Error("角色接管会话已结束，手机持有操作没有执行。");
+    }
+    if (call.role === "agent" && !call.control && (epoch !== this.phoneExecutionEpoch || this.manualPaused || this.residentControl?.mode === "puppet")) {
+      throw new Error("自主设备控制权已改变，手机持有操作没有执行。");
+    }
   }
 
   private async settleGrowthWrites(): Promise<void> {
@@ -3220,6 +3402,12 @@ export class BotAgent {
   // ---------- 发送（原位绑定媒体引用） ----------
 
   private dispatchSend(call: ToolCallRecord): void {
+    const targetError = sendTargetError(call.arguments);
+    if (targetError) {
+      this.pushEvent("system", targetError, { ref: call.id });
+      return;
+    }
+    const id = (call.arguments.id as string).trim();
     // sendBlocking：上一条消息还没回显前，拒绝新的 send（避免连发相近/不连贯的消息）
     if (this.strictToolLoop || this.config.bot.sendBlocking) {
       const busy = sendBusyMessage(SEND_TOOL_NAMES.flatMap((n) => this.scheduler.pendingByName(n)));
@@ -3228,12 +3416,16 @@ export class BotAgent {
         return;
       }
     }
-    const id = this.channelArg(call) ?? "";
     if (call.arguments.msg !== undefined && typeof call.arguments.msg !== "string") {
       this.pushEvent("system", "本次未发送：msg 必须为正文字符串。", { ref: call.id });
       return;
     }
     let msg = call.arguments.msg ?? "";
+    const metadataError = senderTagError(msg);
+    if (metadataError) {
+      this.pushEvent("system", `本次未发送：${metadataError}`, { ref: call.id });
+      return;
+    }
     const aliases = ["images", "replyTo", "quote", "atSender", "at"].filter(key => Object.hasOwn(call.arguments, key));
     if (aliases.length) {
       this.pushEvent("system", `本次未发送：不支持参数 ${aliases.join("、")}。`, { ref: call.id });
@@ -3261,16 +3453,12 @@ export class BotAgent {
     msg = quote.msg; replyTo = quote.replyTo;
     const atRaw = call.arguments.at_sender;
     const atSender = !(atRaw === false || atRaw === "false" || atRaw === 0);
-    if (!id) {
-      this.pushEvent("system", "缺少目标频道：填写 id，或先选择频道。", { ref: call.id });
-      return;
-    }
     if (!msg && !media.length) {
       const alias = ["message", "text", "content"].find((k) => call.arguments[k] != null);
       this.pushEvent(
         "system",
         alias
-          ? `（send 的消息参数必须叫 msg，不存在 ${alias} 这种参数。正确格式：send(id?: string, msg: string, …)。）`
+          ? `（send 的消息参数必须叫 msg，不存在 ${alias} 这种参数。正确格式：send(msg: string, id: string, …)。）`
           : "（send 需要 msg（或 media）参数。）",
         { ref: call.id },
       );

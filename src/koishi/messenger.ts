@@ -34,6 +34,9 @@ import { executeSelfCommand } from "./self-commands.js";
 import { formatMessageTime, MESSAGE_ORDER_GUIDANCE, messageSequence } from "./message-order.js";
 import { firstName, formatMessageSender, messageAccountRelation } from "./identity.js";
 import { sendPlatformMessage } from "./platform-media.js";
+import { AvatarViewer } from "./avatar.js";
+import { extractGroupMemberMetadata } from "./group-metadata.js";
+import { resolveGroupMemberTitle, senderMetadataTag, senderTagError } from "./sender-tags.js";
 
 /** Explicit stable references retain interleaved text/media order without ordinal placeholders. */
 const INLINE_MEDIA = /<media\s+ref=(["'])(media:[1-9]\d*|gallery:[^"'<>]+)\1\s*\/>/g;
@@ -76,6 +79,8 @@ export class KoishiMessenger implements MessengerApi {
   private historyAttempts = new Map<string, { at: number; note: string; limit: number }>();
   private discoveryCatalogs = new Map<DiscoveryKind, DiscoveryCatalog>();
   private discoveryTail: Promise<void> = Promise.resolve();
+  private avatars?: AvatarViewer;
+  private verifiedChannels = new Map<string, { at: number; isDirect: boolean }>();
   constructor(
     private ctx: Context,
     private store: MessageStore,
@@ -168,7 +173,7 @@ export class KoishiMessenger implements MessengerApi {
       channels.map(async ({ key, latest }) => {
         const time = formatMessageTime(latest);
         const identity = await this.names.identity(key, { isDirect: latest.isDirect, guildId: latest.guildId });
-        const who = formatMessageSender(latest, identity);
+        const who = formatMessageSender(latest, identity, this.messaging.groupMetadata);
         // 预览只做轻量替换，不触发解释器
         const kind = conversationKind(latest.isDirect, latest.channelId, latest.guildId);
         return `- ${await this.names.display(key)}（${kind === "direct" ? "私聊" : kind === "group" ? "群聊" : "会话类型未知"}）\n${identity.text}\n${this.notify.channelStatusText(key)}\n[${time}] ${who}: ${truncate(stripPlaceholders(storedQuoteContent(latest)), 80)}`;
@@ -214,13 +219,13 @@ export class KoishiMessenger implements MessengerApi {
     for (let idx = 0; idx < rows.length; idx++) {
       const row = rows[idx]!;
       const messagePartsStart = parts.length;
-      const who = formatMessageSender(row, identity);
+      const who = formatMessageSender(row, identity, this.messaging.groupMetadata);
       const rendered = await this.renderer.render(storedQuoteContent(row));
       if (rendered.attachments) attachments.push(...rendered.attachments);
       const msgTag = this.showMsgId && row.messageId ? ` (msg:${row.messageId})` : "";
       const address = conversationLabel(row.conversation, selfId);
       const header = `〔聊天记录 #${row.id} · ${formatMessageTime(row)}${msgTag}〕\n发送者：${who}；${address}\n消息正文：\n`;
-      const ending = "\n〔该条消息结束〕";
+      const ending = "\n〔该条消息结束〕" + (this.ops.reply && row.messageId ? ` 回复此条：reply_to=${JSON.stringify(row.messageId)}` : "");
       lines.push(header + rendered.text + ending);
       // 行头作为 text 段，随后依序展开该消息的图文交错分段
       if (rendered.parts?.length) {
@@ -526,9 +531,20 @@ export class KoishiMessenger implements MessengerApi {
   }
 
   private async sendResolved(target: MessageTarget, id: string, msg: string, media: (string | number)[], replyTo: string | undefined, atSender: boolean, insist: boolean): Promise<MessageSendReceipt> {
+    const metadataError = senderTagError(msg);
+    if (metadataError) return blockedSend(`消息没有发出：${metadataError}`);
     const quote = resolveOutgoingQuote(msg, replyTo);
     if (quote.error !== undefined) return blockedSend(`消息没有发出：${quote.error}`);
     msg = quote.msg; replyTo = quote.replyTo;
+    if (replyTo && !this.ops.reply) return blockedSend("（消息没有发出：当前未启用引用回复能力；若要发送普通消息，请移除 reply_to 和引用标签后重新决定。）");
+    // Never send an unverified quote and hope the adapter rejects it. Some
+    // adapters discard unknown references and still deliver the body elsewhere.
+    let quoted: WorldMessageRow | null = null;
+    if (replyTo) {
+      quoted = await this.store.findByMessageId(target.platform, target.channelId, replyTo, target.bot.selfId);
+      if (!quoted?.messageId) return blockedSend("消息没有发出：引用不属于当前账号的目标频道，或记录不存在。请重新查看目标频道并选择要回复的那条消息。");
+      replyTo = quoted.messageId;
+    }
     if (/<img\b|\[(?:图片|视频|音频|语音)#\d+/i.test(msg)) {
       return blockedSend('（消息没有发出：旧媒体占位格式已停用。请先 view_media 确认内容，再在原位置填写 <media ref="media:12"/>，或在 media 参数里给出明确引用。）');
     }
@@ -585,8 +601,6 @@ export class KoishiMessenger implements MessengerApi {
       }
     };
 
-    if (replyTo && !this.ops.reply) return blockedSend("（消息没有发出：当前未启用引用回复能力；若要发送普通消息，请移除 reply_to 和引用标签后重新决定。）");
-
     // 引用回复：模拟 QQ 客户端行为——群聊里引用时自动在开头 @ 原发送人 + 空格，
     // Bot 可用 at_sender: false 去掉（如同真人手动删掉自动加上的 @）。
     // 私聊没有 @ 的概念，强制不附加 at（QQ 私聊无法渲染 at，只会留下一个孤零零的空格）。
@@ -594,7 +608,6 @@ export class KoishiMessenger implements MessengerApi {
       add(h("quote", { id: replyTo }), quoteTag({ id: replyTo }));
       if (target.isDirect) atSender = false;
       if (atSender) {
-        const quoted = await this.store.findByMessageId(target.platform, target.channelId, replyTo, target.bot.selfId);
         if (quoted && quoted.userId !== target.bot.selfId && quoted.userId) {
           add(h("at", { id: quoted.userId, name: quoted.username || undefined }), `@${quoted.username || quoted.userId}`);
           add(h.text(" "), " ");
@@ -685,7 +698,11 @@ export class KoishiMessenger implements MessengerApi {
       sentMsgIds.push(...ids.filter(Boolean));
       confirmedAt = new Date();
       // Platform success is irreversible. A local record failure must never claim it did not send.
-      try { await this.storeSelf(target, batch.stored, ids[0], confirmedAt, describeConversation(batch.elements, target.isDirect ? "direct" : "group", isStickerElement)); }
+      try {
+        const conversation = describeConversation(batch.elements, target.isDirect ? "direct" : "group", isStickerElement);
+        if (conversation.reply && quoted?.userId) conversation.reply.userId = quoted.userId;
+        await this.storeSelf(target, batch.stored, ids[0], confirmedAt, conversation);
+      }
       catch { receiptProblems.push(`第 ${bi + 1} 批已由平台确认发送，但本地聊天记录保存失败`); }
     }
     try { await this.focus.focus(channelKey); }
@@ -699,7 +716,7 @@ export class KoishiMessenger implements MessengerApi {
     }
     let result = `消息已发送到 ${id}。`;
     if (this.showMsgId && sentMsgIds[0]) result = `消息已发送到 ${id}（msg:${sentMsgIds.join("、")}）。`;
-    if (replyTo) result += `（引用回复了 msg:${replyTo}${atNote}）`;
+    if (replyTo) result += `（引用回复了 msg:${replyTo}${atNote}；原消息：${JSON.stringify(truncate(stripPlaceholders(quoted!.content), 100))}）`;
     if (sentRefs.length) result += `（附 ${sentRefs.length} 个媒体，依次为 ${sentRefs.map(ref => `media:${ref.id}`).join("、")}）`;
     const stickerCount = ordered.filter(part => part.sticker).length;
     if (stickerCount) result += `（其中 ${stickerCount} 个表情包按原顺序单独发送）`;
@@ -1214,6 +1231,14 @@ export class KoishiMessenger implements MessengerApi {
 
   // ---------- 用户相关（OneBot） ----------
 
+  /** Explicit profile viewing shares the media cache, without adding avatars to incoming messages. */
+  async viewAvatar(id: string, userId: string): Promise<RichText> {
+    const channel = await this.resolveKey(id);
+    if ("error" in channel) return { text: channel.error };
+    this.avatars ??= new AvatarViewer(this.ctx, this.store, this.media, this.renderer, this.captioner, this.ops);
+    return this.avatars.view(channel.key, userId, channel.isPrivate);
+  }
+
   /** 查看某个用户的资料 */
   async userInfo(userId: string): Promise<string> {
     const bot = this.findOnebot();
@@ -1297,13 +1322,21 @@ export class KoishiMessenger implements MessengerApi {
       return `（查看群成员失败：${(err as Error).message ?? err}）`;
     }
     if (!Array.isArray(data) || !data.length) return `（群 ${id} 的成员列表是空的。）`;
-    const roleTag = (r: unknown) => (r === "owner" ? "［群主］" : r === "admin" ? "［管理员］" : "");
-    const sorted = [...data].sort((a, b) => roleRank(a.role) - roleRank(b.role));
+    const sourceCount = data.length;
+    data = data.filter(member => member && typeof member === "object" && (member.group_id == null || String(member.group_id) === target.groupId));
+    if (!data.length) return "（查看群成员失败：平台返回的成员资料与请求的群不匹配。）";
+    // A hidden/on-demand role must not leak through a role-sorted directory.
+    const sorted = (this.messaging.groupMetadata?.role ?? "inline") === "inline"
+      ? [...data].sort((a, b) => roleRank(a.role) - roleRank(b.role)) : data;
     const lines = sorted
       .slice(0, 50)
-      .map((m) => `- ${m.card || m.nickname || m.user_id}（${m.user_id}）${roleTag(m.role)}`);
+      .map((m) => {
+        const tag = senderMetadataTag(extractGroupMemberMetadata(m), this.messaging.groupMetadata, "inline", String(m.user_id ?? ""));
+        return `- ${m.card || m.nickname || m.user_id}（${m.user_id}）${tag ? ` ${tag}` : ""}`;
+      });
     const more = data.length > 50 ? `\n（其余 ${data.length - 50} 人未显示，可用 member_info 查看具体某人）` : "";
-    return `你看了看群 ${id} 的成员（共 ${data.length} 人）：\n${lines.join("\n")}${more}`;
+    const scopeNote = data.length < sourceCount ? "\n（平台返回的部分资料不属于当前群，已略过。）" : "";
+    return `你看了看群 ${id} 的成员（共 ${data.length} 人）：\n${lines.join("\n")}${more}${scopeNote}`;
   }
 
   /** 查看某个群成员的详细信息 */
@@ -1321,13 +1354,20 @@ export class KoishiMessenger implements MessengerApi {
     } catch (err) {
       return `（查看成员信息失败：${(err as Error).message ?? err}）`;
     }
+    if (data.user_id != null && String(data.user_id) !== uid || data.group_id != null && String(data.group_id) !== target.groupId) {
+      return "（查看成员信息失败：平台返回的成员资料与请求的群或账号不匹配。）";
+    }
     const parts: string[] = [];
     if (data.card) parts.push(`群名片：${data.card}`);
     if (data.nickname) parts.push(`昵称：${data.nickname}`);
     parts.push(`QQ：${data.user_id ?? uid}`);
-    if (data.role === "owner") parts.push("身份：群主");
-    else if (data.role === "admin") parts.push("身份：管理员");
-    if (data.title) parts.push(`头衔：${data.title}`);
+    const metadata = extractGroupMemberMetadata(data);
+    const metadataTag = senderMetadataTag(metadata, this.messaging.groupMetadata, "detail", String(data.user_id ?? uid));
+    if (metadataTag) parts.push(`群资料：${metadataTag}`);
+    if (this.messaging.groupMetadata?.levelTitle !== "hidden" && metadata?.level && !metadata.levelTitle
+      && metadata.role !== "owner" && metadata.role !== "admin" && !resolveGroupMemberTitle(metadata)) {
+      parts.push(`活动等级：${metadata.level}（平台未提供等级头衔文字；该数值不是头衔）`);
+    }
     if (typeof data.join_time === "number" && data.join_time > 0) {
       parts.push(`入群时间：${formatTime(new Date(data.join_time * 1000))}`);
     }
@@ -1787,7 +1827,7 @@ export class KoishiMessenger implements MessengerApi {
       for (const row of rows) {
         const evidence = chatMessageEvidence(row, entry.selfId);
         evidence.originEventIds?.forEach(root => roots.add(root));
-        parts.push({ kind: "text", text: `〔记录 #${row.id}${row.messageId ? ` · msg:${row.messageId}` : ""} · ${formatMessageTime(row)}〕\n发送者：${formatMessageSender(row, identity)}；${conversationLabel(row.conversation, entry.selfId)}\n正文片段：${truncate(stripPlaceholders(storedQuoteContent(row)), 160)}\n〔片段结束；完整图文请 select_channel〕\n`,
+        parts.push({ kind: "text", text: `〔记录 #${row.id}${row.messageId ? ` · msg:${row.messageId}` : ""} · ${formatMessageTime(row)}〕\n发送者：${formatMessageSender(row, identity, this.messaging.groupMetadata)}；${conversationLabel(row.conversation, entry.selfId)}\n正文片段：${truncate(stripPlaceholders(storedQuoteContent(row)), 160)}\n〔片段结束；完整图文请 select_channel〕\n`,
           observedMessage: { originEventIds: evidence.originEventIds!, experience: evidence.experience! } });
       }
       if (card.note) parts.push({ kind: "text", text: card.note + "\n" });
@@ -1933,6 +1973,11 @@ export class KoishiMessenger implements MessengerApi {
       let minSeq: bigint | undefined;
       let overlap = false;
       for (const raw of messages) {
+        // Adapters/proxies can return a cached history page from another room.
+        // Explicit transport scope always wins over the requested URL/parameter.
+        if (raw.self_id != null && String(raw.self_id) !== bot.selfId) continue;
+        if (!isDirect && raw.group_id != null && String(raw.group_id) !== channelId) continue;
+        if (raw.message_type === "private" && !isDirect || raw.message_type === "group" && isDirect) continue;
         const seq = messageSequence(raw.message_seq);
         if (seq && (minSeq === undefined || BigInt(seq) < minSeq)) minSeq = BigInt(seq);
         const id = String(raw.message_id ?? "");
@@ -1981,6 +2026,7 @@ export class KoishiMessenger implements MessengerApi {
       }
       rows.push({ platform, channelId, selfId: bot.selfId, guildId: "", userId: senderId,
         username: firstName(sender.card, sender.nickname), content, timestamp: new Date(timeMs),
+        ...(!isDirect ? { memberMetadata: extractGroupMemberMetadata(sender) } : {}),
         platformSequence: messageSequence(raw.message_seq), self, senderOrigin: "unknown", senderOwned: self ? true : null,
         messageId: msgId, isDirect, conversation });
     }
@@ -2016,7 +2062,7 @@ export class KoishiMessenger implements MessengerApi {
    * 1. 与已知频道（消息记录）精确匹配 → 直接通过；
    * 2. 不匹配时，用 id 中的片段模糊匹配已知频道的参与者用户名/用户 id/频道 id ——
    *    找到候选时**不执行操作**，而是返回提示（会以事件形式送达 Bot），让它下次用正确的 id 调用；
-   * 3. 格式正确但完全无线索的 id 放行（可能是没有历史消息的新频道，交由平台判定）。
+   * 3. 无本地记录时，目录或平台必须确认该账号下存在这个频道，不能仅凭格式放行。
    */
   private async resolveChannel(
     id: string,
@@ -2034,7 +2080,7 @@ export class KoishiMessenger implements MessengerApi {
       const accounts = [...new Set(hits.map((c) => c.selfId).filter(Boolean))];
       if (hits.length) return this.withAccount(platform, channelId, hits[0]!.isDirect, selfId ?? (accounts.length === 1 ? accounts[0] : undefined));
       // 显式账号可打开该账号尚无历史的新频道；不能被另一个账号的同名频道纠错抢走。
-      if (selfId) return this.withAccount(platform, channelId, channelId.startsWith("private:"), selfId);
+      if (selfId) return this.verifyUnseenChannel(platform, channelId, selfId);
     }
 
     // 模糊匹配：取 id 中的非平台片段作为查询词
@@ -2073,8 +2119,49 @@ export class KoishiMessenger implements MessengerApi {
     }
 
     if (error) return { error };
-    // 存储查不到（新频道/历史数据）：回退 onebot 的 private: 前缀约定
-    return this.withAccount(platform, channelId, channelId.startsWith("private:"), selfId);
+    return this.verifyUnseenChannel(platform, channelId, selfId);
+  }
+
+  private async verifyUnseenChannel(platform: string, channelId: string, selfId?: string): Promise<
+    { platform: string; channelId: string; selfId?: string; isDirect: boolean } | { error: string }
+  > {
+    const resolved = this.withAccount(platform, channelId, channelId.startsWith("private:"), selfId);
+    if ("error" in resolved) return resolved;
+    const key = makeChannelKey(platform, channelId, resolved.selfId);
+    // A directory entry is platform evidence even before any messages exist.
+    for (const [kind, catalog] of this.discoveryCatalogs ?? []) {
+      if (catalog.entries.some(entry => entry.key === key)) return { ...resolved, isDirect: kind === "friend" };
+    }
+    this.verifiedChannels ??= new Map();
+    const cached = this.verifiedChannels.get(key);
+    if (cached && Date.now() - cached.at < DISCOVERY_TTL) return { ...resolved, isDirect: cached.isDirect };
+    const bot = this.ctx.bots.find(item => item.platform === platform && item.selfId === resolved.selfId);
+    if (bot) {
+      let confirmed = false;
+      if (platform === "onebot") {
+        // OneBot adapters may synthesize getChannel(private:ID) without an API
+        // lookup. Read protocol data with its own ID instead of trusting that echo.
+        try {
+          const direct = channelId.startsWith("private:"), rawId = direct ? channelId.slice(8) : channelId;
+          const info = await callOnebot(bot, direct ? "get_stranger_info" : "get_group_info", {
+            [direct ? "user_id" : "group_id"]: toIdValue(rawId), no_cache: true,
+          }) as Record<string, unknown> | undefined;
+          confirmed = info?.[direct ? "user_id" : "group_id"] != null && String(info[direct ? "user_id" : "group_id"]) === rawId;
+        } catch { /* Fail closed instead of sending to a plausible invented ID. */ }
+      } else {
+        try {
+          const channel = await bot.getChannel?.(channelId);
+          confirmed = channel?.id === channelId;
+          if (confirmed && typeof channel.type === "number") resolved.isDirect = channel.type === Universal.Channel.Type.DIRECT;
+        } catch { /* Unsupported/failed lookups are not evidence of a valid channel. */ }
+      }
+      if (confirmed) {
+        this.verifiedChannels.set(key, { at: Date.now(), isDirect: resolved.isDirect });
+        while (this.verifiedChannels.size > 256) this.verifiedChannels.delete(this.verifiedChannels.keys().next().value!);
+        return resolved;
+      }
+    }
+    return { error: `没有执行操作：频道 ${key} 尚未得到平台确认。请从消息列表、群列表或好友列表重新选择。` };
   }
 
   private withAccount(platform: string, channelId: string, isDirect: boolean, selfId?: string):
@@ -2167,6 +2254,7 @@ export class KoishiMessenger implements MessengerApi {
       self: true,
       senderOrigin: "tool",
       senderOwned: true,
+      ...(!target.isDirect && identity.memberMetadata ? { memberMetadata: { ...identity.memberMetadata } } : {}),
       messageId: messageId ?? "",
       isDirect: target.isDirect,
       ...(conversation ? { conversation } : {}),

@@ -5,6 +5,9 @@ import { BrowserSession, safeBrowserUrl } from "../src/apps/browser-session.js";
 import { BrowserApp } from "../src/apps/browser.js";
 import { Config } from "../src/config.js";
 import { browserPortalHtml } from "../src/apps/browser-home.js";
+import { renderSignature } from "../src/apps/app.js";
+import { ToolCapabilityAnnouncements } from "../src/bot/tool-capabilities.js";
+import { renderToolsText } from "../src/bot/tools.js";
 
 class Element {
   isConnected = true; disabled = false; readOnly = false; checked = false;
@@ -18,7 +21,7 @@ class Page {
   realm: any; listeners = new Map<string, Function>(); closed = false; focused?: Element;
   nodes = [new Element("INPUT", "搜索内容", "text"), new Element("BUTTON", "搜索", "submit", "", 80), new Element("A", "视频", "", "https://video.example/1", 140)];
   clicks: number[][] = []; keys: string[] = []; visits: string[] = []; history: string[] = [];
-  failNavigation = false; duringScreenshot?: () => void; beforeGoto?: () => Promise<void>;
+  failNavigation = false; content = ""; duringScreenshot?: () => void; beforeGoto?: () => Promise<void>;
   constructor() {
     this.realm = vm.createContext({ URL, Math, WeakMap, Map });
     this.realm.innerWidth = 600; this.realm.innerHeight = 800; this.realm.scrollX = this.realm.scrollY = 0;
@@ -44,7 +47,7 @@ class Page {
     this.visits.push(url); if (this.failNavigation) throw new Error("fixture timeout");
     this.history.push(this.realm.location.href); this.realm.location.href = url; this.document(url); return { status: () => 200 };
   }
-  async setContent(html: string) { this.document(html.match(/<title>(.*?)<\/title>/i)?.[1] || "本地主页"); }
+  async setContent(html: string) { this.content = html; this.document(html.match(/<title>(.*?)<\/title>/i)?.[1] || "本地主页"); }
   async evaluate(fn: Function, ...args: any[]) { this.realm.args = args; return vm.runInContext(`(${fn.toString()})(...args)`, this.realm); }
   async evaluateHandle(fn: Function, ...args: any[]) {
     const node = await this.evaluate(fn, ...args);
@@ -120,7 +123,7 @@ async function appTests() {
     const id = rows.length + 1; rows.push({ id, ref: { id, type: "image", mime: "image/png", path: "fixture.png", sha256: "fixture" + id } }); return id;
   }, get: async (id: number) => rows[id - 1], setSummary: async () => {} };
   const app = new BrowserApp({ puppeteer: host } as any, { query() { throw new Error("real browsing has no additional World-LLM request"); } } as any,
-    { readMeta: async () => ({ realWorld: true, phone: { width: 600, height: 800 } }), readPhoneShell: async () => "" } as any, { syncRealTime: true, timeLine: () => "12:00" } as any,
+    { readMeta: async () => ({ realWorld: true, phone: { width: 600, height: 800 } }), readPhoneShell: async () => '<html><body>persisted phone shell {{time}} {{url}}<img class="screen" src="{{screen}}"></body></html>' } as any, { syncRealTime: true, timeLine: () => "12:00" } as any,
     media as any, { importFile: async () => { saved++; return 'web.png'; } } as any,
     { describe() { throw new Error("native screenshots need no extra caption request"); } } as any, () => true, cfg, { warn() {} } as any);
   const opened = await app.open(); assert.equal(typeof opened.opening, "object");
@@ -136,6 +139,37 @@ async function appTests() {
   assert.deepEqual(app.peekScreen(), actualScreen, "a save confirmation never replaces the observed browser page");
   assert.equal(saved, 1); assert.deepEqual(host.pages[0]!.visits, visits, "saved screenshots preserve the current real page instead of reloading URL");
   assert.deepEqual(host.pages[1]!.visits, [], "the compositor never navigates the target URL"); assert.ok(host.pages[1]!.closed);
+  assert.match(host.pages[1]!.content, /persisted phone shell 12:00/);
+  assert.match(host.pages[1]!.content, /data:image\/png;base64/);
+  assert.doesNotMatch(host.pages[1]!.content, /\{\{screen\}\}/);
+  const screenshotTool = opened.tools.find(tool => tool.name === "screenshot")!;
+  assert.equal((screenshotTool.inputSchema!.properties as any).purpose.default, "share");
+  const legacyScreenshot = { name: "screenshot", signature: "screenshot(description?: string)", description: "重新读取实际网页并提供原始视口截图、媒体ID、revision和尺寸。", inputSchema: { type: "object", properties: { description: { type: "string" } } } };
+  const frozenPrefix = renderToolsText([legacyScreenshot]);
+  const capabilities = new ToolCapabilityAnnouncements(frozenPrefix);
+  const updatedScreenshot = { ...screenshotTool, signature: renderSignature(screenshotTool.name, screenshotTool.inputSchema) };
+  const notice = capabilities.prepare([updatedScreenshot])!;
+  assert.match(notice.content, /参数或语义已更新/);
+  assert.match(notice.content, /purpose.*share.*control/);
+  assert.match(notice.content, /带上手机与浏览器外壳/);
+  assert.equal(frozenPrefix, renderToolsText([legacyScreenshot]), "schema upgrade is an appended event; old pinned text is unchanged");
+  capabilities.commit(notice.update); assert.equal(capabilities.prepare([updatedScreenshot]), undefined);
+  assert.match(String(await app.call("screenshot", {})), /截图已存进收藏夹.*带壳收藏图/);
+  assert.equal(saved, 2, "the default screenshot is a shareable phone capture, not a bare GUI frame");
+  assert.match(host.pages[2]!.content, /persisted phone shell 12:00/);
+  assert.deepEqual(host.pages[0]!.visits, visits, "default screenshot keeps the actual browser session");
+  assert.ok((app.viewState() as any).screenshot, "saving does not make the WebUI's current control image disappear");
+  const gui = await app.call("screenshot", { purpose: "control" });
+  assert.equal(typeof gui, "object"); assert.match((gui as any).text, /原始网页截图/);
+  assert.equal(saved, 2, "an explicitly requested GUI frame stays out of the gallery");
+  assert.equal(host.pages.length, 3, "GUI screenshots never compose decorative chrome or change coordinate mapping");
+  assert.equal((app.viewState() as any).screenshot.mediaId, (gui as any).attachments[0].id);
+  assert.match(String(await app.call("screenshot", { purpose: "unknown" })), /截图用途/);
+  const originalCompose = (app as any).live.compose;
+  (app as any).live.compose = async () => { throw new Error("fixture compositor failure"); };
+  assert.match(String(await app.call("screenshot", {})), /合成失败，未保存/);
+  assert.equal(saved, 2, "a failed shell never gets silently saved as a raw screenshot");
+  (app as any).live.compose = originalCompose;
   host.pages[0]!.nodes[0]!.value = "session cookie surrogate";
   await app.close(); await app.open(); assert.equal(host.contexts, 1); assert.equal(host.pages[0]!.nodes[0]!.value, "session cookie surrogate");
   await app.dispose(); assert.ok(host.pages[0]!.closed);

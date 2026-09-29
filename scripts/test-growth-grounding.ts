@@ -18,7 +18,7 @@ const actual = (id: string, at: number, chat: NonNullable<ExperienceMetadata["ch
   experience: { agency: "observed", outcome: "unknown", episodeId: "episode:" + id, chat, ...(chat.senderId ? { subjectIds: [chat.senderId] } : {}) },
 });
 const state = (ids: string[]): ReflectionInput => ({ kind: "state", subject: "正在查看朋友的聊天", statement: "当前看着朋友的聊天界面。", situation: "当前频道界面仍然打开时", evidenceIds: ids });
-const relationship = (ids: string[]): ReflectionInput => ({ kind: "relationship", subject: "朋友", subjectId: FRIEND, statement: "朋友这次愿意一起交流。", evidenceIds: ids });
+const relationship = (ids: string[]): ReflectionInput => ({ kind: "relationship", subject: "朋友", subjectId: FRIEND, statement: "朋友这次愿意一起交流。", evidenceIds: ids, insight: { dimension: "交流意愿", significance: "对方主动表达了愿意交流，可以先开口问候而非预设对方排斥。", anchors: [{ eventId: ids[0]!, quote: "朋友说愿意一起聊聊。" }] } });
 const habit = (ids: string[]): ReflectionInput => ({ kind: "habit", subject: "饭后散步", behavior: "沿河散步", situation: "天气合适的晚饭后", statement: "天气合适时，晚饭后倾向沿河散步；有约或下雨时另作安排。", evidenceIds: ids });
 const choice = (id: string, at: number, action = "晚饭后沿河散步", situation = "晚饭后有空"): BotEvent => ({ id, source: "world", worldTime: at,
   content: action + "，回家后感到放松。", originEventIds: ["cause:" + id], experience: { agency: "self", outcome: "completed", opportunity: true, episodeId: id, action, situation } });
@@ -54,7 +54,8 @@ async function chatScopes(base: string) {
   assert.deepEqual(current.view.scope, { domain: "chat", channelKey: PRIVATE });
   const query = { text: "手机收到消息通知，正在查看朋友的聊天界面", at: 16 };
   assert.equal((await ledger.retrieve({ ...query, channelKeys: [GROUP] })).some(view => view.claimId === current.view.claimId), false);
-  assert.equal((await ledger.retrieve({ ...query, channelKeys: [PRIVATE] })).some(view => view.claimId === current.view.claimId), true);
+  assert.equal((await ledger.retrieve({ ...query, channelKeys: [PRIVATE] })).some(view => view.claimId === current.view.claimId), false, "temporary attention remains in audit, never automatic long-term recall");
+  assert.equal((await ledger.recall({ claimId: current.view.claimId, at: 16 }))[0]!.active, true);
   assert.equal((await ledger.retrieve({ ...query, subjectIds: [SELF], channelKeys: [PRIVATE] })).some(view => view.claimId === relation.view.claimId), false);
   assert.equal((await ledger.retrieve({ ...query, subjectIds: [FRIEND], channelKeys: [PRIVATE] })).some(view => view.claimId === relation.view.claimId), true);
   const cfg = Config({ autoStart: false }); cfg.bot.growth.enabled = true;
@@ -152,7 +153,7 @@ async function boundedIsolation(base: string) {
   const cfg = Config({ autoStart: false }); cfg.bot.growth.enabled = false;
   let runtime = new GrowthRuntime(ledger, cfg.bot, { now: () => 3, unitWorldSeconds: 1 }, context, logger);
   const first = await runtime.drain(); assert.equal(first.length, 1); assert.ok(first[0]!.content.length < 4000);
-  assert.match(first[0]!.content, /不限于下面这一批/); assert.match(first[0]!.content, /后续内容已截断/);
+  assert.match(first[0]!.content, /以下索引只指列出的旧版本/); assert.match(first[0]!.content, /后续内容已截断/);
   assert.equal((await ledger.pendingIsolations()).length, 1);
   assert.ok((await fs.readFile(ledger.file, "utf8")).includes(long), "full audit remains available even though context only gets short excerpts");
   await context.applyCompression({ historySummary: "不沿用未核实的旧归属。", memoryDigest: "以实际消息为准。" }, 4);

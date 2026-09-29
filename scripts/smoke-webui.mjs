@@ -17,6 +17,7 @@ import smokeLayout from './webui-smoke-layout.mjs';
 import smokeNotes from './webui-smoke-notes.mjs';
 import smokeNarrative from './webui-smoke-narrative.mjs';
 import smokeGrowth from './webui-smoke-growth.mjs';
+import smokeGrowthPagination from './webui-smoke-growth-pagination.mjs';
 import smokeLlmConfig from './webui-smoke-llm-config.mjs';
 import smokePhoneShell from './webui-smoke-phone-shell.mjs';
 import smokePhoneApps from './webui-smoke-phone-apps.mjs';
@@ -118,7 +119,7 @@ try {
   if (notificationsOnly) console.log('PASS', await smokeNotifications(helpers));
   if (phoneAppsOnly) { console.log('PASS', await smokePhoneSetup(helpers)); console.log('PASS', await smokePhoneApps(helpers)); }
   if (shellOnly) console.log('PASS', await smokePhoneShell(helpers));
-  if (growthOnly) { console.log('PASS', await smokeGrowth(helpers)); console.log('PASS', await smokeLlmConfig(helpers)); }
+  if (growthOnly) { console.log('PASS', await smokeGrowthPagination(helpers)); console.log('PASS', await smokeGrowth(helpers)); console.log('PASS', await smokeLlmConfig(helpers)); }
   if (playerOnly) { console.log('PASS', await smokeJourney(helpers)); console.log('PASS', await smokeCockpit(helpers)); console.log('PASS', await smokeNarrative(helpers)); console.log('PASS', await smokeActionMenu(helpers)); }
   if (!growthOnly && !shellOnly && !phoneAppsOnly && !playerOnly && !notificationsOnly && !browserOnly && !heartbeatOnly) {
   const routes = ['overview', 'world', 'growth', 'devices', 'player', 'live', 'debug', 'usage', 'state', 'crossing', 'config', 'prompts', 'gallery', 'media', 'data', 'visitors'];
@@ -142,10 +143,12 @@ try {
   await evaluate(`Studio.navigate('world');window.dispatchEvent(new CustomEvent('studio:focus-world-event',{detail:{actorId:'bot',eventId:'narrative_start'}}));`);
   await wait("document.querySelector('.world-event-detail')?.textContent.includes('narrative_start')");
   await navigate('growth');
+  await wait("!!document.querySelector('[data-growth-claim=claim_1]')");
+  await evaluate("document.querySelector('[data-growth-claim=claim_1]').click()");
   await evaluate("document.querySelector('.growth-evidence-node').dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true}))");
   assert.ok(await evaluate("document.querySelector('.growth-evidence-detail')?.textContent.includes('observed_1')"));
   console.log('PASS actor navigation, early event focus and growth evidence');
-  const growthFilter = async (group, label) => evaluate(`Array.from(document.querySelectorAll(${JSON.stringify(group + ' button')})).find(b=>b.textContent===${JSON.stringify(label)}).click()`);
+  const growthFilter = async (group, label) => { await evaluate(`Array.from(document.querySelectorAll(${JSON.stringify(group + ' button')})).find(b=>b.textContent===${JSON.stringify(label)}).click()`); await wait(`document.querySelector('.growth-pagination') && document.querySelector('.world-controls').getAttribute('aria-busy')==='false'`); };
   await growthFilter('.growth-kind-filters', '习惯');
   assert.ok(await evaluate("document.querySelector('.growth-situation').textContent.includes('天气适合出门') && document.querySelector('.growth-cues').textContent.includes('晚饭后')"));
   assert.ok(await evaluate("document.querySelector('.growth-detail').textContent.includes('自动整理') && document.querySelector('.growth-detail').textContent.includes('修订原有判断')"));
@@ -155,20 +158,21 @@ try {
   await growthFilter('.growth-kind-filters', '临时状态');
   assert.ok(await evaluate("document.querySelector('.growth-lifecycle').textContent.includes('已到期') && document.querySelector('.growth-lifecycle').textContent.includes('T 4248.0 TU')"), 'Expiry is world TU, never an epoch date');
   await growthFilter('.growth-lifecycle-filters', '当前有效');
-  assert.ok(await evaluate("document.querySelector('.growth-detail').textContent.includes('不会直接归纳成性格')"));
+  assert.ok(await evaluate("document.querySelector('.growth-detail').textContent.includes('不作为长期成长')"));
   await growthFilter('.growth-kind-filters', '性格倾向');
   assert.ok(await evaluate("document.querySelector('.growth-topline').textContent.includes('存在反证') && document.querySelector('.growth-lifecycle').textContent.includes('当前有效')"), 'Contested and active describe separate dimensions');
   assert.equal(await evaluate("document.querySelector('.growth-identity').open"), false);
   await evaluate("document.querySelector('.growth-identity summary').click()");
   assert.ok(await evaluate("document.querySelector('.growth-identity').textContent.includes('person:preview:friend-account')"));
   assert.ok(await evaluate('document.documentElement.scrollWidth <= innerWidth'), 'Long identity stays inside mobile width');
-  await evaluate("var growthSearch=document.querySelector('[aria-label=搜索成长记录]');growthSearch.focus();growthSearch.value='阿青';growthSearch.dispatchEvent(new Event('input'));growthSearch.setSelectionRange(1,1);var originalGrowthFetch=Studio.fetchGrowth;Studio.fetchGrowth=()=>originalGrowthFetch().then(rows=>rows.map(row=>row.claimId==='claim_trait'?Object.assign({},row,{statement:row.statement+'（刷新样本）'}):row));window.dispatchEvent(new CustomEvent('studio:debug',{detail:{kind:'bot.event'}}));");
+  await evaluate("var growthSearch=document.querySelector('[aria-label=搜索成长记录]');growthSearch.focus();growthSearch.value='阿青';growthSearch.dispatchEvent(new Event('input'));growthSearch.setSelectionRange(1,1);var originalGrowthFetch=Studio.fetchGrowthPage;Studio.fetchGrowthPage=(query)=>originalGrowthFetch(query).then(page=>Object.assign({},page,{items:page.items.map(row=>row.claimId==='claim_trait'?Object.assign({},row,{statement:row.statement+'（刷新样本）'}):row)}));window.dispatchEvent(new CustomEvent('studio:debug',{detail:{kind:'bot.event'}}));");
   await wait("document.querySelector('.growth-detail h2').textContent.includes('刷新样本')");
   assert.ok(await evaluate("document.activeElement===growthSearch && growthSearch.selectionStart===1 && growthSearch.value==='阿青' && document.querySelector('.growth-identity').open"), 'Live updates retain input focus, caret and expanded identity');
-  await evaluate("Studio.fetchGrowth=originalGrowthFetch");
+  await evaluate("Studio.fetchGrowthPage=originalGrowthFetch");
   await growthFilter('.growth-kind-filters', '全部类型');
   await growthFilter('.growth-lifecycle-filters', '全部历史');
   await evaluate("growthSearch.value='';growthSearch.dispatchEvent(new Event('input'))");
+  await wait("document.querySelectorAll('.growth-claim').length===8");
   assert.equal(await evaluate("document.querySelectorAll('.growth-claim').length"), 8, 'All old and new kinds retain their history');
   console.log('PASS growth scopes, habits, traits, expiry, retirement, live input focus and mobile layout');
   await navigate('config');
@@ -207,6 +211,7 @@ try {
   console.log('PASS', await smokeCommands(helpers));
   console.log('PASS', await smokeNarrative(helpers));
   console.log('PASS', await smokeActionMenu(helpers));
+  console.log('PASS', await smokeGrowthPagination(helpers));
   console.log('PASS', await smokeGrowth(helpers));
   console.log('PASS', await smokeLlmConfig(helpers));
   console.log('PASS', await smokePhoneShell(helpers));

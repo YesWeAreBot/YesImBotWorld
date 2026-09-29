@@ -64,9 +64,9 @@ async function backend(dir: string) {
   await service.deviceToolCall("open_app", { name: "chat" });
   await service.deviceToolCall("select_channel", { id: "onebot@b:42" });
   assert.equal((await service.deviceSession()).chat.messages[0].content, "cached");
-  assert.equal((await service.deviceToolCall("send", { msg: "hello" })).ok, false);
+  assert.equal((await service.deviceToolCall("send", { id: "onebot@b:42", msg: "hello" })).ok, false);
   assert.equal(sends, 0, "unconfirmed sends cannot reach the platform");
-  assert.equal((await service.deviceToolCall("send", { msg: "hello" }, 0, true)).ok, true);
+  assert.equal((await service.deviceToolCall("send", { id: "onebot@b:42", msg: "hello" }, 0, true)).ok, true);
   assert.equal(sends, 1);
   const reopened = await service.deviceToolCall("open_app", { name: "notes" }); assert.ok(reopened.ok, reopened.text);
   useSlow = true;
@@ -209,8 +209,8 @@ async function httpPolicy(dir: string) {
   assert.equal((await request("POST", "/api/device/tool", { name: "open_app", args: {}, mode: "stealth" }, "viewer")).status, 403);
   assert.equal((await request("POST", "/api/device/tool", { name: "open_app", args: {}, mode: "stealth" }, "player")).status, 403);
   assert.equal(writes, 0);
-  assert.equal((await request("POST", "/api/device/tool", { name: "send", args: { msg: "fixture" }, mode: "stealth", confirmSend: true })).status, 200);
-  assert.deepEqual(toolRequests[0], ["send", { msg: "fixture" }, undefined, true, "stealth"]);
+  assert.equal((await request("POST", "/api/device/tool", { name: "send", args: { id: "onebot@b:42", msg: "fixture" }, mode: "stealth", confirmSend: true })).status, 200);
+  assert.deepEqual(toolRequests[0], ["send", { id: "onebot@b:42", msg: "fixture" }, undefined, true, "stealth"]);
   assert.equal((await request("POST", "/api/device/tool", { name: "open_app", args: { name: "notes" } })).status, 200);
   assert.equal(toolRequests[1]?.[4], undefined, "old clients retain the service's takeover default");
   assert.equal((await request("POST", "/api/player/cancel", { token: "crossing-fixture", taskId: "task-fixture" }, "viewer")).status, 403);

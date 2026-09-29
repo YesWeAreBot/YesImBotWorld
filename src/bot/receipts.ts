@@ -3,7 +3,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import type { BotEvent, RichText } from "../types.js";
 
-interface StoredReceipt { version: 1; epoch: string; event: BotEvent; precedingObservations?: BotEvent[]; followingObservations?: BotEvent[] }
+interface StoredReceipt { version: 1; epoch: string; event: BotEvent; wake?: boolean; precedingObservations?: BotEvent[]; followingObservations?: BotEvent[] }
 const consumers = new Map<string, { owner: object; wake: () => void }>();
 
 /** Late results never write an old BotContext. Epochs deliberately do not roll back with saves. */
@@ -24,7 +24,7 @@ export class ReceiptInbox {
   async ready(): Promise<void> { await this.epoch; }
   async settled(): Promise<void> { await this.writes; }
 
-  save(content: string | RichText, worldTime: number, refToolCallId?: string): Promise<void> {
+  save(content: string | RichText, worldTime: number, refToolCallId?: string, wake?: boolean): Promise<void> {
     const rich: RichText = typeof content === "string" ? { text: content } : content;
     const toEvent = (value: RichText, source: BotEvent["source"], ref?: string): BotEvent => ({
       id: `ev_receipt_${randomUUID()}`, source, content: value.text, worldTime,
@@ -41,6 +41,8 @@ export class ReceiptInbox {
       await fs.mkdir(this.directory, { recursive: true });
       // One durable envelope preserves receipt-before-readback order through a crash.
       await this.atomicFile(path.join(this.directory, `${event.id}.json`), JSON.stringify({ version: 1, epoch, event,
+        // Scheduling metadata stays outside the model context and survives origin-call compaction.
+        ...(wake !== undefined ? { wake } : {}),
         ...(precedingObservations?.length ? { precedingObservations } : {}),
         ...(followingObservations?.length ? { followingObservations } : {}),
       } satisfies StoredReceipt));
@@ -50,7 +52,7 @@ export class ReceiptInbox {
     return work;
   }
 
-  async drain(accept: (event: BotEvent) => Promise<void>): Promise<void> {
+  async drain(accept: (event: BotEvent, wake?: boolean) => Promise<void>): Promise<void> {
     const epoch = await this.epoch;
     if ((await fs.readFile(this.epochPath, "utf8")).trim() !== epoch) return;
     let names: string[];
@@ -62,7 +64,7 @@ export class ReceiptInbox {
       if (receipt.version !== 1 || receipt.epoch !== epoch) continue; // Retain other timelines as an administrative audit only.
       if ((await fs.readFile(this.epochPath, "utf8")).trim() !== epoch) return;
       for (const observation of receipt.precedingObservations ?? []) await accept(observation);
-      await accept(receipt.event);
+      await accept(receipt.event, receipt.wake);
       for (const observation of receipt.followingObservations ?? []) {
         if ((await fs.readFile(this.epochPath, "utf8")).trim() !== epoch) return;
         await accept(observation);

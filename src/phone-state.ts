@@ -1,5 +1,38 @@
 import type { PhonePhysicalState, PhoneStatus } from "./types.js";
 
+interface PhoneExecutionState { version: number; tail: Promise<void> }
+const executionStates = new WeakMap<PhoneStatus, PhoneExecutionState>();
+function executionState(phone: PhoneStatus): PhoneExecutionState {
+  let state = executionStates.get(phone);
+  if (!state) { state = { version: 0, tail: Promise.resolve() }; executionStates.set(phone, state); }
+  return state;
+}
+
+/** Runtime-only execution identity: a pickup/put-down ABA remains observable even
+ * when the final posture is identical. No counter or lock enters saved phone data. */
+export function phoneExecutionStamp(phone: PhoneStatus): string {
+  const physical = phonePhysicalState(phone);
+  return JSON.stringify([executionState(phone).version, phone.down,
+    physical.reachable, physical.location, physical.usable, physical.perceptible]);
+}
+
+/** Call inside the shared execution lock when another actor may commit phone state. */
+export function setPhoneDown(phone: PhoneStatus, down: boolean): void {
+  if (phone.down === down) return;
+  phone.down = down;
+  executionState(phone).version++;
+}
+
+/** Serialize only local execution/commit sections for this particular phone.
+ * Never hold this lock over model inference or external application/network work. */
+export async function withPhoneExecutionLock<T>(phone: PhoneStatus, fn: () => Promise<T> | T): Promise<T> {
+  const state = executionState(phone), previous = state.tail;
+  let release!: () => void;
+  state.tail = new Promise<void>(resolve => { release = resolve; });
+  await previous;
+  try { return await fn(); } finally { release(); }
+}
+
 /** Legacy worlds retain their old usable-phone behavior without inventing a recorded location. */
 export const DEFAULT_PHONE_PHYSICAL_STATE: Readonly<PhonePhysicalState> = Object.freeze({
   reachable: true, location: null, usable: true, perceptible: true,
@@ -37,7 +70,7 @@ export function applyPhonePhysicalState(phone: PhoneStatus, state?: PhonePhysica
   if (state === undefined) delete phone.physical;
   else phone.physical = { ...state };
   // Losing physical reach cannot leave the execution layer claiming the phone is in hand.
-  if (!canReachPhone(phone)) phone.down = true;
+  if (!canReachPhone(phone)) setPhoneDown(phone, true);
   return before !== JSON.stringify(phone);
 }
 
