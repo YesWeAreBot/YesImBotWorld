@@ -8,6 +8,7 @@ import { WorldFiles } from "../src/files.js";
 import { WorldService } from "../src/service.js";
 import { WebUIServer, SECRET_MASK } from "../src/webui/server.js";
 import { WebUISetup, type SetupHost } from "../src/webui/setup.js";
+import { configurationRevision } from "../src/webui/config-revision.js";
 
 const BOT_DEF = "# 角色定义\n林雨是一名住在海边的修表师，性格温和，喜欢在雨天读书。";
 const WORLD_DEF = "# 世界定义\n架空海港小镇，角色住在钟楼旁的公寓，街对面有一家咖啡馆。";
@@ -27,6 +28,61 @@ async function fixture() {
   };
   return { host, directory, files, setInitialized: (value: boolean) => { initialized = value; }, calls: () => calls,
     stateFile: path.join(host.webuiDir, "setup.json"), cleanup: () => fs.rm(directory, { recursive: true, force: true }) };
+}
+
+async function firstPresentation() {
+  const f = await fixture();
+  try {
+    const setup = new WebUISetup(f.host);
+    const initial = await setup.get();
+    assert.equal(initial.presented, false); assert.equal(initial.presentedAt, null); assert.equal(initial.shouldPrompt, true);
+    await assert.rejects(fs.readFile(f.stateFile), { code: "ENOENT" }, "Reading an unused world does not consume its first prompt");
+    // A tour must be available while the administrator is still fixing settings.
+    f.host.config.bot.maxTokens = -1; f.host.config.bot.model = "";
+    const configBefore = structuredClone(f.host.config), definitionsBefore = await f.files.readDefinitions();
+    const entered = await setup.save({ presented: true });
+    assert.equal(entered.firstPresentation, true);
+    assert.equal(entered.reload, false); assert.equal(entered.setup.presented, true); assert.ok(entered.setup.presentedAt);
+    assert.equal(entered.setup.completed, false); assert.equal(entered.setup.dismissed, false); assert.equal(entered.setup.shouldPrompt, false);
+    assert.equal(f.calls(), 0); assert.deepEqual(f.host.config, configBefore); assert.deepEqual(await f.files.readDefinitions(), definitionsBefore);
+    const recorded = await fs.readFile(f.stateFile, "utf8");
+    const repeated = await setup.save({ presented: true });
+    assert.equal(repeated.firstPresentation, false);
+    assert.equal(repeated.setup.presentedAt, entered.setup.presentedAt);
+    assert.equal(await fs.readFile(f.stateFile, "utf8"), recorded, "Repeated entry leaves the original progress record unchanged");
+    assert.equal((await new WebUISetup(f.host).get()).shouldPrompt, false, "Closing before completion still suppresses prompts in another browser or server instance");
+    for (const body of [{ presented: false }, { presented: "true" }, { presented: true, config: {} }, { presented: true, dismissed: true }]) {
+      await assert.rejects(setup.save(body), error => (error as { status: number }).status === 400);
+    }
+    await setup.save({ completed: false, dismissed: false });
+    assert.equal((await setup.get()).presented, true, "Clearing legacy progress cannot undo first use");
+    await f.files.reset();
+    assert.equal((await new WebUISetup(f.host).get()).shouldPrompt, false, "A real world reset keeps onboarding history");
+  } finally { await f.cleanup(); }
+}
+
+async function existingWorldHistory() {
+  const f = await fixture();
+  try {
+    f.setInitialized(true);
+    const setup = new WebUISetup(f.host), existing = await setup.get();
+    assert.equal((await setup.save({ presented: true })).firstPresentation, false);
+    assert.equal(existing.presented, true); assert.equal(existing.shouldPrompt, false); assert.ok(existing.presentedAt);
+    assert.equal(JSON.parse(await fs.readFile(f.stateFile, "utf8")).presented, true, "An initialized installation records prior use on GET");
+    await f.files.reset(); f.setInitialized(false);
+    assert.equal((await new WebUISetup(f.host).get()).shouldPrompt, false, "Previously initialized installations stay suppressed after a reset and restart");
+    assert.equal(f.calls(), 0);
+    for (const field of ["completed", "dismissed"]) {
+      await fs.writeFile(f.stateFile, JSON.stringify({ version: 1, [field]: true, updatedAt: null, appliedAt: null }));
+      assert.equal((await new WebUISetup(f.host).save({ presented: true })).firstPresentation, false, "Direct claims also recognize legacy progress before any GET migration");
+      await fs.writeFile(f.stateFile, JSON.stringify({ version: 1, [field]: true, updatedAt: null, appliedAt: null }));
+      const legacy = new WebUISetup(f.host), migrated = await legacy.get();
+      assert.equal(migrated.presented, true); assert.equal(migrated.shouldPrompt, false);
+      assert.equal(JSON.parse(await fs.readFile(f.stateFile, "utf8")).presented, true, "Legacy progress is migrated to durable presentation history");
+      await legacy.save({ completed: false, dismissed: false });
+      assert.equal((await new WebUISetup(f.host).get()).shouldPrompt, false);
+    }
+  } finally { await f.cleanup(); }
 }
 
 async function progressAndValidation() {
@@ -95,6 +151,10 @@ async function mergingAndReload() {
     assert.equal((await setup.get()).applied, false, "A delayed loader failure must remain unconfirmed even though completed is persisted");
     await assert.rejects(setup.save({ dismissed: true }), error => (error as { status: number }).status === 409);
     const disk = await fs.readFile(f.stateFile, "utf8");
+    const presented = await setup.save({ presented: true });
+    assert.equal(presented.reload, false); assert.equal(presented.setup.applied, false);
+    assert.equal(await fs.readFile(f.stateFile, "utf8"), disk, "Progress-only entry is safe while reload is pending and leaves its confirmation intact");
+    await assert.rejects(setup.save({ completed: true }), error => (error as { status: number }).status === 409);
     for (const secret of [original.bot.apiKey, original.world.apiKey, original.webui.token, "keep-independent-key"]) {
       assert.ok(!disk.includes(secret)); assert.ok(!JSON.stringify(result).includes(secret));
     }
@@ -176,11 +236,75 @@ async function httpAuthorization() {
     const visitor = await server.visitors.login("operator", "fixture-password");
     assert.equal((await request("GET", { "x-visitor-token": visitor.token })).status, 403, "Even operators with configuration grants cannot read setup");
     assert.equal((await request("POST", { "x-visitor-token": visitor.token }, { dismissed: true })).status, 403);
+    assert.equal((await request("POST", { "x-visitor-token": visitor.token }, { presented: true })).status, 403);
     const admin = { authorization: "Bearer fixture-admin-token" };
     assert.equal((await request("GET", admin)).status, 200); assert.equal((await request("DELETE", admin)).status, 405);
     assert.equal((await request("POST", admin, { config: { webui: { enabled: false } } })).status, 400);
+    const entered = await Promise.all([request("POST", admin, { presented: true }), request("POST", admin, { presented: true })]);
+    assert.ok(entered.every(response => response.status === 200));
+    const claims = await Promise.all(entered.map(response => response.json())) as any[];
+    assert.equal(claims.filter(result => result.firstPresentation === true).length, 1, "Concurrent browser claims have exactly one automatic presentation winner");
+    assert.equal(claims.filter(result => result.firstPresentation === false).length, 1);
+    const progress = claims[0];
+    assert.equal(progress.reload, false); assert.equal(progress.setup.presented, true); assert.equal(progress.setup.shouldPrompt, false);
     const saved = await request("POST", admin, { dismissed: true }); assert.equal(saved.status, 200);
     assert.equal((await saved.json() as any).reload, false); assert.equal(f.calls(), 0);
+  } finally { await server.stop(); await f.cleanup(); }
+}
+
+function configRevisions() {
+  function reorder(value: unknown): unknown {
+    if (Array.isArray(value)) return value.map(reorder);
+    if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).reverse().map(([key, item]) => [key, reorder(item)]));
+    return value;
+  }
+  const config = Config({}), revision = configurationRevision(config);
+  assert.match(revision, /^[a-f0-9]{64}$/);
+  assert.equal(configurationRevision(reorder(config) as Config), revision, "Recursive object insertion order does not affect revisions");
+  const withUndefined = { ...config, ignored: undefined, bot: { ...config.bot, ignored: undefined } };
+  assert.equal(configurationRevision(withUndefined), revision, "Undefined object properties follow JSON semantics");
+  const secretChange = structuredClone(config); secretChange.bot.apiKey = "revision-fixture-private-key";
+  assert.notEqual(configurationRevision(secretChange), revision, "A secret-only rotation changes the revision");
+  const outsideTour = structuredClone(config); outsideTour.apps.computer.docker.image = "different-image:latest";
+  assert.notEqual(configurationRevision(outsideTour), revision, "Configuration outside tour steps is included");
+  const ordered = structuredClone(config); ordered.bot.repeatExclude = ["first", "second"];
+  const reversed = structuredClone(ordered); reversed.bot.repeatExclude.reverse();
+  assert.notEqual(configurationRevision(ordered), configurationRevision(reversed), "Array order is significant");
+}
+
+async function httpConfigRevisions() {
+  const f = await fixture();
+  f.host.config.webui.host = "127.0.0.1"; f.host.config.webui.port = 0;
+  let scheduled: Config | undefined;
+  f.host.applyConfig = async next => { scheduled = next; return { message: "fixture queued reload", port: next.webui.port }; };
+  const server: any = new WebUIServer(f.host as any);
+  try {
+    await server.start(); f.host.config.webui.port = server.server.address().port;
+    const root = "http://127.0.0.1:" + f.host.config.webui.port, admin = { authorization: "Bearer fixture-admin-token" };
+    const request = (method: string, headers = {}, body?: unknown) => fetch(root + "/api/config", { method, headers: { "content-type": "application/json", ...headers }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
+    assert.equal((await request("GET")).status, 401);
+    const activeResponse = await request("GET", admin); assert.equal(activeResponse.status, 200);
+    const active = await activeResponse.json() as any;
+    assert.equal(active.revision, configurationRevision(f.host.config)); assert.equal(active.value.bot.apiKey, SECRET_MASK);
+    await server.visitors.create("operator", "fixture-password", "operator");
+    const visitor = await server.visitors.login("operator", "fixture-password");
+    const visitorHeaders = { "x-visitor-token": visitor.token };
+    const visitorResponse = await request("GET", visitorHeaders); assert.equal(visitorResponse.status, 200);
+    assert.equal(Object.hasOwn(await visitorResponse.json(), "revision"), false, "Visitors with config grants never receive secret-derived revisions");
+    assert.equal((await request("POST", visitorHeaders, { config: active.value })).status, 403);
+    const roundtripResponse = await request("POST", admin, { config: active.value }); assert.equal(roundtripResponse.status, 200);
+    assert.equal((await roundtripResponse.json() as any).revision, active.revision, "Unchanged masks are restored before hashing");
+    const rotated = structuredClone(active.value); rotated.bot.apiKey = "revision-fixture-rotated-key";
+    const savedResponse = await request("POST", admin, { config: rotated }); assert.equal(savedResponse.status, 200);
+    const saved = await savedResponse.json() as any;
+    assert.ok(scheduled); assert.equal(saved.revision, configurationRevision(scheduled)); assert.notEqual(saved.revision, active.revision);
+    assert.ok(!JSON.stringify(saved).includes(rotated.bot.apiKey), "The response exposes only the revision, never the secret");
+    assert.equal((await (await request("GET", admin)).json() as any).revision, active.revision, "An accepted but unapplied reload still reports the active old config");
+    f.host.config = scheduled;
+    assert.equal((await (await request("GET", admin)).json() as any).revision, saved.revision, "Confirmation succeeds only once the active host matches the saved revision");
+    const outsideTour = structuredClone(rotated); outsideTour.apps.computer.docker.image = "outside-tour-change:latest";
+    const extraResponse = await request("POST", admin, { config: outsideTour }); assert.equal(extraResponse.status, 200);
+    assert.notEqual((await extraResponse.json() as any).revision, saved.revision, "The HTTP contract includes fields outside tour controls");
   } finally { await server.stop(); await f.cleanup(); }
 }
 
@@ -204,7 +328,7 @@ async function loaderPreflight() {
 }
 
 async function main() {
-  await progressAndValidation(); await mergingAndReload(); await failuresAndExplicitKeys(); await manuallyRecoveredReload(); await httpAuthorization(); await loaderPreflight();
-  console.log("PASS WebUI setup: admin authorization, first-run persistence, safe patches, source credentials, restart confirmation, atomic rollback and loader preflight");
+  configRevisions(); await firstPresentation(); await existingWorldHistory(); await progressAndValidation(); await mergingAndReload(); await failuresAndExplicitKeys(); await manuallyRecoveredReload(); await httpAuthorization(); await httpConfigRevisions(); await loaderPreflight();
+  console.log("PASS WebUI setup: admin authorization, atomic first-run claims, canonical config revisions, safe patches, source credentials, restart confirmation, atomic rollback and loader preflight");
 }
 void main().catch(error => { console.error(error); process.exitCode = 1; });

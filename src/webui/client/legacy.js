@@ -18,6 +18,7 @@ var activeView = 'overview';
 var lastEventId = Number(localStorage.getItem('wui_last_id') || 0);
 var evtSource = null;
 var cfgCache = null, schemaCache = null, cfgGroup = '', cfgSearch = '', cfgDirty = false, cfgPortOriginal = null;
+var cfgSavePromise = null, cfgReconnectTimer = null, cfgSavedRevision = null;
 var overridesCache = null, promptsDefaults = null;
 var galleryCache = [], currentCategory = '未整理';
 var stateCache = null;
@@ -432,6 +433,16 @@ function gotoCfg(gkey){
   cfgGroup = gkey;
   switchView('config');
 }
+function focusConfigGroup(gkey){
+  if(activeView !== 'config' || !cfgCache || !schemaCache || !$('#cfg-body')) return gotoCfg(gkey);
+  cfgGroup = gkey;
+  cfgSearch = '';
+  var q = $('#cfg-q');
+  if(q) q.value = '';
+  renderCfgBody();
+  var nav = $('#cfg-nav');
+  if(nav) renderCfgNav(nav, schemaCache.children || []);
+}
 var PRIMARY = {
   bot: ['mode', 'apiType', 'baseURL', 'apiKey', 'model', 'stream', 'thinkEnabled', 'unrestrictedPhone', 'strictToolLoop', 'growth'],
   world: ['apiType', 'baseURL', 'apiKey', 'model', 'stream', 'responseFormat'],
@@ -606,10 +617,10 @@ function loadConfig(){
   if(activeView !== 'config') return;
   var main = $('#main');
   main.textContent = '';
-  main.appendChild(viewHead('配置', isVisitor() ? '只读模式：可浏览配置，无法修改。' : '按重要程度分层：常用项直接展开，高级项收起。保存后写入配置文件并重启插件作用域（世界自动恢复运行）。'));
+  main.appendChild(viewHead('配置', isVisitor() ? '只读模式：可浏览配置，无法修改。' : '按重要程度分层：常用项直接展开，高级项收起。保存后写入配置文件并重启插件作用域；世界是否恢复运行取决于自动启动设置。'));
   if(!isVisitor()){
     var heading=main.querySelector('.view-title');heading.classList.add('setup-config-entry');
-    heading.appendChild(el('button', {text:'打开新手引导', onclick:function(){switchView('setup');}}));
+    heading.appendChild(el('button', {text:'重新查看新手引导', onclick:function(){if(window.SetupTour) window.SetupTour.open();}}));
   }
   var holder = el('div', {text:'加载中…', cls:'empty'});
   main.appendChild(holder);
@@ -617,6 +628,7 @@ function loadConfig(){
     if(activeView !== 'config' || !holder.isConnected) return;
     schemaCache = r.schema;
     cfgCache = r.value;
+    cfgSavedRevision = r.revision || null;
     cfgPortOriginal = r.value && r.value.webui ? Number(r.value.webui.port) : null;
     cfgDirty = false;
     if(!cfgGroup) cfgGroup = cfgGroupKey((schemaCache.children || [])[0] || {});
@@ -652,9 +664,10 @@ function renderCfgNav(navBox, groups){
   navBox.textContent = '';
   groups.forEach(function(g){
     var gkey = cfgGroupKey(g);
-    var a = el('a', {cls: gkey === cfgGroup ? 'active' : ''});
+    var a = el('a', {cls: gkey === cfgGroup ? 'active' : '', 'data-config-nav':gkey, tabindex:'0', role:'button'});
     a.appendChild(el('span', {cls:'n', text: g.description || gkey}));
-    a.onclick = function(){ cfgGroup = gkey; cfgSearch = ''; var q = $('#cfg-q'); if(q) q.value = ''; renderCfgBody(); renderCfgNav(navBox, groups); };
+    a.onclick = function(){ focusConfigGroup(gkey); };
+    a.onkeydown = function(event){ if(event.key === 'Enter' || event.key === ' '){ event.preventDefault(); a.onclick(); } };
     navBox.appendChild(a);
   });
 }
@@ -794,11 +807,11 @@ function updateSaveBar(bar){
   }
   bar.appendChild(el('span', {cls:'cfg-save-status', role:'status'}, [
     el('span', {id:'cfg-dirty-dot', cls:'dirty-dot', style: cfgDirty ? '' : 'visibility:hidden'}),
-    el('span', {text: cfgDirty ? '有未保存的修改' : '已保存的状态'})
+    el('span', {text: cfgSavePromise ? '正在保存…' : cfgDirty ? '有未保存的修改' : '已保存的状态'})
   ]));
   var actions = el('div', {cls:'cfg-save-actions'});
-  if(cfgDirty) actions.appendChild(el('button', {text:'放弃修改', onclick:function(){ cfgDirty = false; loadConfig(); }}));
-  actions.appendChild(el('button', {cls:'primary', text:'保存并应用', onclick: saveConfig}));
+  if(cfgDirty) actions.appendChild(el('button', {text:'放弃修改', disabled:!!cfgSavePromise, onclick:function(){ if(cfgSavePromise) return; cfgDirty = false; loadConfig(); }}));
+  actions.appendChild(el('button', {cls:'primary', text:cfgSavePromise ? '正在保存…' : '保存并应用', 'data-tour':'config-save', disabled:!!cfgSavePromise, onclick: saveConfig}));
   bar.appendChild(actions);
 }
 function markCfgDirty(){
@@ -976,9 +989,9 @@ function renderInput(node, path, value){
     if(!isMasked){
       wrap.appendChild(el('button', {text:'显示', onclick:function(){ inp.type = inp.type === 'password' ? 'text' : 'password'; }}));
     } else {
-      wrap.appendChild(el('button', {text:'清除密钥', 'aria-label':'清除 '+path.join('.')+' 的密钥', onclick:function(){setPath(cfgCache,path,'');inp.value='';inp.placeholder='未设置密钥';this.remove();}}));
+      wrap.appendChild(el('button', {text:'清除密钥', 'aria-label':'清除 '+path.join('.')+' 的密钥', onclick:function(){isMasked=false;setPath(cfgCache,path,'');inp.value='';inp.placeholder='未设置密钥';this.remove();}}));
     }
-    inp.oninput = function(){ setPath(cfgCache, path, inp.value); };
+    inp.oninput = function(){ setPath(cfgCache, path, isMasked && inp.value === '' ? '******' : inp.value); };
     return wrap;
   }
   inp.oninput = function(){ setPath(cfgCache, path, inp.value); };
@@ -1044,12 +1057,25 @@ function fetchModelsFor(path, btn){
     });
 }
 function saveConfig(){
-  var newPort = cfgCache.webui ? Number(cfgCache.webui.port) : null;
-  api('POST', '/api/config', {config: cfgCache}).then(function(r){
+  if(cfgSavePromise) return cfgSavePromise;
+  if(!cfgCache || isVisitor()) return Promise.resolve(null);
+  var draft = cfgCache, snapshotText = JSON.stringify(draft), snapshot = JSON.parse(snapshotText);
+  var newPort = snapshot.webui ? Number(snapshot.webui.port) : null;
+  var newToken = snapshot.webui && snapshot.webui.token, ownerToken = TOKEN;
+  // Do not reopen authentication or replay this mutation automatically: a failure keeps the draft intact.
+  cfgSavePromise = Promise.resolve().then(function(){ return api('POST', '/api/config', {config: snapshot}, true); }).then(function(r){
     if(r.error) throw new Error(r.error);
-    cfgDirty = false;
-    updateSaveBar();
-    toast('配置已保存并应用，插件作用域正在重启…', 'ok');
+    cfgSavedRevision = r.revision || null;
+    if(cfgCache === draft) cfgDirty = JSON.stringify(cfgCache) !== snapshotText;
+    if(!isVisitor() && TOKEN === ownerToken){
+      if(typeof newToken === 'string' && newToken !== '******'){
+        TOKEN = newToken;
+        localStorage.setItem('wui_token', TOKEN);
+      }
+      if(evtSource){ evtSource.close(); evtSource = null; }
+    }
+    window.dispatchEvent(new CustomEvent('studio:config-save', {detail:{phase:'saved'}}));
+    toast('配置保存已确认，正在等待插件重启生效…', 'ok');
     // 端口变更判定：与「保存前的配置端口」比较，而不是与浏览器地址栏比较——
     // 经反向代理/域名访问时 location.port 与内部端口无关，误判会把用户跳去打不开的地址
     var portChanged = newPort && cfgPortOriginal && newPort !== cfgPortOriginal;
@@ -1060,12 +1086,33 @@ function saveConfig(){
     } else if(portChanged){
       // 经代理/域名访问：不动地址，提醒用户自己更新反代目标
       toast('WebUI 端口已变更为 ' + newPort + '。你正通过代理/域名访问，请同步更新反向代理的目标端口。', 'warn');
-      setTimeout(function(){ refreshOverview(false); }, 1500);
-    } else {
-      setTimeout(function(){ refreshOverview(false); }, 1500);
     }
+    if(cfgReconnectTimer) clearTimeout(cfgReconnectTimer);
+    var reconnectToken = TOKEN, reconnectAttempts = 0;
+    function reconnect(){
+      cfgReconnectTimer = null;
+      if(isVisitor() || TOKEN !== reconnectToken) return;
+      // Wait for the restarted scope to accept the saved credentials without opening a login modal.
+      api('GET', '/api/overview', undefined, true).then(function(){
+        if(isVisitor() || TOKEN !== reconnectToken) return;
+        if(typeof connectSSE === 'function') connectSSE();
+        if(typeof refreshOverview === 'function') refreshOverview(false).catch(function(){});
+      }).catch(function(){
+        if(++reconnectAttempts < 20) cfgReconnectTimer = setTimeout(reconnect, 1500);
+        else toast('配置已保存，暂未确认服务恢复连接。请检查插件重启状态。', 'warn');
+      });
+    }
+    cfgReconnectTimer = setTimeout(reconnect, 1500);
     if(newPort) cfgPortOriginal = newPort;
-  }).catch(function(err){ toast('保存失败：' + (err.message || err), 'err'); });
+    return r;
+  }).catch(function(err){
+    window.dispatchEvent(new CustomEvent('studio:config-save', {detail:{phase:'error', error:'配置保存未确认，请检查配置页提示后重试。'}}));
+    toast('保存失败：' + (err.message || err), 'err');
+    return null;
+  }).finally(function(){ cfgSavePromise = null; updateSaveBar(); });
+  updateSaveBar();
+  window.dispatchEvent(new CustomEvent('studio:config-save', {detail:{phase:'saving'}}));
+  return cfgSavePromise;
 }
 
 // ---------- 提示词 ----------
@@ -1173,15 +1220,23 @@ function collectOverrides(section, defaults, prefix, out){
 // ---------- 设定与记录编辑组件（由 Studio 组合） ----------
 function statePane(id, title, content, url){
   var sec = el('div', {cls:'section', 'data-pane': id});
-  var ta = el('textarea', {rows: 16});
+  var ta = el('textarea', {rows: 16, 'aria-label':title, 'data-tour-definition':id});
   ta.value = content;
   var projection = id === 'bot' || id === 'world';
   if(isVisitor() || projection) ta.readOnly = true;
   sec.appendChild(el('h3', {html: esc(title) + ' <span class="hint">' + (projection ? '只读状态视图' : isVisitor() ? '只读' : '整体覆盖，保存后实时生效') + '</span>'}));
   var body = el('div', {cls:'body'}, [ta]);
   if(!isVisitor() && !projection){
-    body.appendChild(el('div', {cls:'toolbar'}, [el('button', {cls:'primary', text:'保存', onclick:function(){
-      api('PUT', url, {content: ta.value}).then(function(){ toast(title + ' 已保存', 'ok'); }).catch(showErr);
+    body.appendChild(el('div', {cls:'toolbar'}, [el('button', {cls:'primary', text:'保存', 'data-tour-definition-save':id, onclick:function(){
+      var savedContent = ta.value;
+      api('PUT', url, {content: savedContent}).then(function(){
+        if(stateCache && (id === 'botdef' || id === 'worlddef')) stateCache[id === 'botdef' ? 'botDef' : 'worldDef'] = savedContent;
+        window.dispatchEvent(new CustomEvent('studio:definition-save', {detail:{id:id, phase:'saved'}}));
+        toast(title + ' 已保存', 'ok');
+      }).catch(function(error){
+        window.dispatchEvent(new CustomEvent('studio:definition-save', {detail:{id:id, phase:'error'}}));
+        showErr(error);
+      });
     }})]));
   }
   sec.appendChild(body);

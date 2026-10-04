@@ -42,6 +42,7 @@ import type { DeviceSession, DeviceControlResult, DeviceOperationMode } from "./
 import type { BotIdentity } from "./avatar.js";
 import { CommandRequestError, WebCommandRunner } from "./commands.js";
 import { SetupRequestError, WebUISetup } from "./setup.js";
+import { configurationRevision } from "./config-revision.js";
 
 export interface BotStatusSummary {
   running: boolean;
@@ -1176,10 +1177,12 @@ export class WebUIServer {
     if (pathname === "/api/config" && method === "GET") {
       const schemaNode = introspect(host.configSchema);
       const secretPaths = collectSecretPaths(schemaNode);
+      const activeConfig = withoutRetiredSettings(host.config);
       sendJSON(res, 200, {
         schema: schemaNode,
         // 深度复制后把 secret 字段脱敏，避免 API key / 令牌 / 密码明文回传到浏览器
-        value: maskSecrets(withoutRetiredSettings(host.config), secretPaths),
+        value: maskSecrets(activeConfig, secretPaths),
+        ...(access.kind === "admin" ? { revision: configurationRevision(activeConfig) } : {}),
       });
       return;
     }
@@ -1194,8 +1197,9 @@ export class WebUIServer {
       const restored = withoutRetiredSettings(restoreSecrets(next as Config, host.config, secretPaths) as Config);
       const errors = validateConfig(host.configSchema, restored);
       if (errors.length) return void sendJSON(res, 400, { error: "配置校验失败", errors });
+      const revision = configurationRevision(restored);
       const result = await host.applyConfig(restored as Config);
-      sendJSON(res, 200, result);
+      sendJSON(res, 200, { ...result, revision });
       return;
     }
 

@@ -15,8 +15,8 @@ const require = createRequire(import.meta.url);
 const { build } = require(require.resolve('esbuild', { paths: [dirname(require.resolve('pkgroll/package.json'))] }));
 const temporary = await mkdtemp(join(tmpdir(), 'world-studio-preview-'));
 const configModule = join(temporary, 'config.cjs');
-await build({ stdin: { contents: 'export { Config } from "./src/config.ts"; export { introspect, collectSecretPaths } from "./src/webui/schema.ts"; export { WebCommandRunner } from "./src/webui/commands.ts"; export { WebUISetup } from "./src/webui/setup.ts"; export { WorldFiles } from "./src/files.ts"; export { deviceAppCatalog } from "./src/webui/app-catalog.ts"; export { collectOpportunities } from "./src/bot/opportunities.ts"; export { resolveHumanChoice } from "./src/bot/choice.ts"; export { semanticRecord } from "./src/bot/growth.ts";', resolveDir: root, loader: 'ts' }, outfile: configModule, bundle: true, platform: 'node', format: 'cjs', packages: 'external', alias: { koishi: require.resolve('koishi') }, logLevel: 'warning' });
-const { Config, introspect, collectSecretPaths, WebCommandRunner, WebUISetup, WorldFiles, deviceAppCatalog, collectOpportunities, resolveHumanChoice, semanticRecord } = require(configModule);
+await build({ stdin: { contents: 'export { Config } from "./src/config.ts"; export { introspect, collectSecretPaths } from "./src/webui/schema.ts"; export { WebCommandRunner } from "./src/webui/commands.ts"; export { WebUISetup } from "./src/webui/setup.ts"; export { configurationRevision } from "./src/webui/config-revision.ts"; export { WorldFiles } from "./src/files.ts"; export { deviceAppCatalog } from "./src/webui/app-catalog.ts"; export { collectOpportunities } from "./src/bot/opportunities.ts"; export { resolveHumanChoice } from "./src/bot/choice.ts"; export { semanticRecord } from "./src/bot/growth.ts";', resolveDir: root, loader: 'ts' }, outfile: configModule, bundle: true, platform: 'node', format: 'cjs', packages: 'external', alias: { koishi: require.resolve('koishi') }, logLevel: 'warning' });
+const { Config, introspect, collectSecretPaths, WebCommandRunner, WebUISetup, configurationRevision, WorldFiles, deviceAppCatalog, collectOpportunities, resolveHumanChoice, semanticRecord } = require(configModule);
 let config = Config({ autoStart: false });
 let phoneShell = '', shellDesign = 0;
 config.apps.chatAppName = '消息';
@@ -27,8 +27,8 @@ const sampleWorldDef = '一间光线柔和的工作室，窗外是一座小花�
 const setupFiles = new WorldFiles(join(temporary, 'setup-world'));
 await setupFiles.ensure();
 await setupFiles.writeBotDef(sampleBotDef); await setupFiles.writeWorldDef(sampleWorldDef);
-const setupControls = { failSave: false, failModels: false, rejectGenesis: false, rejectStart: false, saveDelayMs: 0, applyDelayMs: 350, reconnectFailures: 0 };
-const setupCounts = { saves: 0, applies: 0, genesis: 0, starts: 0, reconnects: 0, modelLists: 0 };
+const setupControls = { failSave: false, failModels: false, rejectGenesis: false, rejectStart: false, saveDelayMs: 0, applyDelayMs: 350, configApplyDelayMs: 0, reconnectFailures: 0 };
+const setupCounts = { saves: 0, applies: 0, genesis: 0, starts: 0, reconnects: 0, modelLists: 0, configSaves: 0, definitionSaves: 0 };
 let setupApplyTimer, setupAuthorization = false;
 const secretPaths = collectSecretPaths(introspect(Config)).map(path=>path.split('.'));
 function fixtureSecrets(value, current, restore = false, path = []) {
@@ -119,7 +119,7 @@ async function resetSetupFixture(fresh=false) {
  clearTimeout(setupApplyTimer);setupAuthorization=false;
  config=structuredClone(defaultConfig);config.webui.port=server.address()?.port||18111;
  initialized=!fresh;running=!fresh;
- Object.assign(setupControls,{failSave:false,failModels:false,rejectGenesis:false,rejectStart:false,saveDelayMs:0,applyDelayMs:350,reconnectFailures:0});
+ Object.assign(setupControls,{failSave:false,failModels:false,rejectGenesis:false,rejectStart:false,saveDelayMs:0,applyDelayMs:350,configApplyDelayMs:0,reconnectFailures:0});
  for(const key of Object.keys(setupCounts))setupCounts[key]=0;
  await rm(setupWebuiDir,{recursive:true,force:true});
  await rm(setupFiles.base,{recursive:true,force:true});await setupFiles.ensure();
@@ -265,6 +265,7 @@ const server=http.createServer(async(req,res)=>{
   if(path.startsWith('/api/calls/')){const detail=liveFixture.detail(path.slice('/api/calls/'.length),Number(url.searchParams.get('after') || 0),url.searchParams.get('request')!=='0');return detail?json(detail):json({error:'调用已不可用'},404);}
   if(path==='/api/preview/calls/step' && req.method==='POST')return json(liveFixture.step(body));
   if(path==='/api/usage')return json({summary,entries:usageEntries,snapshot:70});
+  if(['/api/definitions/bot','/api/definitions/world'].includes(path)&&req.method==='PUT'){setupCounts.definitionSaves++;if(path.endsWith('/bot'))await setupFiles.writeBotDef(String(body.content||''));else await setupFiles.writeWorldDef(String(body.content||''));return json({ok:true});}
   if(path==='/api/state')return json({initialized,botDef:await readFile(setupFiles.botDef,'utf8'),worldDef:await readFile(setupFiles.worldDef,'utf8'),botStatus:'开发预览：只读的角色状态投影。',worldStatus:'开发预览：小澈在窗边的工作室。',meta:{botName:'小澈',realWorld:false},news:[],facts:[],phoneShell});
   if(path==='/api/state/phone-shell' && req.method==='GET')return json({content:phoneShell});
   if(path==='/api/state/phone-shell' && req.method==='PUT'){phoneShell=String(body.content||'');return json({ok:true});}
@@ -336,7 +337,7 @@ const server=http.createServer(async(req,res)=>{
   if(path==='/api/player/tool/cancel'){if(body.token!==player?.token)return json({error:'需要接管会话。'},403);const call=cockpitCalls.get(body.callId);call?.cancel();return json({ok:!!call,text:'取消请求已处理。'});}
   if(path==='/api/player/cancel')return json(receipts.has(body.taskId)?{ok:false,status:'too_late',result:receipts.get(body.taskId)}:{ok:true,status:'cancelled'});
   if(path==='/api/player/leave'){if(player?.takeover)fixture.resident(null);player=null;return json({ok:true});}
-  if(path==='/api/config'){if(req.method==='POST')config=fixtureSecrets(body.config||body,config,true);return json({value:fixtureSecrets(config),schema:introspect(Config),port:server.address().port,version:'preview'});}
+  if(path==='/api/config'){if(req.method==='POST'){setupCounts.configSaves++;if(setupControls.saveDelayMs)await new Promise(resolve=>setTimeout(resolve,setupControls.saveDelayMs));if(setupControls.failSave)return json({error:'开发样本保存失败，请保留填写内容并重试。'},500);const next=fixtureSecrets(body.config||body,config,true),revision=configurationRevision(next);if(setupControls.configApplyDelayMs){clearTimeout(setupApplyTimer);setupApplyTimer=setTimeout(()=>{config=next;setupAuthorization=!!config.webui.token;},setupControls.configApplyDelayMs);}else{config=next;setupAuthorization=!!config.webui.token;}return json({ok:true,revision,port:server.address().port});}return json({value:fixtureSecrets(config),schema:introspect(Config),port:server.address().port,version:'preview',revision:configurationRevision(config)});}
   if(path==='/api/llm/models'){modelListRequests.push(body);setupCounts.modelLists++;if(setupControls.failModels)return json({error:'开发样本不提供模型列表；可以手动填写模型名称。'},503);return json({models:[body.group.replaceAll('.','-')+'-model-a',body.group.replaceAll('.','-')+'-model-b']});}
   if(path==='/api/preview/llm/requests')return json({requests:modelListRequests});
   if(path==='/api/crossing')return json({location:null,visitors:[],worlds:[],serverEnabled:true,server:{enabled:true,port:0},invites:[]});

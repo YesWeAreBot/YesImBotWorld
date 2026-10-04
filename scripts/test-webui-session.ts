@@ -41,6 +41,7 @@ class Element {
     this.children = [];
   }
   appendChild(node: Element) { node.parent = this; this.children.push(node); return node; }
+  remove() { if (this.parent) this.parent.children = this.parent.children.filter(child => child !== this); this.parent = null; }
   querySelector(selector: string): Element | null {
     for (const child of this.children) {
       const matches = selector.startsWith(".") ? String(child.className ?? "").split(/\s+/).includes(selector.slice(1))
@@ -58,6 +59,8 @@ class Element {
 
 function harness() {
   const nodes = new Map<string, Element>(), storage = new Map<string, string>(), events: string[] = [];
+  const details: { type: string; detail?: any }[] = [], timers = new Map<number, { callback: () => void; delay: number }>();
+  let timerId = 0;
   const node = (selector: string) => {
     if (!nodes.has(selector)) nodes.set(selector, Object.assign(new Element("div"), { root: true }));
     return nodes.get(selector)!;
@@ -65,10 +68,11 @@ function harness() {
   const context: any = vm.createContext({
     document: { querySelector: node, createElement: (name: string) => new Element(name), createDocumentFragment: () => new Element("fragment") },
     localStorage: { getItem: (key: string) => storage.get(key) ?? null, setItem: (key: string, value: string) => storage.set(key, value), removeItem: (key: string) => storage.delete(key) },
-    window: { dispatchEvent: (event: { type: string }) => events.push(event.type) },
-    CustomEvent: class { constructor(readonly type: string) {} },
-    // Focus/refresh timers are unrelated to this suite. Promise scheduling remains native.
-    setTimeout() {}, setInterval() {}, clearInterval() {}, AbortController, console,
+    window: { dispatchEvent: (event: { type: string; detail?: unknown }) => { events.push(event.type); details.push(event); } },
+    CustomEvent: class { detail?: unknown; constructor(readonly type: string, options?: { detail: unknown }) { this.detail = options?.detail; } },
+    // Timers run only when explicitly selected by a test. Promise scheduling remains native.
+    setTimeout(callback: () => void, delay: number) { timers.set(++timerId, { callback, delay }); return timerId; },
+    clearTimeout(id: number) { timers.delete(id); }, setInterval() {}, clearInterval() {}, AbortController, FormData, Blob, console,
     fetch() { throw new Error("Unexpected external request"); },
   });
   vm.runInContext(source, context, { filename: "src/webui/client/legacy.js" });
@@ -81,7 +85,10 @@ function harness() {
     return result;
   };
   const click = (label: string) => find(element => element.tagName === "button" && element.textContent === label).onclick();
-  return { context, node, storage, events, find, click };
+  const runTimers = (delay: number) => {
+    for (const [id, timer] of [...timers]) if (timer.delay === delay) { timers.delete(id); timer.callback(); }
+  };
+  return { context, node, storage, events, details, find, click, runTimers };
 }
 
 async function authentication() {
@@ -167,5 +174,102 @@ async function managementLifecycle() {
   console.log("PASS WebUI management: route changes and remounts reject stale responses; current responses remain functional");
 }
 
-async function main() { await authentication(); await managementLifecycle(); }
+async function configurationSave() {
+  const h = harness(), c = h.context;
+  const requests: { url: string; options: any; resolve: (value: unknown) => void; reject: (reason: unknown) => void }[] = [];
+  c.fetch = (url: string, options: any) => new Promise((resolve, reject) => requests.push({ url, options, resolve, reject }));
+  c.activeView = 'config'; c.TOKEN = 'fixture-old'; h.storage.set('wui_token', 'fixture-old');
+  c.cfgCache = { bot: { model: 'saved-model' }, webui: { token: 'fixture-new', port: 5100 } };
+  c.cfgPortOriginal = 5100; c.cfgDirty = true;
+  let closed = 0, reconnected = 0;
+  c.evtSource = { close() { closed++; } };
+  c.connectSSE = () => { reconnected++; assert.equal(c.TOKEN, 'fixture-new'); };
+  c.refreshOverview = async () => ({});
+  const phases = () => h.details.filter(event => event.type === 'studio:config-save').map(event => event.detail.phase);
+  const saving = c.saveConfig();
+  assert.equal(c.saveConfig(), saving, 'double submit reuses the pending save');
+  assert.equal(h.node('#cfg-savebar').children[1]!.children.every(button => button.disabled), true);
+  await tick();
+  assert.equal(requests.length, 1); assert.equal(requests[0]!.options.headers.Authorization, 'Bearer fixture-old');
+  assert.equal(c.TOKEN, 'fixture-old'); assert.equal(h.storage.get('wui_token'), 'fixture-old');
+  assert.deepEqual(phases(), ['saving']);
+  c.cfgCache.bot.model = 'edited-while-saving';
+  assert.equal(JSON.parse(requests[0]!.options.body).config.bot.model, 'saved-model', 'the outgoing snapshot is stable');
+  requests.shift()!.resolve({ ok: true, json: async () => ({ message: 'accepted' }) });
+  assert.equal((await deadline(saving)).message, 'accepted');
+  assert.equal(c.cfgDirty, true, 'edits made while saving remain unsaved');
+  assert.equal(c.TOKEN, 'fixture-new'); assert.equal(h.storage.get('wui_token'), 'fixture-new');
+  assert.equal(closed, 1); assert.equal(c.evtSource, null); assert.equal(reconnected, 0);
+  assert.deepEqual(phases(), ['saving', 'saved']); assert.equal(c.cfgSavePromise, null);
+  assert.equal(h.node('#cfg-savebar').children[1]!.children.every(button => !button.disabled), true);
+  h.runTimers(1500); await tick();
+  assert.equal(requests[0]!.url, '/api/overview');
+  assert.equal(requests[0]!.options.headers.Authorization, 'Bearer fixture-new');
+  requests.shift()!.resolve({ ok: false, status: 401, json: async () => ({ error: 'still restarting' }) });
+  await tick(); assert.equal(c.authPromise, null, 'restart probes do not interrupt the draft with authentication');
+  assert.equal(reconnected, 0);
+  h.runTimers(1500); await tick();
+  requests.shift()!.resolve({ ok: true, json: async () => ({}) });
+  await tick(); assert.equal(reconnected, 1, 'SSE resumes only after the saved credentials are accepted');
+
+  c.cfgCache.webui.token = '******';
+  const unchanged = c.saveConfig(); await tick();
+  requests.shift()!.resolve({ ok: true, json: async () => ({}) }); await deadline(unchanged);
+  assert.equal(c.cfgDirty, false); assert.equal(c.TOKEN, 'fixture-new', 'a mask never becomes the login token');
+  c.cfgCache.webui.token = 'fixture-failed'; c.cfgDirty = true;
+  const draft = c.cfgCache, failed = c.saveConfig(); await tick();
+  requests.shift()!.resolve({ ok: false, status: 401, json: async () => ({ error: 'fixture-failed was not accepted' }) });
+  assert.equal(await deadline(failed), null);
+  assert.equal(c.cfgCache, draft); assert.equal(c.cfgDirty, true); assert.equal(c.cfgSavePromise, null);
+  assert.equal(c.cfgCache.webui.token, 'fixture-failed'); assert.equal(c.TOKEN, 'fixture-new');
+  assert.equal(h.storage.get('wui_token'), 'fixture-new'); assert.equal(c.authPromise, null);
+  assert.equal(requests.length, 0, 'failed mutations are not automatically retried');
+  assert.equal(phases().at(-1), 'error');
+  assert.equal(JSON.stringify(h.details).includes('fixture-'), false, 'save events contain no credentials or full configuration');
+  console.log('PASS WebUI config save: busy guard, stable drafts, token acknowledgment, safe events and delayed authorized SSE reconnect');
+}
+
+async function configurationTourHooks() {
+  const h = harness(), c = h.context;
+  c.activeView = 'config'; c.cfgCache = { bot: { apiKey: '******' } };
+  c.schemaCache = { children: ['bot', 'world'].map(key => ({ children: [{ key, type: 'object' }] })) };
+  c.cfgDirty = true; c.cfgSearch = 'previous-search'; h.node('#cfg-q').value = 'previous-search';
+  let rendered = 0, navigated = '';
+  c.renderCfgBody = () => { rendered++; }; c.switchView = (view: string) => { navigated = view; };
+  const draft = c.cfgCache;
+  c.focusConfigGroup('world');
+  assert.equal(c.cfgCache, draft); assert.equal(c.cfgDirty, true); assert.equal(c.cfgGroup, 'world');
+  assert.equal(c.cfgSearch, ''); assert.equal(h.node('#cfg-q').value, ''); assert.equal(navigated, '');
+  const botNav = h.node('#cfg-nav').children.find(node => node['data-config-nav'] === 'bot')!;
+  assert.equal(botNav.role, 'button'); assert.equal(botNav.tabindex, '0');
+  let prevented = false;
+  botNav.onkeydown({ key: 'Enter', preventDefault() { prevented = true; } });
+  assert.equal(c.cfgGroup, 'bot'); assert.equal(prevented, true); assert.equal(rendered, 2);
+  c.activeView = 'overview'; c.focusConfigGroup('webui'); assert.equal(navigated, 'config');
+
+  const field = c.renderInput({ type: 'string', role: 'secret' }, ['bot', 'apiKey'], '******');
+  const input = field.children[0];
+  assert.equal(input.value, '');
+  input.value = 'replacement'; input.oninput(); assert.equal(c.cfgCache.bot.apiKey, 'replacement');
+  input.value = ''; input.oninput(); assert.equal(c.cfgCache.bot.apiKey, '******', 'clearing a temporary replacement preserves the server secret');
+  field.children[1].onclick(); assert.equal(c.cfgCache.bot.apiKey, '');
+  input.value = 'another-replacement'; input.oninput(); input.value = ''; input.oninput();
+  assert.equal(c.cfgCache.bot.apiKey, '', 'an explicit clear remains cleared');
+
+  const pending: ((value: unknown) => void)[] = [];
+  c.api = () => new Promise(resolve => pending.push(resolve));
+  c.stateCache = { botDef: 'old', worldDef: 'world' };
+  const pane = c.statePane('botdef', '角色定义', 'old', '/api/definitions/bot');
+  const definition = pane.querySelector('textarea'), save = pane.querySelector('button');
+  assert.equal(definition['aria-label'], '角色定义'); assert.equal(definition['data-tour-definition'], 'botdef');
+  assert.equal(save['data-tour-definition-save'], 'botdef');
+  definition.value = 'saved definition'; save.onclick(); definition.value = 'new unsaved edit';
+  assert.equal(c.stateCache.botDef, 'old'); pending.shift()!({}); await tick();
+  assert.equal(c.stateCache.botDef, 'saved definition'); assert.equal(definition.value, 'new unsaved edit');
+  const event = h.details.at(-1)!;
+  assert.equal(event.type, 'studio:definition-save'); assert.equal(event.detail.id, 'botdef'); assert.equal(event.detail.phase, 'saved');
+  console.log('PASS WebUI tour hooks: group navigation preserves drafts, masked secrets require explicit clearing and definitions report acknowledged saves');
+}
+
+async function main() { await authentication(); await managementLifecycle(); await configurationSave(); await configurationTourHooks(); }
 main().catch(error => { console.error(error); process.exitCode = 1; });

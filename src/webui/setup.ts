@@ -17,6 +17,8 @@ export interface SetupHost {
 
 interface SetupState {
   version: 1;
+  presented: boolean;
+  presentedAt: string | null;
   completed: boolean;
   dismissed: boolean;
   updatedAt: string | null;
@@ -27,6 +29,8 @@ interface SetupState {
 
 export interface SetupSnapshot {
   version: 1;
+  presented: boolean;
+  presentedAt: string | null;
   completed: boolean;
   dismissed: boolean;
   updatedAt: string | null;
@@ -68,7 +72,7 @@ const ALLOWED_PATHS = new Set([
 ]);
 const SECRET_PATHS = new Set(["bot.apiKey", "world.apiKey", "webui.token"]);
 const SECRET_MASK = "******";
-const EMPTY_STATE: SetupState = { version: 1, completed: false, dismissed: false, updatedAt: null, appliedAt: null };
+const EMPTY_STATE: SetupState = { version: 1, presented: false, presentedAt: null, completed: false, dismissed: false, updatedAt: null, appliedAt: null };
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -155,7 +159,8 @@ export class WebUISetup {
       const input: unknown = JSON.parse(raw);
       if (!isObject(input) || input.version !== 1) return { ...EMPTY_STATE };
       const state: SetupState = {
-        version: 1, completed: input.completed === true, dismissed: input.dismissed === true,
+        version: 1, presented: input.presented === true, presentedAt: typeof input.presentedAt === "string" ? input.presentedAt : null,
+        completed: input.completed === true, dismissed: input.dismissed === true,
         updatedAt: typeof input.updatedAt === "string" ? input.updatedAt : null,
         appliedAt: typeof input.appliedAt === "string" ? input.appliedAt : null,
       };
@@ -173,11 +178,19 @@ export class WebUISetup {
     await this.host.files.atomicWrite(this.stateFile, JSON.stringify(state, null, 2) + "\n");
   }
 
+  private markPresented(state: SetupState): boolean {
+    if (state.presented) return false;
+    state.presented = true;
+    state.presentedAt = state.updatedAt = new Date().toISOString();
+    return true;
+  }
+
   private snapshot(state: SetupState, config: Config, initialized: boolean, botDef: string, worldDef: string): SetupSnapshot {
     return {
-      version: 1, completed: state.completed, dismissed: state.dismissed, updatedAt: state.updatedAt,
+      version: 1, presented: state.presented, presentedAt: state.presentedAt,
+      completed: state.completed, dismissed: state.dismissed, updatedAt: state.updatedAt,
       applied: !state.expectedConfig || !!state.appliedAt, appliedAt: state.appliedAt,
-      initialized, running: this.host.worldRunning(), shouldPrompt: !initialized && !state.completed && !state.dismissed,
+      initialized, running: this.host.worldRunning(), shouldPrompt: !initialized && !state.presented && !state.completed && !state.dismissed,
       definitions: { botReady: definitionReady(botDef), worldReady: definitionReady(worldDef) },
       models: { botReady: modelReady(config.bot), worldReady: modelReady(config.world),
         sameConnection: CONNECTION_KEYS.every(key => (config.bot[key] ?? (key === "apiType" ? "chat-completions" : "")) === (config.world[key] ?? (key === "apiType" ? "chat-completions" : ""))) },
@@ -193,26 +206,44 @@ export class WebUISetup {
         readOptional(this.stateFile), readOptional(this.host.files.botDef), readOptional(this.host.files.worldDef), this.host.isInitialized(),
       ]);
       const state = this.parseState(raw);
+      // An existing world (or legacy setup progress) has already been used. Keep
+      // that fact outside world state so a later world reset cannot reopen onboarding.
+      let changed = (initialized || state.completed || state.dismissed) && this.markPresented(state);
       // A reload can fail after applyConfig has returned. Confirm the actual new host
       // configuration before the browser offers genesis. Later advanced edits do not
       // make an already confirmed setup incomplete again.
       if (state.expectedConfig && !state.appliedAt && configurationDigest(this.host.config, state.expectedConfig.paths) === state.expectedConfig.digest) {
         state.appliedAt = new Date().toISOString();
-        await this.writeState(state);
+        changed = true;
       }
+      if (changed) await this.writeState(state);
       return this.snapshot(state, this.host.config, initialized, botDef ?? "", worldDef ?? "");
     });
   }
 
-  save(body: unknown): Promise<{ ok: true; message: string; port: number; reload: boolean; setup: SetupSnapshot }> {
+  save(body: unknown): Promise<{ ok: true; message: string; port: number; reload: boolean; firstPresentation?: boolean; setup: SetupSnapshot }> {
     return this.exclusive(() => this.saveExclusive(body));
   }
 
-  private async saveExclusive(body: unknown): Promise<{ ok: true; message: string; port: number; reload: boolean; setup: SetupSnapshot }> {
-    if (this.reloadPending) throw new SetupRequestError("配置正在重载，请等待重连后再保存。", 409);
-    if (!isObject(body) || !Object.keys(body).length || Object.keys(body).some(key => !["config", "botDef", "worldDef", "reuseBotModel", "completed", "dismissed"].includes(key))) {
+  private async saveExclusive(body: unknown): Promise<{ ok: true; message: string; port: number; reload: boolean; firstPresentation?: boolean; setup: SetupSnapshot }> {
+    if (!isObject(body) || !Object.keys(body).length || Object.keys(body).some(key => !["config", "botDef", "worldDef", "reuseBotModel", "completed", "dismissed", "presented"].includes(key))) {
       throw new SetupRequestError("向导请求必须是对象，且不能包含未知字段。");
     }
+    if (Object.hasOwn(body, "presented")) {
+      if (body.presented !== true || Object.keys(body).length !== 1) throw new SetupRequestError("记录首次展示只能提交 presented: true，不会保存配置或定义。");
+      const [raw, botDef, worldDef, initialized] = await Promise.all([
+        readOptional(this.stateFile), readOptional(this.host.files.botDef), readOptional(this.host.files.worldDef), this.host.isInitialized(),
+      ]);
+      const state = this.parseState(raw);
+      // Entering the tour consumes the automatic prompt, even if the browser
+      // closes immediately. This progress-only request is safe during a reload.
+      const changed = this.markPresented(state);
+      const firstPresentation = changed && !initialized && !state.completed && !state.dismissed;
+      if (changed) await this.writeState(state);
+      return { ok: true, message: "已记录新手引导首次展示。", port: this.host.config.webui.port, reload: false, firstPresentation,
+        setup: this.snapshot(state, this.host.config, initialized, botDef ?? "", worldDef ?? "") };
+    }
+    if (this.reloadPending) throw new SetupRequestError("配置正在重载，请等待重连后再保存。", 409);
     for (const field of ["reuseBotModel", "completed", "dismissed"]) {
       if (Object.hasOwn(body, field) && typeof body[field] !== "boolean") throw new SetupRequestError(field + " 必须是布尔值。");
     }
@@ -249,6 +280,7 @@ export class WebUISetup {
       readOptional(this.stateFile), readOptional(this.host.files.botDef), readOptional(this.host.files.worldDef), this.host.isInitialized(),
     ]);
     const state = this.parseState(rawState);
+    if (initialized || state.completed || state.dismissed || body.completed === true || body.dismissed === true) this.markPresented(state);
     const botDef = typeof body.botDef === "string" ? body.botDef : oldBotDef ?? "";
     const worldDef = typeof body.worldDef === "string" ? body.worldDef : oldWorldDef ?? "";
     if (body.completed === true) {

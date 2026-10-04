@@ -16,7 +16,6 @@ var Studio = (function () {
         ['gallery', '相册', 'image', ['gallery']],
         ['data', '记事与存档', 'folder', ['notes', 'archive']],
         { group: '世界管理' },
-        ['setup', '新手引导', 'world', ['__admin__']],
         ['state', '世界设定', 'file', ['definitions', 'world_status', 'bot_status', 'news', 'facts']],
         ['crossing', '世界连接', 'portal', ['crossing']],
         ['prompts', '提示词', 'edit', ['prompts']],
@@ -50,12 +49,18 @@ var Studio = (function () {
     function firstRoute() { return (routes.find(function (r) { return !r.group && visitorCanSee(r[3]); }) || ['overview'])[0]; }
     function register(name, render) { views.set(name, render); }
     function navigate(name) {
+        if (name === 'setup') {
+            if (location.hash === '#setup') history.replaceState(null, '', '#' + activeView);
+            if (window.SetupTour) window.SetupTour.open();
+            return;
+        }
         if (name === 'debug') name = 'live';
         if (name === 'commands') name = 'overview';
         if (!can(name))
             name = firstRoute();
         if (cfgDirty && activeView === 'config' && name !== 'config' && !confirm('配置有未保存的修改，仍要离开吗？'))
             return;
+        dispatch('studio:navigate', { view: name });
         var version = ++epoch;
         if (clean) {
             try {
@@ -278,11 +283,11 @@ var Studio = (function () {
                 toast(r.run && r.run.result || (stopping ? '取消／暂停请求已接收，可在更多操作的执行记录中查看结果。' : '启动请求已接收。'), 'ok'); refresh();
             }).catch(showErr).finally(function () { worldActionPending = false; updateWorldButton(); });
         }, true) : null;
-        if (worldButton) actions.appendChild(worldButton);
+        if (worldButton) { worldButton.setAttribute('data-tour', 'world-toggle'); actions.appendChild(worldButton); }
         if (can('world')) actions.appendChild(button('探索世界', 'arrow', function () { navigate('world'); }));
         else if (can('devices')) actions.appendChild(button('打开设备', 'phone', function () { navigate('devices'); }));
         var commandCleanup = !isVisitor() && window.WorldCommands ? window.WorldCommands.mount(actions, { onState: function (state) { commandState = state; updateWorldButton(); } }) : null;
-        if (!isVisitor()) actions.appendChild(button('新手引导', 'sliders', function () { navigate('setup'); }));
+        if (!isVisitor()) actions.appendChild(button('新手引导', 'sliders', function () { if (window.SetupTour) window.SetupTour.open(); }));
         heroCopy.appendChild(actions);
         hero.append(heroCopy, el('div', { cls: 'studio-hero-visual', html: art() }), el('span', { cls: 'studio-hero-footnote', text: 'POSSIBILITIES / UNFOLDING' }));
         heroHost.appendChild(hero); holder.append(headingHost, heroHost);
@@ -400,12 +405,15 @@ var Studio = (function () {
             // Resolve only the preview dimensions; keep the persisted meta record intact.
             var shellMeta = Object.assign({}, s.meta || {}, s.phoneResolution ? { phone: s.phoneResolution } : {});
             var defs = [['botdef', '角色定义', 'definitions', function () { return statePane('botdef', '角色定义', s.botDef, '/api/definitions/bot'); }], ['worlddef', '世界规则', 'definitions', function () { return statePane('worlddef', '世界规则', s.worldDef, '/api/definitions/world'); }], ['news', '世界新闻', 'news', function () { return jsonlPane('世界新闻', '已保存的世界记录', s.news, '/api/state/news', '新增记录…'); }], ['facts', '记忆记录', 'facts', function () { return jsonlPane('记忆记录', '旧资料与补充记忆；基于观测的成长记录请前往「角色与成长」。', s.facts || [], '/api/state/facts', '新增记录…', { sortable: true, pinnable: true }); }], ['shell', '手机与浏览器外壳', 'world_status', function () { return phoneShellPane(s.phoneShell || '', shellMeta); }]].filter(function (d) { return !isVisitor() || visitorCanSee([d[2]]); });
-            defs.forEach(function (d, i) { var b = button(d[1], null, function () { Array.from(tabs.children).forEach(function (t) { t.classList.toggle('active', t === b); }); Array.from(panes.children).forEach(function (p, j) { p.classList.toggle('hidden', j !== i); }); }); b.classList.toggle('active', i === 0); tabs.appendChild(b); var pane = el('div', { cls: i ? 'hidden' : '' }, [d[3]()]); panes.appendChild(pane); });
+            defs.forEach(function (d, i) { var b = button(d[1], null, function () { Array.from(tabs.children).forEach(function (t) { t.classList.toggle('active', t === b); }); Array.from(panes.children).forEach(function (p, j) { p.classList.toggle('hidden', j !== i); }); }); b.setAttribute('data-state-tab', d[0]); b.classList.toggle('active', i === 0); tabs.appendChild(b); var pane = el('div', { cls: i ? 'hidden' : '' }, [d[3]()]); panes.appendChild(pane); });
             content.append(tabs, panes);
             if (!defs.length)
                 content.appendChild(empty('该账号没有编辑设定的权限', '可从导航中查看已授权的世界内容。'));
-            if (!s.initialized && !isVisitor())
-                content.appendChild(el('div', { cls: 'studio-panel' }, [el('h3', { text: '准备好开始了吗？' }), el('p', { cls: 'studio-description', text: '先保存上方两份设定，再让 World 模型写下世界的初始情境。' }), button('创建世界', 'play', function () { worldAction('init', true); }, true)]));
+            if (!s.initialized && !isVisitor()) {
+                var createWorld = button('创建世界', 'play', function () { worldAction('init', true); }, true);
+                createWorld.setAttribute('data-tour', 'world-create');
+                content.appendChild(el('div', { cls: 'studio-panel' }, [el('h3', { text: '准备好开始了吗？' }), el('p', { cls: 'studio-description', text: '先保存上方两份设定，再让 World 模型写下世界的初始情境。' }), createWorld]));
+            }
         }).catch(function (e) { if (alive)
             error(content, e, function () { navigate('state'); }); });
         return function () { alive = false; };
@@ -474,16 +482,18 @@ var Studio = (function () {
             buildNav();
             navigate(firstRoute());
             connectSSE();
+            if (window.SetupTour && !isVisitor()) window.SetupTour.maybeStart();
         } });
         $('#main').appendChild(el('div', { cls: 'studio-skeleton' }));
         buildNav();
         observeMobileNavigation();
         refreshOverview(false).then(async function () {
             var requested = location.hash.slice(1), initial = can(requested) ? requested : firstRoute();
-            if (!isVisitor() && (!requested || requested === 'overview') && window.SetupWizard) {
-                try { if ((await api('GET', '/api/setup')).shouldPrompt && location.hash.slice(1) === requested) initial = 'setup'; } catch (_) { /* The regular studio remains usable if setup status cannot be read. */ }
-            }
             started = true; buildNav(); navigate(initial); connectSSE();
+            if (window.SetupTour) {
+                if (requested === 'setup') window.SetupTour.open();
+                else window.SetupTour.maybeStart();
+            }
         }).catch(function (e) { error($('#main'), e, function () { location.reload(); }); });
         setInterval(function () { if (!document.hidden)
             refreshOverview(false).catch(function () { }); }, 10000);
