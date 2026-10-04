@@ -15,12 +15,32 @@ const require = createRequire(import.meta.url);
 const { build } = require(require.resolve('esbuild', { paths: [dirname(require.resolve('pkgroll/package.json'))] }));
 const temporary = await mkdtemp(join(tmpdir(), 'world-studio-preview-'));
 const configModule = join(temporary, 'config.cjs');
-await build({ stdin: { contents: 'export { Config } from "./src/config.ts"; export { introspect } from "./src/webui/schema.ts"; export { WebCommandRunner } from "./src/webui/commands.ts"; export { deviceAppCatalog } from "./src/webui/app-catalog.ts"; export { collectOpportunities } from "./src/bot/opportunities.ts"; export { resolveHumanChoice } from "./src/bot/choice.ts"; export { semanticRecord } from "./src/bot/growth.ts";', resolveDir: root, loader: 'ts' }, outfile: configModule, bundle: true, platform: 'node', format: 'cjs', packages: 'external', alias: { koishi: require.resolve('koishi') }, logLevel: 'warning' });
-const { Config, introspect, WebCommandRunner, deviceAppCatalog, collectOpportunities, resolveHumanChoice, semanticRecord } = require(configModule);
+await build({ stdin: { contents: 'export { Config } from "./src/config.ts"; export { introspect, collectSecretPaths } from "./src/webui/schema.ts"; export { WebCommandRunner } from "./src/webui/commands.ts"; export { WebUISetup } from "./src/webui/setup.ts"; export { WorldFiles } from "./src/files.ts"; export { deviceAppCatalog } from "./src/webui/app-catalog.ts"; export { collectOpportunities } from "./src/bot/opportunities.ts"; export { resolveHumanChoice } from "./src/bot/choice.ts"; export { semanticRecord } from "./src/bot/growth.ts";', resolveDir: root, loader: 'ts' }, outfile: configModule, bundle: true, platform: 'node', format: 'cjs', packages: 'external', alias: { koishi: require.resolve('koishi') }, logLevel: 'warning' });
+const { Config, introspect, collectSecretPaths, WebCommandRunner, WebUISetup, WorldFiles, deviceAppCatalog, collectOpportunities, resolveHumanChoice, semanticRecord } = require(configModule);
 let config = Config({ autoStart: false });
 let phoneShell = '', shellDesign = 0;
 config.apps.chatAppName = '消息';
 config.world.model = 'preview-world-model';
+const defaultConfig = structuredClone(config);
+const sampleBotDef = '小澈，住在林间小屋，喜欢阅读、植物与安静的午后。她会根据自己的经历，慢慢形成判断。';
+const sampleWorldDef = '一间光线柔和的工作室，窗外是一座小花园。周围的事物遵循稳定的空间与物理规则。';
+const setupFiles = new WorldFiles(join(temporary, 'setup-world'));
+await setupFiles.ensure();
+await setupFiles.writeBotDef(sampleBotDef); await setupFiles.writeWorldDef(sampleWorldDef);
+const setupControls = { failSave: false, failModels: false, rejectGenesis: false, rejectStart: false, saveDelayMs: 0, applyDelayMs: 350, reconnectFailures: 0 };
+const setupCounts = { saves: 0, applies: 0, genesis: 0, starts: 0, reconnects: 0, modelLists: 0 };
+let setupApplyTimer, setupAuthorization = false;
+const secretPaths = collectSecretPaths(introspect(Config)).map(path=>path.split('.'));
+function fixtureSecrets(value, current, restore = false, path = []) {
+ if(!value||typeof value!=='object')return value;
+ const output=Array.isArray(value)?[]:{};
+ for(const [key,item] of Object.entries(value)){
+  const next=[...path,key],secret=secretPaths.some(pattern=>pattern.length===next.length&&pattern.every((part,index)=>part==='*'||part===next[index]));
+  if(secret)output[key]=restore?(item==='******'?current?.[key]:item):(item?'******':item);
+  else output[key]=fixtureSecrets(item,current?.[key],restore,next);
+ }
+ return output;
+}
 const fixture = createDeviceFixture({config:()=>config,running:()=>running,catalog:deviceAppCatalog});
 const modelListRequests = [];
 const debugStreams = new Set();
@@ -71,16 +91,43 @@ const debugEntries = Array.from({ length: 45 }, (_, i) => ({ id: i + 1, ts: now 
 const usageEntries = Array.from({ length: 70 }, (_, i) => ({ id: i+1, ts: now - (70-i)*600000, label: i%3?'Bot':'World', model: i%3?'bot-model':'world-model', promptTokens: 1500+i*17, completionTokens: 180+(i*31)%750, cachedTokens: i%4?900:0, cacheReported: i%4!==0 })).map(r=>({...r,totalTokens:r.promptTokens+r.completionTokens}));
 const total = rows => rows.reduce((t,r)=>({requests:t.requests+1,promptTokens:t.promptTokens+r.promptTokens,completionTokens:t.completionTokens+r.completionTokens,totalTokens:t.totalTokens+r.totalTokens,cachedTokens:t.cachedTokens+r.cachedTokens,cacheReportedPromptTokens:t.cacheReportedPromptTokens+(r.cacheReported?r.promptTokens:0),cacheMissRecords:t.cacheMissRecords+(r.cacheReported?0:1)}),{requests:0,promptTokens:0,completionTokens:0,totalTokens:0,cachedTokens:0,cacheReportedPromptTokens:0,cacheMissRecords:0});
 const summary = { totals: total(usageEntries), byLabel: Object.fromEntries(['Bot','World'].map(k=>[k,total(usageEntries.filter(r=>r.label===k))])), byModel: Object.fromEntries(['bot-model','world-model'].map(k=>[k,total(usageEntries.filter(r=>r.model===k))])), byHour: Array.from({length:24},(_,i)=>{const ts=now-(23-i)*3600000;return {ts,hour:new Date(ts).toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit'}),totals:total(usageEntries.filter(r=>r.ts>=ts&&r.ts<ts+3600000))};}), byDay:[{day:new Date(now).toISOString().slice(0,10),totals:total(usageEntries)}] };
-let running = true, profile = { name: '林岚', persona: '喜欢观察植物与记录日常的旅人。' }, player = null;
-const commandFixture = new WebCommandRunner({
- get config(){return config;},getClock:()=>({}),isInitialized:async()=>true,
+let initialized = true, running = true, profile = { name: '林岚', persona: '喜欢观察植物与记录日常的旅人。' }, player = null;
+const commandHost = {
+ get config(){return config;},getClock:()=>({}),isInitialized:async()=>initialized,
  statusText:async()=>`开发样本世界：${running?'运行中':'已暂停'}\n此指令直接返回网页，没有发送聊天消息。`,
- startWorld:async()=>{running=true;return '开发样本世界已启动。';},stopWorld:async()=>{running=false;return '开发样本世界已暂停。';},
- initWorld:async()=>{await new Promise(resolve=>setTimeout(resolve,650));return '开发样本创世完成。没有访问真实模型或世界。';},
+ startWorld:async()=>{setupCounts.starts++;if(setupControls.rejectStart||!initialized)return '开发样本尚不具备启动条件。';running=true;return '开发样本世界已启动。';},stopWorld:async()=>{running=false;return '开发样本世界已暂停。';},
+ initWorld:async()=>{setupCounts.genesis++;await new Promise(resolve=>setTimeout(resolve,650));if(setupControls.rejectGenesis)return '开发样本创世条件尚未满足。';initialized=true;return '开发样本创世完成。没有访问真实模型或世界。';},
  reloadWorld:async()=>{await new Promise(resolve=>setTimeout(resolve,650));return '开发样本定义已重载。';},
  resetWorld:async()=>{running=false;return '开发样本世界已重置。';},clearMsg:async()=> '开发样本聊天记录已清空。',
  injectEvent:async text=>'开发样本已接收事件：'+text,crossingForce:async name=>'开发样本穿越目标：'+name
-});
+};
+let commandFixture = new WebCommandRunner(commandHost);
+const setupWebuiDir = join(temporary,'setup-webui');
+const setupHost = {
+ get config(){return config;},configSchema:Config,files:setupFiles,webuiDir:setupWebuiDir,
+ isInitialized:async()=>initialized,worldRunning:()=>running,
+ applyConfig:async next=>{
+  if(setupControls.failSave)throw Error('开发样本保存失败，请保留填写内容并重试。');
+  setupCounts.applies++;
+  clearTimeout(setupApplyTimer);
+  setupApplyTimer=setTimeout(()=>{config=next;setupAuthorization=!!config.webui.token;commandFixture=new WebCommandRunner(commandHost);setupFixture=new WebUISetup(setupHost);},setupControls.applyDelayMs);
+  return {ok:true,message:'开发样本配置已保存。',port:server.address().port};
+ }
+};
+let setupFixture = new WebUISetup(setupHost);
+async function resetSetupFixture(fresh=false) {
+ clearTimeout(setupApplyTimer);setupAuthorization=false;
+ config=structuredClone(defaultConfig);config.webui.port=server.address()?.port||18111;
+ initialized=!fresh;running=!fresh;
+ Object.assign(setupControls,{failSave:false,failModels:false,rejectGenesis:false,rejectStart:false,saveDelayMs:0,applyDelayMs:350,reconnectFailures:0});
+ for(const key of Object.keys(setupCounts))setupCounts[key]=0;
+ await rm(setupWebuiDir,{recursive:true,force:true});
+ await rm(setupFiles.base,{recursive:true,force:true});await setupFiles.ensure();
+ if(!fresh){await setupFiles.writeBotDef(sampleBotDef);await setupFiles.writeWorldDef(sampleWorldDef);}
+ if(fresh){config.bot.model='';config.world.model='';}
+ commandFixture=new WebCommandRunner(commandHost);
+ setupFixture=new WebUISetup(setupHost);
+}
 const streams = new Set(), receipts = new Map(), cockpitCalls = new Map();
 const stories = new Map();
 let storySequence = 30, lastStory = null, narrativeMode = process.env.STUDIO_PREVIEW_LEGACY !== '1';
@@ -164,10 +211,36 @@ const server=http.createServer(async(req,res)=>{
   if(path==='/api/player/events'){res.writeHead(200,{'content-type':'text/event-stream','cache-control':'no-cache'});streams.add(res);const initial=playerEnvelope({type:'event',eventId:'initial-'+(player?.token||'preview'),content:JSON.stringify(observation())});res.write('data: '+JSON.stringify({type:'hello',worldName:'林间小屋',unitWorldSeconds:1,timeLine:'09:41 · 初秋的清晨',opportunities:playerMenu(),opportunityRevision:player?.menuRevision||0,worldSequence:player?.menuSequence})+'\n\n');res.write('data: '+JSON.stringify(initial)+'\n\n');const timer=setInterval(()=>res.write(': keepalive\n\n'),15000);req.on('close',()=>{streams.delete(res);clearInterval(timer);});return;}
   let body={};if(!['GET','HEAD'].includes(req.method)){const chunks=[];let size=0;for await(const chunk of req){size+=chunk.length;if(size>1000000)throw Error('body too large');chunks.push(chunk);}const raw=Buffer.concat(chunks).toString('utf8');if(raw)body=JSON.parse(raw);}
   if(path==='/api/health')return json({ok:true,preview:true});
+  if(path==='/api/preview/setup'){
+   if(req.method==='POST'){
+    if(body.reset)await resetSetupFixture(body.reset==='fresh');
+    for(const key of Object.keys(setupControls))if(Object.hasOwn(body,key))setupControls[key]=body[key];
+    if(Object.hasOwn(body,'initialized'))initialized=body.initialized===true;
+    if(Object.hasOwn(body,'running'))running=body.running===true;
+    if(body.storedKeys){config.bot.apiKey='fixture-stored-bot-credential';config.world.apiKey='fixture-stored-world-credential';}
+   }
+   return json({ok:true,initialized,running,counts:{...setupCounts},sameModelKey:!!config.bot.apiKey&&config.bot.apiKey===config.world.apiKey,tokenSet:!!config.webui.token,instanceId:commandFixture.instanceId});
+  }
+  if(['/api/setup','/api/config','/api/commands'].includes(path)){
+   if(path==='/api/setup'&&req.headers['x-visitor-token'])return json({error:'新手向导仅限管理员。'},403);
+   if(setupAuthorization&&req.headers.authorization!=='Bearer '+config.webui.token)return json({error:'需要管理员访问令牌。'},401);
+  }
+  if(path==='/api/setup'){
+   if(req.method==='GET'){
+    if(setupCounts.applies&&setupControls.reconnectFailures>0){setupControls.reconnectFailures--;setupCounts.reconnects++;return json({error:'开发样本正在重连。'},503);}
+    return json(await setupFixture.get());
+   }
+   if(req.method==='POST'){
+    setupCounts.saves++;
+    if(setupControls.saveDelayMs)await new Promise(resolve=>setTimeout(resolve,setupControls.saveDelayMs));
+    if(setupControls.failSave)return json({error:'开发样本保存失败，请保留填写内容并重试。'},500);
+    try{return json(await setupFixture.save(body));}catch(error){return json({error:error.message},error.status||400);}
+   }
+  }
   if(path==='/api/commands'){if(req.method==='GET')return json(commandFixture.catalog());if(req.method==='POST'){try{const run=commandFixture.start(body);return json({instanceId:commandFixture.instanceId,run},run.status==='running'?202:200);}catch(error){return json({error:error.message},error.status||400);}}}
   if(path.startsWith('/api/commands/') && req.method==='GET'){const run=commandFixture.get(path.slice('/api/commands/'.length));return run?json({instanceId:commandFixture.instanceId,run}):json({error:'找不到此执行记录'},404);}
   if(path==='/fixture-avatar.svg'||path==='/api/media/file'){res.writeHead(200,{'content-type':'image/svg+xml'});res.end('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 80 80"><rect width="80" height="80" fill="#b5d0b6"/><path d="M16 80V62c0-27 48-27 48 0v18" fill="#41634e"/><circle cx="40" cy="31" r="19" fill="#edd0aa"/><path d="M21 30C14 2 67 0 60 31L48 17 21 30" fill="#394b3e"/><circle cx="33" cy="31" r="2" fill="#394b3e"/><circle cx="47" cy="31" r="2" fill="#394b3e"/><path d="M36 40h8" stroke="#b68263" stroke-width="2"/></svg>');return;}
-  if(path==='/api/overview'){const s=fixture.session();return json({botIdentity:{platform:'preview',selfId:'fixture',name:'样本平台账号',avatar:'http://127.0.0.1:'+server.address().port+'/fixture-avatar.svg'},version:'0.3.0-preview',initialized:true,worldRunning:running,worldQueue:0,clock:{syncRealTime:false,timeLine:'09:41 · 初秋的清晨',unitRealSeconds:1,unitWorldSeconds:1},bot:{running:running,paused:s.control.paused,waiting:null,streamLength:48,approxChars:16400,pendingTasks:1},appOpen:s.devices.phone.appOpen,computerOn:s.devices.computer.on,phoneDown:false,focusChannels:[],news:[],facts:[],galleryCounts:[],crossing:{location:null,serverEnabled:true,visitors:[],worlds:[]},tokenSet:false,addresses:[]});}
+  if(path==='/api/overview'){const s=fixture.session();return json({botIdentity:{platform:'preview',selfId:'fixture',name:'样本平台账号',avatar:'http://127.0.0.1:'+server.address().port+'/fixture-avatar.svg'},version:'0.3.0-preview',initialized,worldRunning:running,worldQueue:0,clock:{syncRealTime:false,timeLine:'09:41 · 初秋的清晨',unitRealSeconds:1,unitWorldSeconds:1},bot:{running:running,paused:s.control.paused,waiting:null,streamLength:48,approxChars:16400,pendingTasks:1},appOpen:s.devices.phone.appOpen,computerOn:s.devices.computer.on,phoneDown:false,focusChannels:[],news:[],facts:[],galleryCounts:[],crossing:{location:null,serverEnabled:true,visitors:[],worlds:[]},tokenSet:!!config.webui.token,addresses:[]});}
   if(path==='/api/world/state')return json({state:narrativeWorld});
   if(path==='/api/preview/opportunities'){if(!player)return json({error:'No fixture player'},400);if(body.replayScene){playerEvent({type:'event',eventId:'replayed_'+body.replayScene.eventId,content:JSON.stringify({scene:body.replayScene})});return json({ok:true});}const previousScene=player.observation?.scene;const seq=++storySequence,scene={eventId:'opportunities_'+seq,actorId:player.takeover?'bot':'player_fixture',worldSequence:seq,worldTime:seq*2,text:body.text||'窗外的风停了。',situation:body.situation||'',opportunities:body.opportunities||[]};const obs={...observation(),observationId:'suggestions_'+seq,worldSequence:seq,observedAt:seq*2,narrative:scene.text,scene};player.observation=obs;playerEvent({type:'event',eventId:'suggestions_delivery_'+seq,worldSequence:seq,worldTime:seq*2,content:JSON.stringify(obs)});return json({scene,previousScene});}
   if(path==='/api/preview/narrative'){narrativeMode=body.enabled!==false;if(player)delete player.observation;return json({ok:true,mode:narrativeMode?'narrative':'structured'});}
@@ -192,7 +265,7 @@ const server=http.createServer(async(req,res)=>{
   if(path.startsWith('/api/calls/')){const detail=liveFixture.detail(path.slice('/api/calls/'.length),Number(url.searchParams.get('after') || 0),url.searchParams.get('request')!=='0');return detail?json(detail):json({error:'调用已不可用'},404);}
   if(path==='/api/preview/calls/step' && req.method==='POST')return json(liveFixture.step(body));
   if(path==='/api/usage')return json({summary,entries:usageEntries,snapshot:70});
-  if(path==='/api/state')return json({initialized:true,botDef:'小澈，住在林间小屋，喜欢阅读、植物与安静的午后。她会根据自己的经历，慢慢形成判断。',worldDef:'一间光线柔和的工作室，窗外是一座小花园。周围的事物遵循稳定的空间与物理规则。',botStatus:'开发预览：只读的角色状态投影。',worldStatus:'开发预览：小澈在窗边的工作室。',meta:{botName:'小澈',realWorld:false},news:[],facts:[],phoneShell});
+  if(path==='/api/state')return json({initialized,botDef:await readFile(setupFiles.botDef,'utf8'),worldDef:await readFile(setupFiles.worldDef,'utf8'),botStatus:'开发预览：只读的角色状态投影。',worldStatus:'开发预览：小澈在窗边的工作室。',meta:{botName:'小澈',realWorld:false},news:[],facts:[],phoneShell});
   if(path==='/api/state/phone-shell' && req.method==='GET')return json({content:phoneShell});
   if(path==='/api/state/phone-shell' && req.method==='PUT'){phoneShell=String(body.content||'');return json({ok:true});}
   if(path==='/api/state/phone-shell/generate' && req.method==='POST'){
@@ -263,8 +336,8 @@ const server=http.createServer(async(req,res)=>{
   if(path==='/api/player/tool/cancel'){if(body.token!==player?.token)return json({error:'需要接管会话。'},403);const call=cockpitCalls.get(body.callId);call?.cancel();return json({ok:!!call,text:'取消请求已处理。'});}
   if(path==='/api/player/cancel')return json(receipts.has(body.taskId)?{ok:false,status:'too_late',result:receipts.get(body.taskId)}:{ok:true,status:'cancelled'});
   if(path==='/api/player/leave'){if(player?.takeover)fixture.resident(null);player=null;return json({ok:true});}
-  if(path==='/api/config'){if(req.method==='POST')config=body.config||body;return json({value:config,schema:introspect(Config),port,version:'preview'});}
-  if(path==='/api/llm/models'){modelListRequests.push(body);return json({models:[body.group.replaceAll('.','-')+'-model-a',body.group.replaceAll('.','-')+'-model-b']});}
+  if(path==='/api/config'){if(req.method==='POST')config=fixtureSecrets(body.config||body,config,true);return json({value:fixtureSecrets(config),schema:introspect(Config),port:server.address().port,version:'preview'});}
+  if(path==='/api/llm/models'){modelListRequests.push(body);setupCounts.modelLists++;if(setupControls.failModels)return json({error:'开发样本不提供模型列表；可以手动填写模型名称。'},503);return json({models:[body.group.replaceAll('.','-')+'-model-a',body.group.replaceAll('.','-')+'-model-b']});}
   if(path==='/api/preview/llm/requests')return json({requests:modelListRequests});
   if(path==='/api/crossing')return json({location:null,visitors:[],worlds:[],serverEnabled:true,server:{enabled:true,port:0},invites:[]});
   if(path==='/api/visitors')return json({visitors:[]});
@@ -278,6 +351,6 @@ const server=http.createServer(async(req,res)=>{
   return json({error:'开发预览未实现此接口：'+path},404);
  }catch(e){json({error:e.message},500);}
 });
-server.listen(port,'127.0.0.1',()=>console.log('Isolated World Studio preview: http://127.0.0.1:'+server.address().port+' (sample data only; no external operations)'));
-async function close(){server.close();server.closeAllConnections();await rm(temporary,{recursive:true,force:true});process.exit(0);}
+server.listen(port,'127.0.0.1',async()=>{if(process.env.STUDIO_PREVIEW_SETUP==='1')await resetSetupFixture(true);console.log('Isolated World Studio preview: http://127.0.0.1:'+server.address().port+' (sample data only; no external operations)');});
+async function close(){clearTimeout(setupApplyTimer);server.close();server.closeAllConnections();await rm(temporary,{recursive:true,force:true});process.exit(0);}
 process.on('SIGINT',close);process.on('SIGTERM',close);

@@ -84,7 +84,7 @@ function readPackageVersion(): string {
     const require = createRequire(import.meta.url);
     return require("koishi-plugin-yesimbot-world/package.json").version as string;
   } catch {
-    return "0.4.0";
+    return "0.4.1";
   }
 }
 
@@ -1770,6 +1770,10 @@ export class WorldService extends Service<Config> {
    * 旧实例在作用域重启时随 dispose 一起清理。
    */
   async applyConfig(next: Config): Promise<{ message: string; port: number }> {
+    // Fail before accepting the save (and before stopping WebUI) if this service
+    // has no loader capable of persisting and reloading the plugin configuration.
+    const parent = (this.ctx.scope as { parent?: { scope?: { update?: (c: Config, forced: boolean) => void } } }).parent?.scope;
+    if (typeof parent?.update !== "function") throw new Error("找不到插件作用域，无法热重载（可手动重启插件应用新配置）");
     const merged: Config = withoutRetiredSettings({ ...this.config, ...next });
     if (next.webui) merged.webui = { ...this.config.webui, ...next.webui };
     const port = merged.webui.port;

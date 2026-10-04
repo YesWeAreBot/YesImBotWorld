@@ -24,7 +24,7 @@ interface Node {
 }
 export interface NativeSchemaPreparation {
   options: ChatCompleteOptions;
-  /** Append only to this request, after its original task instructions/schema. */
+  /** Append as a user task supplement; never add a system turn after the task. */
   protocolInstruction?: string;
   /** Call after protocol completion, never on log/debug/stream preview text. */
   restoreContent(content: string): string;

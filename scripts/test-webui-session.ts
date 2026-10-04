@@ -41,6 +41,16 @@ class Element {
     this.children = [];
   }
   appendChild(node: Element) { node.parent = this; this.children.push(node); return node; }
+  querySelector(selector: string): Element | null {
+    for (const child of this.children) {
+      const matches = selector.startsWith(".") ? String(child.className ?? "").split(/\s+/).includes(selector.slice(1))
+        : selector.startsWith("#") ? child.id === selector.slice(1) : child.tagName === selector;
+      if (matches) return child;
+      const nested = child.querySelector(selector);
+      if (nested) return nested;
+    }
+    return null;
+  }
   setAttribute(key: string, value: unknown) { this[key] = value; }
   addEventListener(type: string, handler: unknown) { this["on" + type] = handler; }
   focus() {}

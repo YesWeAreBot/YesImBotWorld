@@ -16,6 +16,7 @@ var Studio = (function () {
         ['gallery', '相册', 'image', ['gallery']],
         ['data', '记事与存档', 'folder', ['notes', 'archive']],
         { group: '世界管理' },
+        ['setup', '新手引导', 'world', ['__admin__']],
         ['state', '世界设定', 'file', ['definitions', 'world_status', 'bot_status', 'news', 'facts']],
         ['crossing', '世界连接', 'portal', ['crossing']],
         ['prompts', '提示词', 'edit', ['prompts']],
@@ -281,6 +282,7 @@ var Studio = (function () {
         if (can('world')) actions.appendChild(button('探索世界', 'arrow', function () { navigate('world'); }));
         else if (can('devices')) actions.appendChild(button('打开设备', 'phone', function () { navigate('devices'); }));
         var commandCleanup = !isVisitor() && window.WorldCommands ? window.WorldCommands.mount(actions, { onState: function (state) { commandState = state; updateWorldButton(); } }) : null;
+        if (!isVisitor()) actions.appendChild(button('新手引导', 'sliders', function () { navigate('setup'); }));
         heroCopy.appendChild(actions);
         hero.append(heroCopy, el('div', { cls: 'studio-hero-visual', html: art() }), el('span', { cls: 'studio-hero-footnote', text: 'POSSIBILITIES / UNFOLDING' }));
         heroHost.appendChild(hero); holder.append(headingHost, heroHost);
@@ -476,7 +478,13 @@ var Studio = (function () {
         $('#main').appendChild(el('div', { cls: 'studio-skeleton' }));
         buildNav();
         observeMobileNavigation();
-        refreshOverview(false).then(function () { started = true; buildNav(); navigate(can(location.hash.slice(1)) ? location.hash.slice(1) : firstRoute()); connectSSE(); }).catch(function (e) { error($('#main'), e, function () { location.reload(); }); });
+        refreshOverview(false).then(async function () {
+            var requested = location.hash.slice(1), initial = can(requested) ? requested : firstRoute();
+            if (!isVisitor() && (!requested || requested === 'overview') && window.SetupWizard) {
+                try { if ((await api('GET', '/api/setup')).shouldPrompt && location.hash.slice(1) === requested) initial = 'setup'; } catch (_) { /* The regular studio remains usable if setup status cannot be read. */ }
+            }
+            started = true; buildNav(); navigate(initial); connectSSE();
+        }).catch(function (e) { error($('#main'), e, function () { location.reload(); }); });
         setInterval(function () { if (!document.hidden)
             refreshOverview(false).catch(function () { }); }, 10000);
         setInterval(function () { if (isVisitor() && !document.hidden)

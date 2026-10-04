@@ -130,6 +130,12 @@ async function main() {
       const schemaBefore = structuredClone(shape), observed: string[] = [];
       const roundTrip = await client("schema", false).complete(messages, { responseSchema: { name: "shape", schema: shape }, responseSchemaInPrompt: false, onDelta: text => observed.push(text) });
       assert.deepEqual(JSON.parse(roundTrip.content), { value: "ok", location: null });
+      const schemaRequest = received.at(-1)!.body;
+      const schemaTurns = apiType === "responses" ? schemaRequest.input : schemaRequest.messages;
+      assert.equal(schemaTurns.at(-1).role, "user", "native schema transport guidance is a task supplement, not a late system message");
+      assert.ok(JSON.stringify(schemaTurns.at(-1).content).includes("传输JSON Schema"));
+      if (apiType === "responses") assert.deepEqual(schemaTurns[0], original[0], "Responses retains the fixed system prefix");
+      else assert.equal(schemaRequest.system.map((part: any) => part.text).join(""), original[0]!.content, "Anthropic's cached system block excludes request-specific schema guidance");
       if (apiType === "responses") assert.equal(JSON.parse(observed.at(-1)!).note, null, "wire placeholders remain visible in stream/raw diagnostics");
       assert.deepEqual(shape, schemaBefore, "schema projection never rewrites the application contract");
       const union = { anyOf: [{ ...shape, required: ["kind", "value"], properties: { kind: { type: "string", enum: ["normal"] }, ...shape.properties } },

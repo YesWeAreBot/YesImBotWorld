@@ -125,13 +125,15 @@ export class ChatClient {
     const format = opts.responseFormat ?? (opts.responseSchema ? "json_schema" : "text");
     if ((opts.responseSchema || format !== "text") && (opts.tools?.length || opts.toolChoice)) throw new Error("JSON 响应协议不能同时使用工具调用协议。");
     if (format === "json_schema" && !opts.responseSchema) throw new Error("json_schema 响应需要提供 responseSchema。");
-    // These contracts belong to stateless result requests. Do not mutate any caller's
-    // persisted messages or the Bot's append-only working window.
+    // Per-request output constraints supplement the task, not the fixed system
+    // prefix. Templates such as Qwen reject system messages after the first turn.
+    // Append a user instruction without rewriting/reordering any caller history;
+    // repair schemas can change without changing the cached system/task prefix.
     const apiType = this.cfg.apiType ?? "chat-completions";
     const prepared = prepareNativeSchema(apiType, opts);
-    const contractMessages: ChatMessage[] = prepared.protocolInstruction ? [...messages, { role: "system", content: prepared.protocolInstruction }]
+    const contractMessages: ChatMessage[] = prepared.protocolInstruction ? [...messages, { role: "user", content: prepared.protocolInstruction }]
       : opts.responseSchema && opts.responseSchemaInPrompt !== false ? [...messages, {
-      role: "system", content: "本次只返回一个符合以下 JSON Schema 的完整 JSON 对象，不输出工具调用、代码围栏或额外解释。字段约束描述返回形式，不改变任务事实。\n" + JSON.stringify(opts.responseSchema.schema),
+      role: "user", content: "本次只返回一个符合以下 JSON Schema 的完整 JSON 对象，不输出工具调用、代码围栏或额外解释。字段约束描述返回形式，不改变任务事实。\n" + JSON.stringify(opts.responseSchema.schema),
     }] : messages;
     const adapter = apiType === "responses" ? responsesAdapter : apiType === "anthropic" ? anthropicAdapter : null;
     const url = llmEndpoint(this.cfg.baseURL, apiType);

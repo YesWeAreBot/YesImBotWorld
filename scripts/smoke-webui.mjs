@@ -26,6 +26,7 @@ import smokeNotifications from './webui-smoke-notifications.mjs';
 import smokeActionMenu from './webui-smoke-action-menu.mjs';
 import smokeBrowserLibrary from './webui-smoke-browser-library.mjs';
 import smokeHeartbeat from './webui-smoke-heartbeat.mjs';
+import smokeSetup from './webui-smoke-setup.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const children = [];
@@ -114,6 +115,10 @@ try {
   const notificationsOnly = process.env.STUDIO_SMOKE_ONLY_NOTIFICATIONS === '1';
   const browserOnly = process.env.STUDIO_SMOKE_ONLY_BROWSER === '1';
   const heartbeatOnly = process.env.STUDIO_SMOKE_ONLY_HEARTBEAT === '1';
+  const setupOnly = process.env.STUDIO_SMOKE_ONLY_SETUP === '1';
+  const layoutOnly = process.env.STUDIO_SMOKE_ONLY_LAYOUT === '1';
+  if (setupOnly) console.log('PASS', await smokeSetup(helpers));
+  if (layoutOnly) console.log('PASS', await smokeLayout(helpers));
   if (heartbeatOnly) console.log('PASS', await smokeHeartbeat(helpers));
   if (browserOnly) console.log('PASS', await smokeBrowserLibrary(helpers));
   if (notificationsOnly) console.log('PASS', await smokeNotifications(helpers));
@@ -121,7 +126,7 @@ try {
   if (shellOnly) console.log('PASS', await smokePhoneShell(helpers));
   if (growthOnly) { console.log('PASS', await smokeGrowthPagination(helpers)); console.log('PASS', await smokeGrowth(helpers)); console.log('PASS', await smokeLlmConfig(helpers)); }
   if (playerOnly) { console.log('PASS', await smokeJourney(helpers)); console.log('PASS', await smokeCockpit(helpers)); console.log('PASS', await smokeNarrative(helpers)); console.log('PASS', await smokeActionMenu(helpers)); }
-  if (!growthOnly && !shellOnly && !phoneAppsOnly && !playerOnly && !notificationsOnly && !browserOnly && !heartbeatOnly) {
+  if (!growthOnly && !shellOnly && !phoneAppsOnly && !playerOnly && !notificationsOnly && !browserOnly && !heartbeatOnly && !setupOnly && !layoutOnly) {
   const routes = ['overview', 'world', 'growth', 'devices', 'player', 'live', 'debug', 'usage', 'state', 'crossing', 'config', 'prompts', 'gallery', 'media', 'data', 'visitors'];
   for (const width of [1440, 768, 375]) {
     await page('Emulation.setDeviceMetricsOverride', { width, height: 1050, deviceScaleFactor: 1, mobile: width < 600 });
@@ -218,6 +223,7 @@ try {
   console.log('PASS', await smokePhoneSetup(helpers));
   console.log('PASS', await smokePhoneApps(helpers));
   console.log('PASS', await smokeNotifications(helpers));
+  console.log('PASS', await smokeSetup(helpers));
   }
   assert.deepEqual(errors, [], 'Browser exceptions or unexpected external requests');
   if (process.env.STUDIO_SCREENSHOT_DIR) {

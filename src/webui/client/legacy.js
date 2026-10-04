@@ -607,6 +607,10 @@ function loadConfig(){
   var main = $('#main');
   main.textContent = '';
   main.appendChild(viewHead('配置', isVisitor() ? '只读模式：可浏览配置，无法修改。' : '按重要程度分层：常用项直接展开，高级项收起。保存后写入配置文件并重启插件作用域（世界自动恢复运行）。'));
+  if(!isVisitor()){
+    var heading=main.querySelector('.view-title');heading.classList.add('setup-config-entry');
+    heading.appendChild(el('button', {text:'打开新手引导', onclick:function(){switchView('setup');}}));
+  }
   var holder = el('div', {text:'加载中…', cls:'empty'});
   main.appendChild(holder);
   api('GET', '/api/config').then(function(r){

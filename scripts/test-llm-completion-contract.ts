@@ -16,6 +16,13 @@ async function main() {
   const server = createServer(async (req, res) => {
     let raw = ""; for await (const chunk of req) raw += chunk;
     const body = JSON.parse(raw); received.push(body);
+    // A strict template rejects a trailing system turn before any generation.
+    // This applies to both JSON replies and streaming requests.
+    if (body.messages.some((message: ChatMessage, index: number) => message.role === "system" && index !== 0)) {
+      res.writeHead(400, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "System message must be at the beginning.", type: "BadRequestError", code: 400 } }));
+      return;
+    }
     if (body.model === "empty-error" && !body.stream || body.model === "empty-error-json") {
       res.setHeader("content-type", "application/json");
       res.end(JSON.stringify({ error: { message: "", type: "InternalServerError", param: null, code: 500 } }));
@@ -55,10 +62,17 @@ async function main() {
   const original = structuredClone(messages);
   const responseSchema = { name: "result", schema: { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"], additionalProperties: false } };
   try {
+    const rejected = await fetch(`http://127.0.0.1:${address.port}/v1/chat/completions`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "normal", messages: [...messages, { role: "system", content: JSON.stringify(responseSchema.schema) }] }),
+    });
+    assert.equal(rejected.status, 400, "the old request reproduces the reported template error without calling a real LLM");
+    assert.match(await rejected.text(), /System message must be at the beginning/);
     assert.equal((await client("normal").complete(messages, { responseSchema })).content, '{"ok":true}');
     assert.deepEqual(received.at(-1).response_format, { type: "json_schema", json_schema: { ...responseSchema, strict: true } });
     assert.equal(received.at(-1).tools, undefined);
     assert.ok(received.at(-1).messages.at(-1).content.includes(JSON.stringify(responseSchema.schema)));
+    assert.equal(received.at(-1).messages.at(-1).role, "user", "output constraints are a task supplement, never a trailing system turn");
     assert.deepEqual(received.at(-1).messages.slice(0, -1), original);
     assert.deepEqual(messages, original, "a result contract must never rewrite the persistent prefix");
     await client("normal").complete(messages, { responseSchema, responseFormat: "json_object" });
@@ -67,6 +81,27 @@ async function main() {
     await client("normal").complete(messages, { responseSchema, responseFormat: "text", responseSchemaInPrompt: false });
     assert.equal(received.at(-1).response_format, undefined);
     assert.deepEqual(received.at(-1).messages, original);
+    for (const stream of [true, false]) for (const responseFormat of ["json_schema", "json_object", "text"] as const) {
+      const history: ChatMessage[] = [
+        ...messages, { role: "assistant", content: '{"ok":"invalid"}' },
+        { role: "user", content: [
+          { type: "text", text: "修正ok的类型。图前" },
+          { type: "image_url", image_url: { url: "data:image/png;base64,AAAA" } },
+          { type: "text", text: "图后、音频前" },
+          { type: "input_audio", input_audio: { data: "AAAA", format: "wav" } },
+          { type: "text", text: "音频后" },
+        ] },
+      ];
+      const before = structuredClone(history);
+      assert.equal((await client("normal", stream).complete(history, { responseFormat, responseSchema })).content, '{"ok":true}');
+      const sent = received.at(-1).messages;
+      assert.equal(sent.filter((message: ChatMessage) => message.role === "system").length, 1);
+      assert.deepEqual(sent.slice(0, -1), before, "repair history, message boundaries and interleaved media stay in their original positions");
+      assert.equal(sent.at(-1).role, "user");
+      assert.deepEqual(history, before, "sending a result contract cannot mutate its caller's messages");
+    }
+    await client("normal", false).complete([{ role: "user", content: "Return JSON without an existing system prefix." }], { responseSchema });
+    assert.deepEqual(received.at(-1).messages.map((message: ChatMessage) => message.role), ["user", "user"], "a task supplement does not introduce a late system message when there was no prefix");
     const before = received.length;
     await assert.rejects(client("normal").complete(messages, { responseSchema, tools: [{ type: "function", function: { name: "test", description: "", parameters: {} } }] }), /不能同时/);
     assert.equal(received.length, before, "ambiguous protocols must fail before sending");

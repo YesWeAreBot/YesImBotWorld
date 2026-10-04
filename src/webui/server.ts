@@ -41,6 +41,7 @@ import type { GrowthPageQuery, GrowthPage } from "../bot/growth.js";
 import type { DeviceSession, DeviceControlResult, DeviceOperationMode } from "./device.js";
 import type { BotIdentity } from "./avatar.js";
 import { CommandRequestError, WebCommandRunner } from "./commands.js";
+import { SetupRequestError, WebUISetup } from "./setup.js";
 
 export interface BotStatusSummary {
   running: boolean;
@@ -222,11 +223,13 @@ export class WebUIServer {
   private readonly cfg: WebUIConfig;
   private readonly visitors: VisitorStore;
   private readonly commands: WebCommandRunner;
+  private readonly setup: WebUISetup;
 
   constructor(private host: WebUIHost) {
     this.cfg = host.config.webui;
     this.visitors = new VisitorStore(path.join(host.webuiDir, "visitors.json"));
     this.commands = new WebCommandRunner(host);
+    this.setup = new WebUISetup(host);
   }
 
   async start(): Promise<void> {
@@ -836,6 +839,20 @@ export class WebUIServer {
   ): Promise<void> {
     const host = this.host;
     const q = url.searchParams;
+
+    if (pathname === "/api/setup") {
+      if (access.kind !== "admin") return void sendJSON(res, 403, { error: "仅管理员可使用新手配置向导。" });
+      if (method === "GET") return void sendJSON(res, 200, await this.setup.get());
+      if (method === "POST") {
+        try {
+          const result = await this.setup.save(await readJson(req, 3 * 1024 * 1024));
+          return void sendJSON(res, 200, result);
+        } catch (error) {
+          return void sendJSON(res, error instanceof SetupRequestError ? error.status : 400, { error: String((error as Error).message ?? error) });
+        }
+      }
+      return void sendJSON(res, 405, { error: "不支持的方法" });
+    }
 
     // The entire catalogue and execution history are administrator-only, including GETs.
     if (pathname === "/api/commands" || pathname.startsWith("/api/commands/")) {
