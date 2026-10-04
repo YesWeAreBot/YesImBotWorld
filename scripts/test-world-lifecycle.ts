@@ -46,7 +46,7 @@ async function initializationStagesCannotSurviveReset() {
     const response = (stage: string) => stage === "meta" ? plain('{"real_world":false}') : stage === "calendar" ? plain('{"kind":"gregorian","epoch":"2012-03-04 05:06"}') : stage === "spec" ? plain('{"width":320,"height":640}') : stage === "shell" ? plain('<html><body>{{screen}}</body></html>') : initial();
     f.setHandler(async (messages, options) => {
       calls++; const system = String(messages[0]?.content);
-      const stage = options.tools?.length ? "world" : system === f.prompts.world.assessRealWorldSystem ? "meta" : system.startsWith(f.prompts.world.generateCalendarSystem) ? "calendar" : system === f.prompts.world.phoneSpecSystem ? "spec" : "shell";
+      const stage = options.responseSchema || options.tools?.length ? "world" : system === f.prompts.world.assessRealWorldSystem ? "meta" : system.startsWith(f.prompts.world.generateCalendarSystem) ? "calendar" : system === f.prompts.world.phoneSpecSystem ? "spec" : "shell";
       assert.ok(options.signal, `${stage} must use the lifetime signal`);
       if (!held && stage === blocked) { held = true; entered.resolve(options.signal!); return late.promise; }
       return response(stage);

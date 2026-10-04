@@ -7,6 +7,7 @@ import { AppManager } from "../src/apps/manager.js";
 import { ComputerDevice } from "../src/apps/computerDevice.js";
 import { BotAgent } from "../src/bot/agent.js";
 import { BotContext } from "../src/bot/context.js";
+import { MaintenanceRetry } from "../src/bot/maintenance-retry.js";
 import { toNativeToolDefs } from "../src/bot/nativeTools.js";
 import { BOT_TOOLS } from "../src/bot/tools.js";
 import { Config } from "../src/config.js";
@@ -41,15 +42,17 @@ async function main() {
     agent = new BotAgent(cfg, clock, files, context, world, {} as any, apps, computer, null, phone, logger, BOT_TOOLS,
       { location: () => location, voluntaryWorlds: () => ["Destination"], travelTo: async name => name, goHome: async () => "home" });
     agent.running = true;
+    let maintenanceTime = 0;
+    agent.compressionRetry = new MaintenanceRetry(() => maintenanceTime);
     let allowed: string[] = [], resets = 0;
     agent.backend = { setToolNames(names: string[]) { allowed = [...names]; }, setToolDefs() {}, resetToolSnapshot() { resets++; } };
     agent.refreshToolGate();
     const has = (name: string) => allowed.includes(name);
-    assert.ok(has("put_down_phone") && !has("pick_up_phone"));
+    assert.ok(has("put_down_phone") && has("pick_up_phone"), "unrestricted pickup remains an idempotent capability");
     for (const name of ["close_app", "open_computer", "close_computer", "cancel", "go_home", "exit_forward", "channel_notify"]) assert.equal(has(name), false, name);
     assert.ok(has("travel"));
     assert.match(context.pinned.toolsText!, /put_down_phone/);
-    assert.doesNotMatch(context.pinned.toolsText!, /- pick_up_phone\(/);
+    assert.match(context.pinned.toolsText!, /- pick_up_phone\(/);
     assert.equal(agent.mailbox.length, 0, "fresh context initializes without a redundant capability event");
     await context.appendEvent({ id: context.nextEventId(), source: "system", content: "original observation", worldTime: 1 });
     const first = await context.toChatMessages("original clock");
@@ -93,7 +96,7 @@ async function main() {
     assert.ok(context.stream.some(entry => entry.kind === "event" && /当前界面收起.*fixture_read/.test(entry.event.content)), "known app operations retain a reopen path while the current interface is unavailable");
     await apps.closeCurrent(); agent.refreshToolGate(); assert.ok(!has("close_app"));
     phone.down = true; agent.refreshToolGate(); assert.ok(has("pick_up_phone") && !has("put_down_phone"));
-    phone.down = false; agent.refreshToolGate(); assert.ok(!has("pick_up_phone") && has("put_down_phone"));
+    phone.down = false; agent.refreshToolGate(); assert.ok(has("pick_up_phone") && has("put_down_phone"));
     agent.phoneUi = { chatOpen: true, channelKey: "fixture:chat", channelIsGroup: true, forwardStack: [] };
     agent.attention = "phone"; agent.refreshToolGate(); assert.ok(!has("exit_forward"));
     agent.phoneUi.forwardStack.push("msg:123"); agent.refreshToolGate(); assert.ok(has("exit_forward"));
@@ -224,6 +227,9 @@ async function main() {
     assert.equal((await context.toChatMessages("T"))[0]!.content, prefix);
     assert.ok(!has("act"), "failed compression retains temporary bans");
     compressFails = false;
+    await agent.compactContext("overflow");
+    assert.equal(resets, 0, "direct maintenance cannot bypass the failure cooldown");
+    maintenanceTime += 30_000;
     await agent.compactContext("overflow");
     assert.equal(resets, 1); assert.equal(context.attachmentBudgetExceeded, false);
     assert.ok(has("act")); assert.match(context.pinned.toolsText!, /- act\(/);

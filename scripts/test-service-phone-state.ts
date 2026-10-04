@@ -23,8 +23,10 @@ async function main() {
       actors: { bot: { id: "bot", name: "测试角色", controller: "bot", present: true, state: "坐在书桌前", perception: "房间里没有其他声音" } } });
     const notify = new NotifyManager(path.join(dir, "notify.json"), ["*"], true); await notify.load();
     let changes = 0;
+    const awareness: (string | undefined)[] = [];
     const notices: { rich: RichText; wake: boolean }[] = [];
     const bot: any = { deviceAttention: "phone", phonePhysicalStateChanged() { changes++; },
+      setConsciousness(state: string | undefined) { awareness.push(state); },
       notifyDevice(rich: RichText, opts: { wake: boolean }) { notices.push({ rich, wake: opts.wake }); },
       status: () => ({ running: true, phoneUi: { chatOpen: false, channelKey: null, channelIsGroup: false } }) };
     const world: any = { runtime: { store: async () => store } };
@@ -36,6 +38,24 @@ async function main() {
     await service.bindPhoneState();
     assert.deepEqual(service.phoneStatus.physical, distant); assert.equal(service.phoneStatus.down, true); assert.equal(changes, 1);
     assert.equal(world.runtime.phoneStatusProvider(), service.phoneStatus, "world observes the shared execution posture, not a stale copy");
+    assert.equal(world.runtime.unrestrictedPhoneProvider(), true);
+    assert.equal(awareness.at(-1), undefined, "legacy prose never invents consciousness");
+    await store.commit({ idempotencyKey: "asleep", source: "administrator", actors: { bot: { ...store.snapshot().actors.bot!, consciousness: "asleep" } } });
+    assert.equal(awareness.at(-1), "asleep", "awareness synchronizes even without a phone change");
+    await store.commit({ idempotencyKey: "awake", source: "administrator", actors: { bot: { ...store.snapshot().actors.bot!, consciousness: "awake" } } });
+    assert.equal(awareness.at(-1), "awake");
+    world.isTravelling = true;
+    world.remoteConsciousness = "unconscious";
+    world.onConsciousnessRouteChange();
+    assert.equal(awareness.at(-1), "unconscious");
+    await store.commit({ idempotencyKey: "local-while-away", source: "administrator", actors: { bot: { ...store.snapshot().actors.bot!, consciousness: "asleep" } } });
+    assert.equal(awareness.at(-1), "unconscious", "local updates cannot override the destination's consciousness");
+    world.remoteConsciousness = undefined;
+    world.onConsciousnessRouteChange();
+    assert.equal(awareness.at(-1), undefined, "a legacy remote world leaves awareness unknown rather than carrying a stale sleep gate");
+    world.isTravelling = false;
+    world.onConsciousnessRouteChange();
+    assert.equal(awareness.at(-1), "asleep", "coming home uses the saved local authority immediately");
     await store.commit({ idempotencyKey: "returned", source: "administrator", phoneState: usable });
     assert.deepEqual(service.phoneStatus.physical, usable); assert.equal(changes, 2); assert.equal(service.phoneStatus.down, true, "world reachability never silently picks up the device");
     const info = await service.devicesInfo(); assert.deepEqual(info.phone.physical, usable); assert.ok(info.phone.description.includes("书桌上"));
@@ -44,6 +64,7 @@ async function main() {
     assert.equal(notices.length, 0, "hidden location metadata never becomes a character perception merely by synchronizing state");
 
     service.releasePhoneState();
+    assert.equal(world.onConsciousnessRouteChange, undefined);
     await store.commit({ idempotencyKey: "old-unsubscribed", source: "administrator", phoneState: distant });
     assert.deepEqual(service.phoneStatus.physical, usable, "retired subscriptions cannot mutate current execution state");
     const wait = gate();

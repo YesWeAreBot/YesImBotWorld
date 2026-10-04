@@ -212,6 +212,7 @@ async function dependentDecisionCannotRaceWorldCompletion() {
 async function currentPhysicalGateAndCommittedWriteTruth() {
   const delayed = gate<ParsedToolCall>();
   const blocked = await fixture((index, signal) => index === 1 ? ACTION : index === 2 ? Promise.race([delayed.promise, hold(signal)]) : hold(signal)); blocked.disablePhone();
+  blocked.cfg.bot.unrestrictedPhone = false;
   try {
     await blocked.start(); blocked.notify("chat:lost-phone"); await until(() => blocked.requests.length === 2, "device decision starts with reachable phone");
     blocked.finish.resolve(); await until(() => blocked.commits() === 1, "World commits the changed physical state"); delayed.resolve(SEND);

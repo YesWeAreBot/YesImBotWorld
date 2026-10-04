@@ -4,6 +4,7 @@ import { Prompts, WORLD_PROMPT_DEFAULTS } from "../src/prompts.js";
 import { buildWorldTaskPrompt, type WorldTaskKind, type WorldTaskPromptInput } from "../src/world/prompt.js";
 import { WORLD_EVOLUTION_AUTHORITY, WORLD_INCREMENTAL_AUTHORITY, worldResolutionTool } from "../src/world/proposal.js";
 import { WORLD_TIME_AUTHORITY } from "../src/world/time-boundary.js";
+import { assertConsciousnessAuthority, validNarrativeConsciousness } from "../src/world/consciousness.js";
 
 const input: WorldTaskPromptInput = {
   narrativeSystem: WORLD_PROMPT_DEFAULTS.narrativeSystem,
@@ -32,7 +33,9 @@ function stablePrefixAndCustomization() {
   assert.equal(text.split(custom).length - 1, 1, "user-authored overrides are preserved verbatim exactly once");
   assert.equal(prompts.get().world.narrativeSystem, custom, "rendering never rewrites saved overrides");
   assert.match(taskText(text), /真人聊天由实际平台独占/);
-  assert.match(text, /本次工具契约/);
+  assert.match(text, /本次输出契约/);
+  assert.doesNotMatch(text, /只调用一次resolve_world/);
+  assert.match(prompt({ responseFormat: "tool" }), /只调用一次resolve_world/);
   assert.ok(text.includes(WORLD_TIME_AUTHORITY));
   assert.doesNotMatch(prefix(normal), /app_observe|app_action|kind=evolve|botName|speechSpoken|repair/);
 }
@@ -55,6 +58,17 @@ function actualTaskIsolation() {
   assert.match(normal, /phoneAuthority.stateKnown=false.*默认物理条件/);
   assert.match(normal, /phoneState和phoneHeld所属由phoneAuthority.actorId指定.*不能混用访客/);
   assert.match(normal, /phase=accepted只表示已受理.*phase=ongoing表示已有开始裁定.*不证明行动已经完成/);
+  assert.match(normal, /以本次action.intent为结算单位/);
+  assert.match(normal, /常规步骤可连贯推进.*不逐步索要许可/);
+  assert.match(normal, /当前请求实际达成才completed.*更大目标未完/);
+  assert.match(normal, /仅用力、准备、尝试或本轮生成结束不算达成/);
+  assert.match(normal, /未实现用failed，正文、reason和状态一致/);
+  assert.match(normal, /重复失败不自动加重疼痛、损伤或障碍/);
+  assert.match(normal, /只有已确立的新物理原因才可恶化/);
+  assert.match(normal, /result.text是当时交付结果的物理视图/);
+  assert.match(normal, /omitted\/reasonOmitted仅表示正文省略，不证明没有阻碍/);
+  assert.match(normal, /原意图未授权且会实质改变走向的选择才needs_input/);
+  assert.match(normal, /旧感知是起点，不重演旧动作/);
   assert.match(normal, /角色提出睡觉是尝试入睡，不保证立刻睡着/);
   assert.match(normal, /清醒|困倦|睡眠/); assert.match(normal, /NPC行为与原话/);
   const schema: any = contract().function.parameters;
@@ -63,6 +77,7 @@ function actualTaskIsolation() {
   assert.ok(!schema.properties.perceptions.items.required.includes("situation"));
   assert.ok(!schema.properties.perceptions.items.required.includes("opportunities"));
   assert.doesNotMatch(JSON.stringify(schema), /speechSpoken/, "speech-free requests do not ask for a redundant flag");
+  assert.match(schema.properties.outcome.properties.status.description, /当前请求实际达成才completed.*后续建议不影响完成/);
 
   const legacyProjection = prompt({ allowWorldPatch: false });
   assert.ok(!legacyProjection.includes(WORLD_INCREMENTAL_AUTHORITY));
@@ -101,9 +116,40 @@ function actualTaskIsolation() {
   assert.match(prompt({ kind: "app_action" }), /完整worldState.*明确outcome/);
   // Regression budget: without user definitions, normal tasks must stay materially
   // below the previous >6k-character all-task system prompt and repeated authorities.
-  assert.ok(prompt({ worldDef: "", botDef: "" }).length < 3300, "normal task prompt remains concise");
+  assert.ok(prompt({ worldDef: "", botDef: "" }).length < 3600, "normal task prompt remains concise, including action progress semantics");
   assert.ok(declared.length < 7200, "ordinary provider schema does not reintroduce the full all-task prose");
 }
 
-stablePrefixAndCustomization(); actualTaskIsolation();
+function explicitConsciousness() {
+  assert.equal(validNarrativeConsciousness(undefined), false, "legacy absence is not a fabricated awake value");
+  for (const value of ["awake", "asleep", "unconscious"]) assert.ok(validNarrativeConsciousness(value));
+  for (const value of ["tired", "rest", "睡着", null, false]) assert.equal(validNarrativeConsciousness(value), false);
+  for (const kind of ["initialize", "action"] as const) {
+    const schema = contract({ kind }).function.parameters as any;
+    const item = schema.properties.actorStates.items;
+    assert.deepEqual(item.properties.consciousness.enum, ["awake", "asleep", "unconscious"]);
+    assert.ok(!item.required.includes("consciousness"), "ordinary physical updates do not require a guessed consciousness");
+    assert.doesNotThrow(() => assertConsciousnessAuthority({ actorStates: [{ actorId: "bot", consciousness: "asleep" }] }, kind));
+  }
+  for (const kind of ["observe", "arrive", "leave", "app_action", "app_observe"]) {
+    const schema = contract({ kind: kind as WorldTaskKind }).function.parameters as any;
+    assert.equal(schema.properties.actorStates?.items.properties.consciousness, undefined);
+    assert.throws(() => assertConsciousnessAuthority({ actorStates: [{ actorId: "bot", consciousness: "awake" }] }, kind), /WORLD_CONSCIOUSNESS_AUTHORITY/);
+    assert.doesNotThrow(() => assertConsciousnessAuthority({ actorStates: [{ actorId: "bot" }] }, kind), "read-only prose does not infer a state change");
+  }
+  const effect = { actorId: "bot", consciousness: "awake", changeIds: ["actual-cause"] };
+  assert.doesNotThrow(() => assertConsciousnessAuthority({ actorEffects: [effect] }, "evolve"));
+  assert.throws(() => assertConsciousnessAuthority({ actorEffects: [{ ...effect, changeIds: [] }] }, "evolve"), /WORLD_CONSCIOUSNESS_AUTHORITY/);
+  assert.throws(() => assertConsciousnessAuthority({ actorEffects: [effect] }, "observe"), /WORLD_CONSCIOUSNESS_AUTHORITY/);
+  assert.throws(() => assertConsciousnessAuthority({ actorStates: [{ actorId: "bot", consciousness: "rest" }] }, "action"), /WORLD_CONSCIOUSNESS_VALUE/);
+  assert.throws(() => assertConsciousnessAuthority({ actorStates: [{ actorId: "bot", consciousness: "awake" }] }, "evolve"), /WORLD_CONSCIOUSNESS_AUTHORITY/);
+  const evolve = prompt({ kind: "evolve" });
+  assert.match(evolve, /已明确consciousness=asleep.*不属于待结算行动.*真实经过自然结束/);
+  assert.match(evolve, /unconscious的恢复须有已确立的恢复条件或真实外因/);
+  assert.match(evolve, /躺下、rest、深夜或字段缺失不证明睡着/);
+  assert.match(prompt({ allowOngoing: true }), /真实入睡可开始持续睡眠.*到期后另行结算实际结果及苏醒/);
+  assert.match(prompt({ actionPhase: "finish" }), /睡眠过程结束时裁定实际苏醒/);
+}
+
+stablePrefixAndCustomization(); actualTaskIsolation(); explicitConsciousness();
 console.log("PASS task World prompts: stable prefix, verbatim custom overrides, isolated task contracts, optional narrative extras, concise schemas and program-owned finish speech flag");

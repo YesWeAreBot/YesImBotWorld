@@ -31,6 +31,8 @@ import { debug, type DebugEntry } from "./debug.js";
 import { usageStore } from "./usage.js";
 import { callStore } from "./calls.js";
 import { llmFetch, forEachStreamLine } from "../llm/http.js";
+import { llmEndpoint, llmHeaders } from "../llm/endpoint.js";
+import type { ChatApiType } from "../llm/protocol.js";
 import { PAGE_HTML } from "./page.js";
 import { VisitorStore, type VisitorSession, type VisitorGrant, type VisitorPreset, type PlayerProfile } from "./visitors.js";
 import type { PlayerMode } from "../crossing/protocol.js";
@@ -1184,10 +1186,15 @@ export class WebUIServer {
     if (pathname === "/api/llm/models" && method === "POST") {
       const body = await readJson(req);
       const baseURL = String(body.baseURL ?? "").trim();
+      const group = String(body.group ?? "");
+      const configuredProtocol = group === "captioners.audio" && host.config.captioners.audio.api === "transcription"
+        ? "chat-completions" : getSecretByPath(host.config, group + ".apiType") || "chat-completions";
+      const apiType = body.apiType ?? configuredProtocol;
+      if (typeof apiType !== "string" || !["chat-completions", "responses", "anthropic"].includes(apiType)) return void sendJSON(res, 400, { error: "不支持该 API 协议" });
       let apiKey = String(body.apiKey ?? "");
       // apiKey 被脱敏回传时（仍是掩码），按 group 路径从当前配置回填真实密钥
       if (apiKey === SECRET_MASK) {
-        const keyPath = String(body.group ?? "") + ".apiKey";
+        const keyPath = group + ".apiKey";
         if (!pathIsSecret(keyPath.split("."), collectSecretPaths(introspect(host.configSchema)))) {
           return void sendJSON(res, 400, { error: "模型配置组不存在或未声明独立密钥" });
         }
@@ -1195,10 +1202,12 @@ export class WebUIServer {
       }
       if (!baseURL) return void sendJSON(res, 400, { error: "缺少 baseURL" });
       try {
-        const models = await fetchLlmModels(baseURL, apiKey);
+        const models = await fetchLlmModels(baseURL, apiKey, apiType as ChatApiType);
         sendJSON(res, 200, { models });
       } catch (err) {
-        sendJSON(res, 500, { error: (err as Error).message ?? String(err) });
+        let message = (err as Error).message ?? String(err);
+        if (apiKey) for (const secret of new Set([apiKey, JSON.stringify(apiKey).slice(1, -1), encodeURIComponent(apiKey)])) message = message.split(secret).join(SECRET_MASK);
+        sendJSON(res, 500, { error: message.slice(0, 500) });
       }
       return;
     }
@@ -1660,23 +1669,30 @@ function restoreSecrets(next: unknown, current: unknown, secretPaths: string[]):
   return walk(next, current, []);
 }
 
-/** 向 OpenAI 兼容端点拉取可选模型列表（GET {baseURL}/models） */
-async function fetchLlmModels(baseURL: string, apiKey: string): Promise<string[]> {
-  const root = baseURL.replace(/\/+$/, "");
-  const url = root + "/models";
-  const res = await llmFetch(url, {
-    headers: apiKey ? { authorization: `Bearer ${apiKey}` } : {},
-    signal: AbortSignal.timeout(15_000),
-  });
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`列出模型失败 (${res.status})：${text.slice(0, 200)}`);
+/** Provider-owned model IDs; bounded pagination never follows an upstream-provided URL. */
+async function fetchLlmModels(baseURL: string, apiKey: string, apiType: ChatApiType): Promise<string[]> {
+  const endpoint = llmEndpoint(baseURL, apiType, "models"), headers = llmHeaders(apiType, apiKey);
+  const signal = AbortSignal.timeout(15_000), ids = new Set<string>(), cursors = new Set<string>();
+  let after: string | undefined;
+  for (let page = 0; page < 5; page++) {
+    const url = new URL(endpoint);
+    if (after !== undefined) url.searchParams.set("after_id", after);
+    const res = await llmFetch(url.toString(), { headers, signal });
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      // Redaction happens in the route before truncation, including escaped keys.
+      throw new Error(`列出模型失败 (${res.status})：${text}`);
+    }
+    const data = (await res.json()) as { data?: { id?: string }[]; has_more?: boolean; last_id?: string };
+    if (!Array.isArray(data.data)) throw new Error("模型列表缺少 data 数组；请检查协议和服务地址");
+    const pageIds = data.data.map(model => model?.id).filter((id): id is string => typeof id === "string" && !!id.trim());
+    for (const id of pageIds) { ids.add(id); if (ids.size >= 1000) return [...ids]; }
+    if (apiType !== "anthropic" || data.has_more !== true) break;
+    const cursor = typeof data.last_id === "string" && data.last_id ? data.last_id : pageIds.at(-1);
+    if (!cursor || cursors.has(cursor)) throw new Error("模型列表分页游标无效或重复；可直接填写模型名称");
+    cursors.add(cursor); after = cursor;
   }
-  const data = (await res.json()) as { data?: { id?: string }[] };
-  const ids = (data.data ?? [])
-    .map((m) => m.id)
-    .filter((id): id is string => typeof id === "string" && !!id);
-  return ids;
+  return [...ids];
 }
 
 async function galleryEntries(host: WebUIHost): Promise<unknown[]> {

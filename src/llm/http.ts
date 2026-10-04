@@ -13,6 +13,7 @@
  */
 
 import { Agent, fetch as undiciFetch, Response as UndiciResponse } from "undici";
+import { ChatCompletionError } from "./errors.js";
 
 export type LlmResponse = UndiciResponse;
 
@@ -69,12 +70,87 @@ export async function forEachStreamLine(res: LlmResponse, onLine: (line: string)
         const t = l.trim();
         if (t) onLine(t);
       });
+  } catch (error) {
+    // Releasing the lock alone leaves a rejected SSE response generating upstream.
+    // Cancel before returning the endpoint lease, without masking the parser error.
+    try { await reader.cancel(error); } catch { /* preserve the original failure */ }
+    throw error;
   } finally {
     try {
       reader.releaseLock();
     } catch {
       /* ignore */
     }
+  }
+}
+
+/** Native APIs use framed SSE (including multiline data), sometimes returning JSON
+ * even when stream was requested. Preserve the wire text for the call inspector. */
+export async function readProtocolStream(
+  res: LlmResponse,
+  onEvent: (event: { event: string; data: string }) => void,
+  onText?: (text: string) => void,
+): Promise<unknown | undefined> {
+  if (!res.body) throw new ChatCompletionError("LLM_STREAM_INCOMPLETE", "响应没有可读取的内容。");
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let mode: "sse" | "json" | undefined = /text\/event-stream/i.test(res.headers.get("content-type") ?? "") ? "sse" : undefined;
+  let buffer = "";
+  let event = "message";
+  let data: string[] = [];
+  const dispatch = () => {
+    if (data.length) onEvent({ event, data: data.join("\n") });
+    event = "message";
+    data = [];
+  };
+  const line = (value: string) => {
+    if (!value) { dispatch(); return; }
+    if (value.startsWith(":")) return;
+    const colon = value.indexOf(":");
+    const field = colon < 0 ? value : value.slice(0, colon);
+    let body = colon < 0 ? "" : value.slice(colon + 1);
+    if (body.startsWith(" ")) body = body.slice(1);
+    if (field === "event") event = body;
+    else if (field === "data") data.push(body);
+  };
+  const consume = (text: string, eof = false) => {
+    buffer += text;
+    if (!mode && buffer.trimStart()) mode = /^[\[{]/.test(buffer.trimStart()) ? "json" : "sse";
+    if (mode !== "sse") return;
+    // Keep a trailing CR until the next chunk: it may be the first half of CRLF.
+    for (;;) {
+      const match = /[\r\n]/.exec(buffer);
+      if (!match || (!eof && match[0] === "\r" && match.index === buffer.length - 1)) break;
+      const at = match.index;
+      const width = buffer[at] === "\r" && buffer[at + 1] === "\n" ? 2 : 1;
+      line(buffer.slice(0, at));
+      buffer = buffer.slice(at + width);
+    }
+    if (eof) {
+      if (buffer) line(buffer);
+      buffer = "";
+      dispatch();
+    }
+  };
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const text = decoder.decode(value, { stream: true });
+      onText?.(text);
+      consume(text);
+    }
+    const tail = decoder.decode();
+    if (tail) onText?.(tail);
+    consume(tail, true);
+    if (mode === "sse") return undefined;
+    try { return JSON.parse(buffer); }
+    catch { throw new ChatCompletionError("LLM_RESPONSE_INVALID", "响应不是有效的 SSE 或 JSON。"); }
+  } catch (error) {
+    try { await reader.cancel(error); } catch { /* keep the original failure */ }
+    throw error;
+  } finally {
+    reader.releaseLock();
   }
 }
 

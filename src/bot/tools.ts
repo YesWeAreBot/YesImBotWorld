@@ -97,7 +97,7 @@ export const BOT_TOOLS: BotToolDef[] = [
   {
     name: "think",
     signature: "think(thought: string)",
-    description: "想一想自己的经历、牵挂或打算。thought 是 1 至 1200 字符的简短内心独白，区分事实、回忆与猜测，不写模型的隐藏推理。不会推进时间、执行动作、获取新信息或发给别人，duration 无效。不必每次行动前思考；没有新感知或操作结果时最多连续两段，不用反复独白填满等待。",
+    description: '记录一段内心独白（1 至 1200 字符），区分已知、回忆与猜测；不行动、发言、获取新信息或推进时间。文本调用也可写 think("内容")；原生调用仍用 {"thought":"内容"}。不要求每步先思考。',
     inputSchema: { type: "object", properties: { thought: { type: "string", minLength: 1, maxLength: 1200 } }, required: ["thought"], additionalProperties: false },
   },
   {
@@ -463,6 +463,10 @@ export function availableTools(opts: {
   waitConfirm?: boolean;
   /** bot.disableWait：移除 wait 工具 */
   disableWait?: boolean;
+  /** bot.thinkEnabled: an independent capability switch, enabled when omitted. */
+  thinkEnabled?: boolean;
+  /** Unconditional phone access is the default; disabled preserves physical constraints. */
+  unrestrictedPhone?: boolean;
   /** bot.ignoreSendDuration：send 系工具的 duration 被忽略，消息立即发出 */
   ignoreSendDuration?: boolean;
   /** crossing.worlds 中允许 Bot 主动前往的世界（travel 工具的目的地列表） */
@@ -472,6 +476,8 @@ export function availableTools(opts: {
 }): BotToolDef[] {
   const tools = BOT_TOOLS.filter((t) => {
     switch (t.name) {
+      case "think":
+        return opts.thinkEnabled !== false;
       case "wait":
         return !opts.disableWait;
       case "travel":
@@ -555,6 +561,15 @@ export function availableTools(opts: {
   // 各分支按顺序叠加
   return tools.map((t) => {
     let def = t;
+    if (def.name === "pick_up_phone" && opts.unrestrictedPhone !== false) {
+      def = { ...def,
+        description: "拿到可正常使用的手机；丢失、损坏或距离不阻止拿取。不会自动打开应用或回到会话，聊天须先 open_app，必要时 select_channel。",
+        summary: "拿到可正常使用的手机，不受丢失、损坏或距离限制；不自动打开应用或回到会话。",
+      };
+    } else if (def.name === "pick_up_phone") {
+      def = { ...def, description: "手机可达时拿起；不恢复遗失或损坏的设备，不自动打开应用或回到会话。",
+        summary: "拿起可及手机，不修复设备或打开应用。" };
+    }
     if ((def.name === "wait" || def.name === "rest") && opts.waitConfirm) {
       def = {
         ...def,

@@ -72,7 +72,10 @@ async function main() {
     const reopenedLegacy = await NarrativeStore.open(dir, { now: () => now });
     assert.equal(reopenedLegacy.snapshot().phoneState, undefined);
     assert.equal(await fs.readFile(files.narrativeJournal, "utf8"), legacyJournal, "reading old worlds never rewrites their physical history");
-    assert.deepEqual(inputs[0].phoneState, phonePhysicalState(sharedPhone));
+    assert.deepEqual(inputs[0].phoneState, { ...phonePhysicalState(sharedPhone), location: "持有者手中" }, "the request projects the confirmed held posture over the unknown archival location");
+    assert.deepEqual(sharedPhone, { down: false }, "input projection does not establish a physical record or mutate runtime phone fields");
+    assert.equal(store.snapshot().phoneState, undefined);
+    assert.equal(await fs.readFile(files.narrativeJournal, "utf8"), legacyJournal, "projecting a held phone leaves the journal unchanged");
     assert.equal(inputs[0].phoneHeld, true);
     assert.equal(inputs[0].phoneAuthority.canUpdate, true);
 
@@ -84,7 +87,7 @@ async function main() {
       assert.deepEqual(committed.commit.phoneState, state, "physical gating changes are published only after the entire durable transaction exists");
       applyPhonePhysicalState(sharedPhone, state); changes.push(state);
     });
-    output = { phoneState: lost, phoneChangeIds: ["loss"], externalChanges: [{ id: "loss", description: "货架被风吹倒，桌上的手机坠入缝隙，去向未知。" }], worldState: "小澈仍站在书房中央。货架被风吹倒，桌上的手机坠入缝隙，去向未知。", perceptions: [{ actorId: "bot", text: "货架倒下，桌上的手机滑落后不见了。", changeIds: ["loss"] }] };
+    output = { phoneState: lost, phoneChangeIds: ["loss"], externalChanges: [{ id: "loss", description: "货架被风吹倒，撞到小澈的手，手机脱手坠入缝隙，去向未知。" }], worldState: "小澈仍站在书房中央。货架被风吹倒，撞到小澈的手，手机脱手坠入缝隙，去向未知。", perceptions: [{ actorId: "bot", text: "货架倒下撞到你的手，手机滑落后不见了。", changeIds: ["loss"] }] };
     duringInference = () => assert.ok(canUsePhone(sharedPhone), "an uncommitted model proposal cannot remove phone access");
     now++;
     await runtime.evolve("结算当前物理处境");

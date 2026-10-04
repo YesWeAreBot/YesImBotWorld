@@ -11,6 +11,8 @@ export interface WorldResolutionOptions {
   allowPhoneState?: boolean;
   speech?: "start" | "finish" | false;
   repair?: boolean;
+  /** Registered recipients and state owners visible to this task. */
+  actorIds?: string[];
 }
 
 type ProposalSchema = Record<string, unknown> & { properties?: Record<string, ProposalSchema>; required?: string[] };
@@ -33,12 +35,24 @@ export function worldResolutionTool(initializing = false, evolving = false, opts
   tool.function.description = app
     ? opts.kind === "app_observe" ? "返回请求角色的私有虚构应用读取结果，不写状态或执行操作。" : "提交授权虚构应用操作的完整状态与私有回执，不操作真实平台。"
     : evolution ? "提交外部世界经过、实际来源及角色可感知的部分。" : init ? "建立初始自然语言世界、角色状态与最初感知。" : "提交本次物理世界裁定及实际感知，无变化的状态字段省略。";
-  properties.perceptions!.description = app ? "仅请求actorId的一份私有应用输出，由设备流程决定实际交付。" : "按actorId分别给实际感知；不复制全知状态，无接收者感知时可为空。";
+  properties.perceptions!.description = app ? "仅请求actorId的一份私有应用输出，由设备流程决定实际交付。" : "每个actorId最多一项，把该角色全部实际感知合并到同一text；不复制全知状态，无接收者感知时可为空。";
+  if (opts.actorIds) {
+    const ids = [...new Set(opts.actorIds)];
+    properties.perceptions!.maxItems = ids.length;
+    if (ids.length) perception.properties!.actorId = { type: "string", enum: ids };
+    for (const field of ["actorStates", "actorEffects"]) if (properties[field]) {
+      properties[field]!.maxItems = ids.length;
+      if (ids.length) ((properties[field]!.items as ProposalSchema).properties!).actorId = { type: "string", enum: ids };
+    }
+  }
   perception.properties!.text!.description = app ? "应用实际可提供的内容，保留精确原文，不附身体剧情。" : "本角色实际感知的经过、环境细节与NPC回应；足够理解进展即可，不重抄状态或行动建议。";
   if (perception.properties!.situation) perception.properties!.situation!.description = "可省略；只补正文未清楚表达的必要可知处境，不重复整段剧情或泄露秘密。";
   if (perception.properties!.opportunities) perception.properties!.opportunities!.description = "可省略，只有新的实际选择才更新，最多4项，不为凑数制造事件。物理尝试方向须有区别，不暗示角色已选择或保证成功。省略保留有效旧建议，[]撤销，非空替换；不含软件、通知或真人聊天操作。";
   properties.worldState!.description = app ? "授权应用操作后的完整世界及文件原文，无变化返回原文；不能只声明写入成功。" : init ? "初始完整自然语言世界记忆，包含有效事实、秘密、NPC目标与未完过程。" : "更新后的完整自然语言世界记忆，保留仍有效的事实、秘密、NPC目标与未完过程；无长期变化省略，既有设备原文仅逐字保留。";
   if (properties.actorStates) properties.actorStates.description = init ? "常驻角色的初始客观身体与处境全文。" : "可省略；仅客观身体或处境变化的角色提供state全文，不写主观意图或重复感知。";
+  if (properties.actorStates && !init && opts.kind !== "action") {
+    delete (properties.actorStates.items as ProposalSchema).properties!.consciousness;
+  }
   if (properties.externalChanges) properties.externalChanges.description = "本轮实际外部原因的局部id及经过；可以只记日志，持续事实变化再更新世界记忆，不替受控角色决定或结算行动。";
   if (properties.actorEffects) properties.actorEffects.description = "可省略；实际外因改变身体或处境时，给受影响角色state全文并引用本轮changeIds，不代替角色作决定。";
   properties.phoneState!.description = "可省略；本次真实物理原因改变手机条件时提供完整状态，不生成通知、软件操作或拿放动作，缺省不表示恢复正常。";
@@ -59,7 +73,7 @@ export function worldResolutionTool(initializing = false, evolving = false, opts
   if (outcome) {
     const fields = outcome.properties!;
     fields.status!.enum = ["completed", "failed", "needs_input", ...(opts.allowOngoing && !app && opts.speech !== "finish" ? ["ongoing"] : [])];
-    fields.status!.description = app ? "授权应用操作已完成、受阻或需要新的输入。" : "当下已完成、实际受阻或到达新的自主决定点；仅声明ongoing时可报告持续过程开始，不能预写未来完成。";
+    fields.status!.description = app ? "授权应用操作已完成、受阻或需要新的输入。" : "按本次action.intent判断：当前请求实际达成才completed，更大目标未完或有后续建议不影响完成；仅尝试、准备或生成了回复不算达成。结果未实现用failed，正文与reason须一致；仅出现原意图之外的实质选择才needs_input。ongoing只报告持续过程开始，不能预写未来完成。";
     if (opts.speech === "start" && !app) {
       outcome.required = [...outcome.required!, "speechSpoken"];
       fields.speechSpoken!.description = "本次是否实际说出请求speech；true时行动者感知须逐字保留，并给实际听众感知。";
@@ -97,11 +111,12 @@ export function worldResolutionSchema(initializing = false, evolving = false, op
 }
 
 /** Kept outside editable prose prompts: this operation cannot become a second actor loop. */
-export const WORLD_EVOLUTION_AUTHORITY = `kind=evolve只发展外部世界：从evolutionSinceTU承接已提交经过，以elapsedEvolutionWorldSeconds判断NPC、天气、环境或远处事件的进展。输入的受控角色不是本轮行动者；默认保持状态，不能替其决定、转移注意、困倦/入睡/醒来或结算pendingActions。实际外因如雨水、碰撞可以影响身体，但不能为唤醒角色制造原因。externalChanges登记本轮原因的局部id和真实经过；actorEffects仅在客观身体或处境受影响时给完整state及changeIds，不能写actorStates或outcome。每份perceptions必须有text并引用本轮changeIds，只投递接收者实际感知的部分，远处秘密不泄露。短暂经过可只存原因日志，持续事实变化才更新世界记忆。没有外部变化时perceptions:[]并省略状态，不重演近期已发生的事件，不为选项打断安静。nextIntervalTU仅建议下一次检查间隔，不推进当前时间或授权未来事件。`;
+export const WORLD_EVOLUTION_AUTHORITY = `kind=evolve只发展外部世界：从evolutionSinceTU承接已提交经过，以elapsedEvolutionWorldSeconds判断NPC、天气、环境或远处事件的进展。输入的受控角色不是本轮行动者；默认保持状态，不能替其决定、转移注意或结算pendingActions，也不能仅因时间流逝或旧剧情就让其困倦、入睡或醒来。actors.lastAction仅说明最近一次行动已以该status结束，cancelled/failed不代表动作仍在进行；旧state中的活动措辞也不授权续写。不要叙述“你继续探索/保持着弯腰寻找/仍在等待”来填充心跳。实际外因如雨水、碰撞可以影响身体；真实巨响或他人摇晃也可能惊醒角色，但不能为了让角色继续行动而制造唤醒原因。仅有一项生理过程例外：已明确consciousness=asleep、且不属于待结算行动的既定睡眠可按真实经过自然结束；用externalChanges记实际睡眠结束原因，actorEffects更新awake并引用changeIds，不代写醒后决定。躺下、rest、深夜或字段缺失不证明睡着；unconscious的恢复须有已确立的恢复条件或真实外因，不能任意计时唤醒。externalChanges登记本轮原因的局部id和真实经过；actorEffects仅在客观身体或处境受影响时给完整state及changeIds，不能写actorStates或outcome。每份perceptions必须有text并引用本轮changeIds，只投递接收者实际感知的部分，远处秘密不泄露。短暂经过可只存原因日志，持续事实变化才更新世界记忆。没有外部变化时perceptions:[]并省略状态；“仍然昏暗/依旧安静/继续保持原状”不是新的externalChanges，不重演近期已发生的事件，不为选项打断安静。真实外因可以使角色被雨淋湿、被碰撞或被地震震倒，但不能代写其主动应对。nextIntervalTU仅建议下一次检查间隔，不推进当前时间或授权未来事件。`;
 
 /** Only delivery addresses and execution status are structured; world content is prose. */
 function legacyWorldResolutionTool(initializing = false, evolving = false): ChatToolDef {
   const prose = { type: "string", minLength: 1, maxLength: 200_000 };
+  const consciousness = { type: "string", enum: ["awake", "asleep", "unconscious"], description: "可选，实际确立或改变的意识状态：清醒、睡眠或昏迷；省略保持原记录，未知不猜。须有本次实际身体过程或真实外因，不从wait/rest、深夜、无消息或手机状态推断。正文与字段一致，不能把尝试入睡写成已睡。" };
   const changeIds = { type: "array", minItems: 1, maxItems: 100, uniqueItems: true, items: { type: "string", minLength: 1, maxLength: 80 }, description: "引用本次externalChanges中的id；不能引用旧事件、角色自己的等待/睡眠或尚未完成的行动作为外部原因。" };
   return { type: "function", function: { name: "resolve_world",
     description: "返回自然语言世界裁定。所有字段禁止新增平台消息、通知、收发回执或软件状态；普通任务只保存物理世界事实与感知。app_observe只读返回既有虚构应用输出，app_action保存虚构设备变化及私有回执，由设备流程决定感知；两者均不能模拟真实聊天平台。不需要实体或操作数组。",
@@ -121,8 +136,8 @@ function legacyWorldResolutionTool(initializing = false, evolving = false): Chat
         } } },
       worldState: { ...prose, description: "更新后的完整自然语言物理世界状态，保留仍有效的事实、秘密、在场NPC交谈进度、目标和未完成过程。不能新建或沿用外部聊天断言。已有虚构软件/文件原文普通任务只可逐字保留。已经结束且不再影响后续的细节留在事件日志，不逐轮追加流水账；实际更新时合并重复内容，完整性优先于worldMemory.targetChars软目标，不硬截断。普通任务无长期变化省略；app_action必须填写，无变化原文返回；app_observe不能填写。不是变更摘要或JSON。" },
       ...(evolving ? {
-        externalChanges: { type: "array", maxItems: 100, description: "本轮真正发生的外部变化：NPC行动、天气、环境或世界其他地区的进展。每项id仅在本次裁定内引用；description写原因与实际经过，不能写受控角色的新决定、主动动作、困倦/入睡/睡醒或其待结算行动的进展。平静时可空数组或省略；远方变化存入本轮日志，影响后续的事实还须更新worldState，无可感知内容就不投递。", items: { type: "object", additionalProperties: false, required: ["id", "description"], properties: { id: { type: "string", minLength: 1, maxLength: 80 }, description: prose } } },
-        actorEffects: { type: "array", maxItems: 100, description: "仅在本轮外部变化实际影响受控角色身体/处境时填写，例如雨水打湿衣服、别人撞到身体。引用外部原因，state为承接旧状态的全文，只改该原因造成的客观影响；不能代替角色决定、转移注意、发言、入睡或续写睡醒，不以时间流逝推演疲倦，不结算pendingActions。没有身体影响就省略。", items: { type: "object", additionalProperties: false, required: ["actorId", "changeIds", "state"], properties: { actorId: { type: "string" }, changeIds, state: prose } } },
+        externalChanges: { type: "array", maxItems: 100, description: "本轮真正发生的外部变化：NPC行动、天气、环境或世界其他地区的进展。每项id仅在本次裁定内引用；description写原因与实际经过，不能写受控角色的新决定、主动动作或其待结算行动的进展。已明确asleep且不属于待结算行动的既定睡眠按真实经过自然结束，也可记录其生理原因；不从旧文字猜睡着。平静时可空数组或省略；远方变化存入本轮日志，影响后续的事实还须更新worldState，无可感知内容就不投递。", items: { type: "object", additionalProperties: false, required: ["id", "description"], properties: { id: { type: "string", minLength: 1, maxLength: 80 }, description: prose } } },
+        actorEffects: { type: "array", maxItems: 100, description: "本轮真实外因或已明确睡眠的自然结束改变身体时，state提供完整处境并引用changeIds；意识变化可填consciousness。不能代替角色决定、转移注意或发言，不能从时间流逝推断入睡，不能任意计时解除昏迷，不结算pendingActions。没有身体影响就省略。", items: { type: "object", additionalProperties: false, required: ["actorId", "changeIds", "state"], properties: { actorId: { type: "string" }, changeIds, state: prose, consciousness } } },
         phoneChangeIds: changeIds,
         nextIntervalTU: { type: "number", exclusiveMinimum: 0, description: "可选，仅建议下次心跳间隔（TU）。依据NPC、环境过程或既定日程的下一变化时机；安静时可建议更长间隔。程序按时钟设置约束，不推进当前时间，不表示事件已经发生。" },
       } : {}),
@@ -134,7 +149,7 @@ function legacyWorldResolutionTool(initializing = false, evolving = false): Chat
           perceptible: { type: "boolean", description: "若真实设备发出通知动静，它是否能到达角色感官；远离、隔音等可能为false。仅感知范围，不制造一次响铃/震动，不更改免打扰。" },
         } },
       ...(!evolving ? { actorStates: { type: "array", maxItems: 100, description: "需要更新的受控角色身体、处境、随身物品和活动状态全文；不代写主观认识与意图。NPC记在worldState。", items: {
-        type: "object", additionalProperties: false, required: ["actorId", "state"], properties: { actorId: { type: "string" }, state: prose } } },
+        type: "object", additionalProperties: false, required: ["actorId", "state"], properties: { actorId: { type: "string" }, state: prose, consciousness } } },
       ...(initializing ? { botName: { type: "string", minLength: 1, maxLength: 64 } } : {}),
       outcome: { type: "object", additionalProperties: false, required: ["status"], properties: {
         status: { type: "string", enum: ["completed", "failed", "needs_input", "ongoing"], description: "completed为当下确已完成的短动作；needs_input为已到新的自主决定点并结束本次裁定；failed为实际受阻。仅actionPhase=start可用ongoing，表示持续过程刚开始、尚未到expectedEnd：只写已经发生的开始及当下处境，不预写未来完成。actionPhase=finish和应用操作不可返回ongoing。duration是估计时长，不要求短动作先空等；真正持续的过程仍必须到真实时钟到期后另行结算。" },

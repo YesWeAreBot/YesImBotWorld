@@ -1,6 +1,7 @@
 import type { BusEnvelope } from "./bus.js";
 import type { WorldObservation } from "./state.js";
 import type { PhonePhysicalState } from "../types.js";
+import type { NarrativeConsciousness } from "./consciousness.js";
 
 /** Only identities, execution and provenance are machine state. World content is prose. */
 export interface NarrativeActor {
@@ -11,6 +12,8 @@ export interface NarrativeActor {
   /** Authored character background, retained independently from mutable current-state prose. */
   persona?: string;
   state: string;
+  /** Explicit World fact. Missing older records are unknown, never guessed from prose. */
+  consciousness?: NarrativeConsciousness;
   /** Last actor-visible scene; never the omniscient world document. */
   perception: string;
 }
@@ -44,6 +47,8 @@ export interface NarrativeSnapshot {
   actions: Record<string, NarrativeAction>;
   /** Explicitly adjudicated physical facts; absence preserves legacy behavior without a guessed location. */
   phoneState?: PhonePhysicalState;
+  /** Latest program-owned recovery; old prose is retained, not allowed to undo this newer fact. */
+  phoneAccessRestoration?: { sequence: number; worldTime: number };
 }
 /** A possible next intention, never a fact, instruction, or guaranteed outcome. */
 export interface NarrativeOpportunity {
@@ -64,6 +69,8 @@ export interface NarrativePerception extends NarrativePresentation {
   text: string;
   worldSequence: number;
   worldTime: number;
+  /** Captured from committed actor state at delivery, never inferred from the narrative text. */
+  consciousness?: NarrativeConsciousness;
   actionId?: string;
   phase?: "start" | "finish";
   sourceEventIds: string[];

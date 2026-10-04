@@ -20,6 +20,7 @@ import type { WorldAgent } from "../world/agent.js";
 import { debug } from "../webui/debug.js";
 import { collectOpportunities, type ActionOpportunity } from "../bot/opportunities.js";
 import { choiceRejection, resolveHumanChoice } from "../bot/choice.js";
+import { validNarrativeConsciousness } from "../world/consciousness.js";
 import {
   CROSSING_LIMITS,
   type CrossingSseMsg,
@@ -27,6 +28,7 @@ import {
   type CrossingTaskKind,
   type CrossingTaskPayload,
   type CrossingOpportunityMenu,
+  type CrossingConsciousnessState,
   type PlayerMode,
   type VisitorInfo,
 } from "./protocol.js";
@@ -61,6 +63,8 @@ interface VisitorSession extends VisitorInfo {
   opportunities?: ActionOpportunity[];
   opportunitySequence?: number;
   opportunityRevision?: number;
+  consciousnessState?: CrossingConsciousnessState;
+  consciousnessUnsubscribe?: () => void;
 }
 
 interface SessionTask {
@@ -475,13 +479,36 @@ export class CrossingServer {
       }
       await this.host.world.wakeDormant();
       if (session.closed) return false;
-      return await this.host.world.visitorArrive(session, (content) => {
+      const arrived = await this.host.world.visitorArrive(session, (content) => {
         if (!session.closed) this.pushEvent(session, content);
       }, session.arrivalAbort.signal);
+      if (arrived && !session.closed) await this.attachConsciousness(session);
+      return arrived && !session.closed;
     } catch (err) {
       this.host.logger.warn("[穿越] 到达初始化失败: %s", err);
       return false;
     }
+  }
+
+  /** Execution state has its own authenticated channel: a sleep/wake commit can
+   * be real even without a character-visible perception or a running tool call. */
+  private async attachConsciousness(session: VisitorSession): Promise<void> {
+    const world = this.host.world;
+    if (session.residentControl || !world.runtime?.store) return;
+    const store = await world.runtime.store();
+    if (session.closed || world !== this.host.world || !this.host.ready()) return;
+    session.consciousnessUnsubscribe?.();
+    const update = () => {
+      if (session.closed || world !== this.host.world || !this.host.ready()) return;
+      const snapshot = store.snapshot(), actorId = `visitor:${session.id}`, actor = snapshot.actors[actorId];
+      if (!actor?.present || !validNarrativeConsciousness(actor.consciousness)) return;
+      if (session.consciousnessState?.consciousness === actor.consciousness) return;
+      const state: CrossingConsciousnessState = { actorId, worldSequence: snapshot.sequence, consciousness: actor.consciousness };
+      session.consciousnessState = state;
+      this.push(session, { type: "consciousness", ...state });
+    };
+    session.consciousnessUnsubscribe = store.subscribe(event => { if (event.topic === "world.committed") update(); });
+    update();
   }
 
   private handleEvents(url: URL, req: http.IncomingMessage, res: http.ServerResponse): void {
@@ -504,7 +531,8 @@ export class CrossingServer {
     if (session.absenceTimer) clearTimeout(session.absenceTimer);
     session.absenceTimer = null;
     const timeLine = this.host.clock()?.timeLine() ?? "";
-    res.write(sseFrame({ type: "hello", worldName: this.worldName, timeLine, visitorId: session.id, ...this.timeUnits(), ...(!session.residentControl ? this.currentMenu(session) : {}) }));
+    res.write(sseFrame({ type: "hello", worldName: this.worldName, timeLine, visitorId: session.id, ...this.timeUnits(), ...(!session.residentControl ? this.currentMenu(session) : {}),
+      ...(session.consciousnessState ? { consciousnessState: session.consciousnessState } : {}) }));
     if (session.perceptionReplay?.size) {
       const replay = [...(session.perceptionReplay?.values() ?? [])];
       const cursor = String(req.headers["last-event-id"] ?? url.searchParams.get("lastEventId") ?? "");
@@ -760,12 +788,14 @@ export class CrossingServer {
     }
     // Committed perceptions already have a replay entry; do not queue the same ID twice.
     if (msg.type === "event" && msg.eventId && session.perceptionReplay?.has(msg.eventId)) return;
+    if (msg.type === "consciousness") session.outbox = session.outbox.filter(message => message.type !== "consciousness");
     session.outbox.push(msg);
     if (session.outbox.length > 100) session.outbox.splice(0, session.outbox.length - 100);
   }
 
   private closeSession(session: VisitorSession): void {
     session.closed = true;
+    session.consciousnessUnsubscribe?.(); session.consciousnessUnsubscribe = undefined;
     this.detachPerceptions(session);
     session.arrivalAbort.abort();
     for (const task of session.tasks.values()) if (!task.result) task.abort.abort();

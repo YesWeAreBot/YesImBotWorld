@@ -42,8 +42,11 @@ export async function smokeDevices({ evaluate, wait, assert, navigate }) {
     await wait("document.querySelector('[data-device-control]')?.getAttribute('aria-label')==='强制接管'");
   }
   await evaluate("document.querySelector('.app-back')?.click()");
-  await check("document.querySelectorAll('.phone-app-tile').length===9 && Array.from(document.querySelectorAll('.phone-app-tile')).every(n=>!n.disabled)",
-    'Desktop exposes all installed and configurable apps without pausing Bot');
+  const desktop = await evaluate("fetch('/api/device/session').then(r=>r.json()).then(r=>({catalog:r.appCatalog.map(app=>app.id).sort(),tiles:Array.from(document.querySelectorAll('.phone-app-tile')).map(n=>({id:n.dataset.phoneApp,disabled:n.disabled}))}))");
+  assert.deepEqual(desktop.tiles.map(tile => tile.id).sort(), desktop.catalog,
+    'Desktop exposes every installed and configurable app from the current catalog');
+  assert(desktop.catalog.includes('settings') && desktop.tiles.every(tile => !tile.disabled),
+    'Desktop includes settings and lets administrators open app details without pausing Bot');
   await check("fetch('/api/device/session').then(r=>r.json()).then(r=>r.control.paused===false)", 'Default mode leaves autonomous use running');
 
   await openApp('消息', 'chat');

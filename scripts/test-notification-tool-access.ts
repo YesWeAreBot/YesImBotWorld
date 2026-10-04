@@ -75,6 +75,7 @@ async function operatorAndAutonomousBoundaries(base: string) {
     for (const mode of [undefined, "avatar", "puppet"] as const) {
       const option = f.bot.actionOpportunities(mode).find((item: any) => item.call?.name === "open_app");
       assert.ok(option, "a delivered anonymous phone signal supplies an app-opening opportunity");
+      assert.ok(!f.bot.actionOpportunities(mode).some((item: any) => item.call?.name === "pick_up_phone"), "already holding a usable phone does not suggest repeatedly taking it");
       assert.equal(option.call.arguments.name, CHAT_NAME, "model and human action menus use the configured display name");
     }
     assert.equal((await f.operator("channel_notify", { id: CHANNEL, allow: false })).ok, false);

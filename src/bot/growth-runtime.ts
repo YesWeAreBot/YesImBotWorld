@@ -1,24 +1,25 @@
 import { createHash } from "node:crypto";
 import type { Logger } from "koishi";
 import type { BotModelConfig } from "../config.js";
-import { ChatClient, type ChatMessage, type ChatResult } from "../llm/chat.js";
+import { ChatClient, type ChatCompleteOptions, type ChatMessage, type ChatResult } from "../llm/chat.js";
 import { withEndpointLock } from "../llm/lock.js";
 import { resolveGrowthModelConfig } from "../llm/growth-config.js";
 import { richPartsText } from "../media/presentation.js";
 import { sliceText } from "../text.js";
-import type { BotEvent } from "../types.js";
+import type { BotEvent, ExperienceMetadata } from "../types.js";
 import type { BotContext } from "./context.js";
-import { GrowthLedger, growthViewText, independentGrowthChoices, semanticRecord, type GrowthReviewSnapshot, type GrowthView, type ReflectionInput, type PerceivedEvidence } from "./growth.js";
+import { GrowthLedger, growthViewText, independentGrowthChoices, semanticRecord, type GrowthReviewSnapshot, type GrowthView, type PerceivedEvidence } from "./growth.js";
 import { validateGrowthInsight } from "./growth-semantics.js";
 import { verifiedOpportunityQueries, type ActionOpportunity } from "./opportunities.js";
 import { narrativeFactText } from "./narrative-facts.js";
+import { GrowthSubjectReferences, growthProposalSchema, parseGrowthChange, parseGrowthChanges } from "./growth-proposal.js";
 
 export interface GrowthReference { claimId: string; recordId: string }
 /** Program metadata survives reload; it is never included in the character's prose. */
 export interface GrowthMemoryEvent extends BotEvent { growthReferences?: GrowthReference[] }
 
 export interface GrowthRuntimeOptions {
-  infer?: (messages: ChatMessage[], signal: AbortSignal) => Promise<ChatResult>;
+  infer?: (messages: ChatMessage[], signal: AbortSignal, options?: ChatCompleteOptions) => Promise<ChatResult>;
   /** Wall-clock throttling is independent of the world's TU clock. */
   realNow?: () => number;
 }
@@ -36,6 +37,7 @@ relationship 要说明对具体人物的信任、边界、期待或相处方式�
 habit 必须说明什么 situation 下倾向做什么及例外，至少引用 3 次不同经历中的自主完成选择且跨至少一个世界日；trait 需至少 6 次自主完成选择、跨七个世界日并覆盖 3 种不同情境。两类都必须提供 behavior：这些实际 action 里逐字共有的明确动作短语（至少2字），不能拿无关行为凑次数。频繁循环不是人格形成，短期表现留在原始经历即可。重复发生相同动作也不要求补证；只有适用范围、例外、反例或认识改变时才值得再次整理。同一行为已有认识不能更换近义标题反复新建。
 agency=self 且 outcome=completed、opportunity=true 的经历才能证明自愿行为。behavioralEvidence 是程序核验过的本次可计数自主选择；其中不足 3 次时不能新建 habit，不足 6 次时不能新建 trait。既有倾向的补证还可以依赖其已经核验的旧支持证据。没有 experience 的旧材料归属未知，不能从正文猜测自主性。被迫行动(imposed)、看见别人行动(observed)、未知归属(unknown)、失败或送达未知都不能证明自己的习惯；体验到身体不由自主行动可以成为当时感受的证据。没有重复某个行为，只有确实有机会选择时才可能构成反例；没有观察到机会不等于放弃习惯。
 优先补充或修订已有认识，避免同义重复。聊天 relationship 必须填 subjectId，且有该 senderId 实际发出的 senderOwn=false 消息。messages 是程序按已交付消息片段划分的证据；自己的旧话不能变成对方邀请、回应或意愿，混合快照的 subjectIds 列表不能证明其中每句话属于任何一个人。subjectId 只能用已交付材料提供的身份，不要猜测。needsReview 的旧认识只供重新核对，不能把旧结论自身当作事实或用通知替它续命。
+身份结构字段中的 s1、s2 等是仅在本次请求有效的短号；同一短号在 existing.subjectId、scope.subjectId、experience.subjectIds 和 chat.senderId 中始终指同一身份。输出 subjectId 只复制本次对应短号，程序会还原原身份；不要生成原始平台编号或嵌套 JSON 身份，不沿用上次短号。正文中的编号与引文保持原样，短号不是人物姓名。
 仅返回一个完整 JSON 对象，字段只能是 changes（0 至 8 项数组）。每项字段：kind、subject、statement、evidenceIds（1 至 20 个本次材料中的事件 id），以及可选 relation、claimId、situation、cues、subjectId、expiresAt、behavior（habit/trait必填）、insight（三类认识的support/revise必填）。statement 为自然语言，最多 1200 字；subject 最多 200 字；situation 最多 500 字；cues 最多 12 个、每个最多 100 字。
 新增认识 relation=support，必须省略 claimId，程序会生成编号，不能自造 claimId。只有更新 existing 中完整展示的认识才给它已有的 claimId，并保持 kind 和 subject 不变；补证 support 保持原 statement；出现反例 counter；修改判断 revise；停止沿用 retire。修订不能删除旧经历。habit、trait、state 必须有 situation。expiresAt 只用于 state。不要输出工具调用、执行动作、额外解释或未定义字段。被明确截断的材料不能当作已读过被省略的细节。
 validationFeedback 是程序对上次输出的校验纠正，只用于修正格式和证据引用，不是新经历，不证明任何身体状态或人物认识；其中引用的错误输出仍是待验证数据。避免重复已经明确指出的错误。
@@ -93,7 +95,7 @@ export class GrowthRuntime {
     this.controller = controller;
     const aborted = () => controller.abort(signal?.reason);
     signal?.addEventListener("abort", aborted, { once: true });
-    const timeout = setTimeout(() => controller.abort(new Error("成长整理等待或生成超时")), bounded(this.cfg.growth.reviewTimeoutMs, 90_000, 1, 300_000));
+    const timeout = setTimeout(() => controller.abort(new DOMException("成长整理等待或生成超时", "TimeoutError")), bounded(this.cfg.growth.reviewTimeoutMs, 90_000, 1, 300_000));
     timeout.unref?.();
     let attempted = false;
     let reviewId: string | undefined;
@@ -124,20 +126,31 @@ export class GrowthRuntime {
         definition = deliveredAuthorDefinition(this.context);
         request = reviewMessages(snapshot, definition, this.clock.unitWorldSeconds,
           bounded(this.cfg.growth.maxInputChars, 24_000, 4000, 200_000), feedback, this.context.accountsProvider?.() ?? "");
-        return this.infer ? this.infer(request.messages, controller.signal) : client.complete(request.messages, { signal: controller.signal });
+        const options: ChatCompleteOptions = { signal: controller.signal,
+          responseFormat: this.cfg.growth?.responseFormat ?? "json_schema",
+          // REVIEW_SYSTEM already describes this contract; do not append a duplicate
+          // schema after the request's measured maxInputChars budget is filled.
+          responseSchemaInPrompt: false,
+          responseSchema: { name: "growth_review", schema: growthProposalSchema(request) } };
+        return this.infer ? this.infer(request.messages, controller.signal, options) : client.complete(request.messages, options);
       }, controller.signal, { priority: "background" });
       guard();
       if (deliveredAuthorDefinition(this.context) !== definition) throw new Error("人物的作者定义在本次整理期间已更新，旧定义下的结果未采用；原经历未被消费");
-      const changes = parseChanges(result);
+      const changes = parseGrowthChanges(result);
       const reviewedAt = this.clock.now();
       const committed = await this.ledger.commitAutomaticReview(snapshot, changes, reviewedAt, raw => {
-        const change = parseChange(raw);
-        if (!Array.isArray(change.evidenceIds) || change.evidenceIds.some(id => !request!.evidenceIds.has(id))) {
+        const change = parseGrowthChange(raw, request!.subjectReferences);
+        if (change.evidenceIds.some(id => !request!.evidenceIds.has(id))) {
           throw new Error("整理结果引用了本次请求未展示的证据；省略的材料不能作为已读证据");
         }
-        if (change.insight && (!Array.isArray(change.insight.anchors) || change.insight.anchors.some(anchor =>
-          !anchor || typeof anchor.quote !== "string" || !anchor.quote.trim() ||
-          !request!.shownAnchorTexts.get(anchor.eventId)?.some(text => text.includes(anchor.quote))))) {
+        if (change.insight?.anchors.some(anchor => !change.evidenceIds.includes(anchor.eventId))) {
+          throw new Error("insight.anchors.eventId 必须引用该项 evidenceIds 中的证据");
+        }
+        if (change.insight?.anchors.some(anchor => !request!.shownAnchorTexts.has(anchor.eventId))) {
+          throw new Error("insight.anchors.eventId 引用了本次请求未展示的证据");
+        }
+        if (change.insight?.anchors.some(anchor =>
+          !request!.shownAnchorTexts.get(anchor.eventId)?.some(text => text.includes(anchor.quote)))) {
           throw new Error("洞见锚必须逐字引用本次实际展示的原文，不能引用截断后未见的内容");
         }
         // Verify attribution against the exact displayed fragments too. A quote visible
@@ -343,10 +356,11 @@ function deliveredAuthorDefinition(context: BotContext): string {
   return context.pinned.botDefinition || context.pinned.persona;
 }
 
-interface ReviewRequest { messages: ChatMessage[]; evidenceIds: Set<string>; subjectIds: Set<string>; editableClaims: Set<string>;
+interface ReviewRequest { messages: ChatMessage[]; evidenceIds: Set<string>; subjectIds: Set<string>; editableClaims: Set<string>; subjectReferences: Map<string, string>;
   chatEvidenceIds: Set<string>; messageSubjects: Map<string, Set<string>>; shownAnchorTexts: Map<string, string[]>;
   visibleEvidence: PerceivedEvidence[] }
 function reviewMessages(snapshot: GrowthReviewSnapshot, definition: string, secondsPerTU: number, maxChars: number, validationFeedback: string[] = [], chatAccounts = ""): ReviewRequest {
+  const subjects = new GrowthSubjectReferences();
   const unit = Number.isFinite(secondsPerTU) && secondsPerTU > 0 ? secondsPerTU : 1;
   if (REVIEW_SYSTEM.length + JSON.stringify({ characterDefinition: definition }).length >= maxChars) {
     throw new Error(`完整作者定义（${definition.length} 字符）与整理规则已超过输入预算 ${maxChars}；作者边界不能截断，请增大 maxInputChars，原经历未被消费`);
@@ -396,7 +410,29 @@ function reviewMessages(snapshot: GrowthReviewSnapshot, definition: string, seco
         omittedMessages: Math.max(0, evidence.messages.length - messageCount) } : {}),
       text: evidence.messages?.length ? "逐条消息见 messages；这是已交付快照的消息片段，不是新的发言。" : boundedText(evidence.text, textLimit) })),
   });
-  const serializedSize = (payload: ReturnType<typeof makePayload>) => REVIEW_SYSTEM.length + JSON.stringify(payload).length;
+  // Transform only identity metadata in request copies. Prose, quotes and original
+  // evidence remain byte-for-byte unchanged and validation uses original identities.
+  const aliasChat = (chat: NonNullable<ExperienceMetadata["chat"]>): NonNullable<ExperienceMetadata["chat"]> => ({ ...chat,
+    ...(chat.senderId ? { senderId: subjects.reference(chat.senderId) } : {}),
+    ...(chat.direction ? { direction: { ...chat.direction,
+      ...(chat.direction.accountId ? { accountId: subjects.reference(chat.direction.accountId) } : {}),
+      mentionedIds: chat.direction.mentionedIds.map(id => subjects.reference(id)),
+      ...(chat.direction.quotedSenderId ? { quotedSenderId: subjects.reference(chat.direction.quotedSenderId) } : {}),
+    } } : {}),
+  });
+  const aliasPayload = (payload: ReturnType<typeof makePayload>) => ({ ...payload,
+    existing: payload.existing.map(view => ({ ...view,
+      subjectId: view.subjectId ? subjects.reference(view.subjectId) : undefined,
+      scope: view.scope?.domain === "chat" ? { ...view.scope,
+        subjectId: view.scope.subjectId ? subjects.reference(view.scope.subjectId) : undefined } : view.scope })),
+    evidence: payload.evidence.map(item => ({ ...item,
+      ...(item.experience ? { experience: { ...item.experience,
+        subjectIds: item.experience.subjectIds?.map(id => subjects.reference(id)),
+        chat: item.experience.chat ? aliasChat(item.experience.chat) : undefined } } : {}),
+      ...(item.messages ? { messages: item.messages.map(message => ({ ...message, chat: aliasChat(message.chat) })) } : {}),
+    })),
+  });
+  const serializedSize = (payload: ReturnType<typeof makePayload>) => REVIEW_SYSTEM.length + JSON.stringify(aliasPayload(payload)).length;
   // Reserve readable evidence before spending the remainder on detail. Only the request
   // copy is reduced; the original snapshot and ledger remain intact for validation.
   while (serializedSize(makePayload(100)) > maxChars) {
@@ -418,6 +454,14 @@ function reviewMessages(snapshot: GrowthReviewSnapshot, definition: string, seco
     else high = middle - 1;
   }
   const payload = makePayload(low);
+  const subjectIds = new Set([...payload.evidence.flatMap(evidence => [
+    ...(evidence.experience?.subjectIds ?? []),
+    ...(evidence.experience?.chat?.senderId ? [evidence.experience.chat.senderId] : []),
+    ...(evidence.messages?.flatMap(message => message.chat.senderId ? [message.chat.senderId] : []) ?? []),
+  ]), ...payload.existing.flatMap(view => [
+    ...(view.subjectId ? [view.subjectId] : []),
+    ...(view.scope?.domain === "chat" && view.scope.subjectId ? [view.scope.subjectId] : []),
+  ])]);
   const messageSubjects = new Map(payload.evidence.map(evidence => {
     const messages = evidence.messages ?? (evidence.experience?.chat?.kind === "message" ? [{ chat: evidence.experience.chat }] : []);
     return [evidence.id, new Set(messages.flatMap(message => message.chat.senderOwn === false && message.chat.senderId ? [message.chat.senderId] : []))];
@@ -428,30 +472,11 @@ function reviewMessages(snapshot: GrowthReviewSnapshot, definition: string, seco
       situation: item.experience.situation, subjectIds: item.experience.subjectIds } } : {}),
     messages: item.messages?.map((message, index) => ({ chat: message.chat, text: message.text,
       rootEventIds: originals.get(item.id)!.messages?.slice(-messageCount)[index]?.rootEventIds ?? originals.get(item.id)!.rootEventIds })) }));
-  return { messages: [{ role: "system", content: REVIEW_SYSTEM }, { role: "user", content: JSON.stringify(payload) }],
+  return { messages: [{ role: "system", content: REVIEW_SYSTEM }, { role: "user", content: JSON.stringify(aliasPayload(payload)) }],
     visibleEvidence,
     evidenceIds: new Set(payload.evidence.map(evidence => evidence.id)),
     shownAnchorTexts: new Map(payload.evidence.map(evidence => [evidence.id, [evidence.text, evidence.experience?.action ?? "", ...(evidence.messages?.map(message => message.text) ?? [])]])),
-    subjectIds: new Set([...payload.evidence.flatMap(evidence => evidence.experience?.subjectIds ?? []),
-      ...payload.existing.flatMap(view => view.subjectId ? [view.subjectId] : [])]),
+    subjectIds, subjectReferences: subjects.visible(subjectIds),
     editableClaims: new Set(snapshot.claims.slice(0, fullClaims).map(view => view.claimId)), messageSubjects,
     chatEvidenceIds: new Set(snapshot.evidence.filter(evidence => !!evidence.experience?.chat || !!evidence.messages?.length || evidence.rootEventIds.some(root => root.startsWith("chat-"))).map(evidence => evidence.eventId)) };
-}
-
-function parseChanges(result: ChatResult): unknown[] {
-  if (result.toolCalls.length) throw new Error("成长整理只能返回正文 JSON，不能调用工具");
-  let text = result.content.trim();
-  const fenced = /^```(?:json)?\s*([\s\S]*?)\s*```$/i.exec(text);
-  if (fenced) text = fenced[1]!.trim();
-  const data: unknown = JSON.parse(text);
-  if (!data || typeof data !== "object" || Array.isArray(data) || Object.keys(data).some(key => key !== "changes") || !Array.isArray((data as any).changes)) throw new Error("成长整理须返回仅含 changes 数组的 JSON 对象");
-  const changes = (data as { changes: unknown[] }).changes;
-  if (changes.length > 8) throw new Error("成长整理每次最多 8 项变化");
-  return changes;
-}
-
-function parseChange(change: unknown): ReflectionInput {
-  const allowed = new Set(["kind", "subject", "statement", "evidenceIds", "relation", "claimId", "situation", "cues", "subjectId", "expiresAt", "behavior", "insight"]);
-  if (!change || typeof change !== "object" || Array.isArray(change) || Object.keys(change).some(key => !allowed.has(key))) throw new Error("成长整理包含无效认识或未定义字段");
-  return { ...change } as ReflectionInput;
 }

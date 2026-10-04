@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import type { BotEvent, ParsedToolCall, StreamEntry, ToolCallRecord } from "../types.js";
 import { canonicalizeArgs } from "./repeatGuard.js";
 
-/** Scheduling limits are not fatigue, sleep, or a change to the character's body. */
+/** Scheduling backoff is not lost ability, fatigue, sleep, or a bodily change. */
 export class DeliberationBudget {
   private thoughts = new Set<string>();
   private thoughtCount = 0;
@@ -20,13 +20,15 @@ export class DeliberationBudget {
     }
   }
 
-  get canThink(): boolean { return this.thoughtCount < 2; }
+  /** Continuous monologue can yield computation without declaring thought unavailable. */
+  get pauseMs(): number { return this.thoughtCount < 3 ? 0 : Math.min(30_000, 1000 * 2 ** Math.min(5, this.thoughtCount - 3)); }
 
   hasThought(thought: string): boolean { return this.thoughts.has(thought.trim().replace(/\s+/gu, " ")); }
 
   recordThought(thought: string): void {
     this.thoughtCount++;
     this.thoughts.add(thought.trim().replace(/\s+/gu, " "));
+    while (this.thoughts.size > 128) this.thoughts.delete(this.thoughts.values().next().value!);
   }
 
   /** Rereads, timers and our own acknowledgements cannot restart an inner monologue. */

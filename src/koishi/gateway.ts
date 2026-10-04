@@ -22,6 +22,8 @@ import { canUsePhone, canPerceivePhone } from "../phone-state.js";
 export { isStickerElement } from "./conversation.js";
 
 export interface GatewayCallbacks {
+  /** Explicitly sleeping/unconscious characters cannot read a screen; this never decides when they wake. */
+  canViewScreen?(): boolean;
   /** 向 Bot-LLM 投递通知事件；wake 表示是否唤醒 wait() 中的 Bot */
   notify(content: RichText, wake: boolean): boolean | void;
   /** 外部（其他插件/指令输出）以 Bot 账号发出的消息（externalSelfMessages 开启时）；msgId 为平台消息 id（可能为空） */
@@ -294,23 +296,27 @@ export class Gateway {
    * after names/media await. A hidden screen never carries channel/subject facts. */
   private async deliverChannelNotice(key: string, render: () => Promise<RichText>, evidence: Pick<RichText, "originEventIds" | "experience">,
     ticket: MessageOrderTicket, focusedOnly = false, row?: WorldMessageRow, notifyOnArrival = this.notificationAllowed(key)): Promise<void> {
-    const visible = () => canUsePhone(this.phone) && this.focus.isFocused(key);
+    const visible = () => this.canReadScreen() && this.focus.isFocused(key);
     if (focusedOnly && !visible()) return;
     if (!visible() && (!notifyOnArrival || !this.notificationAllowed(key))) return;
-    if (!canUsePhone(this.phone)) {
+    if (!this.canReadScreen()) {
       if (notifyOnArrival) this.deliverVibration(evidence, ticket.observedAt.getTime(), key);
       return;
     }
     const content = await render();
     if (focusedOnly && !visible()) return;
     if (!visible() && (!notifyOnArrival || !this.notificationAllowed(key))) return;
-    if (!canUsePhone(this.phone)) {
+    if (!this.canReadScreen()) {
       if (notifyOnArrival) this.deliverVibration(evidence, ticket.observedAt.getTime(), key);
       return;
     }
     const accepted = this.callbacks.notify({ ...content, ...evidence, experience: { ...evidence.experience, agency: "observed", chat: { channelKey: key, kind: "notice" } } },
       notifyOnArrival && this.shouldWake(key, visible()));
     if (accepted !== false && row) await this.notifyList.markSeen?.(key, [row]);
+  }
+
+  private canReadScreen(): boolean {
+    return canUsePhone(this.phone) && this.callbacks.canViewScreen?.() !== false;
   }
 
   private notificationAllowed(key: string): boolean {
@@ -355,7 +361,7 @@ export class Gateway {
     });
     // 手机被放下：只感觉到震动，不呈现内容（请求仍已登记，拿起手机后可处理）
     if (!this.chatNotificationsAllowed()) return;
-    if (!canUsePhone(this.phone)) {
+    if (!this.canReadScreen()) {
       this.deliverVibration({}, Date.now());
       return;
     }
@@ -369,7 +375,7 @@ export class Gateway {
         : kind === "guild"
           ? `手机弹出提示：${who} 邀请你加入群 ${guild}${note}。${hint}`
           : `手机弹出提示：${who} 申请加入你管理的群 ${guild}${note}。${hint}`;
-    if (!canUsePhone(this.phone)) { this.deliverVibration({}, Date.now()); return; }
+    if (!this.canReadScreen()) { this.deliverVibration({}, Date.now()); return; }
     if (!this.chatNotificationsAllowed()) return;
     this.callbacks.notify({ text }, (this.notifyList.appVibrates?.("chat") ?? (this.notifyList.notificationMode ?? "vibrate") === "vibrate") && this.cfg.wakeOnNotify);
   }
@@ -422,7 +428,7 @@ export class Gateway {
     }, ticket);
     // Store all enabled modes, but expand media only when that mode actually exposes
     // the message. A put-down phone event must never smuggle images into awareness.
-    const visible = this.cfg.externalSelfMessages === "simulate" || (this.cfg.externalSelfMessages === "event" && canUsePhone(this.phone));
+    const visible = this.cfg.externalSelfMessages === "simulate" || (this.cfg.externalSelfMessages === "event" && this.canReadScreen());
     const rendered: RichText = visible
       ? { ...prefixRichText(`〔聊天记录 #${saved.id}〕（${conversationLabel(saved.conversation, bot.selfId)}）\n`, await this.renderer.render(content)), ...chatMessageEvidence(saved) }
       : this.cfg.externalSelfMessages === "event"
@@ -499,8 +505,8 @@ export class Gateway {
     const mayNotify = notifyOnArrival && this.notificationAllowed(key);
     if (!focused && !mayNotify) return;
 
-    // 手机被放下：本会通知的消息一律降级为"感觉到震动"，不呈现任何内容
-    if (!canUsePhone(this.phone)) {
+    // An unreadable screen (including explicit sleep) exposes only the existing anonymous signal.
+    if (!this.canReadScreen()) {
       if (notifyOnArrival) this.deliverVibration(chatMessageEvidence(saved), saved.observedAt?.getTime() ?? ticket.observedAt.getTime(), key);
       return;
     }
@@ -510,7 +516,7 @@ export class Gateway {
       : await this.renderNotification(key, session, content, conversation, saved);
     // Rendering images or resolving names can finish after the phone was put down.
     // Recheck the actual delivery boundary before exposing text or participant facts.
-    if (!canUsePhone(this.phone)) {
+    if (!this.canReadScreen()) {
       if (notifyOnArrival) this.deliverVibration(chatMessageEvidence(saved), saved.observedAt?.getTime() ?? ticket.observedAt.getTime(), key);
       return;
     }
@@ -518,7 +524,7 @@ export class Gateway {
       focused = false;
       if (!notifyOnArrival || !this.notificationAllowed(key)) return;
       notification = await this.renderNotification(key, session, content, conversation, saved);
-      if (!canUsePhone(this.phone)) { this.deliverVibration(chatMessageEvidence(saved), ticket.observedAt.getTime(), key); return; }
+      if (!this.canReadScreen()) { this.deliverVibration(chatMessageEvidence(saved), ticket.observedAt.getTime(), key); return; }
     }
     if (!focused && (!notifyOnArrival || !this.notificationAllowed(key))) return;
     // Only full message delivery grants the evidence identity and its participants.

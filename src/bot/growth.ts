@@ -1165,9 +1165,19 @@ function normalizeMetadata(value: ExperienceMetadata): ExperienceMetadata {
 
 function normalizeChat(chat: NonNullable<ExperienceMetadata["chat"]>): NonNullable<ExperienceMetadata["chat"]> {
   if (!["message", "notice", "attention", "send"].includes(chat.kind)) throw new Error("聊天证据类别无效");
+  const direction = chat.direction;
+  if (direction && !["direct", "group", "unknown"].includes(direction.kind)) throw new Error("聊天会话类型无效");
   return { kind: chat.kind, channelKey: requiredText(chat.channelKey, "chat.channelKey", 500),
     ...(chat.senderId ? { senderId: requiredText(chat.senderId, "chat.senderId", 300) } : {}),
-    ...(typeof chat.senderOwn === "boolean" ? { senderOwn: chat.senderOwn } : {}) };
+    ...(typeof chat.senderOwn === "boolean" ? { senderOwn: chat.senderOwn } : {}),
+    ...(direction ? { direction: {
+      kind: direction.kind,
+      ...(direction.accountId ? { accountId: requiredText(direction.accountId, "chat.direction.accountId", 300) } : {}),
+      mentionedIds: stringList(direction.mentionedIds, "chat.direction.mentionedIds", 200, 300),
+      mentionsEveryone: direction.mentionsEveryone === true,
+      ...(direction.quotedSenderId ? { quotedSenderId: requiredText(direction.quotedSenderId, "chat.direction.quotedSenderId", 300) } : {}),
+    } } : {}),
+  };
 }
 
 /** Additional support is audit history, not a stronger personality instruction or a fresh recollection. */

@@ -69,7 +69,7 @@ export type RichTextPart = (
   | {
     kind: "media"; ref: MediaRef; name?: string; summary?: string; sticker?: boolean; marker: string;
     /** Persisted rendering version: missing means preserve the historical text verbatim. */
-    presentation?: "media-v1" | "expression-v1";
+    presentation?: "media-v1" | "expression-v1" | "media-v2" | "expression-v2";
     /** Usage-specific recognition, never the sender's asserted intent or an ordinary image caption. */
     expressionSummary?: string;
     /** The character's personal selection note, distinct from media recognition. */
@@ -105,6 +105,15 @@ export interface ExperienceMetadata {
     /** Stable chatSubjectId, never a display name. */
     senderId?: string;
     senderOwn?: boolean;
+    /** Platform-declared direction. For attention snapshots this describes the last visible row. */
+    direction?: {
+      kind: "direct" | "group" | "unknown";
+      /** Receiving account and mentioned/quoted authors use chatSubjectId, never nicknames. */
+      accountId?: string;
+      mentionedIds: string[];
+      mentionsEveryone: boolean;
+      quotedSenderId?: string;
+    };
   };
   /** Roots of messages explicitly quoted by this delivered message; never inferred from proximity. */
   responseToRoots?: string[];
@@ -171,6 +180,8 @@ export interface BotEvent {
   contextHint?: { text: string };
   /** Durable, non-experiential tool announcements; restored names reuse a definition in this window. */
   toolAvailability?: { removed: string[]; definitions: Record<string, string>; restored: string[] };
+  /** Program-authored tool help after failure; not an experience to retain in memory. */
+  toolTutorial?: true;
   /** A read-only message slice of an already delivered parent, not a newly performed action. */
   perceptionOf?: { eventId: string; partIndexes: number[] };
   experience?: ExperienceMetadata;

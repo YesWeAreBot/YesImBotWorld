@@ -17,6 +17,7 @@ import type { ToolCallRecord } from "../types.js";
 import type { RemoteWorldLink } from "../world/agent.js";
 import type { WorldObservation } from "../world/state.js";
 import { CROSSING_LIMITS, type CrossingSseMsg, type CrossingTaskKind, type CrossingTaskPayload } from "./protocol.js";
+import { validNarrativeConsciousness, type NarrativeConsciousness } from "../world/consciousness.js";
 
 /** 等待主世界任务结果的上限（主世界的 World-LLM 可能排队/推理很久） */
 const TASK_TIMEOUT_MS = 12 * 60_000;
@@ -57,6 +58,10 @@ export class CrossingClient implements RemoteWorldLink {
   private hostUnitWorldSeconds: number | null = null;
   private lastPerceptionId = "";
   private seenPerceptions = new Set<string>();
+  private visitorId?: string;
+  private _consciousness?: NarrativeConsciousness;
+  private consciousnessSequence = -1;
+  private consciousnessListeners = new Set<() => void>();
 
   constructor(
     private target: CrossingWorldConfig,
@@ -68,6 +73,24 @@ export class CrossingClient implements RemoteWorldLink {
 
   get worldName(): string {
     return this._worldName;
+  }
+  get consciousness(): NarrativeConsciousness | undefined { return this._consciousness; }
+  subscribeConsciousness(listener: () => void): () => void {
+    this.consciousnessListeners.add(listener); return () => { this.consciousnessListeners.delete(listener); };
+  }
+  private updateConsciousness(value: { actorId?: unknown; worldSequence?: unknown; consciousness?: unknown }): void {
+    if (!this.active || !this.visitorId || value.actorId !== `visitor:${this.visitorId}` || !validNarrativeConsciousness(value.consciousness)
+      || typeof value.worldSequence !== "number" || !Number.isSafeInteger(value.worldSequence) || value.worldSequence < 0 || value.worldSequence <= this.consciousnessSequence) return;
+    this.consciousnessSequence = value.worldSequence;
+    if (this._consciousness === value.consciousness) return;
+    this._consciousness = value.consciousness;
+    for (const listener of this.consciousnessListeners) listener();
+  }
+  private observationConsciousness(content: string): void {
+    try {
+      const parsed = JSON.parse(content), observation = parsed?.observation ?? parsed;
+      if (observation && typeof observation.observationId === "string" && Array.isArray(observation.sourceEventIds)) this.updateConsciousness(observation);
+    } catch { /* Prose is never an authority for consciousness. */ }
   }
 
   private base(): string {
@@ -90,6 +113,8 @@ export class CrossingClient implements RemoteWorldLink {
       throw new Error(String(r.error ?? "对方世界拒绝了到达请求"));
     }
     this.token = r.token;
+    this.visitorId = typeof r.visitorId === "string" && r.visitorId ? r.visitorId : undefined;
+    this._consciousness = undefined; this.consciousnessSequence = -1;
     this.lastPerceptionId = "";
     this.seenPerceptions.clear();
     const hostUnit = Number(r.unitWorldSeconds);
@@ -251,7 +276,7 @@ export class CrossingClient implements RemoteWorldLink {
     while (task.queuedParts.has(task.nextIndex)) {
       const part = task.queuedParts.get(task.nextIndex)!;
       task.queuedParts.delete(task.nextIndex++);
-      task.delivery = task.delivery.then(async () => { if (part.trim()) await task.deliver(part); });
+      task.delivery = task.delivery.then(async () => { if (part.trim()) { this.observationConsciousness(part); await task.deliver(part); } });
       void task.delivery.catch(() => {}); // surfaced by the owning runTask, not an unhandled SSE rejection
     }
   }
@@ -321,9 +346,15 @@ export class CrossingClient implements RemoteWorldLink {
   }
 
   private receiveMessage(msg: CrossingSseMsg): string | null {
-    if (msg.type === "event") {
+    if (msg.type === "hello") {
+      if (typeof msg.visitorId === "string" && msg.visitorId && !this.visitorId) this.visitorId = msg.visitorId;
+      if (msg.consciousnessState) this.updateConsciousness(msg.consciousnessState);
+    } else if (msg.type === "consciousness") {
+      this.updateConsciousness(msg);
+    } else if (msg.type === "event") {
       if (msg.eventId && this.seenPerceptions.has(msg.eventId)) return null;
       if (msg.content?.trim()) {
+        this.observationConsciousness(msg.content);
         this.hooks.onEvent(msg.content);
         if (msg.eventId && !/[\r\n\0]/.test(msg.eventId)) {
           this.lastPerceptionId = msg.eventId;

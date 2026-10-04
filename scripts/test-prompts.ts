@@ -46,7 +46,7 @@ async function main() {
     const seen: any[] = [];
     (world as any).client = { complete: async (messages: any[], options: any = {}) => {
       seen.push({ messages, options });
-      return options.tools?.length ? { content: "", toolCalls: [{ id: "p", type: "function", function: { name: "resolve_world", arguments: '{"perceptions":[]}' } }] } : { content: "未知", toolCalls: [] };
+      return options.responseSchema ? { content: '{"perceptions":[]}', toolCalls: [] } : { content: "未知", toolCalls: [] };
     } };
     for (const version of ["A", "B"]) {
       prompts.setOverrides({ bot: { constitutionHead: version }, world: { narrativeSystem: "裁定-" + version, presentationSystem: "呈现-" + version } });
@@ -55,8 +55,10 @@ async function main() {
       assert.equal(system.split("裁定-" + version).length - 1, 1, "live owner prose is retained verbatim once inside the stable task prompt");
       assert.match(system, /本次任务：evolve/);
       assert.match(system, /真人聊天由实际平台独占/);
-      assert.deepEqual(seen.at(-2).options.tools.map((t: any) => t.function.name), ["resolve_world"]);
-      assert.deepEqual(seen.at(-2).options.toolChoice, { type: "function", function: { name: "resolve_world" } });
+      assert.equal(seen.at(-2).options.responseFormat, "json_schema");
+      assert.equal(seen.at(-2).options.responseSchema.name, "world_resolution");
+      assert.equal(seen.at(-2).options.tools, undefined);
+      assert.equal(seen.at(-2).options.toolChoice, undefined);
       assert.equal(seen.at(-1).messages[0].content, "呈现-" + version);
       assert.equal(seen.at(-1).options.tools, undefined);
       const context = new BotContext(files, "", prompts); await context.load();
@@ -93,7 +95,7 @@ async function main() {
           assert.match(system, /已有原生声明的能力使用 function calling/);
           assert.match(system, /当前可用或已学会且可导航的工具、参数尚无原生声明时，用正文 JSON/);
         }
-        else { assert.equal(options.tools, undefined); assert.match(system, /本次使用正文 JSON 协议/); }
+        else { assert.equal(options.tools, undefined); assert.match(system, /本次使用正文工具协议/); }
         return { content: '{"name":"check_time","arguments":{},"duration":0}', toolCalls: [] };
       } };
       const protocolFiles = new WorldFiles(path.join(dir, `protocol-${nativeToolCalls}`)); await protocolFiles.ensure();
@@ -157,7 +159,7 @@ async function main() {
     assert.ok(concise.length < focusedTools.map(renderToolHelp).join("\n").length * 0.8, "normal discovery is appreciably smaller than full tutorials");
     assert.match(TOOL_HELP_GUIDANCE, /help\(tool\).*完整说明/);
     assert.match(TOOL_HELP_GUIDANCE, /当前清单是界面上展开的能力.*熟悉的设备工具可直接调用.*目标明确的必要导航/);
-    assert.match(TOOL_HELP_GUIDANCE, /缺少目标、物理障碍或权限限制不能自动跨过/);
+    assert.match(TOOL_HELP_GUIDANCE, /缺少目标或权限限制不能自动跨过.*设备物理限制以对应工具的当前规则为准/);
     assert.doesNotMatch(BOT_PROMPT_DEFAULTS.constitution, /每次命令默认从电脑主目录执行|远程桌面通过 screen、mouse、keyboard|先打开聊天应用|裸打/,
       "fixed guidance keeps factual boundaries; step-by-step device tutorials stay in explicit help");
     assert.match(sendDescription, /<at id=.*<face id=.*<quote id=/, "moving markup tutorials out of the fixed block must retain queryable send help");
@@ -184,9 +186,10 @@ async function main() {
     const channelReader = toolDefs.find(t => t.name === "read_channel")!;
     assert.match(channelReader.signature, /id\?: string/);
     assert.match(renderToolHelp(channelReader), /不会自行改用最近通知的频道/);
-    assert.match(THOUGHT_RUNTIME_GUIDANCE, /牵挂.*打算/);
-    assert.match(THOUGHT_RUNTIME_GUIDANCE, /不为填满等待时间而编造独白/);
-    assert.match(THOUGHT_RUNTIME_GUIDANCE, /不强制每次行动前都思考/);
+    assert.match(THOUGHT_RUNTIME_GUIDANCE, /回想.*打算/);
+    assert.match(THOUGHT_RUNTIME_GUIDANCE, /不限制连续思考次数/);
+    assert.match(THOUGHT_RUNTIME_GUIDANCE, /不要求每步先思考/);
+    assert.match(THOUGHT_RUNTIME_GUIDANCE, /think\("内容"\).*原生调用用/);
     assert.match(CHAT_CONTINUITY_GUIDANCE, /短暂停留等后文，不必放下手机/);
     assert.match(CHAT_CONTINUITY_GUIDANCE, /不需要反复 read_channel 轮询/);
     assert.ok(INITIATIVE_GUIDANCE.includes(CHAT_CONTINUITY_GUIDANCE), "continuity reaches existing contexts through append-only runtime guidance");

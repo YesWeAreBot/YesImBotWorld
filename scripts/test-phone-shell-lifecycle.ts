@@ -37,7 +37,7 @@ async function fixture() {
   const calls: string[] = [];
   let handler = async (messages: ChatMessage[], options: { signal?: AbortSignal; tools?: unknown[] }): Promise<ChatResult> => {
     const prompt = String(messages[0]?.content);
-    if (options.tools?.length) return { content: "", toolCalls: [{ id: "genesis", type: "function", function: { name: "resolve_world", arguments: JSON.stringify({
+    if (options.responseSchema || options.tools?.length) return { content: "", toolCalls: [{ id: "genesis", type: "function", function: { name: "resolve_world", arguments: JSON.stringify({
       botName: "小澈", worldState: "自习室里有桌椅。", actorStates: [{ actorId: "bot", state: "坐在桌前。" }], perceptions: [{ actorId: "bot", text: "你看见桌上的书。" }],
     }) } }] };
     if (prompt === prompts.world.assessRealWorldSystem) return plain('{"real_world":true}');

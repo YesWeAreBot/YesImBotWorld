@@ -3,6 +3,7 @@ import type { AudioCaptionerConfig, CaptionerConfig, CaptionersConfig, MediaConf
 import { ChatClient, type ContentPart } from "../llm/chat.js";
 import type { MediaRef, MediaType } from "../types.js";
 import { mediaToContentPart } from "./parts.js";
+import { normalizeAudio } from "./audio.js";
 import type { MediaStore } from "./store.js";
 
 /**
@@ -159,8 +160,9 @@ export class CaptionService {
     promptOverride?: string,
   ): Promise<string | null> {
     const data = await this.store.readFile(ref);
-    const part = partOverride ?? mediaToContentPart(ref, data);
+    const part = partOverride ?? await mediaToContentPart(ref, data);
     const client = new ChatClient({
+      apiType: cfg.apiType,
       baseURL: cfg.baseURL,
       apiKey: cfg.apiKey || undefined,
       model: cfg.model,
@@ -179,11 +181,10 @@ export class CaptionService {
 
   /** whisper 风格 /v1/audio/transcriptions */
   private async transcribe(ref: MediaRef, cfg: AudioCaptionerConfig): Promise<string | null> {
-    const data = await this.store.readFile(ref);
+    const data = await normalizeAudio(await this.store.readFile(ref));
     const url = cfg.baseURL.replace(/\/+$/, "") + "/audio/transcriptions";
     const form = new FormData();
-    const filename = ref.file.split("/").pop() ?? "audio";
-    form.append("file", new Blob([new Uint8Array(data)], { type: ref.mime }), filename);
+    form.append("file", new Blob([new Uint8Array(data)], { type: "audio/wav" }), `media-${ref.id}.wav`);
     if (cfg.model) form.append("model", cfg.model);
     const res = await fetch(url, {
       method: "POST",

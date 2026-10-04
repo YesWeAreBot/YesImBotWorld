@@ -8,7 +8,7 @@ import { BotAgent } from "../src/bot/agent.js";
 import { BotContext } from "../src/bot/context.js";
 import { AppManager } from "../src/apps/manager.js";
 import { ComputerDevice } from "../src/apps/computerDevice.js";
-import { BOT_TOOLS } from "../src/bot/tools.js";
+import { BOT_TOOLS, renderToolHelp } from "../src/bot/tools.js";
 import { WorldFiles } from "../src/files.js";
 import { Config } from "../src/config.js";
 import { applyPhonePhysicalState, canUsePhone } from "../src/phone-state.js";
@@ -38,6 +38,24 @@ async function purePlans() {
     steps: [step("select_channel", { id: PRIVATE })],
   }, "an explicit recipient must override the currently visible channel");
   assert.deepEqual(await plan("read_channel", {}, state({ chatOpen: true, channelKey: PRIVATE })), { steps: [] });
+  assert.deepEqual(await plan("read_channel", { id: PRIVATE, n: 10 }, state({ phone: { down: true } })), {
+    steps: [step("pick_up_phone"), step("open_app", { name: "fixture-chat" }), step("select_channel", { id: PRIVATE })],
+  }, "an explicit read target does not require a previously selected channel");
+  for (const current of [state(), state({ chatOpen: true, channelKey: GROUP, channelIsGroup: true })]) {
+    const beforeAlias = resolved.length;
+    const alias = await plan("read_channel", { channel_id: PRIVATE, n: "10" }, current);
+    assert.match(alias.error!, /channel_id.*id/, "the rejection identifies the wrong field, rather than claiming there was no supplied target");
+    assert.doesNotMatch(alias.error!, /缺少目标频道/);
+    assert.deepEqual(alias.steps, []);
+    assert.equal(resolved.length, beforeAlias, "an unsupported target field cannot fall back to the currently selected channel");
+    for (const id of ["", " ", null, 123, false, `"${PRIVATE}"`]) {
+      const beforeInvalid = resolved.length;
+      const invalidRead = await plan("read_channel", { id, n: 10 }, current);
+      assert.ok(invalidRead.error); assert.deepEqual(invalidRead.steps, []);
+      assert.equal(resolved.length, beforeInvalid, "an invalid explicit read target is never replaced by current-channel state");
+      if (typeof id === "string" && id.startsWith('"')) assert.match(invalidRead.error, /引号/);
+    }
+  }
   assert.deepEqual(await plan("send", { id: PRIVATE, msg: "明确的同一会话" }, state({ chatOpen: true, channelKey: PRIVATE })), { steps: [] });
   const beforeMissing = resolved.length;
   const missing = await plan("send", { msg: "没有指定给谁" }, state({ phone: { down: true }, channelKey: PRIVATE }));
@@ -97,7 +115,7 @@ type Mode = "native" | "body";
 async function runtimeFixture(target: ParsedToolCall, options: { mode?: Mode; phone?: PhoneStatus; channel?: string;
   banned?: string[]; apps?: WorldApp[]; prelearn?: boolean; onChatOpen?: (agent: any) => Promise<void> | void;
   onGenerate?: (agent: any) => void; puppet?: boolean; computer?: (files: WorldFiles) => Promise<ComputerDevice>;
-  ignoreSendDuration?: boolean; realMsUntil?: (at: number) => number; sendGate?: Promise<void>; holdNextGeneration?: boolean } = {}) {
+  unrestrictedPhone?: boolean; ignoreSendDuration?: boolean; realMsUntil?: (at: number) => number; sendGate?: Promise<void>; holdNextGeneration?: boolean } = {}) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "yesimbot-tool-navigation-")); dirs.push(dir);
   const files = new WorldFiles(dir); await files.ensure();
   const context = new BotContext(files); await context.load();
@@ -105,6 +123,7 @@ async function runtimeFixture(target: ParsedToolCall, options: { mode?: Mode; ph
   Object.assign(cfg.bot, { nativeToolCalls: true, minIntervalMs: 0, retryDelayMs: 1, maxWindowChars: 1_000_000,
     restCompressMinChars: 1_000_000, spillMinChars: 0, ignoreSendDuration: options.ignoreSendDuration ?? true, waitRateThreshold: 0 });
   cfg.bot.growth.enabled = false; cfg.messaging.sendEcho = false; cfg.apps.chatAppName = "fixture-chat";
+  cfg.bot.unrestrictedPhone = options.unrestrictedPhone ?? true;
   const definitions = BOT_TOOLS.filter(def => ["help", "think", "pick_up_phone", "put_down_phone", "open_app", "close_app", "open_computer", "close_computer", "select_channel", "read_channel", "send", "group_info", "cancel"].includes(def.name));
   const apps = new AppManager("fixture-chat", options.apps ?? [], new Set(definitions.map(def => def.name)), logger);
   if (options.prelearn) for (const app of options.apps ?? []) { await apps.open(app); await apps.closeCurrent(); }
@@ -179,8 +198,8 @@ async function runtimeNavigation() {
   for (const test of [
     { label: "missing target", target: call("send", { msg: "不要猜测给谁" }), options: {} },
     { label: "private group operation", target: call("group_info", { id: PRIVATE }), options: {} },
-    { label: "lost phone", target: call("send", { id: PRIVATE, msg: "遗失不能恢复" }), options: { phone: { down: true, physical: { reachable: false, location: null, usable: true, perceptible: false } } } },
-    { label: "damaged phone", target: call("send", { id: PRIVATE, msg: "损坏不能恢复" }), options: { phone: { down: true, physical: { reachable: true, location: "面前", usable: false, perceptible: true } } } },
+    { label: "lost phone (strict mode)", target: call("send", { id: PRIVATE, msg: "遗失不能恢复" }), options: { unrestrictedPhone: false, phone: { down: true, physical: { reachable: false, location: null, usable: true, perceptible: false } } } },
+    { label: "damaged phone (strict mode)", target: call("send", { id: PRIVATE, msg: "损坏不能恢复" }), options: { unrestrictedPhone: false, phone: { down: true, physical: { reachable: true, location: "面前", usable: false, perceptible: true } } } },
     { label: "banned target", target: call("send", { id: PRIVATE, msg: "禁用不能绕过" }), options: { banned: ["send"] } },
     { label: "banned pickup", target: call("send", { id: PRIVATE, msg: "禁用不能绕过" }), options: { banned: ["pick_up_phone"] } },
     { label: "banned app opening", target: call("send", { id: PRIVATE, msg: "禁用不能绕过" }), options: { banned: ["open_app"] } },
@@ -253,6 +272,49 @@ async function runtimeNavigation() {
   assert.equal(puppetThink.phone.down, true);
 }
 
+async function readTargetDiagnostics() {
+  let helped: Awaited<ReturnType<typeof runtimeFixture>> | undefined;
+  for (const mode of ["native", "body"] as const) {
+    for (const channel of [undefined, GROUP]) {
+      const f = await runtimeFixture(call("read_channel", { channel_id: PRIVATE, n: "10" }), { mode, channel });
+      f.agent.start(); await until(() => f.requests.length === 2); await f.agent.stop();
+      const attempt = f.context.stream.find(entry => entry.kind === "tool_call" && entry.call.name === "read_channel");
+      assert.ok(attempt?.kind === "tool_call");
+      const rejection = f.context.stream.find(entry => entry.kind === "event" && entry.event.refToolCallId === attempt.call.id);
+      assert.ok(rejection?.kind === "event");
+      assert.match(rejection.event.content, /channel_id.*id/);
+      assert.doesNotMatch(rejection.event.content, /缺少目标频道/);
+      assert.match(JSON.stringify(f.requests[1]!.messages), /channel_id/, "the next real model request receives the exact parameter correction");
+      assert.equal(f.chatOpens(), 0); assert.equal(f.channelReads(), 0); assert.equal(f.sends.length, 0);
+      assert.deepEqual(f.calls(), ["read_channel"], "bad arguments do not execute interface prerequisites or fallback reads");
+      assert.equal(f.agent.phoneUi.channelKey, channel ?? null);
+      helped = f;
+    }
+    const f = await runtimeFixture(call("read_channel", { id: PRIVATE, n: 10 }), { mode });
+    f.agent.start(); await until(() => f.requests.length === 2); await f.agent.stop();
+    assert.deepEqual(f.calls(), ["pick_up_phone", "open_app", "select_channel", "read_channel"]);
+    assert.equal(f.agent.phoneUi.channelKey, PRIVATE);
+    assert.equal(f.channelReads(), 2, "entering the explicit conversation and the requested history read both actually run");
+    assert.equal(f.sends.length, 0); assert.equal(f.worldCalls(), 0);
+    assert.doesNotMatch(JSON.stringify(f.requests[1]!.messages), /缺少目标频道/);
+  }
+
+  const f = helped!;
+  const help = renderToolHelp(BOT_TOOLS.find(def => def.name === "read_channel")!);
+  const helpEvents = () => f.context.stream.filter(entry => entry.kind === "event" && entry.event.content === help);
+  assert.equal(helpEvents().length, 1, "the first failed read exposes its full usage instructions");
+  f.agent.pendingToolHelp.add("read_channel"); await f.agent.announceFailedToolHelp();
+  assert.equal(helpEvents().length, 1, "repeated failures do not append tutorials already present in this context window");
+  await f.context.applyCompression({ historySummary: "此前读消息的尝试未执行。", memoryDigest: "尚未读到目标会话。" }, 11);
+  assert.equal(helpEvents().length, 0);
+  await f.agent.announceFailedToolHelp();
+  assert.equal(helpEvents().length, 0, "compression alone does not reinsert tutorials");
+  f.agent.pendingToolHelp.add("read_channel"); await f.agent.announceFailedToolHelp();
+  assert.equal(helpEvents().length, 1, "a fresh failure after compression can restore help that is no longer in the model's context");
+  f.agent.pendingToolHelp.add("read_channel"); await f.agent.announceFailedToolHelp();
+  assert.equal(helpEvents().length, 1, "restored help is also deduplicated within the new window");
+}
+
 async function physicalChangesCancelOnlyUnsubmittedPhoneTasks() {
   for (const [label, physical] of [
     ["lost", { reachable: false, location: null, usable: true, perceptible: false }],
@@ -301,8 +363,9 @@ async function main() {
   try {
     await purePlans();
     await runtimeNavigation();
+    await readTargetDiagnostics();
     await physicalChangesCancelOnlyUnsubmittedPhoneTasks();
-    console.log("PASS tool navigation: exact/implicit channel plans, physical/target/control/ban/ambiguity barriers, loss/recovery cancellation with committed receipt preservation, real ordered steps and receipts through native/body runLoop, learned apps and stable cached prefixes");
+    console.log("PASS tool navigation: exact/implicit channel plans, truthful alias/quoted-id errors and post-compaction help, physical/target/control/ban/ambiguity barriers, loss/recovery cancellation with committed receipt preservation, real ordered steps and receipts through native/body runLoop, learned apps and stable cached prefixes");
   } finally {
     await Promise.allSettled(agents.map(agent => agent.stop()));
     await Promise.all(dirs.map(dir => fs.rm(dir, { recursive: true, force: true })));

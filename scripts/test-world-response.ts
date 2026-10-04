@@ -81,7 +81,7 @@ async function streamingTransport() {
         tools: [{ type: "function", function: { name: "resolve_world", description: "fixture", parameters: { type: "object" } } }],
         toolChoice: { type: "function", function: { name: "resolve_world" } },
       });
-      assert.deepEqual(result, cases[index], "SSE reconstruction preserves the real transport shape, including malformed arguments");
+      assert.deepEqual(result, { ...cases[index], finishReason: "stop" }, "SSE reconstruction preserves the real transport shape and termination reason, including malformed arguments");
       if (index < 3) assert.deepEqual(parseWorldResponse(result).value, proposal);
       else assert.throws(() => parseWorldResponse(result), /WORLD_RESPONSE_JSON/);
     }

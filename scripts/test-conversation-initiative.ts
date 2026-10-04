@@ -6,6 +6,7 @@ import { conversationMaterialReminder, CONVERSATION_MATERIAL_PREFIX } from "../s
 import { BotAgent } from "../src/bot/agent.js";
 import { BotContext } from "../src/bot/context.js";
 import { BOT_TOOLS } from "../src/bot/tools.js";
+import { derivePerceivedDeviceContext, INITIAL_WORLD_EPOCH } from "../src/bot/opportunities.js";
 import { WorldFiles } from "../src/files.js";
 import { COMPRESSION_SOURCE_GUIDANCE, CONVERSATION_INITIATIVE_GUIDANCE, INITIATIVE_GUIDANCE, Prompts, WORLD_PROMPT_DEFAULTS } from "../src/prompts.js";
 import type { BotEvent, StreamEntry, ToolCallRecord } from "../src/types.js";
@@ -96,6 +97,58 @@ function boundaries() {
   console.log("PASS conversation material: only delivered self-action progress, bounded sourced excerpts, no hidden world/web/forced actions, durable readback dedup and no notification-triggered posting cues");
 }
 
+function visibleConversation() {
+  const life = experience("finished-cup", "你把烧好的陶杯带了回来，杯沿有个小缺口。"), opened = read("opened-before-life");
+  const message: BotEvent = { id: "fresh-message", source: "koishi", worldTime: 6, content: "甲：今天过得怎么样？",
+    originEventIds: ["chat-message:fresh"], experience: { agency: "observed", chat: {
+      kind: "message", channelKey: "mock:group:account", senderOwn: false, senderId: "甲", direction: { kind: "group", accountId: "我", mentionedIds: ["我"], mentionsEveryone: false },
+    } } };
+  const live = [...opened, ...life, entry(message)];
+  const cue = conversationMaterialReminder(live, 6)!;
+  assert.ok(cue, "a real message in the already viewed conversation can recall newer life without another read");
+  assert.match(cue.content, /小缺口/); assert.deepEqual(cue.originEventIds, []);
+  const othersChat = { ...message.experience!.chat!, direction: { kind: "group" as const, accountId: "我", mentionedIds: [], mentionsEveryone: false, quotedSenderId: "乙" } };
+  const others = entry({ ...message, id: "others-exchange", originEventIds: ["chat-message:others"], experience: { ...message.experience, chat: othersChat } });
+  assert.equal(conversationMaterialReminder([...life, ...opened, others], 6), undefined, "an actual newer A-to-B exchange retires an earlier generic sharing cue");
+  const readOthers = read("read-others").map(item => item.kind === "event" ? entry({ ...item.event,
+    experience: { ...item.event.experience, chat: { ...othersChat, kind: "attention" } } }) : item);
+  assert.equal(conversationMaterialReminder([...life, ...readOthers], 6), undefined, "reading an explicit exchange between others does not insert life-sharing material");
+  assert.equal(conversationMaterialReminder([...live, entry(cue), entry({ ...message, id: "copy" })], 7), undefined);
+  for (const chat of [
+    { ...message.experience!.chat!, kind: "notice" as const },
+    { ...message.experience!.chat!, kind: "send" as const },
+    { ...message.experience!.chat!, senderOwn: true },
+    { ...message.experience!.chat!, senderOwn: undefined },
+    { ...message.experience!.chat!, direction: undefined },
+    { ...message.experience!.chat!, direction: { kind: "group" as const, accountId: "我", mentionedIds: [], mentionsEveryone: false, quotedSenderId: "乙" } },
+    { ...message.experience!.chat!, channelKey: "mock:another:account" },
+  ]) assert.equal(conversationMaterialReminder([...opened, ...life, entry({ ...message, experience: { ...message.experience, chat } })], 6), undefined);
+  for (const override of [
+    { source: "system" as const }, { originEventIds: [] },
+    { experience: { ...message.experience, agency: "imposed" as const } },
+    { experience: { ...message.experience, worldPerception: true } },
+  ]) assert.equal(conversationMaterialReminder([...opened, ...life, entry({ ...message, ...override })], 6), undefined);
+  assert.equal(conversationMaterialReminder([...life, entry(message)], 6), undefined, "a message cannot manufacture visible-screen knowledge");
+  const alreadyRead = opened.map(item => item.kind === "event" ? entry({ ...item.event, originEventIds: message.originEventIds }) : item);
+  assert.equal(conversationMaterialReminder([...alreadyRead, ...life, entry(message)], 6), undefined, "a message already in an older read is not a fresh arrival");
+  assert.equal(conversationMaterialReminder([...opened, entry(message), ...life, entry({ ...message, id: "replayed" })], 6), undefined, "replayed messages cannot invite sharing a newer episode");
+  const notice = entry({ ...message, id: "notice", originEventIds: ["chat-notice:fresh"], experience: { agency: "observed" as const } });
+  assert.ok(conversationMaterialReminder([...opened, ...life, notice, entry(message)], 6), "an earlier anonymous notice does not consume the actual body");
+  const left = [operation("put-away", "put_down_phone"), entry({ id: "left", source: "tool" as const, worldTime: 7,
+    refToolCallId: "put-away", content: "已放下。" })];
+  assert.equal(conversationMaterialReminder([...live, ...left], 7), undefined, "batch delivery uses the final observed screen");
+  assert.equal(conversationMaterialReminder(live, 6, { channelKey: "mock:another:account" }), undefined);
+  const historic = life.map(item => item.kind === "event" ? entry({ ...item.event, experience: { ...item.event.experience,
+    worldEpoch: INITIAL_WORLD_EPOCH } }) : item);
+  const past = conversationMaterialReminder([...opened, ...historic, entry(message)], 6,
+    { channelKey: "mock:group:account", worldEpoch: "other-world" })!;
+  assert.match(past.content, /先前世界的经历，不代表当前处境/);
+  const markedHistoric = life.map(item => item.kind === "event" ? entry({ ...item.event,
+    experience: { ...item.event.experience, historicalWorld: true } }) : item);
+  assert.match(conversationMaterialReminder([...opened, ...markedHistoric, entry(message)], 6)!.content, /先前世界的经历/);
+  console.log("PASS live conversation recall: visible non-self fresh messages only, provenance dedup, no unseen channel or notification cue, historical-world labeling");
+}
+
 async function runtime() {
   const base = await fs.mkdtemp(path.join(os.tmpdir(), "conversation-initiative-"));
   let agent: any;
@@ -118,7 +171,7 @@ async function runtime() {
     const clock = { now: () => time, timeLine: () => `T${time}`, unitWorldSeconds: 1, realMsUntil: () => 0 } as any;
     const world = { adjudicateAct: async (action: ToolCallRecord, deliver: (text: string) => void) => {
       worldCalls++;
-      const data = JSON.parse(physical("bridge", "你走到桥头，发现木桥的一块踏板断了，折回了岸边。").content);
+      const data = JSON.parse(physical(`bridge-${worldCalls}`, worldCalls === 1 ? "你走到桥头，发现木桥的一块踏板断了，折回了岸边。" : "你沿另一条河岸回家，发现路边的柳树开花了。").content);
       data.action.id = `bot:${action.id}`;
       await deliver(JSON.stringify(data)); return true;
     } } as any;
@@ -164,7 +217,21 @@ async function runtime() {
     assert.match(WORLD_PROMPT_DEFAULTS.compressUser, /亲身经历.*感受、疑问.*聊天待办/);
     assert.match(COMPRESSION_SOURCE_GUIDANCE, /主观想法与亲历分开/);
     assert.match(COMPRESSION_SOURCE_GUIDANCE, /谈话素材提示.*不是新经历、分享任务/);
+    assert.match(CONVERSATION_INITIATIVE_GUIDANCE, /没有必须多 act、少聊天的比例/);
+    await invoke("act", { description: "沿另一条路回家" });
+    assert.equal(cueCount(context.stream), 0, "new life alone is still not a posting instruction");
+    assert.deepEqual(derivePerceivedDeviceContext(context.stream), {}, "the active window has no new screen read after compression");
+    assert.deepEqual(derivePerceivedDeviceContext(context.opportunityStream()), { channelKey: "mock:group:account" });
+    const compressedPrefix = structuredClone(await context.toChatMessages("after-compression"));
+    agent.pushEvent("koishi", { text: "甲：你回来了？", originEventIds: ["chat-message:new-after-compaction"],
+      experience: { agency: "observed", chat: { kind: "message", channelKey: "mock:group:account", senderOwn: false, direction: { kind: "group", accountId: "我", mentionedIds: ["我"], mentionsEveryone: false } } } });
+    await agent.drainMailbox();
+    assert.equal(cueCount(context.stream), 1, "current screen checkpoint allows a fresh message to recall newly delivered life");
+    const liveCue = context.stream.find(item => item.kind === "event" && item.event.content.startsWith(CONVERSATION_MATERIAL_PREFIX))! as Extract<StreamEntry, { kind: "event" }>;
+    assert.match(liveCue.event.content, /柳树开花/); assert.doesNotMatch(liveCue.event.content, /踏板断了/, "compressed old episodes cannot be offered as a new posting backlog");
+    assert.deepEqual((await context.toChatMessages("after-message")).slice(0, compressedPrefix.length), compressedPrefix);
+    assert.equal(sends, 0); assert.equal(generations, 0); assert.equal(worldCalls, 2);
     console.log("PASS Bot act→chat read integrates optional personal recall without inference, messages, new evidence or cached-prefix mutation; restart and compaction retain provenance");
   } finally { if (agent) await agent.stop(); await fs.rm(base, { recursive: true, force: true }); }
 }
-boundaries(); runtime().catch(error => { console.error(error); process.exitCode = 1; });
+boundaries(); visibleConversation(); runtime().catch(error => { console.error(error); process.exitCode = 1; });

@@ -25,8 +25,8 @@ async function main() {
     const infer = (world.runtime as any).infer;
     (world.runtime as any).infer = (...args: any[]) => { requested.resolve(); return infer(...args); };
     let count = 0;
-    (world as any).client = { complete: async (_messages: unknown, options: { tools?: unknown[] }) => {
-      if (options.tools?.length) { events.push("observation"); return observation; }
+    (world as any).client = { complete: async (_messages: unknown, options: { tools?: unknown[]; responseSchema?: unknown }) => {
+      if (options.responseSchema || options.tools?.length) { events.push("observation"); return observation; }
       count++; events.push("maintenance" + count);
       if (count === 1) { entered.resolve(); return release.promise; }
       return summary(count);

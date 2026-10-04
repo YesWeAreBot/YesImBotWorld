@@ -165,7 +165,8 @@ async function choices(dir: string) {
       await f.service.botToolCall("open_app", { name: "chat" }, 0, "human");
       await f.service.botToolCall("select_channel", { id: "onebot@fixture:target" }, 0, "human");
       await f.bot.drainMailbox();
-      f.bot.pushEvent("koishi", { text: "朋友：今天去哪里了？", experience: { chat: { kind: "message", channelKey: "onebot@fixture:target", senderOwn: false } } });
+      f.bot.pushEvent("koishi", { text: "朋友：今天去哪里了？", experience: { chat: { kind: "message", channelKey: "onebot@fixture:target", senderOwn: false,
+        direction: { kind: "direct", mentionedIds: [], mentionsEveryone: false } } } });
       await f.bot.drainMailbox();
       const reply = f.bot.actionOpportunities(mode).find((item: any) => item.replyTo); assert.ok(reply);
       const replyRef = { opportunityId: reply.id, sourceEventId: reply.sourceEventId };

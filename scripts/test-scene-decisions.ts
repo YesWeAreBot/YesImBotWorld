@@ -79,7 +79,7 @@ async function main() {
     const factMessage = generated.find(message => String(message.content).includes(`id="${actual.id}"`));
     assert.ok(factMessage); assert.doesNotMatch(String(factMessage.content), /面包师问路|尚未整理/);
     const suggestion = notices(context).at(-1)!;
-    assert.match(suggestion.content, /建议不代表已经行动或保证结果/);
+    assert.match(suggestion.content, /可自由取舍，尚未执行/);
     assert.ok(suggestion.content.includes(firstIntent)); assert.match(suggestion.content, /取舍组 去向/);
     assert.deepEqual(suggestion.originEventIds, []);
     assert.equal(f.agent.actionOpportunities().length, 2);

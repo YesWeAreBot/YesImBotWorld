@@ -106,7 +106,7 @@ async function truncatedAnchorsCannotReadHiddenOriginals() {
   messageFixture.response(payload => {
     assert.ok(!payload.evidence[0].messages[0].text.includes(peerQuote));
     assert.match(payload.evidence[0].messages[0].text, /截断/);
-    return [{ kind: "relationship", subject: "技术朋友", subjectId: "peer", statement: "遇到调试问题可以向对方求助。",
+    return [{ kind: "relationship", subject: "技术朋友", subjectId: payload.evidence[0].messages[0].chat.senderId, statement: "遇到调试问题可以向对方求助。",
       evidenceIds: [peer.eventId], insight: insight(peer.eventId, peerQuote, "技术求助的信任") }];
   });
   await messageFixture.tick();
@@ -124,9 +124,11 @@ async function truncatedAnchorsCannotReadHiddenOriginals() {
   const mixedFixture = await fixture([mixed], [], { maxInputChars: 10000 });
   mixedFixture.response(payload => {
     const messages = payload.evidence[0].messages;
-    assert.ok(!messages.find((item: any) => item.chat.senderId === "peer").text.includes(peerQuote));
-    assert.equal(messages.find((item: any) => item.chat.senderId === "other-peer").text, peerQuote);
-    return [{ kind: "relationship", subject: "被截断的朋友", subjectId: "peer", statement: "遇到调试问题可以向对方求助。",
+    const [target, other] = messages;
+    assert.notEqual(target.chat.senderId, other.chat.senderId);
+    assert.ok(!target.text.includes(peerQuote));
+    assert.equal(other.text, peerQuote);
+    return [{ kind: "relationship", subject: "被截断的朋友", subjectId: target.chat.senderId, statement: "遇到调试问题可以向对方求助。",
       evidenceIds: [mixed.eventId], insight: insight(mixed.eventId, peerQuote, "技术求助的信任") }];
   });
   await mixedFixture.tick();

@@ -278,7 +278,7 @@ export class KoishiMessenger implements MessengerApi {
       experience: {
         ...chatMessageEvidence(rows[rows.length - 1]!, selfId).experience,
         subjectIds: [...new Set(rows.flatMap(row => chatMessageEvidence(row, selfId).experience?.subjectIds ?? []))],
-        chat: { channelKey: makeChannelKey(platform, channelId, selfId), kind: "attention" },
+        chat: { ...chatMessageEvidence(rows[rows.length - 1]!, selfId).experience!.chat!, kind: "attention" },
       },
       attachments: attachments.length ? attachments : undefined,
       parts: [{ kind: "text", text: heading }, ...parts, ...(tail ? [{ kind: "text" as const, text: tail }] : [])],

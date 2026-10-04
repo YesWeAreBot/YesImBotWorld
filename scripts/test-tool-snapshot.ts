@@ -153,7 +153,7 @@ async function main() {
     await restoredText.applyCompression({ historySummary: "关闭原生协议", memoryDigest: "" }, 21);
     await turnNativeOff.generate(restoredText, "下一窗口");
     assert.equal(received.at(-1)!.body.tools, undefined);
-    assert.match(received.at(-1)!.body.messages[0].content, /本次使用正文 JSON 协议/);
+    assert.match(received.at(-1)!.body.messages[0].content, /本次使用正文工具协议/);
     console.log("PASS native tool snapshots: stable HTTP prefix, blocked requests during pinned/commit cleanup failures, automatic recovery cutover, updated validation, body JSON fallback and empty snapshots");
   } finally {
     server.closeAllConnections(); await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));

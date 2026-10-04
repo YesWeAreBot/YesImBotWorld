@@ -117,4 +117,97 @@ assert.equal(api.createResponseDecoder().update('\uFEFF' + jsonRaw, 'application
 assert.equal(api.createResponseDecoder().update('{"choices":[{"message":{"content":null,"refusal":"拒绝原因"}}]}', 'application/json', false).choices[0].content, '拒绝原因');
 const legacyStream = api.createResponseDecoder().update(frame(delta({ function_call: { name: 'select_', arguments: '{' } })) + frame(delta({ function_call: { name: 'channel', arguments: '}' } })), 'sse', true);
 assert.equal(legacyStream.choices[0].toolCalls[0].name, 'select_channel'); assert.equal(legacyStream.choices[0].toolCalls[0].arguments, '{}');
+
+const responseInput = [{ role: 'user', content: [{ type: 'input_text', text: '图片在这里' }, { type: 'input_image', image_url: 'data:image/png;base64,AAAA' }] },
+  { type: 'function_call', call_id: 'r-call', name: 'act', arguments: '{"description":"出门"}' },
+  { type: 'function_call_output', call_id: 'r-call', output: [{ type: 'input_text', text: '结果' }, { type: 'input_image', image_url: 'data:image/png;base64,BBBB' }] }];
+const responsesRequest = api.request(JSON.stringify({ model: 'responses', instructions: '固定规则', input: responseInput, store: false, tools: [{ type: 'function', name: 'act', parameters: {} }] }));
+assert.equal(responsesRequest.messages[0].role, 'system'); assert.equal(responsesRequest.messages[0].content, '固定规则');
+assert.deepEqual(plain(responsesRequest.messages[1].content), responseInput[0].content);
+assert.equal(responsesRequest.messages[2].toolCalls[0].function.name, 'act'); assert.equal(responsesRequest.messages[2].toolCalls[0].id, 'r-call');
+assert.equal(responsesRequest.messages[3].role, 'tool'); assert.equal(responsesRequest.messages[3].toolCallId, 'r-call');
+assert.deepEqual(plain(responsesRequest.messages[3].content), responseInput[2].output);
+assert.equal(responsesRequest.settings.input, undefined); assert.equal(responsesRequest.settings.instructions, undefined); assert.equal(responsesRequest.settings.store, false);
+assert.equal(api.request('{"input":"普通输入"}').messages[0].content, '普通输入');
+assert.equal(api.request('{"input":{"unknown":"保留"}}').messages[0].content.unknown, '保留');
+const anthropicParts = [{ type: 'text', text: '先说话' }, { type: 'tool_use', id: 'a-call', name: 'read', input: {} }, { type: 'text', text: '后说话' }];
+const anthropicRequest = api.request(JSON.stringify({ model: 'claude', system: [{ type: 'text', text: '系统规则' }], messages: [{ role: 'assistant', content: anthropicParts },
+  { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'a-call', content: [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'AAAA' } }] }] }], tools: [{ name: 'read', input_schema: {} }] }));
+assert.equal(anthropicRequest.messages[0].role, 'system'); assert.deepEqual(plain(anthropicRequest.messages[1].content), anthropicParts, 'mixed tool and prose blocks retain request order');
+assert.equal(anthropicRequest.messages[2].content[0].tool_use_id, 'a-call'); assert.equal(anthropicRequest.settings.system, undefined);
+
+const rItem = { type: 'message', id: 'rm', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: '你好', annotations: [] }] };
+const rTool = { type: 'function_call', id: 'rf', call_id: 'rc', name: 'send', arguments: '{"msg":"好"}', status: 'completed' };
+const rReason = { type: 'reasoning', id: 'rr', summary: [{ type: 'summary_text', text: '考虑一下' }] };
+const rFinal = { id: 'response-id', object: 'response', model: 'fixture', status: 'completed', output: [rReason, rItem, rTool], usage: { input_tokens: 12, input_tokens_details: { cached_tokens: 4 }, output_tokens: 7 } };
+const rEvents = [
+  { type: 'response.created', response: { id: 'response-id', status: 'in_progress', output: [] } },
+  { type: 'response.output_item.added', output_index: 0, item: { ...rReason, summary: [] } },
+  { type: 'response.reasoning_summary_text.delta', output_index: 0, summary_index: 0, delta: '考虑' },
+  { type: 'response.reasoning_summary_text.delta', output_index: 0, summary_index: 0, delta: '一下' },
+  { type: 'response.output_item.done', output_index: 0, item: rReason },
+  { type: 'response.output_item.added', output_index: 1, item: { ...rItem, content: [] } },
+  { type: 'response.output_text.delta', output_index: 1, content_index: 0, delta: '你', sequence_number: 12 },
+  { type: 'response.output_text.delta', output_index: 1, content_index: 0, delta: '你', sequence_number: 12 },
+  { type: 'response.output_text.delta', output_index: 1, content_index: 0, delta: '好' },
+  { type: 'response.output_text.done', output_index: 1, content_index: 0, text: '你好' },
+  { type: 'response.output_item.done', output_index: 1, item: rItem },
+  { type: 'response.output_item.added', output_index: 2, item: { ...rTool, arguments: '' } },
+  { type: 'response.function_call_arguments.delta', output_index: 2, delta: '{"msg":' },
+  { type: 'response.function_call_arguments.delta', output_index: 2, delta: '"好"}' },
+  { type: 'response.function_call_arguments.done', output_index: 2, arguments: rTool.arguments },
+  { type: 'response.output_item.done', output_index: 2, item: rTool },
+  { type: 'response.completed', response: rFinal },
+];
+function incremental(events: unknown[]) {
+  const body = events.map(item => frame(item)).join(''), decoder = api.createResponseDecoder(), before = parses;
+  for (let i = 1; i <= body.length; i++) decoder.update(body.slice(0, i), 'sse', true);
+  const result = decoder.update(body, 'sse', false);
+  assert.equal(parses - before, events.length, 'native protocol frames parse only once during character-level updates');
+  decoder.update(body, 'sse', false); assert.equal(parses - before, events.length);
+  return result;
+}
+const rRead = incremental(rEvents);
+assert.equal(rRead.choices[0].content, '你好'); assert.equal(rRead.choices[0].reasoning, '考虑一下'); assert.equal(rRead.choices[0].toolCalls.length, 1);
+assert.equal(rRead.choices[0].toolCalls[0].id, 'rc'); assert.equal(rRead.choices[0].toolCalls[0].arguments, rTool.arguments);
+assert.equal(rRead.choices[0].finishReason, 'tool_calls'); assert.equal(rRead.usage.input_tokens_details.cached_tokens, 4); assert.equal(rRead.pending, false);
+assert.equal(rRead.metadata.output, undefined, 'full final response is not duplicated into metadata'); assert.equal(rRead.metadata.delta, undefined);
+assert.equal(rRead.warnings.length, 0); assert.equal(rRead.unparsed, undefined);
+const rJson = api.createResponseDecoder().update(JSON.stringify(rFinal), 'json', false);
+assert.deepEqual(plain(rJson.choices), plain(rRead.choices));
+const rTruncated = api.createResponseDecoder().update(frame({ type: 'response.incomplete', response: { ...rFinal, status: 'incomplete', incomplete_details: { reason: 'max_output_tokens' } } }), 'sse', false);
+assert.equal(rTruncated.choices[0].finishReason, 'max_output_tokens');
+const rNoTerminal = api.createResponseDecoder().update(rEvents.slice(0, -1).map(item => frame(item)).join('') + 'data: [DONE]\n\n', 'sse', false);
+assert(rNoTerminal.warnings.some((text: string) => text.includes('response.completed')), 'Chat DONE marker is not a Responses terminal event');
+const rUnknown = frame({ type: 'response.output_item.done', output_index: 5, item: { type: 'future_audio', data: 'do-not-drop' } });
+assert.equal(api.createResponseDecoder().update(rUnknown, 'sse', false).unparsed, rUnknown);
+const rError = api.createResponseDecoder().update(frame({ type: 'response.failed', response: { status: 'failed', error: { message: 'offline' }, output: [] } }), 'sse', false);
+assert.equal(rError.error.message, 'offline'); assert.equal(rError.choices[0].finishReason, 'failed');
+
+const aEvents = [
+  { type: 'message_start', message: { type: 'message', id: 'anthropic-id', role: 'assistant', model: 'claude', content: [], stop_reason: null, usage: { input_tokens: 20, cache_read_input_tokens: 8, output_tokens: 1 } } },
+  { type: 'content_block_start', index: 0, content_block: { type: 'thinking', thinking: '' } },
+  { type: 'content_block_delta', index: 0, delta: { type: 'thinking_delta', thinking: '考虑过了' } },
+  { type: 'content_block_stop', index: 0 },
+  { type: 'content_block_start', index: 1, content_block: { type: 'text', text: '' } },
+  { type: 'content_block_delta', index: 1, delta: { type: 'text_delta', text: '你好' } },
+  { type: 'content_block_stop', index: 1 },
+  { type: 'content_block_start', index: 2, content_block: { type: 'tool_use', id: 'ac', name: 'send', input: {} } },
+  { type: 'content_block_delta', index: 2, delta: { type: 'input_json_delta', partial_json: '{"msg":' } },
+  { type: 'content_block_delta', index: 2, delta: { type: 'input_json_delta', partial_json: '"好"}' } },
+  { type: 'content_block_stop', index: 2 },
+  { type: 'message_delta', delta: { stop_reason: 'tool_use' }, usage: { output_tokens: 9 } },
+  { type: 'message_stop' },
+];
+const aRead = incremental(aEvents);
+assert.equal(aRead.choices[0].content, '你好'); assert.equal(aRead.choices[0].reasoning, '考虑过了'); assert.equal(aRead.choices[0].toolCalls[0].id, 'ac');
+assert.equal(aRead.choices[0].toolCalls[0].arguments, '{"msg":"好"}', 'Anthropic placeholder {} is not concatenated with streamed input JSON');
+assert.equal(aRead.choices[0].finishReason, 'tool_use'); assert.equal(aRead.usage.input_tokens, 20); assert.equal(aRead.usage.output_tokens, 9); assert.equal(aRead.usage.cache_read_input_tokens, 8);
+assert.equal(aRead.warnings.length, 0); assert.equal(aRead.pending, false); assert.equal(aRead.unparsed, undefined);
+const aJson = api.createResponseDecoder().update(JSON.stringify({ ...aEvents[0].message, content: [{ type: 'thinking', thinking: '考虑过了' }, { type: 'text', text: '你好' }, { type: 'tool_use', id: 'ac', name: 'send', input: { msg: '好' } }], stop_reason: 'tool_use', usage: aRead.usage }), 'json', false);
+assert.deepEqual(plain(aJson.choices), plain(aRead.choices));
+const aNoTerminal = api.createResponseDecoder().update(aEvents.slice(0, -1).map(item => frame(item)).join(''), 'sse', false);
+assert(aNoTerminal.warnings.some((text: string) => text.includes('message_stop')), 'stop_reason alone does not mask a missing message_stop');
+const aOpaque = frame({ type: 'content_block_delta', index: 0, delta: { type: 'signature_delta', signature: 'opaque-signature' } });
+assert.equal(api.createResponseDecoder().update(aOpaque, 'sse', false).unparsed, aOpaque, 'unrendered native signatures remain available without becoming prose');
 console.log('PASS captured call decoding: incremental SSE/JSON, reasoning, tools, branches, errors, incomplete frames and resets');

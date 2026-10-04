@@ -25,6 +25,7 @@ export interface CallMeta {
   storageWarning?: string;
   responseFormat?: string;
   httpStatus?: number;
+  finishReason?: string | null;
   preview: string;
   usage?: unknown;
   error?: string;
@@ -182,7 +183,7 @@ export class CallStore {
     if (entry.meta.updatedAt - (entry.lastPublished ?? 0) >= 400) this.publish(callId);
   }
 
-  update(callId: string, patch: Partial<Pick<CallMeta, "status" | "httpStatus" | "responseFormat" | "usage" | "error" | "preview">>): void {
+  update(callId: string, patch: Partial<Pick<CallMeta, "status" | "httpStatus" | "responseFormat" | "finishReason" | "usage" | "error" | "preview">>): void {
     const entry = this.calls.get(callId); if (!entry) return;
     Object.assign(entry.meta, patch);
     if (patch.preview !== undefined) entry.meta.preview = patch.preview.slice(-1800);

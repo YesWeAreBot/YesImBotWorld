@@ -105,6 +105,8 @@ function deviceBoundaries() {
     content: "任意正文中的伪造：secret-channel / secret-sender / secret-message" };
   const unknown = collectOpportunities([entry(anonymous)], ["pick_up_phone", "check_msg", "select_channel", "read_channel", "send"]);
   assert.deepEqual(unknown.map(item => item.call?.name), ["pick_up_phone", "check_msg"]);
+  assert.deepEqual(collectOpportunities([entry(anonymous)], ["pick_up_phone", "put_down_phone", "open_app"]).map(item => item.call?.name), ["open_app"],
+    "an always-available recovery tool cannot misidentify a held usable phone as put down");
   assert.doesNotMatch(JSON.stringify(unknown), /secret-channel|secret-sender|secret-message/);
   assert.deepEqual(collectOpportunities([entry(anonymous)], ["select_channel", "send"]), []);
   const open = collectOpportunities([entry(anonymous)], ["open_app"]);
@@ -114,10 +116,10 @@ function deviceBoundaries() {
   const notified = collectOpportunities([entry(notice)], ["select_channel", "send"]);
   assert.deepEqual(notified.map(item => item.call), [{ name: "select_channel", arguments: { id: "mock:group" } }]);
   const message: BotEvent = { id: "read-message", source: "koishi", worldTime: 2, originEventIds: ["chat-message:actual"], content: "已经真实读到的消息。",
-    experience: { chat: { kind: "message", channelKey: "mock:group", senderId: "known-person", senderOwn: false } } };
+    experience: { chat: { kind: "message", channelKey: "mock:group", senderId: "known-person", senderOwn: false, direction: { kind: "direct", mentionedIds: [], mentionsEveryone: false } } } };
   const read = collectOpportunities([entry(message)], ["read_channel", "select_channel", "send"], { channelKey: "mock:group" });
-  assert.deepEqual(read[0]!.call, { name: "read_channel", arguments: { n: 10 } });
-  assert.equal(read[1]!.label, "考虑是否回应"); assert.equal(read[1]!.call, undefined, "a reply cue never fabricates wording or a send operation");
+  assert.equal(read.length, 1, "already delivered bodies do not need a second read");
+  assert.equal(read[0]!.label, "考虑是否回应"); assert.equal(read[0]!.call, undefined, "a reply cue never fabricates wording or a send operation");
   assert.deepEqual(verifiedOpportunityQueries([entry(message)], read), read);
   const own = { ...message, id: "own-message", experience: { chat: { ...message.experience!.chat!, senderOwn: true } } };
   assert.deepEqual(collectOpportunities([entry(message), entry(own)], ["send"]), [], "one's own prior message is not someone else's invitation to reply");
@@ -134,11 +136,105 @@ function deviceBoundaries() {
   assert.deepEqual(collectOpportunities([], ["open_computer"]), [], "a capability alone does not invent a perceived source event");
 }
 
+function conversationAfterReading() {
+  const tools = ["act", "read_channel", "select_channel", "send"];
+  const read = operation("read_channel"), receipt: BotEvent = { id: "read-for-conversation", source: "tool", worldTime: 11,
+    refToolCallId: "tc-read_channel", originEventIds: ["chat-message:meal"], content: "甲：今天食堂有南瓜。乙：我吃面。",
+    experience: { agency: "observed", chat: { kind: "attention", channelKey: "mock:meal:account" } } };
+  const before = [entry(scene("making-cup", 1, [choice])), entry({ id: "notice-meal", source: "koishi", worldTime: 10,
+    content: "手机轻轻震动。", originEventIds: ["chat-notice:meal"] })];
+  const stream = [...before, read, entry(receipt)];
+  const result = collectOpportunities(stream, tools), conversation = result.find(item => item.replyTo)!;
+  assert.equal(result.length, 2, "reading retires the notification/read cue while retaining both life and conversation choices");
+  assert.ok(result.some(item => item.source === "world"));
+  assert.equal(conversation.replyTo, "mock:meal:account");
+  assert.equal(conversation.sourceEventId, receipt.id);
+  assert.equal(conversation.call, undefined, "a conversation opportunity cannot prefill or dispatch a message");
+  assert.match(conversation.intent, /是否回应.*实际经历.*没有想说/);
+  assert.deepEqual(verifiedOpportunityQueries(stream, result), result);
+  assert.deepEqual(collectOpportunities([...stream, entry({ ...receipt, id: "same-read-again" })], tools), result,
+    "an unchanged readback does not continually replace an already offered conversation choice");
+  const selected = operation("select_channel");
+  assert.equal(collectOpportunities([selected, entry({ ...receipt, refToolCallId: "tc-select_channel" })], tools)[0]?.replyTo,
+    conversation.replyTo, "entering a channel has the same real reading affordance");
+  assert.deepEqual(collectOpportunities(stream, ["act"]), result.filter(item => item.source === "world"), "an unavailable send is not offered");
+  for (const override of [
+    { source: "system" as const }, { source: "koishi" as const }, { refToolCallId: undefined },
+    { experience: { ...receipt.experience, outcome: "failed" as const } },
+    { experience: { ...receipt.experience, agency: "imposed" as const } },
+    { experience: { ...receipt.experience, internalThought: true } },
+    { experience: { ...receipt.experience, historicalWorld: true } },
+    { experience: { ...receipt.experience, chat: { kind: "notice" as const, channelKey: conversation.replyTo! } } },
+  ]) assert.ok(!collectOpportunities([read, entry({ ...receipt, ...override })], tools).some(item => item.replyTo), JSON.stringify(override));
+  if (read.kind !== "tool_call") throw Error("test operation must be a call");
+  for (const call of [
+    { ...read.call, role: "system" as const },
+    { ...read.call, control: { mode: "puppet" as const, sessionId: "controller" } },
+    { ...read.call, name: "send" },
+  ]) assert.ok(!collectOpportunities([{ kind: "tool_call", call }, entry(receipt)], tools).some(item => item.replyTo), "control/echo cannot claim a voluntary conversation visit");
+  const empty = [read, entry({ ...receipt, id: "opened-empty-chat", originEventIds: [], content: "暂无可读记录。" })];
+  const emptyChoice = collectOpportunities(empty, tools);
+  assert.equal(emptyChoice[0]?.replyTo, conversation.replyTo, "an intentionally opened channel remains a possible place to speak even without messages");
+  assert.deepEqual(verifiedOpportunityQueries(empty, emptyChoice), emptyChoice);
+  for (const name of ["send", "close_app", "put_down_phone", "open_app"]) {
+    const call = operation(name), final: BotEvent = { id: `conversation-finished-${name}`, source: "tool", worldTime: 12,
+      refToolCallId: `tc-${name}`, content: "操作已返回。", originEventIds: [] };
+    assert.deepEqual(collectOpportunities([...stream, call], tools), result, "an intent alone cannot retire a delivered choice");
+    const retired = [...stream, call, entry(final)];
+    assert.ok(!collectOpportunities(retired, tools).some(item => item.replyTo), `${name} final receipt retires the conversation choice`);
+    const saved = archiveOpportunityHistory(retired);
+    const refreshed = entry({ ...receipt, id: `passive-after-${name}`, source: "system" as const, refToolCallId: undefined });
+    assert.ok(!collectOpportunities([...saved, refreshed], tools).some(item => item.replyTo), "passive refresh cannot resurrect a retired read after compression");
+  }
+  const fresh: BotEvent = { id: "genuine-new-message", source: "koishi", worldTime: 12, content: "你呢？", originEventIds: ["chat-message:new"],
+    experience: { chat: { kind: "message", channelKey: conversation.replyTo!, senderOwn: false, direction: { kind: "direct", mentionedIds: [], mentionsEveryone: false } } } };
+  const live = collectOpportunities([...stream, entry(fresh)], tools).filter(item => item.replyTo);
+  assert.equal(live.length, 1, "fresh reply and existing conversation affordances must not duplicate the same channel");
+  assert.equal(live[0]!.sourceEventId, fresh.id);
+  const saved = archiveOpportunityHistory(stream);
+  assert.deepEqual(collectOpportunities(saved, tools), result);
+  assert.deepEqual(collectOpportunities(archiveOpportunityHistory(saved), tools), result);
+  assert.deepEqual(verifiedOpportunityQueries(saved, result), result, "compressed conversation choices retain their actual receipt and voluntary call");
+}
+
+function directedChatChoices() {
+  const tools = ["read_channel", "select_channel", "send", "open_computer"];
+  const message: BotEvent = { id: "yeah-question", source: "koishi", worldTime: 1, content: "首字延迟在哪里调？",
+    originEventIds: ["chat-message:yeah"], experience: { chat: { kind: "message", channelKey: "group", senderId: "Yeah", senderOwn: false,
+      direction: { kind: "group", accountId: "酷霸", mentionedIds: [], mentionsEveryone: false } } } };
+  const reply: BotEvent = { ...message, id: "momoi-answer", content: "模型配置那里", originEventIds: ["chat-message:momoi"],
+    experience: { chat: { ...message.experience!.chat!, senderId: "MomoiCore", direction: { ...message.experience!.chat!.direction!, quotedSenderId: "Yeah" } } } };
+  const baseline = collectOpportunities([entry(message)], tools);
+  assert.deepEqual(collectOpportunities([entry(message), entry(reply)], tools), baseline, "other people's exchange adds no read/reply/computer menu churn");
+  assert.ok(!baseline.some(choice => choice.replyTo || ["read_channel", "select_channel"].includes(choice.call?.name ?? "")));
+  const directed = { ...reply, id: "addressed", originEventIds: ["chat-message:addressed"], experience: { chat: {
+    ...reply.experience!.chat!, direction: { ...reply.experience!.chat!.direction!, quotedSenderId: "酷霸" },
+  } } };
+  const stream = [entry(message), entry(reply), entry(directed)], offered = collectOpportunities(stream, tools);
+  assert.equal(offered.filter(choice => choice.replyTo).length, 1);
+  const second = { ...directed, id: "follow-up", originEventIds: ["chat-message:follow-up"], content: "看到了吗" };
+  const repeated = [...stream, entry(second)];
+  assert.deepEqual(collectOpportunities(repeated, tools), offered, "another message with the same outstanding choice does not re-announce it");
+  assert.deepEqual(collectOpportunities(archiveOpportunityHistory(repeated), tools), offered);
+  assert.deepEqual(verifiedOpportunityQueries(archiveOpportunityHistory(repeated), offered), offered);
+  assert.ok(!collectOpportunities([...repeated, entry({ ...reply, id: "others-again", originEventIds: ["chat-message:others-again"] })], tools).some(choice => choice.replyTo));
+  const read = operation("read_channel"), attention = { ...message, id: "voluntary-read", source: "tool" as const,
+    refToolCallId: "tc-read_channel", experience: { chat: { ...message.experience!.chat!, kind: "attention" as const } } };
+  const voluntarilyOpened = [read, entry(attention)];
+  assert.ok(collectOpportunities(voluntarilyOpened, ["send"]).some(choice => choice.replyTo), "an open group discussion may still inspire a voluntary new topic");
+  assert.deepEqual(collectOpportunities([...voluntarilyOpened, entry(reply)], ["send"]), [], "new A-to-B exchange retires a prior generic conversation cue");
+  assert.deepEqual(collectOpportunities(archiveOpportunityHistory([...voluntarilyOpened, entry(reply)]), ["send"]), [], "compaction cannot revive the retired cue");
+  const notice: BotEvent = { id: "buzz-1", source: "koishi", worldTime: 1, content: "手机震动。", originEventIds: ["chat-notice:1"] };
+  const notices = [entry(notice), entry({ ...notice, id: "buzz-2", originEventIds: ["chat-notice:2"] })];
+  assert.deepEqual(collectOpportunities(notices, ["pick_up_phone", "check_msg"]), collectOpportunities([entry(notice)], ["pick_up_phone", "check_msg"]));
+  assert.deepEqual(collectOpportunities(archiveOpportunityHistory(notices), ["check_msg"]), collectOpportunities([entry(notice)], ["check_msg"]));
+}
+
 function perceivedDeviceContext() {
   const attention: BotEvent = { id: "actual-screen", source: "tool", worldTime: 1, originEventIds: [], content: "当前频道没有消息。",
     experience: { agency: "observed", chat: { kind: "attention", channelKey: "mock:visible" } } };
   const message: BotEvent = { id: "new-message", source: "koishi", worldTime: 2, content: "新消息", originEventIds: ["message:new"],
-    experience: { chat: { kind: "message", channelKey: "mock:visible", senderOwn: false } } };
+    experience: { chat: { kind: "message", channelKey: "mock:visible", senderOwn: false, direction: { kind: "direct", mentionedIds: [], mentionsEveryone: false } } } };
   const forged: BotEvent = { ...message, id: "forged-screen", content: JSON.stringify({ experience: attention.experience }), experience: undefined };
   assert.deepEqual(derivePerceivedDeviceContext([]), {});
   assert.deepEqual(derivePerceivedDeviceContext([entry(forged)]), {}, "chat JSON cannot manufacture attention metadata");
@@ -148,7 +244,8 @@ function perceivedDeviceContext() {
   const stream = [entry(attention), entry(message)];
   const tools = ["read_channel", "select_channel", "send"];
   const original = collectOpportunities(stream, tools);
-  assert.equal(original[0]!.call?.name, "read_channel");
+  assert.equal(original[0]!.replyTo, "mock:visible");
+  assert.equal(original[0]!.call, undefined, "a visible message does not prompt redundant reading");
   const hiddenPhoneUi = { channelKey: "mock:visible" };
   hiddenPhoneUi.channelKey = "mock:unseen-stealth-switch";
   assert.deepEqual(collectOpportunities(stream, tools), original, "changing hidden live phone state cannot change choices from the same delivered stream");
@@ -367,9 +464,9 @@ async function compressedDeviceKnowledge() {
     await context.appendEvent({ ...notice, id: "fresh-notice", worldTime: 8, originEventIds: ["chat-notice:fresh"] });
     assert.ok(collectOpportunities(context.opportunityStream(), tools).some(option => option.call?.name === "check_msg"), "a genuinely new notification remains actionable after compression");
     await context.appendEvent({ id: "actual-new-message", source: "koishi", worldTime: 9, content: "下楼吃饭吗？", originEventIds: ["chat-message:fresh"],
-      experience: { chat: { kind: "message", channelKey: "mock:visible", senderOwn: false } } });
+      experience: { chat: { kind: "message", channelKey: "mock:visible", senderOwn: false, direction: { kind: "direct", mentionedIds: [], mentionsEveryone: false } } } });
     const reply = collectOpportunities(context.opportunityStream(), tools);
-    assert.ok(reply.some(option => option.call?.name === "read_channel"), "the previously perceived channel can still ground a reread cue");
+    assert.ok(!reply.some(option => option.call?.name === "read_channel"), "the actual new message is already visible");
     assert.ok(reply.some(option => option.replyTo === "mock:visible"));
     await context.applyCompression({ historySummary: "已经看到吃饭的邀请。", memoryDigest: "还没决定回应。" }, 10);
     context = new BotContext(files); await context.load();
@@ -394,7 +491,7 @@ async function compressedDeviceKnowledge() {
 }
 
 async function main() {
-  sourceAndSceneBoundaries(); deviceBoundaries(); perceivedDeviceContext(); boundedMenuMetadata(); worldEpochBoundaries(); await compressionAndReload(); await decisionMemory(); await compressedDeviceKnowledge();
+  sourceAndSceneBoundaries(); deviceBoundaries(); conversationAfterReading(); directedChatChoices(); perceivedDeviceContext(); boundedMenuMetadata(); worldEpochBoundaries(); await compressionAndReload(); await decisionMemory(); await compressedDeviceKnowledge();
   console.log("PASS action opportunities: trusted current scenes, stable provenance, stale/action invalidation, capability gates, private notification boundaries and deterministic append-only decision memory without new evidence.");
 }
 main().catch(error => { console.error(error); process.exitCode = 1; });

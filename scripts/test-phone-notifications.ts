@@ -84,7 +84,7 @@ async function delivery(dir: string) {
   let worldNow = 0;
   const store = new MessageStore(ctx), notify = new NotifyManager(path.join(dir, "live-notify.json"), ["*"], true,
     { clock: () => ({ now: worldNow, unitWorldSeconds: 60, format: tu => `世界分钟 ${tu}` }) }); await notify.load();
-  let focused = false, accepted = true;
+  let focused = false, accepted = true, canViewScreen = true;
   const focus: any = { isFocused: () => focused, focus: async () => {} };
   const renderer: any = { render: async (text: string) => ({ text, parts: [{ kind: "text", text }] }) };
   const phone: PhoneStatus = { down: true };
@@ -92,7 +92,7 @@ async function delivery(dir: string) {
   const messaging = { ...cfg.messaging, notifyPolicy: "channel" as "channel" | "content", externalSelfMessages: "off" as const };
   const received: { content: RichText; wake: boolean }[] = [];
   const gateway: any = new Gateway(ctx, messaging, cfg.platformOps, store, {} as any, renderer, focus, notify, phone, {} as any, new OwnSendTracker(), names, () => null,
-    { notify(content, wake) { if (!accepted) return false; received.push({ content, wake }); return true; }, selfMessage() {}, channelActivity() {} });
+    { canViewScreen: () => canViewScreen, notify(content, wake) { if (!accepted) return false; received.push({ content, wake }); return true; }, selfMessage() {}, channelActivity() {} });
   const incoming = async (id: string) => gateway.handle({ platform: "fixture", selfId: "a", bot: ctx.bots[0], channelId: "group", guildId: "group",
     userId: "friend", username: "朋友", timestamp: Date.now(), isDirect: false, messageId: id, elements: [h.text("原文 " + id)] });
   await incoming("placed"); assert.equal(notify.unreadCount(keyA), 1); assert.equal(received.length, 1); assert.match(received[0]!.content.text, /震/);
@@ -173,6 +173,34 @@ async function delivery(dir: string) {
   const queued = gateway.messageTails.get(keyA);
   worldNow = 4; release.run!(); await queued;
   assert.equal(received.length, before, "a message queued during DND is not notified when it reaches the handler after expiry");
+  phone.down = false; focused = true; canViewScreen = false;
+  before = received.length; unread = notify.unreadCount(keyA);
+  await incoming("asleep-focused");
+  assert.equal(received.length, before + 1);
+  assert.match(received.at(-1)!.content.text, /震/);
+  assert.doesNotMatch(received.at(-1)!.content.text, /原文|asleep-focused|朋友/);
+  assert.ok(received.at(-1)!.content.originEventIds?.every(id => id.startsWith("chat-notice:")), "a sleep-time signal carries only notice identity, never the unseen message root");
+  assert.equal(notify.unreadCount(keyA), unread + 1, "an already-focused held phone is not read during explicit sleep");
+  focused = false; messaging.notifyPolicy = "content";
+  await incoming("asleep-content-policy");
+  assert.doesNotMatch(received.at(-1)!.content.text, /原文|asleep-content-policy|朋友/);
+  assert.equal(notify.unreadCount(keyA), unread + 2, "content notifications also retain unread while unconscious");
+  focused = true; canViewScreen = true;
+  renderer.render = async (text: string) => { canViewScreen = false; return render(text); };
+  await incoming("sleep-during-render");
+  assert.doesNotMatch(received.at(-1)!.content.text, /原文|sleep-during-render|朋友/);
+  assert.equal(notify.unreadCount(keyA), unread + 3, "sleep committed during media rendering is rechecked before delivery");
+  renderer.render = render;
+  before = received.length; canViewScreen = true;
+  assert.equal(received.length, before, "waking does not retroactively manufacture perceptions of unread messages");
+  assert.equal(notify.unreadCount(keyA), unread + 3);
+  const afterWake = await messenger.channelMessages(keyA, 3, { intro: "echo" });
+  for (const id of ["asleep-focused", "asleep-content-policy", "sleep-during-render"]) assert.ok(afterWake.text.includes(id));
+  assert.equal(notify.unreadCount(keyA), unread, "a real read after waking delivers and acknowledges the sleeping interval");
+  canViewScreen = false;
+  await gateway.handleRequestEvent({ platform: "fixture", selfId: "a", userId: "friend", username: "朋友", content: "睡眠期间申请" }, "friend");
+  assert.equal(registered, 2, "sleep does not drop incoming platform requests");
+  assert.doesNotMatch(received.at(-1)!.content.text, /朋友|睡眠期间申请|请求编号/);
   console.log("PASS actual gateway/messenger: physical phone, silent/off/visible semantics, inactive delivery, async visibility race and exact history read acknowledgement");
 }
 

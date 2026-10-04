@@ -10,6 +10,8 @@ import { WorldFiles } from "../src/files.js";
 import { Prompts } from "../src/prompts.js";
 import { BotContext } from "../src/bot/context.js";
 import { BotAgent } from "../src/bot/agent.js";
+import { collectOpportunities } from "../src/bot/opportunities.js";
+import { explicitlyAddressesOthers, explicitlyAddressesSelf } from "../src/bot/chat-attention.js";
 import { BOT_TOOLS } from "../src/bot/tools.js";
 import { Gateway } from "../src/koishi/gateway.js";
 import { KoishiMessenger, rawGroupConversation } from "../src/koishi/messenger.js";
@@ -161,22 +163,32 @@ async function main() {
     assert.deepEqual(rows.at(-1)!.conversation!.mentions, ["bob"]);
     assert.match(received.at(-1)!.value.text, /@ 其他账号 "bob"/);
     assert.doesNotMatch(received.at(-1)!.value.text, /明确 @ 本账号/);
+    assert.equal(explicitlyAddressesOthers(received.at(-1)!.value.experience?.chat), true);
     await incoming([h("at", { id: "bot-a" }), h.text("你觉得呢？")]);
     assert.match(received.at(-1)!.value.text, /明确 @ 本账号/);
+    assert.equal(explicitlyAddressesSelf(received.at(-1)!.value.experience?.chat), true);
     await incoming([h("at", { type: "all" }), h.text("晚上集合")]);
     assert.match(received.at(-1)!.value.text, /@ 全体，不是单独找你/);
+    assert.equal(explicitlyAddressesSelf(received.at(-1)!.value.experience?.chat), false);
 
     await store.store({ ...base, userId: "bob", self: false, content: "谁一起去？", timestamp: new Date(), messageId: "q1" });
     await incoming([h.text("我也去")], { quote: { id: "q1" } });
     assert.equal(rows.at(-1)!.conversation!.reply!.userId, "bob");
     assert.match(received.at(-1)!.value.text, /引用其他账号 "bob"/);
+    assert.equal(explicitlyAddressesOthers(received.at(-1)!.value.experience?.chat), true);
+    assert.deepEqual(collectOpportunities([{ kind: "event", event: { id: "others-live", source: "koishi", worldTime: 1,
+      content: received.at(-1)!.value.text, ...received.at(-1)!.value } }], ["read_channel", "select_channel", "send"]), [],
+      "a live A-to-B quote is visible without recommending that our account read or answer it");
     await store.store({ ...base, userId: "bot-a", self: true, content: "谁一起去？", timestamp: new Date(), messageId: "q2" });
     await incoming([h.text("我也去")], { quote: { id: "q2" } });
     assert.match(received.at(-1)!.value.text, /引用本账号/);
+    assert.equal(explicitlyAddressesSelf(received.at(-1)!.value.experience?.chat), true);
     await store.store({ ...base, selfId: "bot-b", userId: "bot-a", self: false, content: "隔离账号", timestamp: new Date(), messageId: "other-account-only" });
     await incoming([h.text("我也去")], { quote: { id: "other-account-only" } });
     assert.equal(rows.at(-1)!.conversation!.reply!.userId, undefined, "quote lookup cannot cross Bot accounts");
     assert.match(received.at(-1)!.value.text, /原作者未知/);
+    assert.equal(explicitlyAddressesSelf(received.at(-1)!.value.experience?.chat), false);
+    assert.equal(explicitlyAddressesOthers(received.at(-1)!.value.experience?.chat), false);
     await incoming([h("quote", { id: "q1" }, [h("at", { id: "bot-a" })]), h.text("哈哈")]);
     assert.deepEqual(rows.at(-1)!.conversation!.mentions, [], "mentions inside quoted text do not address the outer message");
     await incoming([h("forward", { id: "f1" }, [h("at", { id: "bot-a" })])]);
@@ -186,6 +198,7 @@ async function main() {
     await incoming([h.text("今天好吗")], { isDirect: true, channelId: "12345" });
     assert.equal(rows.at(-1)!.conversation!.kind, "direct");
     assert.match(received.at(-1)!.value.text, /私聊/);
+    assert.equal(explicitlyAddressesSelf(received.at(-1)!.value.experience?.chat), true);
     assert.equal(conversationKind(undefined, "12345", ""), "unknown");
     assert.deepEqual(rawGroupConversation([
       { type: "at", data: { qq: "bob" } }, { type: "reply", data: { id: "quoted" } },
@@ -221,6 +234,17 @@ async function main() {
     assert.ok(!full.includes("隔离账号"));
     const allText = richPartsText(history.parts!);
     assert.equal(allText, history.text, "history prose and ordered media parts preserve identical contextual framing");
+    assert.equal(history.experience!.chat!.senderOwn, true, "history attention retains who sent its last visible row");
+    assert.equal(history.experience!.chat!.direction!.kind, "group");
+    await store.store({ ...base, userId: "alice", senderOwned: false, self: false, content: "模型配置那里", timestamp: new Date(Date.now() + 2000),
+      messageId: "reply-to-bob", conversation: { kind: "group", mentions: [], mentionsEveryone: false, reply: { userId: "bob", messageId: "q1" }, hasText: true, media: [] } });
+    const exchange = await messenger.channelMessages("fixture@bot-a:group", 50);
+    const voluntaryRead = [{ kind: "tool_call" as const, call: { id: "read-exchange", role: "agent" as const, name: "read_channel", arguments: {}, issuedAt: 1, expectedAt: 1 } },
+      { kind: "event" as const, event: { id: "read-exchange-result", source: "tool" as const, worldTime: 2, refToolCallId: "read-exchange", content: exchange.text,
+        experience: exchange.experience, originEventIds: exchange.originEventIds } }];
+    assert.equal(explicitlyAddressesOthers(exchange.experience?.chat), true);
+    assert.deepEqual(collectOpportunities(voluntaryRead, ["send", "read_channel", "select_channel"]), [],
+      "real messenger snapshots keep quote authorship so reading another pair's exchange does not invite a reply/topic");
     assert.match(history.text, /这是此刻可见记录的快照/);
     assert.match(history.text, /发送者：[\s\S]*消息正文：[\s\S]*〔该条消息结束〕/);
     const rawSticker = await (messenger as any).serializeRawSegments([{ type: "image", data: { file: "marketface", url: "fixture:marketface" } }]);

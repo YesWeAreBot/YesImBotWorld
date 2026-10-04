@@ -1,4 +1,5 @@
 import type { NarrativePresentation } from "./narrative-types.js";
+import type { NarrativeConsciousness } from "./consciousness.js";
 
 /** JSON values are the only values admitted to the authoritative world. */
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
@@ -90,6 +91,8 @@ export interface WorldObservation extends NarrativePresentation {
   actorId: string;
   worldSequence: number;
   observedAt: number;
+  /** Explicit actor fact at this observation's sequence; absent historical data stays unknown. */
+  consciousness?: NarrativeConsciousness;
   /** Stable IDs of perceptible source events, suitable as deduplicated memory evidence. */
   sourceEventIds: string[];
   entities: ObservedEntity[];

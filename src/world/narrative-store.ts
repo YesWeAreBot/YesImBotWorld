@@ -9,6 +9,7 @@ import { assertJson, assertSafeKey, KernelError, type JsonValue, type WorldEntit
 import type { NarrativeActor, NarrativeAction, NarrativeCommit, NarrativeCommitResult, NarrativePerception, NarrativeSnapshot } from "./narrative-types.js";
 import { validNarrativeEvolution, validNarrativePresentation } from "./narrative-types.js";
 import { validPhonePhysicalState } from "../phone-state.js";
+import { validNarrativeConsciousness } from "./consciousness.js";
 
 interface StoreOptions {
   now?: () => number;
@@ -68,6 +69,54 @@ export class NarrativeStore {
     return clone(this.records.filter(record => record.sequence > sinceSequence).flatMap(record => record.perceptions)
       .filter(perception => perception.actorId === actorId && (actionId === undefined || perception.actionId === actionId)));
   }
+  /** Recent terminal requests, not a replay of scenes or proof that an intent succeeded. */
+  readRecentActions(actorId: string, excludeActionId?: string, limit = 3, maxChars = 1800,
+    feedback?: { currentPerception?: string; projectText?: (text: string) => string },
+  ): { sequence: number; worldTime: number; intent: string; status: NarrativeAction["status"]; reason?: string; reasonOmitted?: true;
+    result?: { eventId: string; text?: string; inCurrentPerception?: true; omitted?: true } }[] {
+    const count = Number.isFinite(limit) ? Math.max(0, Math.floor(limit)) : 3;
+    const budget = Number.isFinite(maxChars) ? Math.max(0, Math.floor(maxChars)) : 1800;
+    const recent: ReturnType<NarrativeStore["readRecentActions"]> = [];
+    const seen = new Set<string>();
+    let chars = 2;
+    for (let index = this.records.length - 1; index >= 0 && recent.length < count; index--) {
+      const record = this.records[index]!;
+      for (const action of Object.values(record.commit.actions ?? {})) {
+        if (action.actorId !== actorId || action.id === excludeActionId || seen.has(action.id)) continue;
+        seen.add(action.id);
+        if (action.status === "pending") continue;
+        const row: (typeof recent)[number] = { sequence: record.sequence, worldTime: record.effectiveAt, intent: action.intent, status: action.status };
+        if (feedback) {
+          if (action.reason) {
+            const reason = feedback.projectText?.(action.reason) ?? action.reason;
+            if (reason.trim() && reason.length <= 600) row.reason = reason;
+            else row.reasonOmitted = true;
+          }
+          // Only this committed action's actual actor-visible outcome is evidence. A
+          // suggestion, another actor's scene or an earlier accepted phase is not.
+          const perception = record.perceptions.find(item => item.actorId === actorId && item.actionId === action.id);
+          if (perception) {
+            const text = feedback.projectText?.(perception.text) ?? perception.text;
+            row.result = !text.trim() ? { eventId: perception.eventId, omitted: true }
+              : perception.text === feedback.currentPerception
+              ? { eventId: perception.eventId, inCurrentPerception: true }
+              : text.length <= 1800 ? { eventId: perception.eventId, text } : { eventId: perception.eventId, omitted: true };
+          }
+        }
+        const size = () => JSON.stringify(row).length + (recent.length ? 1 : 0);
+        // Prefer intact execution metadata over a clipped quote. Omission remains
+        // explicit and never means that an action had no result or no obstacle.
+        if (chars + size() > budget && row.result?.text !== undefined) row.result = { eventId: row.result.eventId, omitted: true };
+        if (chars + size() > budget && row.reason !== undefined) { delete row.reason; row.reasonOmitted = true; }
+        // Keep complete intent/status pairs; never clip an instruction into a different
+        // meaning or skip an oversized recent request and hide that chronological gap.
+        if (chars + size() > budget) return recent.reverse();
+        recent.push(row); chars += size();
+        if (recent.length >= count) break;
+      }
+    }
+    return recent.reverse();
+  }
   /** Bounded, chronological window of actual external changes; never infer causes from legacy prose. */
   readRecentEvolution(limit = 3, maxChars = 6000): { sequence: number; worldTime: number; changes: { id: string; description: string }[] }[] {
     const count = Number.isFinite(limit) ? Math.max(0, Math.floor(limit)) : 3;
@@ -116,7 +165,9 @@ export class NarrativeStore {
       const transactionId = randomUUID();
       const perceptions: NarrativePerception[] = (commit.perceptions ?? []).map(perception => {
         const eventId = randomUUID();
+        const actor = Object.hasOwn(commit.actors ?? {}, perception.actorId) ? commit.actors![perception.actorId] : this.state.actors[perception.actorId];
         return { eventId, actorId: perception.actorId, text: perception.text, worldSequence: sequence, worldTime: effectiveAt,
+          ...(actor?.consciousness !== undefined ? { consciousness: actor.consciousness } : {}),
           ...(perception.situation !== undefined ? { situation: perception.situation } : {}),
           ...(perception.opportunities !== undefined ? { opportunities: perception.opportunities } : {}),
           ...(commit.actionPhase !== undefined ? { phase: commit.actionPhase } : {}),
@@ -164,6 +215,14 @@ export class NarrativeStore {
           if (record.perceptions.length !== (commit.perceptions?.length ?? 0)) throw new Error("感知记录数量不一致");
           record.perceptions.forEach((perception, index) => {
             const draft = commit.perceptions![index]!;
+            const actor = Object.hasOwn(commit.actors ?? {}, perception.actorId) ? commit.actors![perception.actorId] : next.actors[perception.actorId];
+            // Older journals did not record this fact on each perception. Do not
+            // reconstruct it during replay or replace it with today's actor state.
+            if (Object.hasOwn(perception, "consciousness") && (!validNarrativeConsciousness(perception.consciousness)
+              || perception.consciousness !== actor?.consciousness)) throw new Error("感知意识状态与同笔角色事实不一致");
+            const event = record.events.find(event => event.id === perception.eventId);
+            const payload = event?.payload as { consciousness?: unknown } | undefined;
+            if (payload?.consciousness !== perception.consciousness) throw new Error("感知事件意识状态与记录不一致");
             if (perception.actorId !== draft.actorId || perception.text !== draft.text || perception.worldSequence !== record.sequence ||
               perception.situation !== draft.situation || JSON.stringify(perception.opportunities) !== JSON.stringify(draft.opportunities) ||
               perception.phase !== commit.actionPhase ||
@@ -267,8 +326,12 @@ function copyCommit(input: NarrativeCommit): NarrativeCommit {
   if (input.expectedSequence !== undefined && (!Number.isSafeInteger(input.expectedSequence) || input.expectedSequence < 0)) throw new KernelError("INVALID_VERSION", "世界版本必须是非负整数。");
   if (input.worldState !== undefined && typeof input.worldState !== "string") throw new KernelError("INVALID_PROPOSAL", "世界状态必须是自然语言文本。");
   if (input.phoneState !== undefined && (!validPhonePhysicalState(input.phoneState)
-    || !["initialize", "action", "observe", "evolve", "administrator"].includes(input.source)
+    || !["initialize", "action", "observe", "evolve", "administrator", "phone_restore"].includes(input.source)
     || input.actorId !== undefined && input.actorId !== "bot")) throw new KernelError("INVALID_PHONE_STATE", "手机物理状态必须完整且有效，仅常驻角色的物理世界裁定或管理员可更新；访客和应用任务不能修改。");
+  if (input.source === "phone_restore" && (input.actorId !== "bot" || !input.phoneState?.reachable || !input.phoneState.usable || !input.phoneState.perceptible
+    || input.phoneState.location !== "持有者手中" || Object.keys(input).some(key => !["idempotencyKey", "source", "actorId", "phoneState"].includes(key)))) {
+    throw new KernelError("INVALID_PHONE_RESTORATION", "手机恢复只能提交常驻角色手机回到手中且可用的事实，不能附带剧情、感知或其他状态修改。");
+  }
   if (input.initialized !== undefined && typeof input.initialized !== "boolean") throw new KernelError("INVALID_PROPOSAL", "初始化状态必须为布尔值。");
   if (input.actionPhase !== undefined && (!input.actionId || !["start", "finish"].includes(input.actionPhase))) throw new KernelError("INVALID_ACTION", "行动感知阶段需要有效动作编号和start/finish。");
   if (input.toolReceipt !== undefined) {
@@ -280,7 +343,8 @@ function copyCommit(input: NarrativeCommit): NarrativeCommit {
   for (const value of [input.actors, input.actions]) if (value !== undefined && (!value || typeof value !== "object" || Array.isArray(value))) throw new KernelError("INVALID_PROPOSAL", "角色与行动更新必须按标识寻址。");
   for (const [id, actor] of Object.entries(input.actors ?? {})) {
     assertSafeKey(id);
-    if (!actor || actor.id !== id || !actor.name?.trim() || !["bot", "player"].includes(actor.controller) || typeof actor.present !== "boolean" || typeof actor.state !== "string" || typeof actor.perception !== "string" || (actor.persona !== undefined && typeof actor.persona !== "string")) throw new KernelError("INVALID_ACTOR", "角色身份和自然语言状态无效。");
+    if (!actor || actor.id !== id || !actor.name?.trim() || !["bot", "player"].includes(actor.controller) || typeof actor.present !== "boolean" || typeof actor.state !== "string" || typeof actor.perception !== "string" || (actor.persona !== undefined && typeof actor.persona !== "string")
+      || actor.consciousness !== undefined && !validNarrativeConsciousness(actor.consciousness)) throw new KernelError("INVALID_ACTOR", "角色身份、自然语言状态或意识状态无效。");
   }
   for (const [id, action] of Object.entries(input.actions ?? {})) {
     assertSafeKey(id);
@@ -308,7 +372,7 @@ function applyCommit(base: NarrativeSnapshot, commit: NarrativeCommit, sequence:
   if (commit.expectedSequence !== undefined && commit.expectedSequence !== base.sequence) throw new KernelError("VERSION_CONFLICT", `世界已更新：预期版本 ${commit.expectedSequence}，当前版本 ${base.sequence}。`);
   if (commit.evolution) for (const [id, actor] of Object.entries(commit.actors ?? {})) {
     const previous = base.actors[id];
-    if (!previous?.present || JSON.stringify({ ...actor, state: previous.state }) !== JSON.stringify(previous)) throw new KernelError("INVALID_EVOLUTION", "外部身体影响只能更新既有在场角色的客观状态，不能改写身份、在场登记或感知记录。");
+    if (!previous?.present || JSON.stringify({ ...actor, state: previous.state, consciousness: previous.consciousness }) !== JSON.stringify(previous)) throw new KernelError("INVALID_EVOLUTION", "外部身体影响只能更新既有在场角色的客观状态和意识状态，不能改写身份、在场登记或感知记录。");
   }
   if (!Number.isFinite(effectiveAt) || effectiveAt < base.effectiveAt || sequence !== base.sequence + 1) throw new KernelError("INVALID_TIME", "世界更新顺序或时间无效。");
   const next = clone(base);
@@ -316,12 +380,16 @@ function applyCommit(base: NarrativeSnapshot, commit: NarrativeCommit, sequence:
   const proseChanged = (commit.worldState !== undefined && commit.worldState !== base.worldState)
     || (commit.phoneState !== undefined && JSON.stringify(commit.phoneState) !== JSON.stringify(base.phoneState)) || Object.entries(commit.actors ?? {}).some(([id, actor]) => {
     const previous = Object.hasOwn(base.actors, id) ? base.actors[id] : undefined;
-    return !previous || previous.state !== actor.state || previous.present !== actor.present;
+    return !previous || previous.state !== actor.state || previous.present !== actor.present || previous.consciousness !== actor.consciousness;
   });
   if (proseChanged) { next.stateUpdatedAt = effectiveAt; next.stateSequence = sequence; }
   if (commit.initialized !== undefined) next.initialized = commit.initialized;
   if (commit.worldState !== undefined) next.worldState = commit.worldState;
   if (commit.phoneState !== undefined) next.phoneState = clone(commit.phoneState);
+  if (commit.source === "phone_restore") {
+    if (!base.initialized) throw new KernelError("WORLD_NOT_INITIALIZED", "世界尚未创建，不能恢复手机。");
+    next.phoneAccessRestoration = { sequence, worldTime: effectiveAt };
+  }
   for (const [id, actor] of Object.entries(commit.actors ?? {})) next.actors[id] = clone(actor);
   if (commit.phoneState !== undefined && !next.actors.bot?.present) throw new KernelError("INVALID_PHONE_STATE", "常驻角色不在本世界时不能裁定其手机物理状态。");
   if (commit.toolReceipt && !Object.hasOwn(next.actors, commit.toolReceipt.actorId)) throw new KernelError("MISSING_ACTOR", "应用操作角色不存在。");

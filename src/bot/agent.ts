@@ -8,9 +8,11 @@ import type { WorldClock } from "../clock.js";
 import { needsMsgIds, type Config } from "../config.js";
 import type { WorldFiles } from "../files.js";
 import { canonicalizeArgs, RepeatGuard, type ObserveResult } from "./repeatGuard.js";
+import { MaintenanceRetry } from "./maintenance-retry.js";
 import { ToolCallParseError } from "../llm/parse.js";
 import type { BotEvent, CompressionResult, EventSource, ExperienceMetadata, MediaRef, ParsedToolCall, PhoneStatus, PickFailure, PickResult, RichText, RichTextPart, ToolCallRecord } from "../types.js";
 import type { WorldAgent } from "../world/agent.js";
+import type { NarrativeConsciousness } from "../world/consciousness.js";
 import type { NotifyManager } from "../koishi/notify.js";
 import { normalizeMsgId } from "../koishi/markers.js";
 import { resolveOutgoingQuote } from "../koishi/quotes.js";
@@ -25,12 +27,13 @@ import { GrowthRuntime } from "./growth-runtime.js";
 import { ReceiptInbox } from "./receipts.js";
 import { DeliberationBudget, thoughtError } from "./deliberation.js";
 import { WorldActionInterleave, worldActionReceiptKey } from "./world-action-interleave.js";
-import { collectOpportunities, currentWorldEpoch, type ActionOpportunity } from "./opportunities.js";
+import { collectOpportunities, currentWorldEpoch, derivePerceivedDeviceContext, type ActionOpportunity } from "./opportunities.js";
 import { choiceRejection, type ChoiceSelection } from "./choice.js";
 import { conversationMaterialReminder } from "./conversation-material.js";
 import { ToolCapabilityAnnouncements } from "./tool-capabilities.js";
-import { planToolNavigation, sendTargetError } from "./navigation.js";
-import { canReachPhone, canUsePhone, canPerceivePhone, phonePhysicalState, phoneUnavailableReason, setPhoneDown, withPhoneExecutionLock } from "../phone-state.js";
+import { channelTargetError, planToolNavigation, sendTargetError } from "./navigation.js";
+export { misusedTargetKeys } from "./navigation.js";
+import { applyPhonePhysicalState, canReachPhone, canUsePhone, canPerceivePhone, phonePhysicalState, phoneUnavailableReason, setPhoneDown, withPhoneExecutionLock } from "../phone-state.js";
 import { spillNarrativeText } from "./narrative-spill.js";
 import type { WorldObservation } from "../world/state.js";
 import { typingSlackTU } from "./typing.js";
@@ -40,6 +43,7 @@ import { signatureParams } from "./nativeTools.js";
 import { sliceText } from "../text.js";
 import { detectDeviceRequest, DEVICE_TOOL_GUIDANCE } from "../world/device-boundary.js";
 import { SCENE_CHOICE_GUIDANCE, THOUGHT_RUNTIME_GUIDANCE, TOOL_HELP_GUIDANCE, TOOL_RESULT_GUIDANCE, SLEEP_AND_DEVICE_GUIDANCE } from "../prompts.js";
+import { classifyMediaRequestFailure } from "../media/request-failure.js";
 
 /** 代理执行单个工具调用的回传结果（管理员「手动驾驶」Bot） */
 export interface ManualToolResult {
@@ -201,7 +205,6 @@ export class BotAgent {
   private growthToolWrites = new Set<Promise<string | RichText>>();
   private operationCalls = new Map<string, ToolCallRecord>();
   private pendingOperationNotices = new Map<string, BotEvent>();
-  private failedToolHelp = new Set<string>();
   private pendingToolHelp = new Set<string>();
   private navigationOutcomes = new Map<string, boolean>();
   private readonly receipts: ReceiptInbox;
@@ -212,6 +215,10 @@ export class BotAgent {
   private reflectionPending: { opportunity: ReflectionOpportunity; event: BotEvent; appended: boolean } | null = null;
   private compressionRequested: "overflow" | "breakLoop" | "rest" | null = null;
   private compressionPromise: Promise<void> | null = null;
+  private readonly compressionRetry = new MaintenanceRetry();
+  private fixedContextBlockNotice: string | null = null;
+  /** A call can cross admission and dispatch, but contributes to repetition only once. */
+  private readonly observedAttempts = new WeakMap<ToolCallRecord, boolean>();
   private generationAbort: AbortController | null = null;
   private mailbox: MailboxItem[] = [];
   private running = false;
@@ -222,11 +229,19 @@ export class BotAgent {
   /** Wakes mailbox maintenance without releasing the pending tool's generation gate. */
   private toolResultWakeFn: (() => void) | null = null;
   private deliberation: DeliberationBudget;
+  private thoughtRetryAt = 0;
+  private awaitingThought = false;
+  private consciousness: NarrativeConsciousness | undefined;
   private awaitingToolRetry = false;
+  private invalidToolFailures = 0;
+  private invalidToolRetryAt = 0;
+  private invalidToolInputSequence = 0;
+  /** One new-input escape per failure streak; busy chats cannot erase every cooldown. */
+  private invalidToolWakeUsed = false;
   private awaitingToolResult: string | null = null;
   private readonly worldActionInterleave = new WorldActionInterleave();
   private phoneExecutionEpoch = 0;
-  private thoughtGuidanceDelivered = false;
+  private thoughtGuidanceDelivered: boolean | undefined;
   private expressionGuidanceDelivered = false;
   private opportunityStamp: string | undefined;
   private announcedOpportunities: ActionOpportunity[] = [];
@@ -275,6 +290,9 @@ export class BotAgent {
   private pauseConfirmArmed: "wait" | "rest" | null = null;
   /** 连续几次模型输出不是合法工具调用，用于在反馈里提示模型直接输出 JSON */
   private parseFailures = 0;
+  /** One rebuild can retire pre-normalization audio bytes; repeated codec errors need diagnosis, not more compaction. */
+  private audioFormatCompactionAttempted = false;
+  private rejectedMediaModalities = new Set<"image" | "audio" | "video">();
   /**
    * 手动驾驶标志：管理员「扮演（avatar）接管 Bot」时开启，runLoop 只排空邮箱、
    * 处理外部注入的工具调用，不再自主 generate；「操纵（puppet）」不暂停。
@@ -399,6 +417,7 @@ export class BotAgent {
         // Preserve non-voluntary provenance before a retired agent persists a late receipt.
         content = this.describeExperience(content, performed, outcome?.ok);
         content = this.puppetReceipt(content, ref);
+        if (outcome?.ok && performed?.role === "agent" && !performed.control && !performed.navigationFor) this.resetInvalidToolRetry();
         if (this.retired) {
           if (ref) {
             this.externalToolResults.get(ref)?.resolve({ ok: outcome?.ok ?? true, text: toPlainText(content), ...(typeof content === "string" ? {} : { content }) });
@@ -471,10 +490,10 @@ export class BotAgent {
     const meaningful = (name: string): boolean => {
       switch (name) {
         case "choose": return false; // Retired model shortcut; human menus resolve stable references separately.
-        case "think": return !autonomous || this.deliberation.canThink;
+        case "think": return this.config.bot.thinkEnabled !== false && this.canDeliberate;
         case "observe": return false; // Retired public tool; historical receipts remain readable.
         case "act": return !this.strictToolLoop && this.config.bot.blockingAct === false || !pending.some(task => task.name === "act");
-        case "pick_up_phone": return this.phone.down && canReachPhone(this.phone);
+        case "pick_up_phone": return this.config.bot.unrestrictedPhone !== false || this.phone.down && canReachPhone(this.phone);
         case "put_down_phone": return !this.phone.down;
         case "open_app": return !!this.apps;
         case "close_app": return this.phoneUi.chatOpen || !!this.apps?.currentName;
@@ -491,7 +510,7 @@ export class BotAgent {
     };
     const independentWorld = autonomous && this.independentWorldScope();
     // 打破死循环：临时禁用被判定为「反复调用」的工具（下次压缩后自然恢复）
-    return [...new Set(names)].filter((n) => (includeBanned || !this.tempBannedTools.has(n)) && meaningful(n) &&
+    return [...new Set(names)].filter((n) => (n === "think" || includeBanned || !this.tempBannedTools.has(n)) && meaningful(n) &&
       // beforeStart validates the original act after scheduling it. It may execute
       // itself, but meaningful() above still excludes any second pending act.
       (!independentWorld || this.independentWorldTool(n) ||
@@ -516,6 +535,7 @@ export class BotAgent {
   /** Keep execution gates live; announce only the net change at a delivery boundary. */
   private refreshToolGate(): void {
     if (this.deviceExecution.getStore()?.stealth) return;
+    this.tempBannedTools.delete("think");
     let allowed = this.currentToolNames(undefined, true);
     let appDefs = [...(this.apps?.activeToolDefs() ?? []), ...(this.computer?.activeToolDefs() ?? [])];
     for (const name of allowed) { const kind = this.classifyDevice(name); if (kind) this.knownDeviceTools.set(name, kind); }
@@ -530,7 +550,7 @@ export class BotAgent {
     appDefs = [...appDefs.filter(def => !hidden(def.name)), ...this.perceivedAppDefs.filter(def => hidden(def.name))];
     this.perceivedToolNames = [...new Set(allowed)];
     this.perceivedAppDefs = structuredClone(appDefs);
-    allowed = this.perceivedToolNames.filter(name => !this.tempBannedTools.has(name) && (this.residentControl?.mode !== "puppet" || this.autonomousDuringPuppet(name)));
+    allowed = this.perceivedToolNames.filter(name => (name === "think" || !this.tempBannedTools.has(name)) && (this.residentControl?.mode !== "puppet" || this.autonomousDuringPuppet(name)));
     this.backend.setToolNames(allowed);
     this.backend.setNavigableToolNames?.(this.navigableToolNames());
     this.backend.setToolDefs?.([...this.toolDefs, ...this.learnedDeviceDefs(), ...appDefs]);
@@ -578,7 +598,8 @@ export class BotAgent {
   /** A default target belongs to the screen seen when deciding, not a screen
    * another operator opened while generation or navigation was in flight. */
   private channelDecisionError(call: ParsedToolCall, channelAtDecision: string | null): string | undefined {
-    if (call.name === "send") return sendTargetError(call.arguments);
+    const targetError = channelTargetError(call);
+    if (targetError) return targetError;
     const layer = toolLayer(call.name);
     if (call.name === "exit_forward" || layer !== "channel" && layer !== "group" || Object.hasOwn(call.arguments, "id") || Object.hasOwn(call.arguments, "channel")) return;
     if (!channelAtDecision) return "缺少目标频道：尚未确认当前会话，请填写 id。";
@@ -623,6 +644,12 @@ export class BotAgent {
   }
 
   async stop(): Promise<void> {
+    this.thoughtRetryAt = 0;
+    this.resetInvalidToolRetry();
+    this.awaitingToolRetry = false;
+    this.compressionRetry.reset();
+    this.compressionRequested = null;
+    this.fixedContextBlockNotice = null;
     this.phoneExecutionEpoch++;
     this.worldActionInterleave.reset();
     this.growthRuntime.stop();
@@ -697,10 +724,17 @@ export class BotAgent {
     paused: boolean;
     awaitingToolRetry: boolean;
     awaitingToolResult: string | null;
+    consciousness: NarrativeConsciousness | null;
+    /** A scheduler deadline, never character sleep or unavailable thought ability. */
+    thoughtRetryAt: number | null;
+    /** Runtime maintenance, separate from character rest and manual control. */
+    maintenance: { state: "compressing" | "cooldown" | "blocked"; failures: number; retryAt: number; generationPaused: boolean;
+      reason?: string; fixedPrefixChars?: number } | null;
     opportunities: ActionOpportunity[];
     /** 手机界面状态（WebUI「设备」页窥视手机用） */
     phoneUi: { chatOpen: boolean; channelKey: string | null; channelIsGroup: boolean; forwardDepth: number };
   } {
+    const fixedBlock = this.running ? this.fixedContextBlock() : null;
     return {
       running: this.running,
       waiting: this.waiting?.callId ?? null,
@@ -710,6 +744,13 @@ export class BotAgent {
       paused: this.manualPaused,
       awaitingToolRetry: this.awaitingToolRetry,
       awaitingToolResult: this.awaitingToolResult,
+      consciousness: this.consciousness ?? null,
+      thoughtRetryAt: this.running && this.canDeliberate && this.thoughtRetryAt > Date.now() ? this.thoughtRetryAt : null,
+      maintenance: fixedBlock ? { state: "blocked", ...this.compressionRetry.snapshot(), generationPaused: true, ...fixedBlock }
+        : this.compressionPromise || this.compressionRetry.remainingMs() > 0 ? {
+        state: this.compressionPromise ? "compressing" : "cooldown", ...this.compressionRetry.snapshot(),
+        generationPaused: !!this.compressionPromise || this.contextNeedsCompression(),
+      } : null,
       opportunities: this.actionOpportunities(),
       phoneUi: {
         chatOpen: this.phoneUi.chatOpen,
@@ -741,11 +782,11 @@ export class BotAgent {
   private async announceOpportunities(opportunities: ActionOpportunity[]): Promise<void> {
     const prefix = "（当前可考虑的行动机会；";
     const lines = opportunities.map((option, index) => `${index + 1}. [${option.source === "world" ? "世界" : "设备"}] ${option.label}：${option.intent}` +
-      (option.exclusiveGroup ? `〔取舍组 ${option.exclusiveGroup}，可能无法同时选择〕` : "") +
-      (option.replyTo ? `\n   使用 send，id=${JSON.stringify(option.replyTo)}，msg 由你自行组织；不是物理 act。` : "") +
+      (option.exclusiveGroup ? `〔取舍组 ${option.exclusiveGroup}〕` : "") +
+      (option.replyTo ? `\n   使用 send(id=${JSON.stringify(option.replyTo)}, msg=你想说的话)。` : "") +
       (option.call ? `\n   对应工具：${JSON.stringify(option.call)}` : ""));
-    const content = prefix + "有合适的就使用对应工具，也可自由行动。物理行动用 act；聊天和软件必须通过实际设备工具。建议不代表已经行动或保证结果。）\n" +
-      (lines.length ? lines.join("\n") : "此前的建议已不再作为当前选择；仍可依照当前能力自由行动。");
+    const content = prefix + "可自由取舍，尚未执行。）\n" +
+      (lines.length ? lines.join("\n") : "此前的建议已不再适用。");
     const stamp = JSON.stringify([this.context.windowRevision, opportunities]);
     if (stamp === this.opportunityStamp) return;
     const prior = [...this.context.stream].reverse().find(entry => entry.kind === "event" && entry.event.source === "system" && entry.event.content.startsWith(prefix));
@@ -841,11 +882,11 @@ export class BotAgent {
       source,
       opts.ref ? ` (${opts.ref})` : "",
       truncate(rich.text, 120),
-      rich.attachments?.length ? ` [+${rich.attachments.length} 附件]` : "",
+      rich.attachments?.length ? ` （待按原位置注入的媒体：${rich.attachments.map(ref => `media:${ref.id}/${ref.type}`).join("、")}）` : "",
     );
 
     // Result waiting is a scheduler state, independent of the character's wait/rest timer.
-    if (this.awaitingToolRetry && source !== "system" && !rich.experience?.internalThought) this.wakeFn?.();
+    if ((this.awaitingToolRetry || this.awaitingThought) && source !== "system" && !rich.experience?.internalThought) this.wakeFn?.();
     this.signalMailbox();
   }
 
@@ -907,7 +948,7 @@ export class BotAgent {
   private signalMailbox(): void {
     if (!this.running) return;
     this.toolResultWakeFn?.();
-    if (this.waiting) this.wakeFn?.();
+    if (this.waiting || this.awaitingThought || !this.canDeliberate) this.wakeFn?.();
   }
 
   /** Text and ordered multimodal parts carry the same agency attribution, including after restart. */
@@ -1012,6 +1053,28 @@ export class BotAgent {
 
   // ---------- 手动驾驶（管理员接管 Bot） ----------
 
+  /** Only a committed world state establishes consciousness; scheduler pauses do not. */
+  setConsciousness(state: NarrativeConsciousness | undefined): void {
+    if (this.consciousness === state) return;
+    this.consciousness = state;
+    if (!this.canDeliberate) {
+      this.generationAbort?.abort();
+      this.attention = null;
+      this.observingPlacedPhone = false;
+    }
+    else this.thoughtRetryAt = 0;
+    const label = state === "awake" ? "清醒" : state === "asleep" ? "睡着" : state === "unconscious" ? "失去意识" : "未确认";
+    this.pushEvent("system", `（世界的清醒状态记录：${label}。）`, { originEventIds: [] });
+    this.refreshToolGate();
+    this.wakeFn?.();
+    this.toolResultWakeFn?.();
+  }
+
+  private get canDeliberate(): boolean { return this.consciousness !== "asleep" && this.consciousness !== "unconscious"; }
+
+  /** A real screen may remain on while its owner is no longer conscious of it. */
+  get canViewDeviceScreen(): boolean { return this.canDeliberate; }
+
   /**
    * 开启/关闭手动驾驶。管理员「扮演（avatar）接管 Bot」时传 true：runLoop 暂停自主 generate，
    * 只排空邮箱并处理外部注入的工具调用；「操纵（puppet）」不暂停（Bot-LLM 继续自主运行，
@@ -1020,6 +1083,7 @@ export class BotAgent {
   setManualPaused(paused: boolean): void {
     if (this.manualPaused === paused) return;
     this.manualPaused = paused;
+    if (paused) this.awaitingToolRetry = false;
     if (paused) this.phoneExecutionEpoch++;
     if (paused) this.worldActionInterleave.pause();
     this.wakeFn?.();
@@ -1057,7 +1121,7 @@ export class BotAgent {
 
   get manualBusy(): boolean { return this.autonomousDispatch !== null || this.scheduler.pendingCount > 0; }
   get deviceBusy(): boolean { return this.deviceOperations > 0; }
-  get deviceAttention(): DeviceKind | null { return this.attention === "phone" && (!canPerceivePhone(this.phone) || this.phone.down && !this.observingPlacedPhone) ? null : this.attention; }
+  get deviceAttention(): DeviceKind | null { return !this.canViewDeviceScreen || this.attention === "phone" && (!canPerceivePhone(this.phone) || this.phone.down && !this.observingPlacedPhone) ? null : this.attention; }
 
   get residentMode(): "avatar" | "puppet" | null { return this.residentControl?.mode ?? null; }
 
@@ -1364,6 +1428,39 @@ export class BotAgent {
     // Navigation and device receipt waits cannot take this exit.
   }
 
+  /** Narrow recovery preserves all bytes in the failed prefix until normal durable compaction. */
+  private recoverMediaRequestFailure(error: unknown): boolean {
+    if (this.context.attachmentsDisabled) return false;
+    const failure = classifyMediaRequestFailure(error, this.context.lastAttachmentPartTypes);
+    if (!failure) return false;
+    if (failure.kind === "audio-format") {
+      if (this.audioFormatCompactionAttempted) return false;
+      this.audioFormatCompactionAttempted = true;
+      this.context.requestAttachmentCompaction();
+      this.compressionRequested = "overflow";
+      this.pushEvent("system", "（音频输入格式被服务端拒绝，本次没有执行动作；整理当前上下文后重试，音频能力保留。）");
+      this.logger.warn("音频格式被服务端拒绝；正在通过正常上下文整理淘汰旧编码输入，保留所有模态能力。每个实例仅自动尝试一次格式恢复；重复失败按普通请求错误重试。原始错误：%s", error);
+      return true;
+    }
+    if (failure.kind === "unsupported-modality") {
+      const kinds = failure.modalities.filter(kind => !this.rejectedMediaModalities.has(kind));
+      if (!kinds.length || !this.context.degradeModalities) return false;
+      this.context.degradeModalities(kinds);
+      for (const kind of kinds) this.rejectedMediaModalities.add(kind);
+      this.context.requestAttachmentCompaction();
+      this.compressionRequested = "overflow";
+      this.pushEvent("system", `（模型服务明确不支持 ${kinds.join("、")} 输入；整理后停用这些原始媒体输入，其他模态保留。本次没有执行动作。）`);
+      this.logger.warn("模型服务明确拒绝 %s 输入；仅停用这些模态，已有请求前缀在上下文整理完成前保持不变。原始错误：%s", kinds.join("、"), error);
+      return true;
+    }
+    this.context.attachmentsDisabled = true;
+    this.context.requestAttachmentCompaction();
+    this.compressionRequested = "overflow";
+    this.pushEvent("system", "（请求体过大，本次没有执行动作；整理后暂时停用原始媒体输入，保留媒体身份和已有文字摘要。）");
+    this.logger.warn("生成请求返回 413（请求体过大）：本次会话停用附件注入；请调小媒体数量/体积预算或提高服务端请求体上限。原始错误：%s", error);
+    return true;
+  }
+
   private async runLoop(): Promise<void> {
     this.logger.info("Bot-LLM 开始持续推理");
     while (this.running) {
@@ -1382,6 +1479,10 @@ export class BotAgent {
           await sleep(250, this.abort?.signal);
           continue;
         }
+        if (!this.canDeliberate) {
+          await this.waitForConsciousness();
+          continue;
+        }
 
         // A pending receipt is a scheduling concern, not another model decision.
         // This also covers returning from manual control while a committed operation is unfinished.
@@ -1390,12 +1491,41 @@ export class BotAgent {
           continue;
         }
 
+        const fixedBlock = this.fixedContextBlock();
+        if (fixedBlock) {
+          if (this.fixedContextBlockNotice !== fixedBlock.reason) {
+            this.fixedContextBlockNotice = fixedBlock.reason;
+            this.logger.warn("%s", fixedBlock.reason);
+            debug.emit("lifecycle", "上下文固定块超出预算", fixedBlock, "warn");
+          }
+          // Compressing an empty/tiny stream cannot create room for an oversized fixed block.
+          // Keep delivering incoming facts; changing the budget is detected on the next pass.
+          await sleep(1000, this.abort?.signal);
+          continue;
+        }
+        this.fixedContextBlockNotice = null;
+
         // Maintenance is independent of the character's sleep, physical condition, and device state.
-        if (this.context.stream.length && (this.context.approxChars() > this.config.bot.maxWindowChars || this.context.attachmentBudgetExceeded)) this.compressionRequested ??= "overflow";
-        if (this.compressionRequested) {
+        const overBudget = this.contextNeedsCompression();
+        if (overBudget) this.compressionRequested ??= "overflow";
+        if (this.compressionRequested && this.compressionRetry.remainingMs() === 0) {
           const reason = this.compressionRequested;
           this.compressionRequested = null;
           await this.doRest(null, reason === "rest" ? null : reason);
+          continue;
+        }
+        if (overBudget) {
+          // Keep receiving facts during a failed-maintenance cooldown, but never issue another
+          // over-budget request. Real notifications do not bypass this technical boundary.
+          await sleep(Math.min(1000, this.compressionRetry.remainingMs()), this.abort?.signal);
+          continue;
+        }
+        if (this.invalidToolRetryAt > Date.now()) {
+          await this.waitForInvalidToolRetry();
+          continue;
+        }
+        if (this.thoughtRetryAt > Date.now()) {
+          await this.waitForThoughtRetry();
           continue;
         }
 
@@ -1411,14 +1541,16 @@ export class BotAgent {
         // 生成前再次排空，避免 Bot 看不到"就差一步"的结果而误以为调用无效、重复调用
         this.refreshToolGate();
         await this.drainMailbox();
-        if (!this.running || this.manualPaused || this.waiting || this.compressionRequested) continue;
+        if (this.fixedContextBlock()) continue;
+        if (this.contextNeedsCompression()) { this.compressionRequested ??= "overflow"; continue; }
+        if (!this.running || this.manualPaused || !this.canDeliberate || this.waiting || this.compressionRequested && this.compressionRetry.remainingMs() === 0) continue;
         if (this.strictToolLoop && this.blockingAutonomousResults().length) continue;
 
         let parsed: ParsedToolCall;
         const channelAtDecision = this.phoneUi.chatOpen && !this.concealedDevices.has("phone") ? this.phoneUi.channelKey : null;
         const independentWorldDecision = this.independentWorldScope();
         if (independentWorldDecision) this.worldActionInterleave.consume();
-        const decisionCurrent = () => this.running && !this.manualPaused && !this.generationAbort?.signal.aborted;
+        const decisionCurrent = () => this.running && !this.manualPaused && this.canDeliberate && !this.generationAbort?.signal.aborted;
         try {
           this.generationAbort = new AbortController();
           const signal = AbortSignal.any([this.abort!.signal, this.generationAbort.signal]);
@@ -1439,6 +1571,17 @@ export class BotAgent {
               this.parseFailures,
               truncate(err.raw ?? err.message, 1200),
             );
+            if (err.parsedCall) {
+              // Availability rejections are real model attempts, just like navigation refusals.
+              // Malformed text has no parsedCall and must never become an invented tool record.
+              const call = this.finalize(err.parsedCall);
+              await this.context.appendToolCall(call);
+              this.observeToolAttempt(call);
+              this.pushEvent("system", `（${err.message}）`, { ref: call.id });
+              this.pendingToolHelp.add(call.name);
+              await this.backoffInvalidToolRetry();
+              continue;
+            }
             // 「工具此刻不可用 / 未知工具」是可执行的明确原因（分层允许集造成）——必须原样透传给模型，
             // 让它知道该先 open_app 进聊天应用、select_channel 进频道，而不是吞成"恍惚"后原地重试同一个调用。
             if (/(此刻不可用|未知工具)/.test(err.message) || /^(think\.thought|(?:arguments\.)?duration\b)/.test(err.message) || err.message.endsWith("本次没有执行操作。")) {
@@ -1458,55 +1601,10 @@ export class BotAgent {
               "system",
               `（本次输出未能解析为唯一有效的工具调用，没有执行操作。${emphasis}请重新输出一个合法的工具调用。）`,
             );
+            await this.backoffInvalidToolRetry();
             continue;
           }
-          // 400/413 且上下文含原生附件：
-          // - 400：模型/服务端不接受某种附件（content part 类型不支持或格式不被接受）。
-          //   先精准降级：失败请求里注入过 video_url / input_audio 时，只关掉对应模态
-          //   （GIF 自动改走拼帧图的 image_url 通道），正常的图片附件不受牵连；
-          //   纯图片附件仍 400 才整体熔断（模型实际不具备视觉能力）。
-          // - 413：请求体超过服务端上限（base64 附件把请求撑爆了）→ 整体熔断并提示调预算。
-          // Append a capability event and compact before retrying; never rewrite the existing media prefix.
-          if (
-            !this.context.attachmentsDisabled &&
-            /\((400|413)\)/.test(String(err)) &&
-            this.context.lastAttachmentPartTypes.size > 0
-          ) {
-            if (/\(400\)/.test(String(err))) {
-              const kinds: ("video" | "audio")[] = [];
-              if (this.context.lastAttachmentPartTypes.has("video_url")) kinds.push("video");
-              if (this.context.lastAttachmentPartTypes.has("input_audio")) kinds.push("audio");
-              if (kinds.length && this.context.degradeModalities) {
-                this.context.degradeModalities(kinds);
-                this.context.requestAttachmentCompaction();
-                this.pushEvent("system", `（本次含 ${kinds.join("、")} 原始媒体的生成请求被模型服务拒绝，没有执行动作。正在尝试停用这些原始输入并整理已有经历；整理完成后新媒体按剩余能力呈现，已记录的经历保持不变。）`);
-                this.compressionRequested = "overflow";
-                this.logger.warn(
-                  "生成请求返回 400，失败请求含 %s 附件：服务端很可能不支持这类 content part，" +
-                    "已降级停用对应模态（本次会话内；GIF 动图改用拼帧图注入，图片附件不受影响）。" +
-                    "请核对 bot.modalities.%s 配置与模型的实际能力。原始错误：%s",
-                  kinds.map((k) => (k === "video" ? "video_url" : "input_audio")).join("/"),
-                  kinds.join("/"),
-                  err,
-                );
-                continue;
-              }
-            }
-            this.context.attachmentsDisabled = true;
-            this.context.requestAttachmentCompaction();
-            this.pushEvent("system", "（本次包含原始媒体的生成请求被模型服务拒绝，没有执行动作。正在尝试暂时停用原始媒体输入并整理已有经历，之后以媒体身份和文字摘要继续，不能把未展开的媒体当作已看见。）");
-            this.compressionRequested = "overflow";
-            this.logger.warn(
-              /\(413\)/.test(String(err))
-                ? "生成请求返回 413（请求体过大）：已停用附件注入（本次会话内）。" +
-                    "请调小 media.maxAttachmentsPerRequest / maxAttachmentMbPerRequest，" +
-                    "或提高 API 服务端的请求体大小上限。原始错误：%s"
-                : "生成请求返回 400 且上下文含原生媒体附件：已停用附件注入（本次会话内）。" +
-                    "请核对 bot.modalities 配置与模型的实际多模态能力。原始错误：%s",
-              err,
-            );
-            continue;
-          }
+          if (this.recoverMediaRequestFailure(err)) continue;
           this.logger.warn("Bot-LLM 生成失败，%dms 后重试: %s", this.config.bot.retryDelayMs, err);
           await sleep(this.config.bot.retryDelayMs, this.abort?.signal);
           continue;
@@ -1521,12 +1619,15 @@ export class BotAgent {
         if (!decisionCurrent()) continue;
         const call = this.finalize(parsed);
         await this.context.appendToolCall(call);
+        const repeatBlocked = this.observeToolAttempt(call);
         const channelError = this.channelDecisionError(parsed, channelAtDecision);
         if (navigationError || channelError) {
           this.pushEvent("system", navigationError ?? channelError!, { ref: call.id });
           this.pendingToolHelp.add(call.name);
+          await this.backoffInvalidToolRetry();
           continue;
         }
+        if (repeatBlocked) { await this.backoffInvalidToolRetry(); continue; }
         debug.emit("bot.tool", `${call.id} ${call.name}`, {
           id: call.id,
           name: call.name,
@@ -1592,14 +1693,22 @@ export class BotAgent {
       const retirement = await this.context.retireLegacyRegulation(this.clock.now());
       if (retirement) this.publishPerception(retirement);
     }
-    if (this.running && !this.thoughtGuidanceDelivered && this.toolDefs.some(def => def.name === "think")) {
-      if (!this.context.stream.some(entry => entry.kind === "event" && entry.event.source === "system" && entry.event.content === THOUGHT_RUNTIME_GUIDANCE + "\n\n" + SCENE_CHOICE_GUIDANCE)) {
-        const event: BotEvent = { id: this.context.nextEventId(), source: "system", worldTime: this.clock.now(),
-          content: THOUGHT_RUNTIME_GUIDANCE + "\n\n" + SCENE_CHOICE_GUIDANCE, originEventIds: [] };
-        await this.context.appendEvent(event);
-        this.publishPerception(event);
+    const thoughtEnabled = this.config.bot.thinkEnabled !== false && this.toolDefs.some(def => def.name === "think");
+    if (this.running && this.thoughtGuidanceDelivered !== thoughtEnabled) {
+      if (!thoughtEnabled) {
+        if (this.config.bot.thinkEnabled === false) {
+          const event = await this.context.ensureGuidance("think 已由配置关闭，旧说明中的思考工具当前不可调用。", this.clock.now());
+          if (event) this.publishPerception(event);
+        }
+      } else {
+        if (!this.context.stream.some(entry => entry.kind === "event" && entry.event.source === "system" && entry.event.content === THOUGHT_RUNTIME_GUIDANCE + "\n\n" + SCENE_CHOICE_GUIDANCE)) {
+          const event: BotEvent = { id: this.context.nextEventId(), source: "system", worldTime: this.clock.now(),
+            content: THOUGHT_RUNTIME_GUIDANCE + "\n\n" + SCENE_CHOICE_GUIDANCE, originEventIds: [] };
+          await this.context.appendEvent(event);
+          this.publishPerception(event);
+        }
       }
-      this.thoughtGuidanceDelivered = true;
+      this.thoughtGuidanceDelivered = thoughtEnabled;
     }
     if (!this.growthRestored) {
       await this.growth.restorePerceptions(this.context.stream);
@@ -1618,7 +1727,11 @@ export class BotAgent {
         const wake = receiptWake ?? (event.source !== "tool" || this.isWakeableToolResult(origin?.kind === "tool_call" ? origin.call.name : undefined, event));
         this.interruptPause(event.source, { ...event, text: event.content }, event.refToolCallId, wake);
       }
-      if (this.deliberation.perceive(event, origin?.kind === "tool_call" ? origin.call : undefined)) this.parseFailures = 0;
+      if (this.deliberation.perceive(event, origin?.kind === "tool_call" ? origin.call : undefined)) {
+        this.thoughtRetryAt = 0;
+        this.parseFailures = 0;
+        this.invalidToolInputSequence++;
+      }
       // Recovered receipts retain their truth but cannot renew a new lifetime's
       // independent-action allowance.
       debug.emit("bot.event", `[tool receipt] ${event.id}`, { ...event, recovered: true });
@@ -1676,7 +1789,11 @@ export class BotAgent {
         this.logger.warn("感知证据保存失败，保留当前事件与邮箱，写入恢复前暂停新的推理：%s", err);
         throw err;
       });
-      if (this.deliberation.perceive(event, originCall?.kind === "tool_call" ? originCall.call : undefined)) this.parseFailures = 0;
+      if (this.deliberation.perceive(event, originCall?.kind === "tool_call" ? originCall.call : undefined)) {
+        this.thoughtRetryAt = 0;
+        this.parseFailures = 0;
+        this.invalidToolInputSequence++;
+      }
       this.perceiveIndependentWork(event, item.wake === true && !item.toolObservation, originCall?.kind === "tool_call" ? originCall.call : undefined, item.toolResultOk === true, item.toolResultKey);
       this.noteProgress(event);
       const resultLabel = event.refToolCallId
@@ -1705,7 +1822,12 @@ export class BotAgent {
       const opportunities = this.actionOpportunities();
       if (announceCapabilities) await this.announceOpportunities(opportunities);
       if (this.currentToolNames().includes("send")) {
-        const material = conversationMaterialReminder(this.context.stream, this.clock.now());
+        // The visible channel survives compaction in delivered-screen metadata. Old
+        // scene excerpts do not: only this active window can supply a new recall cue.
+        const perceivedHistory = this.context.opportunityStream();
+        const material = conversationMaterialReminder(this.context.stream, this.clock.now(), {
+          ...derivePerceivedDeviceContext(perceivedHistory), worldEpoch: currentWorldEpoch(perceivedHistory),
+        });
         if (material) {
           // An optional, source-linked reminder. It neither wakes the character nor
           // enters growth as a new experience, and never creates a send operation.
@@ -1762,6 +1884,35 @@ export class BotAgent {
     this.wakeFn = null;
   }
 
+  private async waitForConsciousness(): Promise<void> {
+    if (this.canDeliberate || !this.running || this.manualPaused || this.receiptsPending || this.mailbox.length) return;
+    try {
+      await new Promise<void>(resolve => {
+        this.wakeFn = resolve;
+        if (this.canDeliberate || !this.running || this.manualPaused || this.receiptsPending || this.mailbox.length) resolve();
+      });
+    } finally { this.wakeFn = null; }
+  }
+
+  /** Yield computation between monologues; this is neither rest nor lost thought ability. */
+  private async waitForThoughtRetry(): Promise<void> {
+    this.awaitingThought = true;
+    try {
+      while (this.running && !this.manualPaused && this.canDeliberate && this.thoughtRetryAt > Date.now()) {
+        await this.drainMailbox();
+        if (this.thoughtRetryAt <= Date.now() || this.config.bot.thinkEnabled === false) { this.thoughtRetryAt = 0; break; }
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        try {
+          await new Promise<void>(resolve => {
+            this.wakeFn = resolve;
+            timer = setTimeout(resolve, Math.max(1, this.thoughtRetryAt - Date.now()));
+            if (!this.running || this.manualPaused || !this.canDeliberate || this.receiptsPending || this.mailbox.length) resolve();
+          });
+        } finally { clearTimeout(timer); this.wakeFn = null; }
+      }
+    } finally { this.awaitingThought = false; }
+  }
+
   private pendingWorldOperations(): boolean {
     return this.pendingWorldCalls().length > 0;
   }
@@ -1777,24 +1928,49 @@ export class BotAgent {
     this.lastGenAt = Date.now();
   }
 
-  /** Invalid calls back off independently of act concurrency; fresh events can wake them. */
+  /** Failure throttling is independent of the optional forced ban/compaction policy. */
   private async backoffInvalidToolRetry(): Promise<void> {
-    if (this.parseFailures < 2) return;
-    // Persist the correction first, and let any real input already queued reset failures.
+    this.invalidToolFailures++;
+    if (this.invalidToolFailures < 2) return;
+    const delay = Math.min(60_000, Math.max(1000, this.config.bot.retryDelayMs) * 2 ** Math.min(6, this.invalidToolFailures - 2));
+    this.invalidToolRetryAt = Date.now() + delay;
+    await this.waitForInvalidToolRetry();
+  }
+
+  private resetInvalidToolRetry(): void {
+    this.invalidToolFailures = 0;
+    this.invalidToolRetryAt = 0;
+    this.invalidToolWakeUsed = false;
+    if (this.awaitingToolRetry) this.wakeFn?.();
+  }
+
+  private async waitForInvalidToolRetry(): Promise<void> {
+    const inputSequence = this.invalidToolInputSequence;
+    // Publish the waiting status only after the corresponding correction is durable.
     await this.drainMailbox();
-    if (!this.running || this.manualPaused || this.parseFailures < 2) return;
-    const delay = Math.min(60_000, Math.max(1000, this.config.bot.retryDelayMs) * 2 ** Math.min(6, this.parseFailures - 2));
-    let timer: ReturnType<typeof setTimeout> | undefined;
+    if (!this.running || this.manualPaused || this.invalidToolRetryAt <= Date.now()) return;
     this.awaitingToolRetry = true;
     try {
-      await new Promise<void>(resolve => {
-        this.wakeFn = resolve;
-        timer = setTimeout(resolve, delay);
-        if (!this.running || this.manualPaused || this.receiptsPending ||
-          this.mailbox.some(item => item.source !== "system" && !item.experience?.internalThought)) resolve();
-      });
+      while (this.running && !this.manualPaused && this.invalidToolRetryAt > Date.now()) {
+        this.awaitingToolRetry = true;
+        // A genuine new fact deserves one immediate reconsideration. More input in the same
+        // still-failing streak is retained, but cannot fund unbounded repeated bad requests.
+        if (!this.invalidToolWakeUsed && this.invalidToolInputSequence > inputSequence) {
+          this.invalidToolWakeUsed = true;
+          this.invalidToolRetryAt = 0;
+          return;
+        }
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        try {
+          await new Promise<void>(resolve => {
+            this.wakeFn = resolve;
+            timer = setTimeout(resolve, Math.max(1, this.invalidToolRetryAt - Date.now()));
+            if (!this.running || this.manualPaused || this.receiptsPending || this.mailbox.length) resolve();
+          });
+        } finally { clearTimeout(timer); this.wakeFn = null; }
+        await this.drainMailbox();
+      }
     } finally {
-      clearTimeout(timer);
       this.wakeFn = null;
       this.awaitingToolRetry = false;
     }
@@ -1806,14 +1982,10 @@ export class BotAgent {
     if (error) { this.pushEvent("system", `（${error}）`, { ref: call.id, originEventIds: [] }); return; }
     const thought = call.arguments.thought as string;
     if (call.role === "agent") {
-      const repeated = this.deliberation.hasThought(thought);
       this.deliberation.recordThought(thought);
-      if (repeated) {
-        this.pushEvent("system", "（这个想法刚刚已经记下，没有新的内容；先等实际进展，或做一件有意义的事。）", { ref: call.id, originEventIds: [] });
-        this.refreshToolGate();
-        return;
-      }
+      this.thoughtRetryAt = Date.now() + this.deliberation.pauseMs;
     }
+    if (call.role === "agent" && !call.control) this.resetInvalidToolRetry();
     const content: RichText = { text: "（这段内心独白已记下。）", contextHint: { text: "" }, originEventIds: [],
       experience: { internalThought: true, agency: call.role === "agent" || call.control?.mode === "avatar" ? "self" : "unknown", opportunity: false } };
     const pending = this.externalToolResults.get(call.id);
@@ -1860,12 +2032,13 @@ export class BotAgent {
       const def = [...this.toolDefs, ...this.learnedDeviceDefs(), ...this.perceivedAppDefs].find(def => def.name === name);
       if (!def) { this.pendingToolHelp.delete(name); continue; }
       const content = renderToolHelp(def);
-      if (!this.failedToolHelp.has(content) && !this.context.stream.some(entry => entry.kind === "event" && entry.event.source === "system" && entry.event.content === content)) {
-        const event: BotEvent = { id: this.context.nextEventId(), source: "system", originEventIds: [], worldTime: this.clock.now(), content };
+      // A help message is useful once per working window, not once per process:
+      // after compression a later failure may need the exact interface again.
+      if (!this.context.stream.some(entry => entry.kind === "event" && entry.event.source === "system" && entry.event.content === content)) {
+        const event: BotEvent = { id: this.context.nextEventId(), source: "system", originEventIds: [], worldTime: this.clock.now(), content, toolTutorial: true };
         await this.context.appendEvent(event);
         this.publishPerception(event);
       }
-      this.failedToolHelp.add(content);
       this.pendingToolHelp.delete(name);
     }
   }
@@ -1873,15 +2046,17 @@ export class BotAgent {
   private async prepareNavigation(parsed: ParsedToolCall, current: () => boolean): Promise<string | undefined> {
     const builtin = this.toolDefs.some(def => def.name === parsed.name);
     const learned = this.learnedDeviceDefs().some(def => def.name === parsed.name);
-    if (this.tempBannedTools.has(parsed.name) || !builtin && !learned) return `${parsed.name} 此刻不可用。`;
+    if (parsed.name !== "think" && this.tempBannedTools.has(parsed.name) || !builtin && !learned) return `${parsed.name} 此刻不可用。`;
     if (this.residentControl?.mode === "puppet") return this.autonomousDuringPuppet(parsed.name) ? undefined : "身体与设备正受外部操纵。";
-    if (toolLayer(parsed.name) !== "core" && misusedTargetKeys(parsed.arguments).length) return "目标参数应使用 id。";
+    const targetError = channelTargetError(parsed);
+    if (targetError) return targetError;
     const app = learned ? this.apps?.toolOwner?.(parsed.name) : null;
     const computer = learned && this.computer?.knownToolDefs?.().some(def => def.name === parsed.name);
     const device = app ? "phone" : computer ? "computer" : this.classifyDevice(parsed.name);
     if (!device) return undefined;
     const plan = await planToolNavigation(parsed, {
-      phone: this.phone, chatOpen: this.phoneUi.chatOpen, channelKey: this.phoneUi.channelKey,
+      phone: this.phone, unrestrictedPhone: this.config.bot.unrestrictedPhone !== false,
+      chatOpen: this.phoneUi.chatOpen, channelKey: this.phoneUi.channelKey,
       channelIsGroup: this.phoneUi.channelIsGroup, chatApp: this.config.apps?.chatAppName || "chat", builtin,
       device, app,
       activeAppId: app && !this.apps?.hasTool(parsed.name) ? null : this.apps?.view()?.id,
@@ -1921,6 +2096,7 @@ export class BotAgent {
   }
 
   private async dispatchTool(call: ToolCallRecord): Promise<void> {
+    if (this.observeToolAttempt(call)) return;
     if (call.role === "agent" && !call.control && call.name !== this.pauseConfirmArmed) this.pauseConfirmArmed = null;
     if (call.control && (this.residentClosing || this.residentControl?.sessionId !== call.control.sessionId || this.residentControl.mode !== call.control.mode)) {
       this.pushEvent("system", "（角色接管会话已结束，此调用没有执行。）", { ref: call.id });
@@ -1943,24 +2119,10 @@ export class BotAgent {
       this.attention = null;
       this.observingPlacedPhone = false;
     }
-    // 通用防重复守卫：观察这次调用，连续重复达到阈值时注入提醒。
-    // 放在 dispatch 最前，让所有工具——包括下面被目标误写/参数缺失拦截的
-    // denied 调用——都计入链（模型反复撞被拒的调用，正是最该打断的循环）。
-    // 开启 breakLoop 时，除 advisory 提醒外还会真正干预：先移除被重复的工具，仍重复则强制 rest。
-    const repeat = call.role === "system" ? null : this.repeatGuard.observe(call);
-    if (repeat && this.handleRepeat(call, repeat)) return;
-    // 目标参数误写拦截（频道类工具）：Bot 幻觉出 OneBot API 风格的 detail/channel_id
-    // 等写法且没给 id 时，绝不静默回退到当前频道（那会把消息发进无关频道）——
-    // 拦下并告知正确格式，让它重试。不打捞：打捞会让错误格式被强化
-    const misused = misusedTargetKeys(call.arguments);
-    if (misused.length && toolLayer(call.name) !== "core") {
-      this.pushEvent(
-        "system",
-        `（${call.name} 的目标参数格式不对：不存在 ${misused.join(" / ")} 这种参数。` +
-          `频道一律用 id 参数指定，格式为 "平台:频道id"，直接从 check_msg 列表或消息通知里照抄完整的频道 id 即可；` +
-          (call.name === "send" ? "send 每次必须填写 id，本次未发送。）" : "已在目标频道页内时可省略 id。什么都没有发生，请改正后重试。）"),
-        { ref: call.id },
-      );
+    // Direct dispatch uses the same target diagnostics as autonomous planning.
+    const targetError = channelTargetError(call);
+    if (targetError) {
+      this.pushEvent("system", targetError, { ref: call.id });
       return;
     }
     switch (call.name) {
@@ -2079,7 +2241,8 @@ export class BotAgent {
         });
       }
       case "read_channel": {
-        // 读当前所在频道的消息（不切换频道）。需先 select_channel 进入某个频道
+        // Navigation has opened an explicit target when supplied; omitted id
+        // stays bound to the current channel rather than a recent notification.
         if (!this.phoneUi.chatOpen || !this.phoneUi.channelKey) {
           this.pushEvent("system", "（你还没进入任何频道：先 open_app 打开聊天应用，再用 select_channel 进入一个频道。）", { ref: call.id });
           return;
@@ -2191,15 +2354,29 @@ export class BotAgent {
       case "pick_up_phone":
         return this.dispatchLocal(call, async () => {
           const epoch = this.phoneExecutionEpoch;
-          return withPhoneExecutionLock(this.phone, () => {
+          return withPhoneExecutionLock(this.phone, async () => {
             this.checkPhoneExecution(call, epoch);
+            const physical = phonePhysicalState(this.phone);
+            const restore = this.config.bot.unrestrictedPhone !== false && (!physical.reachable || !physical.usable || !physical.perceptible);
+            if (restore) {
+              const state = await this.world.restorePhoneAccess(`pickup:${call.id}`, { signal: this.abort?.signal,
+                beforeCommit: () => { this.checkPhoneExecution(call, epoch); return this.config.bot.unrestrictedPhone !== false; } });
+              // Publication happens after storage succeeds. The callback and this local
+              // assignment share the same durable facts; neither guesses a repair cause.
+              applyPhonePhysicalState(this.phone, state);
+            }
             if (!canReachPhone(this.phone)) throw new Error(phoneUnavailableReason(this.phone));
-            if (!this.phone.down) return "（手机本来就在你手里。）";
+            if (!this.phone.down && !restore) return "（手机本来就在你手里。）";
             setPhoneDown(this.phone, false);
+            // Publishing the recovered physical state can clear attention while
+            // the phone is still down. Only the completed pickup restores it.
+            if ((call.role === "agent" || call.control) && this.canViewDeviceScreen) this.attention = "phone";
+            this.observingPlacedPhone = false;
+            this.refreshToolGate();
             const screen = this.phoneUi.chatOpen
               ? this.phoneUi.channelKey ? `${this.config.apps?.chatAppName || "QQ"} 频道 ${this.phoneUi.channelKey}` : `${this.config.apps?.chatAppName || "QQ"} 的消息列表，尚未选择频道`
               : this.apps?.currentName ? `「${this.apps.currentName}」` : "手机桌面";
-            return `已拿起手机。当前显示：${phonePhysicalState(this.phone).usable ? screen : "设备无法正常使用"}。` + this.phoneDesktopBadge();
+            return `${restore ? "已拿到可正常使用的手机。" : "已拿起手机。"}当前显示：${phonePhysicalState(this.phone).usable ? screen : "设备无法正常使用"}。` + this.phoneDesktopBadge();
           });
         });
       case "channel_notify": {
@@ -2914,7 +3091,7 @@ export class BotAgent {
         if (call.control && (this.residentClosing || this.residentControl?.sessionId !== call.control.sessionId)) throw new Error("角色接管会话已结束，此设备操作没有执行");
         if (call.role === "agent" && this.residentControl?.mode === "puppet" && !this.autonomousDuringPuppet(call.name)) throw new Error("身体与设备正受外部操纵，此自主操作没有执行");
         if (kind === "phone" && call.name !== "observe_device") {
-          if (call.name === "pick_up_phone" && !canReachPhone(this.phone)) throw new Error(phoneUnavailableReason(this.phone));
+          if (call.name === "pick_up_phone" && this.config.bot.unrestrictedPhone === false && !canReachPhone(this.phone)) throw new Error(phoneUnavailableReason(this.phone));
           if (!["pick_up_phone", "put_down_phone"].includes(call.name) &&
             (stealth || call.role === "system" && !call.control ? !phonePhysicalState(this.phone).usable : !canUsePhone(this.phone))) throw new Error(phoneUnavailableReason(this.phone));
         }
@@ -3009,6 +3186,9 @@ export class BotAgent {
    * 这是对「纯 advisory 压不住持续自主运行的 Bot」的兜底：不依赖模型听从提醒，直接改变它的可用工具集。
    */
   private handleRepeat(call: ToolCallRecord, repeat: ObserveResult): boolean {
+    // Deliberation has interruptible scheduling backoff, not a removable ability or
+    // a reason to fabricate rest/force another model's memory-maintenance request.
+    if (call.name === "think") return false;
     // advisory 提醒：命中阈值/检出循环时才有（未命中但计数仍在累加时静默）
     if (repeat.notice) {
       this.pushEvent("system", `（${repeat.notice}）`, { ref: call.id });
@@ -3028,7 +3208,8 @@ export class BotAgent {
     // 交替循环（cycle）视为立即达到移除阈值——循环本身就是最该打断的形态。
     if (removeAt > 0) {
       const shouldRemove = repeat.cycle || repeat.count >= removeAt;
-      if (shouldRemove && !this.tempBannedTools.has(repeat.toolName) && !isBreakLoopSafeTool(repeat.toolName)) {
+      if (shouldRemove && !this.tempBannedTools.has(repeat.toolName) && !isBreakLoopSafeTool(repeat.toolName) &&
+        !(this.config.bot.unrestrictedPhone !== false && repeat.toolName === "pick_up_phone")) {
         this.tempBannedTools.add(repeat.toolName);
         this.refreshToolGate();
         this.logger.warn("打破死循环：暂时移除反复调用的工具 %s（下次压缩后恢复）", repeat.toolName);
@@ -3063,6 +3244,15 @@ export class BotAgent {
       }
     }
     return false;
+  }
+
+  private observeToolAttempt(call: ToolCallRecord): boolean {
+    const previous = this.observedAttempts.get(call);
+    if (previous !== undefined) return previous;
+    const repeat = call.role === "system" ? null : this.repeatGuard.observe(call);
+    const blocked = !!repeat && this.handleRepeat(call, repeat);
+    this.observedAttempts.set(call, blocked);
+    return blocked;
   }
 
   /** Interruptions alone are not progress: require a new delivered fact or completed choice. */
@@ -3630,33 +3820,49 @@ export class BotAgent {
   /** Memory maintenance runs only at a generation boundary; it does not alter the body or devices. */
   private async doRest(_call: ToolCallRecord | null, reason: "overflow" | "breakLoop" | null): Promise<void> {
     if (this.compressionPromise) return this.compressionPromise;
+    if (this.fixedContextBlock()) return;
+    if (this.compressionRetry.remainingMs() > 0) return;
     this.compressionPromise = this.compactContext(reason).finally(() => { this.compressionPromise = null; });
     return this.compressionPromise;
   }
 
   private async compactContext(reason: "overflow" | "breakLoop" | null): Promise<void> {
+    if (this.fixedContextBlock()) return;
+    if (this.compressionRetry.remainingMs() > 0) return;
+    try {
+      await this.performContextCompression(reason);
+      if (this.running) {
+        this.compressionRetry.reset();
+        this.compressionRequested = null;
+      }
+    } catch (err) {
+      if (!this.running) return;
+      const retry = this.compressionRetry.failed();
+      this.logger.warn("记忆整理失败，保留原始经历；%dms 后再试：%s", retry.delayMs, err);
+      debug.emit("lifecycle", "记忆整理延期", { ...retry, generationPaused: this.contextNeedsCompression(), error: String(err) }, "warn");
+      if (retry.failures === 1) this.pushEvent("system", "（记忆整理暂未完成，已有经历保留。整理会稍后重试；这不是角色的休息、睡眠或身体变化。）", { originEventIds: [] });
+      this.compressionRequested ??= reason ?? "rest";
+    }
+  }
+
+  /** The complete maintenance attempt, including snapshot and durable cutover, shares one retry boundary. */
+  private async performContextCompression(reason: "overflow" | "breakLoop" | null): Promise<void> {
     await this.drainMailbox();
+    if (this.fixedContextBlock()) return;
     if (this.running && !this.manualPaused) this.growthRuntime.tick(this.abort?.signal, true);
     const snapshot = await this.context.compressionSnapshot();
     if (!snapshot.entries.length) return;
     await this.growth.restorePerceptions(snapshot.entries);
+    if (this.fixedContextBlock()) return;
     this.logger.info("整理记忆（%s）：%d 条记录", reason ?? "rest", snapshot.entries.length);
-    let result: CompressionResult;
-    try {
-      result = await abortable(this.world.compress({
-        persona: this.context.pinned.botDefinition,
-        historySummary: this.context.pinned.historySummary,
-        memoryDigest: this.context.pinned.memoryDigest,
-        streamText: snapshot.text,
-        timeLine: this.clock.timeLine(),
-        chatAccounts: this.context.accountsProvider?.() ?? "",
-      }), this.abort?.signal);
-    } catch (err) {
-      if (!this.running) return;
-      this.logger.warn("记忆整理失败，保留原始经历：%s", err);
-      await sleep(this.config.bot.retryDelayMs, this.abort?.signal);
-      return;
-    }
+    const result: CompressionResult = await abortable(this.world.compress({
+      persona: this.context.pinned.botDefinition,
+      historySummary: this.context.pinned.historySummary,
+      memoryDigest: this.context.pinned.memoryDigest,
+      streamText: snapshot.text,
+      timeLine: this.clock.timeLine(),
+      chatAccounts: this.context.accountsProvider?.() ?? "",
+    }), this.abort?.signal);
     if (!this.running) return;
     // Stage the exact post-compression capability list before the durable prefix cutover.
     // Failed writes retain the previous native snapshot and restore any temporary bans.
@@ -3680,6 +3886,20 @@ export class BotAgent {
     }
     this.refreshToolGate();
     this.wakeTimeLine = this.clock.timeLine();
+  }
+
+  private contextNeedsCompression(): boolean {
+    return this.context.stream.length > 0 &&
+      (this.context.approxChars() > this.config.bot.maxWindowChars || this.context.attachmentBudgetExceeded);
+  }
+
+  private fixedContextBlock(): { reason: string; fixedPrefixChars: number } | null {
+    const fixedPrefixChars = this.context.approxFixedChars();
+    const budget = this.config.bot.maxWindowChars;
+    return fixedPrefixChars >= budget ? {
+      reason: `固定提示与记忆摘要共 ${fixedPrefixChars} 字符，已达到上下文预算 ${budget}；暂停生成与自动压缩。请增大上下文预算，或在明确更新上下文时缩短固定内容。`,
+      fixedPrefixChars,
+    } : null;
   }
 
 }
@@ -3723,17 +3943,6 @@ function abortable<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
   });
 }
 
-/**
- * 频道目标参数的常见误写（OneBot API 风格等）：没给 id/channel 却带着这些键时返回键名列表。
- * 注意 user_id 不算——群管理工具里它合法地表示"群成员"（此时频道缺省为当前群页）。
- */
-export function misusedTargetKeys(args: Record<string, unknown>): string[] {
-  if (args.id != null || args.channel != null) return [];
-  return ["detail", "channel_id", "channelId", "target", "to", "group_id"].filter(
-    (k) => args[k] != null,
-  );
-}
-
 function truncate(text: string, max: number): string {
   const single = text.replace(/\n/g, "\\n");
   return single.length > max ? sliceText(single, 0, max) + "…" : single;
@@ -3772,7 +3981,7 @@ const SEND_TOOL_NAMES = ["send"];
 
 /** 打破死循环时不该被移除的"安全"工具：计时/书签类，移除它们反而会让模型无处安放、更疯狂 */
 function isBreakLoopSafeTool(name: string): boolean {
-  return name === "wait" || name === "rest" || name === "observe_device";
+  return name === "think" || name === "wait" || name === "rest" || name === "observe_device";
 }
 
 /**

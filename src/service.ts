@@ -84,7 +84,7 @@ function readPackageVersion(): string {
     const require = createRequire(import.meta.url);
     return require("koishi-plugin-yesimbot-world/package.json").version as string;
   } catch {
-    return "0.3.1";
+    return "0.4.0";
   }
 }
 
@@ -176,17 +176,29 @@ export class WorldService extends Service<Config> {
     const epoch = this.phoneStateEpoch, world = this.world;
     if (!world?.runtime?.store) return;
     world.runtime.phoneStatusProvider = () => this.phoneStatus;
+    world.runtime.unrestrictedPhoneProvider = () => this.config.bot.unrestrictedPhone !== false;
     const store = await world.runtime.store(true);
     const current = () => this.phoneStateEpoch === epoch && this.world === world && !this.serviceStopped;
     if (!current()) return;
+    const syncConsciousness = () => {
+      if (!current()) return;
+      this.bot?.setConsciousness(world.isTravelling ? world.remoteConsciousness : store.snapshot().actors.bot?.consciousness);
+    };
     const sync = () => {
       if (!current()) return;
-      if (applyPhonePhysicalState(this.phoneStatus, store.snapshot().phoneState)) this.bot?.phonePhysicalStateChanged();
+      const snapshot = store.snapshot();
+      if (applyPhonePhysicalState(this.phoneStatus, snapshot.phoneState)) this.bot?.phonePhysicalStateChanged();
+      syncConsciousness();
     };
+    world.onConsciousnessRouteChange = syncConsciousness;
     sync();
-    this.phoneStateSubscription = store.subscribe(event => {
-      if (event.topic === "world.committed" && (event.payload as { phoneStateChanged?: boolean })?.phoneStateChanged) sync();
+    const unsubscribe = store.subscribe(event => {
+      if (event.topic === "world.committed") sync();
     });
+    this.phoneStateSubscription = () => {
+      unsubscribe();
+      if (world.onConsciousnessRouteChange === syncConsciousness) world.onConsciousnessRouteChange = undefined;
+    };
   }
 
   private deliverAppNotice(recipient: BotAgent | null, notice: RichText, alarm?: "alarm" | "timer", appId = "chat"): void {
@@ -291,6 +303,7 @@ export class WorldService extends Service<Config> {
 
     // 消息网关始终活跃：所有消息入库；通知事件仅在世界运行时投递
     new Gateway(ctx, config.messaging, config.platformOps, this.store, this.media, this.renderer, this.focus, this.notifyMgr, this.phoneStatus, this.requests, this.ownSends, this.names, () => this.clock ?? null, {
+      canViewScreen: () => this.bot?.canViewDeviceScreen ?? false,
       notify: (content, wake) => {
         if (!this.worldActive || !this.bot) return false;
         this.bot.pushEvent("koishi", content, { wake });
@@ -312,7 +325,7 @@ export class WorldService extends Service<Config> {
           } catch (error) { this.logger.warn("外发消息认领失败: %s", error); }
         } else if (mode === "event") {
           const recipient = this.bot;
-          const visible = () => canUsePhone(this.phoneStatus) && (this.focus.isFocused(key) || this.notifyMgr.allowsNotification(key));
+          const visible = () => recipient.canViewDeviceScreen && canUsePhone(this.phoneStatus) && (this.focus.isFocused(key) || this.notifyMgr.allowsNotification(key));
           const signal = () => {
             if (canPerceivePhone(this.phoneStatus) && this.notifyMgr.vibrates(key))
               recipient.pushEvent("koishi", { text: "手机传来一阵振动。", ...anonymousChatNoticeEvidence(content) }, { wake: config.messaging.wakeOnNotify });
@@ -366,6 +379,7 @@ export class WorldService extends Service<Config> {
       generateShell: this.config.apps.browserEnabled,
     });
     this.world.runtime.phoneStatusProvider = () => this.phoneStatus;
+    this.world.runtime.unrestrictedPhoneProvider = () => this.config.bot.unrestrictedPhone !== false;
     if (await this.files.isInitialized()) await this.bindPhoneState();
     // 先启动 WebUI（初始化 usageStore 并确保 webui 目录存在），再自动恢复世界运行。
     // 否则 autoStart 时 Bot 会先发出 LLM 请求，而 usageStore 尚未 init / 目录未建，
@@ -562,6 +576,7 @@ export class WorldService extends Service<Config> {
     this.botContext = new BotContext(this.files, this.pinnedToolsText(), this.promptStore);
     // wait 被移除时，行为准则与时间说明不再提及等待
     this.botContext.waitRemoved = this.config.bot.disableWait;
+    this.botContext.thinkEnabled = this.config.bot.thinkEnabled !== false;
     // 聊天账号列表：Bot 识别 <at id/>、引用等结构里的"自己"的依据。
     // 固定前缀只在首次投影/压缩时取值；迟连接或账号变化在生成边界另追加身份事件。
     this.botContext.accountsProvider = () => {
@@ -590,7 +605,7 @@ export class WorldService extends Service<Config> {
         : modalities[ref.type];
     this.botContext.attachmentLoader = async (ref) =>
       allowed(ref) && nativeSafeMime(ref) ? loader(ref) : null;
-    // 运行时降级：服务端 400 拒收 video_url / input_audio 时只关对应模态，
+    // 仅在服务端明确不支持对应输入模态时降级；音频格式错误不关闭能力。
     // 新分段的加载缓存重建；已有请求分段在压缩前保持原字节。
     this.botContext.degradeModalities = (kinds) => {
       for (const k of kinds) modalities[k] = false;
@@ -833,6 +848,8 @@ export class WorldService extends Service<Config> {
     // 旧世界 meta.json 缺 botName（新字段）：从定义补判一次（不阻塞启动，失败下次启动再试）
     void this.world.ensureBotName().catch((err) => this.logger.warn("Bot 名字补判失败: %s", err));
 
+    signal.throwIfAborted();
+    if (this.world.runtime?.store) this.bot.setConsciousness(this.world.isTravelling ? this.world.remoteConsciousness : (await this.world.runtime.store(true)).snapshot().actors.bot?.consciousness);
     signal.throwIfAborted();
     this.bot.start();
     this.tingle = new TingleTimer(
@@ -1425,6 +1442,8 @@ export class WorldService extends Service<Config> {
       blockingAct: this.config.bot.blockingAct,
       waitConfirm: this.config.bot.waitRateThreshold > 0,
       disableWait: this.config.bot.disableWait,
+      thinkEnabled: this.config.bot.thinkEnabled !== false,
+      unrestrictedPhone: this.config.bot.unrestrictedPhone !== false,
       ignoreSendDuration: this.config.bot.ignoreSendDuration,
       crossingWorlds: this.config.crossing.worlds
         .filter((w) => w.allowVoluntary && w.name.trim() && w.url.trim())

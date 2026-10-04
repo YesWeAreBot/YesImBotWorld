@@ -4,6 +4,8 @@ export class ToolCallParseError extends Error {
   constructor(
     message: string,
     readonly raw?: string,
+    /** A structurally valid attempt rejected by availability, never an executed call. */
+    readonly parsedCall?: ParsedToolCall,
   ) {
     super(message);
     this.name = "ToolCallParseError";
@@ -15,11 +17,18 @@ export class ToolCallParseError extends Error {
  * 兼容 <think> 段、markdown 代码块、前后杂散文本。
  */
 export function extractToolCall(raw: string, allowedNames: string[]): ParsedToolCall {
-  let text = raw
-    .replace(/^\uFEFF/, "")
-    .replace(/<think>[\s\S]*?<\/think>/g, "")
-    .replace(/<thinking>[\s\S]*?<\/thinking>/g, "")
-    .trim();
+  let text = raw.replace(/^\uFEFF/, "").trim();
+  // Reasoning envelopes are outside the call. Never remove similarly spelled text
+  // inside a JSON argument or a quoted character monologue.
+  while (/^<(?:think|thinking)>/.test(text)) {
+    const tag = text.startsWith("<thinking>") ? "thinking" : "think";
+    const end = text.indexOf(`</${tag}>`);
+    if (end < 0) break;
+    text = text.slice(end + tag.length + 3).trim();
+  }
+  text = unwrapCodeFence(text);
+  const shorthand = parseThoughtShorthand(text, allowedNames, raw);
+  if (shorthand) return shorthand;
 
   // 模板强制开启思考（prompt 里预置了 <think>）时，输出的思考段没有配对的开标签，
   // 只以 </think> 结尾——若它出现在第一个 JSON 之前，裁掉前导思考段
@@ -31,7 +40,9 @@ export function extractToolCall(raw: string, allowedNames: string[]): ParsedTool
     }
   }
   // 去掉 markdown 代码块围栏
-  text = text.replace(/```(?:json)?/g, "");
+  text = unwrapCodeFence(text);
+  const thoughtAfterReasoning = parseThoughtShorthand(text, allowedNames, raw);
+  if (thoughtAfterReasoning) return thoughtAfterReasoning;
 
   const json = findFirstJsonObject(text);
   if (!json) {
@@ -51,9 +62,29 @@ export function extractToolCall(raw: string, allowedNames: string[]): ParsedTool
     return validateToolCall(parsed, allowedNames);
   } catch (err) {
     if (err instanceof ToolCallParseError) {
-      throw new ToolCallParseError(err.message, raw);
+      throw new ToolCallParseError(err.message, raw, err.parsedCall);
     }
     throw err;
+  }
+}
+
+function unwrapCodeFence(text: string): string {
+  const fenced = text.match(/^```(?:json|js|javascript|text)?\s*\n([\s\S]*?)\n```\s*$/);
+  return fenced ? fenced[1]!.trim() : text;
+}
+
+/** A literal-only convenience syntax, not JavaScript execution or a second tool protocol. */
+function parseThoughtShorthand(text: string, allowedNames: string[], raw: string): ParsedToolCall | undefined {
+  if (!/^think\s*\(/.test(text)) return;
+  const match = text.match(/^think\s*\(\s*("(?:\\[\s\S]|[^"\\])*")\s*\)$/u);
+  if (!match) throw new ToolCallParseError('think 简写须为 think("内容")，只包含一个 JSON 字符串；本次没有执行操作。', raw);
+  let thought: unknown;
+  try { thought = JSON.parse(match[1]!); }
+  catch { throw new ToolCallParseError('think 简写中的字符串转义无效；本次没有执行操作。', raw); }
+  try { return validateToolCall({ name: "think", arguments: { thought } }, allowedNames); }
+  catch (error) {
+    if (error instanceof ToolCallParseError) throw new ToolCallParseError(error.message, raw, error.parsedCall);
+    throw error;
   }
 }
 
@@ -63,7 +94,7 @@ export function validateToolCall(parsed: unknown, allowedNames: string[]): Parse
   }
   const obj = parsed as Record<string, unknown>;
   const name = obj.name;
-  if (typeof name !== "string" || !allowedNames.includes(name)) {
+  if (typeof name !== "string" || !name.trim()) {
     throw new ToolCallParseError(
       `未知工具 "${String(name)}"，可用工具: ${allowedNames.join(", ")}`,
     );
@@ -97,7 +128,11 @@ export function validateToolCall(parsed: unknown, allowedNames: string[]): Parse
   }
   const duration = topDuration ?? argumentDuration;
   delete args.duration;
-  return { name, arguments: args, duration };
+  const call = { name, arguments: args, duration };
+  if (!allowedNames.includes(name)) {
+    throw new ToolCallParseError(`未知工具 "${name}"，可用工具: ${allowedNames.join(", ")}`, undefined, call);
+  }
+  return call;
 }
 
 function parseDuration(value: unknown, location: string): number {

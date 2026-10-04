@@ -24,6 +24,8 @@ async function main() {
   let world: WorldAgent | undefined;
   try {
     const cfg = Config({ autoStart: false });
+    // These fixtures exercise the explicitly supported native-tool compatibility path.
+    cfg.world.responseFormat = "tool";
     const files = new WorldFiles(dir); await files.ensure(); await files.writeMeta({ realWorld: false } as any);
     const clock = { now: () => 10, timeLine: () => "T=10", syncRealTime: false, realMsUntil: () => 0 } as any;
     world = new WorldAgent(cfg.world, files, clock, logger, new Prompts());

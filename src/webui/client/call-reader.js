@@ -37,6 +37,19 @@ var CallReader = (function () {
             var attachment = attachments.render(part);
             if (attachment) { holder.appendChild(attachment); return; }
             if (part && typeof part === 'object' && ['text', 'input_text', 'output_text'].includes(part.type)) holder.appendChild(renderData(part.text, 1, attachments));
+            else if (part && typeof part === 'object' && part.type === 'tool_use') {
+                var call = el('section', { cls: 'live-tool-call' });
+                call.append(title('调用工具 · ' + (part.name || '未命名')), el('small', { text: part.id || '' }), renderData(part.input, 2, attachments));
+                holder.appendChild(call);
+            } else if (part && typeof part === 'object' && part.type === 'tool_result') {
+                var result = el('section', { cls: 'live-tool-call' });
+                result.append(title(part.is_error ? '工具执行失败' : '工具回执'), el('small', { text: '对应调用：' + (part.tool_use_id || '未记录') }), contentParts(part.content, attachments));
+                holder.appendChild(result);
+            } else if (part && typeof part === 'object' && part.type === 'thinking') {
+                var thought = el('section', { cls: 'live-reasoning' }); thought.append(title('模型推理'), renderData(part.thinking, 1, attachments));
+                if (part.signature) thought.appendChild(el('small', { text: '包含提供方推理签名，可在原始数据中核对。' }));
+                holder.appendChild(thought);
+            }
             else holder.appendChild(renderData(part == null ? '没有正文' : part, 1, attachments));
         }
         if (Array.isArray(value)) value.forEach(show); else show(value);
@@ -60,13 +73,13 @@ var CallReader = (function () {
             container.appendChild(title('发送给模型的内容 · ' + messages.length + ' 条消息'));
             var list = el('div', { cls: 'live-messages' }), start = Math.max(0, messages.length - 20), earlier = el('button', { type: 'button', cls: 'live-button live-earlier', text: '显示更早的消息' });
             function messageCard(message, index) {
-                var name = roles[message.role] || message.role || '消息', contentText = plain(message.content), preview = contentText.replace(/\s+/g, ' ').slice(0, 90), long = contentText.length > 4000;
+                var name = roles[message.role] || message.role || '消息', contentText = message.content == null && message.toolCalls?.length ? '调用工具 · ' + message.toolCalls.map(function (call) { return call.function?.name || call.name || '未命名'; }).join('、') : plain(message.content), preview = contentText.replace(/\s+/g, ' ').slice(0, 90), long = contentText.length > 4000;
                 var card = el('details', { cls: 'live-message', open: index >= messages.length - 3 && !long }, [el('summary', {}, [el('span', { cls: 'live-message-role', text: name }), el('small', { text: '#' + (index + 1) + (message.name ? ' · ' + message.name : '') + (long ? ' · 长消息，点击展开' : '') }), el('span', { cls: 'live-message-preview', text: preview })])]);
                 function fill() {
                     if (!card.open || card.dataset.loaded) return;
                     card.dataset.loaded = 'true';
                     if (message.toolCallId) card.appendChild(el('code', { cls: 'live-tool-ref', text: '对应调用：' + message.toolCallId }));
-                    card.appendChild(contentParts(message.content, attachments));
+                    if (message.content != null || !message.toolCalls?.length) card.appendChild(contentParts(message.content, attachments));
                     if (message.toolCalls && message.toolCalls.length) card.append(title('工具调用'), data(message.toolCalls));
                 }
                 card.addEventListener('toggle', fill); fill(); return card;
@@ -120,7 +133,9 @@ var CallReader = (function () {
                     setValue(item.args, thought !== null ? JSON.stringify({ name: 'think', arguments: { thought: thought } }) : call.arguments || '参数正在生成…', attachments);
                 });
                 nodes.toolNodes.forEach(function (item, id) { if (!toolIds.has(id)) { item.element.remove(); nodes.toolNodes.delete(id); } });
-                nodes.finish.textContent = choice.finishReason ? '结束原因 · ' + ({ stop: '正常结束', tool_calls: '交给工具执行', function_call: '交给工具执行', length: '达到生成长度限制', content_filter: '内容过滤' }[choice.finishReason] || choice.finishReason) : options.active ? '正在生成…' : '';
+                nodes.finish.textContent = choice.finishReason ? '结束原因 · ' + ({ stop: '正常结束', completed: '正常结束', end_turn: '本轮结束', stop_sequence: '遇到停止标记',
+                    tool_calls: '交给工具执行', function_call: '交给工具执行', tool_use: '交给工具执行', length: '达到生成长度限制', max_tokens: '达到生成长度限制', max_output_tokens: '达到生成长度限制',
+                    max_messages: '达到消息数量限制', model_context_window_exceeded: '达到上下文容量限制', content_filter: '内容过滤', refusal: '模型拒绝', failed: '生成失败', incomplete: '未完整生成', in_progress: '生成尚未完成', queued: '仍在排队', cancelled: '已取消', pause_turn: '提供方暂停本轮', steered: '被后续输入中断' }[choice.finishReason] || choice.finishReason) : options.active ? '正在生成…' : '';
             });
             warning.textContent = (decoded.warnings || []).join('\n'); warning.hidden = !warning.textContent;
             placeholder.hidden = !!messages.length || !!decoded.error || !!decoded.unparsed;

@@ -109,9 +109,9 @@ async function renderPerOccurrence() {
   const rich = await renderer.render(`前${mediaPlaceholder(f.id, "image", true)}中${mediaPlaceholder(f.id, "image", false)}后`);
   const parts = rich.parts!.filter((part): part is Extract<RichTextPart, { kind: "media" }> => part.kind === "media");
   assert.equal(parts.length, 2); assert.equal(parts[0]!.ref.id, parts[1]!.ref.id);
-  assert.equal(parts[0]!.presentation, "expression-v1"); assert.equal(parts[0]!.expressionSummary, expression);
+  assert.equal(parts[0]!.presentation, "expression-v2"); assert.equal(parts[0]!.expressionSummary, expression);
   assert.equal(parts[0]!.summary, undefined);
-  assert.equal(parts[1]!.presentation, "media-v1"); assert.equal(parts[1]!.summary, ordinary);
+  assert.equal(parts[1]!.presentation, "media-v2"); assert.equal(parts[1]!.summary, ordinary);
   assert.equal(parts[1]!.sticker, undefined, "a past sticker ingestion cannot reclassify today's ordinary image");
   assert.equal(rich.text, richPartsText(rich.parts!));
   assert.ok(rich.text.indexOf(expression) < rich.text.indexOf("中") && rich.text.indexOf("中") < rich.text.indexOf(ordinary));
@@ -150,10 +150,18 @@ async function unchangedHistoricalPrefix() {
   const expected = `<media ref="media:${f.id}" type="image" usage="sticker" name="过去的名字">\n表情包（按表情使用）；文字摘要（可能有误）：猫 &amp; 字幕\n`;
   assert.equal(mediaOpen(legacy), expected);
   assert.equal(richPartsText([{ kind: "text", text: "旧消息" }, legacy]), "旧消息" + expected + "此处仅保留媒体身份与文字摘要，未展开原始媒体\n</media>");
+  const v1 = { ...mediaPart(f.ref), presentation: "media-v1" as const };
+  const oldOpen = `<media ref="media:${f.id}" type="image">\n图片；暂无文字摘要\n`;
+  assert.equal(mediaOpen(v1, true), oldOpen, "v1 native request headers retain their exact historical bytes");
+  assert.equal(mediaText(v1), oldOpen + "此处仅保留媒体身份与文字摘要，未展开原始媒体\n</media>");
+  const expressionV1 = { ...mediaPart(f.ref, { sticker: true, expressionSummary: expression }), presentation: "expression-v1" as const };
+  assert.equal(mediaOpen(expressionV1, true), mediaOpen(expressionV1), "v1 expression headers must not gain the new native status line");
   const files = new WorldFiles(path.join(f.dir, "legacy")); await files.ensure();
   const c = new BotContext(files); await c.load();
   c.attachmentLoader = createAttachmentLoader(f.store, { image: true, audio: false, video: false }, logger);
   await c.appendEvent({ id: c.nextEventId(), source: "koishi", content: mediaText(legacy), parts: [legacy], attachments: [f.ref], worldTime: 1 });
+  await c.appendEvent({ id: c.nextEventId(), source: "koishi", content: mediaText(v1), parts: [v1], attachments: [f.ref], worldTime: 1 });
+  await c.appendEvent({ id: c.nextEventId(), source: "koishi", content: mediaText(expressionV1), parts: [expressionV1], attachments: [f.ref], worldTime: 1 });
   const prefix = await c.toChatMessages("T1");
   const before = await fs.readFile(path.join(files.base, "stream.jsonl"), "utf8");
   const current = mediaPart(f.ref, { sticker: true, expressionSummary: expression });
@@ -163,6 +171,13 @@ async function unchangedHistoricalPrefix() {
   assert.deepEqual(after.slice(0, prefix.length), prefix, "new expression rendering cannot change a pre-upgrade media prefix after restart");
   assert.ok((await fs.readFile(path.join(files.base, "stream.jsonl"), "utf8")).startsWith(before));
   assert.equal((restarted.stream[0] as any).event.parts[0].presentation, undefined);
+  const oldFiles = new WorldFiles(path.join(f.dir, "without-parts")); await oldFiles.ensure();
+  const noParts = new BotContext(oldFiles); await noParts.load(); noParts.attachmentLoader = c.attachmentLoader;
+  await noParts.appendEvent({ id: noParts.nextEventId(), source: "koishi", content: "旧消息", attachments: [f.ref], worldTime: 1 });
+  const historical = JSON.stringify((await noParts.toChatMessages("T1")).slice(1));
+  assert.match(historical, /原始插入位置未记录/);
+  assert.ok(historical.includes(JSON.stringify(oldOpen).slice(1, -1)));
+  assert.doesNotMatch(historical, /以下为消息原位置的原始/, "unknown legacy positions must not gain a new claim of inline ordering");
 }
 
 async function main() {

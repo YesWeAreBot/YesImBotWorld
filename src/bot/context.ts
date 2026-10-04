@@ -4,7 +4,7 @@ import { appendJsonLine } from "../jsonl.js";
 import type { WorldFiles } from "../files.js";
 import type { ChatMessage, ChatToolDef, ContentPart } from "../llm/chat.js";
 import type { AttachmentLoadFn } from "../media/parts.js";
-import { BOT_PROMPT_DEFAULTS, CHAT_ACCOUNTS_NOTICE_PREFIX, CHAT_EXPRESSION_GUIDANCE, CHAT_IDENTITY_GUIDANCE, WORLD_PERCEPTION_SCOPE, type Prompts } from "../prompts.js";
+import { BOT_PROMPT_DEFAULTS, CHAT_ACCOUNTS_NOTICE_PREFIX, CHAT_EXPRESSION_GUIDANCE, CHAT_IDENTITY_GUIDANCE, THOUGHT_RUNTIME_GUIDANCE, WORLD_PERCEPTION_SCOPE, type Prompts } from "../prompts.js";
 import type {
   BotEvent,
   CompressionResult,
@@ -17,6 +17,7 @@ import { renderToolsText } from "./tools.js";
 import { canonicalizeArgs } from "./repeatGuard.js";
 import { mediaOpen, mediaPart, mediaText, richPartsText } from "../media/presentation.js";
 import { archiveOpportunityHistory } from "./opportunities.js";
+import { chatAttributionForEvent, isCompressionScaffolding, readChatAttribution, renderChatAttribution, retainChatAttribution, type ChatAttribution } from "./compression-attribution.js";
 
 // Exact program-authored legacy receipts only; ordinary dialogue about sleep stays intact.
 const LEGACY_REST_INTERRUPTS = new Set([
@@ -40,6 +41,7 @@ interface CompressionCommit {
   previousStream: StreamEntry[];
   stream: StreamEntry[];
   opportunityHistory?: StreamEntry[];
+  chatAttribution?: ChatAttribution[];
 }
 
 interface PinnedPersist {
@@ -47,6 +49,8 @@ interface PinnedPersist {
   counters: { tool: number; event: number };
   /** Delivered menu sources only; never rendered as new observations or added to growth. */
   opportunityHistory?: StreamEntry[];
+  /** Exact delivered chat ownership, bounded independently of model-authored summaries. */
+  chatAttribution?: ChatAttribution[];
   /** Exact provider prefix for this working window. Missing in pre-upgrade archives. */
   rendered?: { systemText: string; nativeToolCalls?: boolean; nativeTools?: ChatToolDef[] };
 }
@@ -72,6 +76,7 @@ export class BotContext {
   };
   stream: StreamEntry[] = [];
   private retainedOpportunityHistory: StreamEntry[] = [];
+  private retainedChatAttribution: ChatAttribution[] = [];
   /** Menu reconstruction may consult delivered pre-compression sources without replaying their prose. */
   opportunityStream(): readonly StreamEntry[] { return [...this.retainedOpportunityHistory, ...this.stream]; }
   /** 附件加载器（chat 模式 + 原生多模态时由 service 注入） */
@@ -80,12 +85,11 @@ export class BotContext {
   attachmentsDisabled = false;
   /**
    * 最近一次渲染实际注入的附件 content part 类型集合。
-   * agent 据此对 400 精准降级：请求里有 video_url / input_audio 时先只关掉对应模态
-   * （GIF 会改走拼帧图的 image_url 通道），不殃及正常的图片附件。
+   * 结合服务端明确的模态错误进行定向降级；仅有附件不证明 400 由模态引起。
    */
   lastAttachmentPartTypes = new Set<string>();
   /** 运行时降级回调（service 注入）：关闭指定模态的附件注入并重建附件缓存 */
-  degradeModalities: ((kinds: ("video" | "audio")[]) => void) | null = null;
+  degradeModalities: ((kinds: ("image" | "video" | "audio")[]) => void) | null = null;
   /** 单次请求注入的附件总数预算（service 按配置注入；历史附件每次请求都会重发，必须设上限） */
   maxAttachmentsPerRequest = 8;
   /** 单次请求注入的附件总体积预算（base64 后的字符数） */
@@ -153,6 +157,7 @@ export class BotContext {
       this.counters = raw.counters;
       if (raw.opportunityHistory !== undefined && !Array.isArray(raw.opportunityHistory)) throw new Error("已保存的行动建议来源损坏");
       this.retainedOpportunityHistory = structuredClone(raw.opportunityHistory ?? []);
+      this.retainedChatAttribution = readChatAttribution(raw.chatAttribution);
       this.frozenSystemText = raw.rendered?.systemText ?? null;
       this.frozenNativeTools = raw.rendered?.nativeTools === undefined ? undefined : structuredClone(raw.rendered.nativeTools);
       this.frozenNativeMode = raw.rendered?.nativeToolCalls ?? (raw.rendered?.nativeTools !== undefined ? true : undefined);
@@ -164,6 +169,7 @@ export class BotContext {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
       this.frozenSystemText = null; this.frozenNativeTools = undefined; this.frozenNativeMode = undefined; this.renderedNeedsSave = false;
       this.retainedOpportunityHistory = [];
+      this.retainedChatAttribution = [];
       this.pinned.persona = (await this.files.readDefinitions()).botDef;
     }
     // 迁移/兜底：置顶区缺少「最初设定」（旧版 pinned.json 或没有 pinned.json 的旧世界），
@@ -245,6 +251,7 @@ export class BotContext {
   private async persistPinnedUnlocked(): Promise<void> {
     const data: PinnedPersist = { pinned: this.pinned, counters: this.counters,
       ...(this.retainedOpportunityHistory.length ? { opportunityHistory: this.retainedOpportunityHistory } : {}),
+      ...(this.retainedChatAttribution.length ? { chatAttribution: this.retainedChatAttribution } : {}),
       ...(this.frozenSystemText !== null ? { rendered: { systemText: this.frozenSystemText, ...(this.frozenNativeMode !== undefined ? { nativeToolCalls: this.frozenNativeMode } : {}), ...(this.frozenNativeTools !== undefined ? { nativeTools: this.frozenNativeTools } : {}) } } : {}) };
     await this.files.atomicWrite(this.files.pinned, JSON.stringify(data, null, 2));
     this.renderedNeedsSave = false;
@@ -307,9 +314,16 @@ export class BotContext {
    * a transient suffix would disappear from the next request and invalidate the shared prefix.
    * This is protocol text, not a receipt, perception, wake-up or learning signal.
    */
-  async ensureGenerationCue(): Promise<void> {
+  async ensureGenerationCue(ensureInitial = false): Promise<void> {
     await this.mutate(async () => {
       const last = [...this.stream].reverse().find(entry => entry.kind === "tool_call" || !isHiddenConfirmation(entry.event));
+      if (!last && ensureInitial) {
+        const event: BotEvent = { id: this.nextEventId(), source: "system", generationCue: true,
+          worldTime: 0, originEventIds: [], content: "请选择下一步。" };
+        await this.appendEntry({ kind: "event", event });
+        await this.persistPinnedUnlocked();
+        return;
+      }
       if (last?.kind !== "tool_call") return;
       const event: BotEvent = {
         id: `ev_generation_${last.call.id}`, source: "system", generationCue: true,
@@ -347,6 +361,8 @@ export class BotContext {
   botNameProvider: (() => string) | null = null;
   /** wait 工具被移除（service 按 bot.disableWait 注入）：行为准则不再提及等待 */
   waitRemoved = false;
+  /** Updated declarations/guidance apply only when the next fixed block is built. */
+  thinkEnabled = true;
 
   renderSystemText(timeLine: string, nativeToolCalls = true): string {
     if (this.frozenNativeMode === undefined) { this.frozenNativeMode = nativeToolCalls; this.renderedNeedsSave = true; }
@@ -397,19 +413,30 @@ export class BotContext {
     const botName = this.botNameProvider?.()?.trim() ?? "";
     const c = this.constitution;
     const original = this.pinned.botDefinition?.trim();
+    const persona = this.pinned.persona.trim();
+    // Remove only built-in tool guidance, never historical monologues or user-authored
+    // memories. A running window continues to use its persisted systemText unchanged.
+    const thoughtMode = (text: string) => this.thinkEnabled ? text : text
+      .replace("## 内心独白\n" + THOUGHT_RUNTIME_GUIDANCE, "")
+      .replace(THOUGHT_RUNTIME_GUIDANCE, "")
+      .replace("think 的想法已留在调用记录，不另给确认。", "")
+      .replace("，无需先 think", "")
+      .replace("，也无需为了分享先调用 think", "")
+      .replace("think 可整理困惑或计划，不会替代实际查询、行动或休息；不要求每一步先 think，也不需要为了活跃而机械轮流使用应用。", "不需要为了活跃而机械轮流使用应用。")
+      .replace("，整理主观打算可用 think", "");
     return [
-      ...(original ? ["# 最初的你\n" + original] : []),
-      "# 你是谁\n" + (this.pinned.persona.trim() || "（角色设定缺失）"),
+      ...(original && original !== persona ? ["# 最初的你\n" + original] : []),
+      "# 你是谁\n" + (persona || "（角色设定缺失）"),
       ...(botName ? [`# 你的名字\n你叫「${botName}」。这是角色姓名，可以与账号昵称及各群的群名片不同。群里仅提到同名不证明在和你说话，结合 @ 的账号、引用对象与上下文判断。`] : []),
       c.constitutionHead +
         "\n\n" +
         (nativeToolCalls ? c.outputFormatNative : c.outputFormatText) +
         "\n" +
-        c.constitution +
+        thoughtMode(c.constitution) +
         "\n" +
         c.conversation +
         "\n" +
-        (this.waitRemoved ? c.lifestyleNoWait : c.lifestyleWithWait),
+        thoughtMode(this.waitRemoved ? c.lifestyleNoWait : c.lifestyleWithWait),
       ...(accounts
         ? [
             "# 你的聊天账号\n" +
@@ -420,6 +447,7 @@ export class BotContext {
       "# 基础工具说明（以当前展开和有效的工具为准）\n" + this.pinned.toolsText,
       "# 过往经历（压缩）\n" + this.pinned.historySummary,
       "# 记忆摘要\n" + this.pinned.memoryDigest,
+      ...(this.retainedChatAttribution.length ? ["# 最近看过的聊天：原始归属核对\n" + renderChatAttribution(this.retainedChatAttribution)] : []),
       ...(this.pinned.growthSummary ? ["# 经历之后形成的认识与倾向\n这些是可修订、受情境限制的记忆，不是必须执行的命令。临时状态有适用时段，较新的回忆或变化事件优先。\n" + this.pinned.growthSummary] : []),
       "# 时间\n世界以 Time Unit (TU) 计时" +
         (this.timeInfo ? `，${this.timeInfo}` : "") +
@@ -467,18 +495,22 @@ export class BotContext {
         { kind: "text", text: event.content },
         ...(event.attachments?.length ? [
           { kind: "text" as const, text: "\n（以下为旧事件独立保存的媒体；原始插入位置未记录，不能据排列推断对应文字。）\n" },
-          ...event.attachments.map(ref => mediaPart(ref)),
+          // These pre-parts events were already rendered with v1 before the upgrade.
+          ...event.attachments.map(ref => ({ ...mediaPart(ref), presentation: "media-v1" as const })),
         ] : []),
       ];
       for (const seg of segments) {
         if (seg.kind === "text") { buf += seg.text; continue; }
+        const current = seg.presentation === "media-v2" || seg.presentation === "expression-v2";
         // Reading the same conversation/photo again must not refill the media budget and force
         // premature memory compression. Keep the original image and its bytes in the prefix;
         // only this newly appended occurrence refers back to its already visible source event.
         const assetKey = JSON.stringify([seg.ref.id, seg.ref.type, seg.ref.mime, seg.ref.file]);
         const previousEvent = event.mediaReuse ? window.assets.get(assetKey) : undefined;
         if (previousEvent) {
-          buf += mediaText(seg, `同一媒体的原始内容已在事件 ${previousEvent} 中展开；此处是再次看到同一素材，按 media 引用对应，勿当作另一张图`);
+          buf += mediaText(seg, current
+            ? `同一媒体的原始内容已在事件 ${previousEvent} 中展开；此处再次出现同一素材，按 media 引用对应。`
+            : `同一媒体的原始内容已在事件 ${previousEvent} 中展开；此处是再次看到同一素材，按 media 引用对应，勿当作另一张图`);
           continue;
         }
         let part = loader && eligible.has(seg.ref.id) ? await loader(seg.ref) : null;
@@ -489,11 +521,13 @@ export class BotContext {
             part = null;
             // A single asset larger than the whole budget cannot be fixed by repeated compaction.
             if (window.count && size <= this.maxAttachmentBytesPerRequest && this.maxAttachmentsPerRequest > 0) window.exceeded = true;
-            reason = "本次媒体预算已满，尚未展开此媒体；整理记忆后可再次 view_media 查看，不能将摘要当作已看见原图";
+            reason = current
+              ? "本次媒体预算已满，尚未展开此媒体；整理记忆后可再次 view_media 查看，不能把摘要当作原始媒体内容"
+              : "本次媒体预算已满，尚未展开此媒体；整理记忆后可再次 view_media 查看，不能将摘要当作已看见原图";
           } else { window.count++; window.bytes += size; admitted.push({ key: assetKey, size }); }
         }
         if (part) {
-          buf += mediaOpen(seg);
+          buf += mediaOpen(seg, true);
           if (seg.ref.mime === "image/gif" && part.type === "image_url" && part.image_url.url.startsWith("data:image/png;")) {
             buf += "这是同一动图按时间顺序抽帧的拼图，格子不是独立的多张图片。\n";
           }
@@ -570,7 +604,12 @@ export class BotContext {
     }));
   }
 
-  /** 近似上下文大小（字符数），用于判断是否需要强制 rest。每个原生附件按 2000 字符计 */
+  /** Read-only size estimate; never freeze or rewrite the active prompt prefix. */
+  approxFixedChars(): number {
+    return (this.frozenSystemText ?? this.buildSystemText("")).length;
+  }
+
+  /** 近似上下文大小（字符数）。每个原生附件按 2000 字符计。 */
   approxChars(): number {
     const assets = new Set<string>();
     let attachmentCost = 0;
@@ -581,12 +620,14 @@ export class BotContext {
         for (const key of current) assets.add(key);
       }
     }
-    return (this.frozenSystemText ?? this.buildSystemText("")).length + this.renderStreamText().length + attachmentCost;
+    return this.approxFixedChars() + this.renderStreamText().length + attachmentCost;
   }
 
   /** 供压缩用：序列化当前工作窗口（把连续重复的工具调用折叠成一条汇总，避免千篇一律的历史占满压缩输入） */
   serializeForCompression(entries: StreamEntry[] = this.stream): string {
     const lines: string[] = [];
+    if (this.retainedChatAttribution.length) lines.push("此前已看过的聊天归属参考（不是新消息）：\n" + renderChatAttribution(this.retainedChatAttribution));
+    const annotatedChatFacts = new Set<string>();
     // A selected compression slice may start with a receipt whose call precedes the slice.
     // Resolve that identity without rebuilding its already frozen narrative projection.
     const calls = new Map([...this.stream, ...entries].flatMap(entry => entry.kind === "tool_call" ? [[entry.call.id, entry.call] as const] : []));
@@ -594,7 +635,7 @@ export class BotContext {
     while (i < entries.length) {
       const entry = entries[i]!;
       if (entry.kind !== "tool_call") {
-        if (entry.event.generationCue) { i++; continue; }
+        if (isCompressionScaffolding(entry.event)) { i++; continue; }
         const call = entry.event.refToolCallId ? calls.get(entry.event.refToolCallId) : undefined;
         if (entry.event.source === "system" && call?.name === "rest" && LEGACY_REST_INTERRUPTS.has(entry.event.content)) {
           // Read projection only: the original event and frozen Bot prefix stay byte-identical.
@@ -612,6 +653,17 @@ export class BotContext {
             || entry.event.source === "tool" && ["act", "observe"].includes(call?.name ?? "");
           const compressionEvent = narrative && !isHiddenConfirmation(entry.event)
             ? entry.event : { ...entry.event, contextText: undefined };
+          for (const row of chatAttributionForEvent(entry.event)) {
+            // The body follows in the unchanged receipt. Keep source attribution separate
+            // from both remote message text and the model's interpretation of that text.
+            const { text: _body, ...identity } = row;
+            // A notification and its real send confirmation may share a root but establish
+            // different facts. Omit exact rereads, never the later confirmation or quote link.
+            const fact = JSON.stringify({ ...identity, eventId: undefined });
+            if (annotatedChatFacts.has(fact)) continue;
+            annotatedChatFacts.add(fact);
+            lines.push("（程序核对的聊天归属；不证明话语正确）" + JSON.stringify(identity));
+          }
           lines.push(BotContext.renderEventLine(compressionEvent));
         }
         i++;
@@ -692,6 +744,7 @@ export class BotContext {
         previousStream: this.stream,
         stream: remaining,
         opportunityHistory: archiveOpportunityHistory([...this.retainedOpportunityHistory, ...prefix]),
+        chatAttribution: retainChatAttribution(this.retainedChatAttribution, prefix),
         counters: { ...this.counters },
         pinned: {
           botDefinition: botDef, persona: botDef,
@@ -722,6 +775,7 @@ export class BotContext {
       commit.opportunityHistory !== undefined && !Array.isArray(commit.opportunityHistory)) {
       throw new Error("记忆提交记录损坏，需要恢复归档；当前上下文未被丢弃");
     }
+    const chatAttribution = readChatAttribution(commit.chatAttribution);
     const lines = (entries: StreamEntry[]) => entries.length ? entries.map((entry) => JSON.stringify(entry)).join("\n") + "\n" : "";
     // Replaying after a failed archive may make another recovery copy, but cannot lose the source stream.
     await this.files.atomicWrite(this.files.stream, lines(commit.previousStream));
@@ -732,13 +786,14 @@ export class BotContext {
       event: Math.max(this.counters.event, commit.counters.event),
     };
     const opportunityHistory = structuredClone(commit.opportunityHistory ?? []);
-    const persisted: PinnedPersist = { pinned: commit.pinned, counters, ...(opportunityHistory.length ? { opportunityHistory } : {}) };
+    const persisted: PinnedPersist = { pinned: commit.pinned, counters, ...(opportunityHistory.length ? { opportunityHistory } : {}), ...(chatAttribution.length ? { chatAttribution } : {}) };
     await this.files.atomicWrite(this.files.pinned, JSON.stringify(persisted, null, 2));
     await fs.rm(this.compressionCommitPath, { force: true });
     // Publish one complete window only after both files and the recovery marker are committed.
     // On any failure, reads keep the old coherent view and settled() must recover before rendering.
     this.stream = commit.stream;
     this.retainedOpportunityHistory = opportunityHistory;
+    this.retainedChatAttribution = chatAttribution;
     this.pinned = commit.pinned;
     this.counters = counters;
     this.resetRenderingAfterCompression();

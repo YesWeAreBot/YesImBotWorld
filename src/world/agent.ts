@@ -17,10 +17,13 @@ import {
   resolvePhoneResolution,
   type PhoneResolution,
 } from "../phone.js";
-import { COMPRESSION_SOURCE_GUIDANCE, fill, type Prompts } from "../prompts.js";
-import type { CompressionResult, RichText, ToolCallRecord } from "../types.js";
+import { COMPRESSION_CHAT_ATTRIBUTION_GUIDANCE, COMPRESSION_SOURCE_GUIDANCE, fill, type Prompts } from "../prompts.js";
+import type { CompressionResult, PhonePhysicalState, RichText, ToolCallRecord } from "../types.js";
 import type { PlayerMode } from "../crossing/protocol.js";
 import { debug } from "../webui/debug.js";
+import { WorldDeadline } from "./deadline.js";
+import { worldGenerationSchema } from "./generation-schema.js";
+import type { NarrativeConsciousness } from "./consciousness.js";
 
 /** 在场访客的完整通道（穿越服务提供） */
 export interface PresentVisitor {
@@ -52,6 +55,9 @@ export interface VisitorRef {
  */
 export interface RemoteWorldLink {
   worldName: string;
+  /** Authenticated remote actor state; old hosts omit this and remain unknown. */
+  readonly consciousness?: NarrativeConsciousness;
+  subscribeConsciousness?(listener: () => void): () => void;
   adjudicateAct(call: ToolCallRecord, deliver: (content: string) => void | Promise<void>, signal?: AbortSignal, beforeCommit?: () => boolean): Promise<boolean>;
   observe?(args?: { intent?: string; target?: string; modality?: string }): Promise<WorldObservation>;
   observeVirtualApp?(task: string): Promise<RichText>;
@@ -107,10 +113,13 @@ export class WorldAgent {
   }
   private async maintenanceComplete(messages: ChatMessage[], signal: AbortSignal): Promise<ChatResult> {
     signal.throwIfAborted();
-    const result = await withEndpointLock(this.cfg.baseURL,
-      () => this.client.complete(messages, { signal }), signal, { priority: "background" });
-    signal.throwIfAborted();
-    return result;
+    const deadline = new WorldDeadline(this.cfg.actionTimeoutMs, signal, "WORLD_MAINTENANCE_TIMEOUT");
+    try {
+      const result = await abortable(withEndpointLock(this.cfg.baseURL,
+        () => this.client.complete(messages, { signal: deadline.signal }), deadline.signal, { priority: "background" }), deadline.signal);
+      deadline.signal.throwIfAborted();
+      return result;
+    } finally { deadline.dispose(); }
   }
   readonly runtime: NarrativeWorld;
   private perceptionCursors = new Map<string, number>();
@@ -121,6 +130,14 @@ export class WorldAgent {
     const signal = this.maintenanceAbort.signal;
     signal.throwIfAborted();
     await this.runtime.ensure(undefined, undefined, signal);
+  }
+  /** The resident's portable device remains owned by this instance while travelling.
+   * This records no local/remote plot or visitor event and does not grant local LLM authority. */
+  async restorePhoneAccess(idempotencyKey: string, options: { signal?: AbortSignal; beforeCommit?: () => boolean } = {}): Promise<PhonePhysicalState> {
+    const epoch = this.routeEpoch;
+    const signal = options.signal ? AbortSignal.any([this.maintenanceAbort.signal, options.signal]) : this.maintenanceAbort.signal;
+    signal.throwIfAborted();
+    return this.runtime.restorePhoneAccess(idempotencyKey, { signal, beforeCommit: () => this.routeEpoch === epoch && (options.beforeCommit?.() ?? true) });
   }
   /** Camera grounding is limited to an already delivered physical perception. */
   async cameraScene(): Promise<{ visible: string; appearance: string; actorName: string; observedAt: string }> {
@@ -136,6 +153,7 @@ export class WorldAgent {
   resetPerceptionDelivery(): void { this.perceptionCursors.clear(); this.directlyObserved.clear(); }
   /** Call only after shutdown, when replacing the saved world rather than merely pausing it. */
   resetSessionState(): void {
+    this.remoteConsciousnessUnsubscribe?.(); this.remoteConsciousnessUnsubscribe = undefined;
     this.botName = ""; this.dormantSinceTU = null; this.remote = null;
     this.routeEpoch = randomUUID();
     this.resetPerceptionDelivery(); this.pendingReceiptActions.clear(); this.deliveryTails.clear();
@@ -246,6 +264,11 @@ export class WorldAgent {
    * 只保留上下文压缩等 Bot 私有的记忆工作）；本地 Tingle 静默。
    */
   private remote: RemoteWorldLink | null = null;
+  private remoteConsciousnessUnsubscribe?: () => void;
+  /** The service selects local/remote authority synchronously when this route changes. */
+  onConsciousnessRouteChange?: () => void;
+  get isTravelling(): boolean { return this.remote != null; }
+  get remoteConsciousness(): NarrativeConsciousness | undefined { return this.remote?.consciousness; }
   /** Changes even for home -> elsewhere -> home; object equality alone misses that round trip. */
   private routeEpoch = randomUUID();
   /** 穿越服务注册的在场访客和定向感知通道。 */
@@ -276,8 +299,15 @@ export class WorldAgent {
 
   /** 穿越：设置/清除 Bot 所在的远方世界。回家（null）后由调用方负责 wakeDormant 补叙 */
   setRemote(link: RemoteWorldLink | null): void {
-    if (this.remote !== link) this.routeEpoch = randomUUID();
+    if (this.remote === link) return;
+    this.remoteConsciousnessUnsubscribe?.(); this.remoteConsciousnessUnsubscribe = undefined;
+    this.routeEpoch = randomUUID();
     this.remote = link;
+    const epoch = this.routeEpoch;
+    this.remoteConsciousnessUnsubscribe = link?.subscribeConsciousness?.(() => {
+      if (this.remote === link && this.routeEpoch === epoch) this.onConsciousnessRouteChange?.();
+    });
+    this.onConsciousnessRouteChange?.();
     if (link) this.notePresenceChange();
   }
 
@@ -354,6 +384,7 @@ export class WorldAgent {
     private phoneCfg: { resolution: string; generateShell: boolean } = { resolution: "auto", generateShell: false },
   ) {
     this.client = new ChatClient({
+      apiType: cfg.apiType,
       baseURL: cfg.baseURL,
       apiKey: cfg.apiKey || undefined,
       model: cfg.model,
@@ -366,9 +397,22 @@ export class WorldAgent {
     // The lock owns the provider promise, not an abortable wrapper. Reset may settle
     // its caller promptly; only a provider ignoring cancellation can keep later
     // same-origin inference queued until its request ends or times out.
-    this.runtime = new NarrativeWorld(files, clock, (messages, tools, signal, options) => withEndpointLock(cfg.baseURL,
-      () => this.client.complete(messages, { tools, signal, toolChoice: { type: "function", function: { name: "resolve_world" } } }),
-      signal, { priority: options?.background ? "background" : "interactive", onTiming: options?.onEndpointTiming }), prompts, { heartbeatTimeoutMs: cfg.heartbeatTimeoutMs });
+    this.runtime = new NarrativeWorld(files, clock, async (messages, tools, signal, options) => {
+      const deadline = new WorldDeadline(cfg.actionTimeoutMs, signal ?? this.maintenanceAbort.signal, "WORLD_REQUEST_TIMEOUT");
+      const responseFormat = cfg.responseFormat ?? "json_schema";
+      const proposalMaxTokens = Number.isFinite(cfg.proposalMaxTokens) && cfg.proposalMaxTokens! > 0 ? cfg.proposalMaxTokens! : 2048;
+      const maxTokens = Number.isFinite(cfg.maxTokens) && cfg.maxTokens > 0 ? Math.min(cfg.maxTokens, proposalMaxTokens) : proposalMaxTokens;
+      try {
+        const result = await abortable(withEndpointLock(cfg.baseURL,
+          () => this.client.complete(messages, { signal: deadline.signal, maxTokens,
+            ...(responseFormat === "tool" ? { tools, toolChoice: { type: "function" as const, function: { name: "resolve_world" } } }
+              : { responseFormat, responseSchema: { name: "world_resolution", schema: responseFormat === "json_schema"
+                ? worldGenerationSchema(tools[0]!.function.parameters) : tools[0]!.function.parameters } }),
+          }), deadline.signal, { priority: options?.background ? "background" : "interactive", onTiming: options?.onEndpointTiming }), deadline.signal);
+        deadline.signal.throwIfAborted();
+        return result;
+      } finally { deadline.dispose(); }
+    }, prompts, { heartbeatTimeoutMs: cfg.heartbeatTimeoutMs, actionTimeoutMs: cfg.actionTimeoutMs, responseFormat: cfg.responseFormat });
     this.runtime.phoneAuthorityProvider = () => this.remote === null;
   }
 
@@ -473,7 +517,7 @@ export class WorldAgent {
   async tingle(deliver: (content: string) => void): Promise<HeartbeatResult> {
     const lifetime = this.maintenanceAbort.signal; lifetime.throwIfAborted();
     if (this.remote && !(this.visitorsProvider?.().length)) { this.notePresenceChange(); return { status: "yielded", reason: "常驻角色在异世界，当前无访客" }; }
-    const result = await this.runtime.evolve("世界心跳：按实际经过的世界时间演化外部环境、天气与NPC生活，保留仍有关联的进展和远处事件。受控角色不是本轮行动者，不能续写其困倦、入睡、醒来或推进待完成行动；只有本轮外部原因确实造成的物理影响可更新其状态。只向真正感知到新变化的角色投递相应片段，远处或未注意到的经过只记入externalChanges，影响后续的事实还须更新worldState。没有合理变化时保持安静，不制造冲突、奇遇或重复旧场景，不必每轮提供建议。", { heartbeat: true });
+    const result = await this.runtime.evolve("世界心跳：按实际经过的世界时间演化外部环境、天气与NPC生活，保留仍有关联的进展和远处事件。受控角色不是本轮行动者，不续写其自主决定或推进待完成行动；本轮真实外因可造成身体变化。已明确asleep且不属于待结算行动的既定睡眠，也可按真实经过自然结束，记录原因并更新awake；不能从rest、躺下或夜色猜测睡眠，昏迷恢复须有既定条件或真实外因。只向真正感知到新变化的角色投递相应片段，远处或未注意到的经过只记入externalChanges，影响后续的事实还须更新worldState。没有合理变化时保持安静，不制造冲突、奇遇或重复旧场景，不必每轮提供建议。", { heartbeat: true });
     lifetime.throwIfAborted();
     await this.publishAll(undefined, deliver); return result;
   }
@@ -481,7 +525,7 @@ export class WorldAgent {
   /** 补叙离线期间的自然演化，向恢复连接的角色交付当前可感知变化。 */
   async resolveOfflineGap(fromTU: number, deliver: (content: string) => void): Promise<boolean> {
     const lifetime = this.maintenanceAbort.signal; lifetime.throwIfAborted();
-    await this.runtime.evolve('结算离线期间的外部世界：fromTU=' + fromTU + '，现在=' + this.clock.now() + '。天气、环境、NPC与远处事件可以发展并保存。不能替受控角色编造决定、行动、发言、困倦、入睡、醒来或主观经历，不结算其待完成行动；只有外部实际原因造成的物理影响可更新角色状态。只把恢复感知时实际可知的新变化送给角色，远处和未知经过只保存于externalChanges，影响后续的事实还须更新worldState。');
+    await this.runtime.evolve('结算离线期间的外部世界：fromTU=' + fromTU + '，现在=' + this.clock.now() + '。天气、环境、NPC与远处事件可以发展并保存。不能替受控角色编造决定、行动、发言或主观经历，不结算其待完成行动。真实外因可改变身体；已明确asleep且不属于待结算行动的既定睡眠，可按真实经过自然结束并更新awake，仍需登记原因。离线、rest或夜色不证明睡眠，昏迷恢复须有既定条件或真实外因。只把恢复感知时实际可知的新变化送给角色，远处和未知经过只保存于externalChanges，影响后续的事实还须更新worldState。');
     lifetime.throwIfAborted();
     await this.publishAll(undefined, deliver); return true;
   }
@@ -871,8 +915,9 @@ export class WorldAgent {
       }
 
       const configuredSystem = this.prompts.world.compressSystem;
-      const system = configuredSystem.includes(COMPRESSION_SOURCE_GUIDANCE)
+      let system = configuredSystem.includes(COMPRESSION_SOURCE_GUIDANCE)
         ? configuredSystem : configuredSystem + "\n\n" + COMPRESSION_SOURCE_GUIDANCE;
+      if (!system.includes(COMPRESSION_CHAT_ATTRIBUTION_GUIDANCE)) system += "\n\n" + COMPRESSION_CHAT_ATTRIBUTION_GUIDANCE;
       // 滚动状态：每一轮的产出作为下一轮的输入
       const persona = input.persona;
       let historySummary = input.historySummary;

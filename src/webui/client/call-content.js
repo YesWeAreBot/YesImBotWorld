@@ -9,19 +9,32 @@
         try {
             var body = JSON.parse(raw);
             if (!object(body)) throw new Error('请求体不是 JSON 对象');
-            if (Array.isArray(body.messages)) result.messages = body.messages.map(function (message) {
+            function messageItem(message) {
                 if (!object(message)) return { role: 'unknown', content: message };
+                if (message.type === 'function_call') return { role: 'assistant', content: null, toolCalls: [{ id: message.call_id || message.id, type: 'function', function: { name: message.name, arguments: message.arguments } }] };
+                if (message.type === 'function_call_output') return { role: 'tool', content: message.output, toolCallId: message.call_id };
+                if (message.type === 'reasoning') return { role: 'assistant', content: message };
+                if (!message.role) return { role: 'unknown', content: message };
                 var item = { role: message.role || 'unknown', content: own(message, 'content') ? message.content : null };
                 if (Array.isArray(message.tool_calls)) item.toolCalls = message.tool_calls;
                 else if (object(message.function_call)) item.toolCalls = [{ type: 'function', function: message.function_call }];
                 if (own(message, 'tool_call_id')) item.toolCallId = message.tool_call_id;
                 if (own(message, 'name')) item.name = message.name;
                 return item;
-            });
+            }
+            if (own(body, 'system')) result.messages.push({ role: 'system', content: body.system });
+            if (own(body, 'instructions') && body.instructions != null) {
+                if (Array.isArray(body.instructions)) result.messages.push.apply(result.messages, body.instructions.map(messageItem));
+                else result.messages.push({ role: 'system', content: body.instructions });
+            }
+            if (Array.isArray(body.messages)) result.messages.push.apply(result.messages, body.messages.map(messageItem));
+            else if (Array.isArray(body.input)) result.messages.push.apply(result.messages, body.input.map(messageItem));
+            else if (typeof body.input === 'string') result.messages.push({ role: 'user', content: body.input });
+            else if (own(body, 'input')) result.messages.push({ role: 'unknown', content: body.input });
             if (Array.isArray(body.tools)) result.tools = body.tools;
             else if (Array.isArray(body.functions)) result.tools = body.functions.map(function (fn) { return { type: 'function', function: fn }; });
             Object.keys(body).forEach(function (key) {
-                if (key !== 'messages' && key !== 'tools' && key !== 'functions') Object.defineProperty(result.settings, key, { value: body[key], enumerable: true });
+                if (['messages', 'tools', 'functions', 'input', 'system', 'instructions'].indexOf(key) < 0) Object.defineProperty(result.settings, key, { value: body[key], enumerable: true });
             });
         } catch (error) { result.error = '无法解析请求 JSON：' + error.message; }
         return result;
@@ -39,10 +52,11 @@
         return JSON.stringify(value);
     }
     function createResponseDecoder() {
-        var previous = '', mode = '', hint = '', state, choices, scan, lineStart, frameStart, data, event, unknownFields, frameNumber, done, finalized;
+        var previous = '', mode = '', hint = '', state, choices, scan, lineStart, frameStart, data, event, unknownFields, frameNumber, done, finalized, nativeItems, nativeProtocol, nativeSequence;
         var jsonScan, jsonDepth, jsonString, jsonEscape, jsonStarted, jsonKind, jsonEnd, jsonExtra, jsonParsed;
         function reset() {
             state = initial(); choices = new Map(); scan = 0; lineStart = 0; frameStart = 0;
+            nativeItems = new Map(); nativeProtocol = ''; nativeSequence = new Set();
             data = []; event = ''; unknownFields = false; frameNumber = 0; done = false; finalized = false;
             jsonScan = 0; jsonDepth = 0; jsonString = false; jsonEscape = false; jsonStarted = false;
             jsonKind = ''; jsonEnd = 0; jsonExtra = false; jsonParsed = false;
@@ -80,8 +94,152 @@
             addTools(choice, message.tool_calls, append);
             if (object(message.function_call)) addTools(choice, [{ index: 0, function: message.function_call }], append);
         }
+        function metadata(value) {
+            ['id', 'model', 'object', 'status', 'created_at', 'stop_sequence', 'incomplete_details'].forEach(function (key) {
+                if (own(value, key)) Object.defineProperty(state.metadata, key, { value: value[key], enumerable: true, configurable: true });
+            });
+        }
+        function nativeSlot(index) {
+            if (!nativeItems.has(index)) nativeItems.set(index, { texts: new Map(), thoughts: new Map(), tool: null });
+            return nativeItems.get(index);
+        }
+        function nativeText(index, part, text, append, thinking) {
+            var parts = thinking ? nativeSlot(index).thoughts : nativeSlot(index).texts;
+            parts.set(part, (append ? parts.get(part) || '' : '') + textContent(text));
+        }
+        function nativeRefresh() {
+            var choice = choiceAt(0), text = [], thoughts = [], tools = [];
+            Array.from(nativeItems.entries()).sort(function (a, b) { return a[0] - b[0]; }).forEach(function (entry) {
+                var item = entry[1];
+                Array.from(item.texts.entries()).sort(function (a, b) { return a[0] - b[0]; }).forEach(function (part) { text.push(part[1]); });
+                Array.from(item.thoughts.entries()).sort(function (a, b) { return a[0] - b[0]; }).forEach(function (part) { thoughts.push(part[1]); });
+                if (item.tool) tools.push({ index: entry[0], id: item.tool.id, name: item.tool.name || '', arguments: item.tool.arguments || '' });
+            });
+            choice.content = text.join(''); choice.reasoning = thoughts.join('\n'); choice.toolCalls = tools;
+        }
+        function responseItem(item, index, keep) {
+            if (!object(item)) { keep(); return; }
+            var slot = nativeSlot(index);
+            if (item.type === 'function_call') slot.tool = { id: item.call_id || item.id, name: item.name, arguments: textContent(item.arguments) };
+            else if (item.type === 'message' && Array.isArray(item.content)) item.content.forEach(function (part, p) {
+                if (part && part.type === 'output_text') { nativeText(index, p, part.text, false, false); if (part.annotations && part.annotations.length) keep(); }
+                else if (part && part.type === 'refusal') nativeText(index, p, part.refusal, false, false);
+                else keep();
+            });
+            else if (item.type === 'reasoning') {
+                if (Array.isArray(item.summary)) item.summary.forEach(function (part, p) {
+                    if (part && typeof part.text === 'string') nativeText(index, p, part.text, false, true); else keep();
+                });
+                if (item.encrypted_content != null) keep();
+            } else keep();
+        }
+        function responseSnapshot(value, keep, terminal) {
+            metadata(value);
+            if (value.usage != null) state.usage = value.usage;
+            if (value.error) state.error = value.error;
+            if (Array.isArray(value.output)) {
+                nativeItems.clear(); value.output.forEach(function (item, index) { responseItem(item, index, keep); }); nativeRefresh();
+            }
+            if (terminal || ['completed', 'failed', 'incomplete', 'cancelled'].indexOf(value.status) >= 0) {
+                var reason = object(value.incomplete_details) && value.incomplete_details.reason;
+                choiceAt(0).finishReason = reason || (value.status === 'completed' ? (choiceAt(0).toolCalls.length ? 'tool_calls' : 'stop') : value.status || terminal);
+                done = true;
+                if (value.status === 'in_progress' || value.status === 'queued') warn('响应结束时提供方仍未完成生成；当前展示已收到的内容。');
+            }
+        }
+        function anthropicBlock(block, index, keep) {
+            if (!object(block)) { keep(); return; }
+            var slot = nativeSlot(index);
+            if (block.type === 'text') { nativeText(index, 0, block.text, false, false); if (block.citations && block.citations.length) keep(); }
+            else if (block.type === 'thinking') {
+                nativeText(index, 0, block.thinking, false, true);
+                if (block.signature != null) keep();
+            } else if (block.type === 'tool_use') slot.tool = { id: block.id, name: block.name, arguments: textContent(block.input) };
+            else keep();
+        }
+        function anthropicSnapshot(value, keep, terminal) {
+            metadata(value);
+            if (value.usage != null) state.usage = Object.assign(Object.create(null), state.usage || {}, value.usage);
+            if (Array.isArray(value.content)) {
+                nativeItems.clear(); value.content.forEach(function (part, index) { anthropicBlock(part, index, keep); }); nativeRefresh();
+            }
+            if (value.stop_reason) choiceAt(0).finishReason = value.stop_reason;
+            if (terminal) { done = true; if (!value.stop_reason) warn('响应未包含结束原因；当前展示已收到的内容。'); }
+        }
+        function nativePayload(value, raw, eventName) {
+            var type = typeof value.type === 'string' ? value.type : eventName, preserved = false;
+            function keep() {
+                if (!preserved) { preserve(raw); preserved = true; }
+                warn('响应包含阅读视图尚未支持的项目，已保留原始片段。');
+            }
+            if (Array.isArray(value.output) || value.object === 'response') {
+                nativeProtocol = 'responses'; responseSnapshot(value, keep, true); return true;
+            }
+            if (type && type.indexOf('response.') === 0) {
+                nativeProtocol = 'responses';
+                if (Number.isInteger(value.sequence_number)) {
+                    if (nativeSequence.has(value.sequence_number)) return true;
+                    nativeSequence.add(value.sequence_number);
+                }
+                if (['response.completed', 'response.failed', 'response.incomplete', 'response.cancelled'].indexOf(type) >= 0) {
+                    if (object(value.response)) responseSnapshot(value.response, keep, type.slice(9)); else keep();
+                    return true;
+                }
+                if (type === 'response.created' || type === 'response.in_progress' || type === 'response.queued') {
+                    if (object(value.response)) metadata(value.response); return true;
+                }
+                var index = Number.isInteger(value.output_index) ? value.output_index : 0, part = Number.isInteger(value.content_index) ? value.content_index : 0;
+                if (type === 'response.output_item.added' || type === 'response.output_item.done') responseItem(value.item, index, keep);
+                else if (type === 'response.output_text.delta' || type === 'response.output_text.done') nativeText(index, part, type.endsWith('.delta') ? value.delta : value.text, type.endsWith('.delta'), false);
+                else if (type === 'response.refusal.delta' || type === 'response.refusal.done') nativeText(index, part, type.endsWith('.delta') ? value.delta : value.refusal, type.endsWith('.delta'), false);
+                else if (type === 'response.content_part.added' || type === 'response.content_part.done') {
+                    if (value.part && value.part.type === 'output_text') nativeText(index, part, value.part.text, false, false);
+                    else if (value.part && value.part.type === 'refusal') nativeText(index, part, value.part.refusal, false, false);
+                    else keep();
+                } else if (type === 'response.function_call_arguments.delta' || type === 'response.function_call_arguments.done') {
+                    var slot = nativeSlot(index); if (!slot.tool) slot.tool = { id: value.item_id, name: '', arguments: '' };
+                    slot.tool.arguments = (type.endsWith('.delta') ? slot.tool.arguments : '') + textContent(type.endsWith('.delta') ? value.delta : value.arguments);
+                } else if (/^response\.reasoning(?:_summary)?_text\.(delta|done)$/.test(type)) {
+                    nativeText(index, Number.isInteger(value.summary_index) ? value.summary_index : part, type.endsWith('.delta') ? value.delta : value.text, type.endsWith('.delta'), true);
+                } else if (type === 'response.reasoning_summary_part.added' || type === 'response.reasoning_summary_part.done') {
+                    if (value.part && typeof value.part.text === 'string') nativeText(index, value.summary_index || 0, value.part.text, false, true); else keep();
+                } else keep();
+                nativeRefresh(); return true;
+            }
+            if (type === 'message' && Array.isArray(value.content)) {
+                nativeProtocol = 'anthropic'; anthropicSnapshot(value, keep, true); return true;
+            }
+            if (['message_start', 'content_block_start', 'content_block_delta', 'content_block_stop', 'message_delta', 'message_stop', 'ping'].indexOf(type) >= 0) {
+                nativeProtocol = 'anthropic';
+                if (type === 'message_start') { if (object(value.message)) anthropicSnapshot(value.message, keep, false); else keep(); return true; }
+                if (type === 'message_stop') { done = true; return true; }
+                if (type === 'ping' || type === 'content_block_stop') return true;
+                if (type === 'message_delta') {
+                    if (value.delta && value.delta.stop_reason) choiceAt(0).finishReason = value.delta.stop_reason;
+                    if (value.usage != null) state.usage = Object.assign(Object.create(null), state.usage || {}, value.usage);
+                    return true;
+                }
+                var blockIndex = Number.isInteger(value.index) ? value.index : 0;
+                if (type === 'content_block_start') {
+                    anthropicBlock(value.content_block, blockIndex, keep);
+                    // Anthropic's initial empty input object is a placeholder, not part of JSON deltas.
+                    var started = nativeSlot(blockIndex); if (started.tool) started.tool.deltaStarted = false;
+                } else if (object(value.delta)) {
+                    var delta = value.delta, current = nativeSlot(blockIndex);
+                    if (delta.type === 'text_delta') nativeText(blockIndex, 0, delta.text, true, false);
+                    else if (delta.type === 'thinking_delta') nativeText(blockIndex, 0, delta.thinking, true, true);
+                    else if (delta.type === 'input_json_delta') {
+                        if (!current.tool) current.tool = { name: '', arguments: '' };
+                        current.tool.arguments = (current.tool.deltaStarted ? current.tool.arguments : '') + textContent(delta.partial_json); current.tool.deltaStarted = true;
+                    } else keep();
+                } else keep();
+                nativeRefresh(); return true;
+            }
+            return false;
+        }
         function payload(value, raw, eventName) {
             if (!object(value)) { warn('响应片段不是可识别的模型响应对象，已保留原文。'); preserve(raw); return; }
+            if (nativePayload(value, raw, eventName)) return;
             var recognized = false, preserved = false;
             function keep() { if (!preserved) { preserve(raw); preserved = true; } }
             Object.keys(value).forEach(function (key) {
@@ -118,7 +276,7 @@
             if (unknownFields) warn('第 ' + frameNumber + ' 个 SSE 帧含有未知字段，已保留原文。');
             if (!data.length) { if (unknownFields) preserve(raw); data = []; event = ''; unknownFields = false; return; }
             var body = data.join('\n');
-            if (body.trim() === '[DONE]') done = true;
+            if (body.trim() === '[DONE]') { if (!nativeProtocol) done = true; }
             else {
                 try { payload(JSON.parse(body), raw, event); }
                 catch (_) {
@@ -157,7 +315,10 @@
                     dispatch(raw.slice(frameStart), true);
                 }
             }
-            if (!active && !done && state.choices.length && state.choices.some(function (choice) { return !choice.finishReason; })) warn('流已结束，但未收到 [DONE] 或完整的结束原因；当前展示已收到的内容。');
+            if (!active && !done && (state.choices.length || nativeProtocol)) {
+                if (nativeProtocol) warn('流已结束，但未收到 ' + (nativeProtocol === 'responses' ? 'response.completed' : 'message_stop') + ' 终止事件；当前展示已收到的内容。');
+                else if (state.choices.some(function (choice) { return !choice.finishReason; })) warn('流已结束，但未收到 [DONE] 或完整的结束原因；当前展示已收到的内容。');
+            }
         }
         function scanJson(raw) {
             for (; jsonScan < raw.length; jsonScan++) {

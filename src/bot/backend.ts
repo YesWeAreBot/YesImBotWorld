@@ -35,6 +35,7 @@ export class ChatBackend implements BotBackend {
   private maxTokens: number;
   private baseURL: string;
   private useNativeTools: boolean;
+  private requireInitialCue: boolean;
 
   constructor(cfg: BotModelConfig, toolNames: string[] = BOT_TOOL_NAMES, toolDefs: NamedToolDef[] = []) {
     this.toolNames = [...toolNames];
@@ -45,7 +46,9 @@ export class ChatBackend implements BotBackend {
     this.maxTokens = cfg.maxTokens;
     this.baseURL = cfg.baseURL;
     this.useNativeTools = cfg.nativeToolCalls;
+    this.requireInitialCue = cfg.apiType === "anthropic";
     this.client = new ChatClient({
+      apiType: cfg.apiType,
       baseURL: cfg.baseURL,
       apiKey: cfg.apiKey || undefined,
       model: cfg.model,
@@ -94,7 +97,7 @@ export class ChatBackend implements BotBackend {
   async generate(context: BotContext, timeLine: string, signal?: AbortSignal): Promise<ParsedToolCall> {
     let messages: ChatMessage[], tools: ChatToolDef[] | undefined;
     for (;;) {
-      await context.ensureGenerationCue();
+      await context.ensureGenerationCue(this.requireInitialCue);
       const revision = context.windowRevision;
       const nativeToolCalls = context.generationUsesNativeTools(this.useNativeTools);
       tools = nativeToolCalls ? await context.nativeToolSnapshot(timeLine, this.currentNativeDefs(context, revision)) : undefined;
@@ -134,12 +137,13 @@ export class ChatBackend implements BotBackend {
     const native = result.toolCalls[0];
     if (native) {
       const name = native.function.name;
-      this.assertAvailable(name);
       let args: unknown;
       try { args = JSON.parse(native.function.arguments); }
       catch { throw new ToolCallParseError("工具参数 JSON 未闭合或格式无效，本次未执行。", native.function.arguments); }
       // The shared validator normalizes native and body-JSON duration identically.
-      return validateToolCall({ name, arguments: args }, [...this.toolNames, ...this.navigableToolNames]);
+      const parsed = validateToolCall({ name, arguments: args }, [name]);
+      this.assertAvailable(name, parsed);
+      return parsed;
     }
     // Parse known-but-inactive names too so both protocols report the same truthful availability
     // error. Do not present the historical catalogue as currently usable in an unknown-name error.
@@ -147,19 +151,19 @@ export class ChatBackend implements BotBackend {
     try { parsed = extractToolCall(result.content, [...this.knownToolNames]); }
     catch (error) {
       if (error instanceof ToolCallParseError && error.message.startsWith("未知工具 ")) {
-        throw new ToolCallParseError(error.message.replace(/，可用工具:[\s\S]*$/, "。本次没有执行操作；请以最近的能力变化事件和当前工具说明为准。"), error.raw);
+        throw new ToolCallParseError(error.message.replace(/，可用工具:[\s\S]*$/, "。本次没有执行操作；请以最近的能力变化事件和当前工具说明为准。"), error.raw, error.parsedCall);
       }
       throw error;
     }
-    this.assertAvailable(parsed.name);
+    this.assertAvailable(parsed.name, parsed);
     return parsed;
   }
 
-  private assertAvailable(name: string): void {
-    if (name === "observe") throw new ToolCallParseError("工具 observe 此刻不可用，主动观察已合并到 act(description)，日常感知与行动结果自动送达。本次没有执行操作；请依据最新能力说明表达具体意图。");
+  private assertAvailable(name: string, parsed: ParsedToolCall): void {
+    if (name === "observe") throw new ToolCallParseError("工具 observe 此刻不可用，主动观察已合并到 act(description)，日常感知与行动结果自动送达。本次没有执行操作；请依据最新能力说明表达具体意图。", undefined, parsed);
     if (this.toolNames.includes(name) || this.navigableToolNames.has(name)) return;
     const description = this.knownToolNames.has(name) ? `工具 ${name} 此刻不可用` : `未知工具 ${JSON.stringify(name)}`;
-    throw new ToolCallParseError(`${description}。本次没有执行操作；请以最近的能力变化事件和当前工具说明为准，不要因旧声明仍存在就重复调用。`);
+    throw new ToolCallParseError(`${description}。本次没有执行操作；请以最近的能力变化事件和当前工具说明为准，不要因旧声明仍存在就重复调用。`, undefined, parsed);
   }
 }
 

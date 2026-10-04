@@ -391,8 +391,18 @@ function renderTopbar(o){
   pill.className = 'pill ' + st[1];
   pill.textContent = st[0];
   $('#tb-clock').textContent = o.clock ? (o.clock.timeLine + (o.clock.syncRealTime ? '' : (' · 1TU=' + o.clock.unitRealSeconds + 's'))) : '';
-  $('#tb-extra').textContent = o.bot && o.bot.running ? ('Bot 推理中 · ' + o.bot.streamLength + ' 条 · 队列 ' + o.worldQueue) : '';
+  $('#tb-extra').textContent = o.bot && o.bot.running ? ((botMaintenanceText(o.bot) || 'Bot 运行中') + ' · ' + o.bot.streamLength + ' 条 · 队列 ' + o.worldQueue) : '';
   $('#side-ver').textContent = 'v' + (o.version || VERSION);
+}
+function botMaintenanceText(bot){
+  if(bot && bot.consciousness==='asleep')return '角色正在睡眠';
+  if(bot && bot.consciousness==='unconscious')return '角色暂时失去意识';
+  var m=bot && bot.maintenance;
+  if(!m)return bot && bot.thoughtRetryAt>Date.now()?'内心思考暂歇 · 新消息可打断':'';
+  if(m.state==='blocked')return '固定上下文超过工作窗口 · 推理暂停，请增大工作窗口预算';
+  if(m.state==='compressing')return '正在整理上下文';
+  if(m.state==='cooldown')return (m.generationPaused?'上下文整理待重试 · 推理暂停':'上下文整理稍后重试')+(m.retryAt?' · '+Math.max(0,Math.ceil((m.retryAt-Date.now())/1000))+' 秒后':'');
+  return bot && bot.thoughtRetryAt>Date.now()?'内心思考暂歇 · 新消息可打断':'';
 }
 function worldStateText(o){
   if(!o.initialized) return ['未初始化', 'off'];
@@ -423,21 +433,24 @@ function gotoCfg(gkey){
   switchView('config');
 }
 var PRIMARY = {
-  bot: ['mode', 'baseURL', 'apiKey', 'model', 'stream', 'strictToolLoop', 'growth'],
-  world: ['baseURL', 'apiKey', 'model', 'stream'],
+  bot: ['mode', 'apiType', 'baseURL', 'apiKey', 'model', 'stream', 'thinkEnabled', 'unrestrictedPhone', 'strictToolLoop', 'growth'],
+  world: ['apiType', 'baseURL', 'apiKey', 'model', 'stream', 'responseFormat'],
   clock: ['syncRealTime', 'epoch', 'realSecondsPerUnit', 'tingleEveryUnits', 'tingleMode', 'tingleMinUnits', 'tingleMaxUnits'],
   apps: ['chatAppName', 'botManagedNotifications', 'weatherEnabled', 'weatherDefaultCity', 'browserEnabled', 'browserHomeURL', 'browserSearchURL', 'browserSearchFallbackURLs', 'browserAutoScreenshot', 'clockEnabled', 'camera', 'assistant', 'phoneResolution', 'phoneShellImage', 'notesEnabled', 'computer'],
   messaging: ['notifyChannels', 'botManagedNotifyChannels', 'notifyPolicy', 'wakeOnNotify', 'offlineHistory', 'groupMetadata', 'typingCharsPerSec', 'sendDeferFactor']
 };
 var CFG_ICONS = {root:'sliders', bot:'cpu', world:'gauge', clock:'activity', platformOps:'phone', apps:'monitor', captioners:'image', tts:'film', media:'folder', webui:'sliders', messaging:'edit'};
-var GROWTH_FIELD_LABELS = { enabled:'自动整理与回忆', minEpisodes:'积累几段经历后整理', reviewIntervalMs:'整理间隔（现实毫秒）', reviewTimeoutMs:'等待与生成超时（毫秒）', maxInputChars:'每次整理的输入字符预算', recallCount:'每次最多唤起几条认识' };
-var BOT_FIELD_LABELS = { strictToolLoop:'等待工具结果', blockingAct:'非严格模式：等待上一行动', sendBlocking:'非严格模式：等待上一发送' };
-var AUXILIARY_LLM_FIELD_LABELS = {mode:'模型配置方式',baseURL:'模型端点',apiKey:'API 密钥',model:'模型名称',temperature:'采样温度',maxTokens:'最大输出 Token',disableThinking:'关闭思考模式',stream:'流式返回'};
+var GROWTH_FIELD_LABELS = { enabled:'自动整理与回忆', responseFormat:'整理返回协议', minEpisodes:'积累几段经历后整理', reviewIntervalMs:'整理间隔（现实毫秒）', reviewTimeoutMs:'等待与生成超时（毫秒）', maxInputChars:'每次整理的输入字符预算', recallCount:'每次最多唤起几条认识' };
+var BOT_FIELD_LABELS = { thinkEnabled:'启用内心独白', unrestrictedPhone:'手机不受剧情限制', strictToolLoop:'等待工具结果', blockingAct:'非严格模式：等待上一行动', sendBlocking:'非严格模式：等待上一发送' };
+var LLM_PROTOCOL_NAMES = {'chat-completions':'OpenAI Chat Completions',responses:'OpenAI Responses',anthropic:'Anthropic Messages'};
+var AUXILIARY_LLM_FIELD_LABELS = {mode:'模型配置方式',apiType:'API 协议',baseURL:'模型端点',apiKey:'API 密钥',model:'模型名称',temperature:'采样温度',maxTokens:'最大输出 Token',disableThinking:'关闭思考模式',stream:'流式返回'};
 function isAuxiliaryLlmGroup(path){return path.length===3 && path[0]==='bot' && path[1]==='growth' && path[2]==='llm';}
 function cfgFieldName(path){
+  if(path[path.length-1]==='apiType')return 'API 协议';
   if(path[0]==='messaging'&&path[1]==='groupMetadata')return path.length===2 ? '群身份与头衔' : {role:'群聊角色',specialTitle:'群授予头衔',levelTitle:'等级头衔'}[path[2]] || path[path.length-1];
   if(isAuxiliaryLlmGroup(path.slice(0,-1))) return AUXILIARY_LLM_FIELD_LABELS[path[path.length-1]] || path[path.length-1];
   if(path.length===2&&path[0]==='bot')return BOT_FIELD_LABELS[path[1]] || path[1];
+  if(path.length===2&&path[0]==='world')return {responseFormat:'裁定返回协议',actionTimeoutMs:'行动处理总时限（毫秒）',proposalMaxTokens:'裁定输出 Token 预算'}[path[1]] || path[1];
   return path[0] === 'bot' && path[1] === 'growth' ? GROWTH_FIELD_LABELS[path[2]] || path[path.length-1] : path[path.length-1];
 }
 function updateToolLoopPolicy(){
@@ -446,7 +459,7 @@ function updateToolLoopPolicy(){
 function updateLlmInheritanceNotes(){
   document.querySelectorAll('[data-llm-inherit-note]').forEach(function(note){
     var model=cfgCache?.bot;
-    note.textContent='当前继承 Bot 主模型：'+(model?.model || '尚未设置模型')+' · '+(model?.baseURL || '尚未设置端点')+'。密钥与生成参数也随主模型配置；独立配置草稿保留。';
+    note.textContent='当前继承 Bot 主模型：'+(model?.model || '尚未设置模型')+' · '+(LLM_PROTOCOL_NAMES[model?.apiType || 'chat-completions'])+' · '+(model?.baseURL || '尚未设置端点')+'。协议、密钥与生成参数随主模型配置；独立配置草稿保留。';
   });
 }
 var PLAT_CATS = [
@@ -806,7 +819,6 @@ function renderField(node, path, value){
         inheritNote.hidden=!inherit;independent.hidden=inherit;
         independent.querySelectorAll('input,select,textarea,button').forEach(function(control){control.disabled=inherit;});
         updateLlmInheritanceNotes();
-        if(inherit)inheritNote.textContent='当前继承 Bot 主模型：'+(cfgCache?.bot?.model || '尚未设置模型')+' · '+(cfgCache?.bot?.baseURL || '尚未设置端点')+'。密钥与生成参数也随主模型配置；独立配置草稿保留。';
       }
       sec.updateLlmMode=updateMode;
       updateMode();
@@ -989,12 +1001,14 @@ function fetchModelsFor(path, btn){
   if(isAuxiliaryLlmGroup(parent) && getPath(cfgCache,parent.concat('mode'))!=='independent'){toast('该组正在继承 Bot 主模型，请在主模型配置中选择模型。','warn');return;}
   var baseURL = getPath(cfgCache, parent.concat('baseURL'));
   var apiKey = getPath(cfgCache, parent.concat('apiKey')) || '';
+  var apiType = parent.join('.')==='captioners.audio' && getPath(cfgCache,parent.concat('api'))==='transcription'
+    ? 'chat-completions' : getPath(cfgCache,parent.concat('apiType')) || 'chat-completions';
   if(!baseURL){ toast('请先填写该组的 baseURL', 'warn'); return; }
   var old = btn.textContent;
   btn.textContent = '加载中…';
   btn.disabled = true;
   // apiKey 可能已被脱敏（******）：把 group 路径一并传给后端，由后端按未改动时回填真实密钥
-  api('POST', '/api/llm/models', {baseURL: baseURL, apiKey: apiKey, group: parent.join('.')}).then(function(r){
+  api('POST', '/api/llm/models', {baseURL: baseURL, apiKey: apiKey, apiType: apiType, group: parent.join('.')}).then(function(r){
     if(activeView !== 'config' || !btn.isConnected) return;
     var models = r.models || [];
     if(!models.length){ toast('该端点未返回模型列表', 'warn'); return; }
@@ -1892,7 +1906,7 @@ function setPath(obj, arr, val){
   }
   cur[arr[arr.length-1]] = val;
   markCfgDirty();
-  if(obj===cfgCache && arr[0]==='bot' && (arr[1]==='model' || arr[1]==='baseURL'))updateLlmInheritanceNotes();
+  if(obj===cfgCache && arr[0]==='bot' && (arr[1]==='model' || arr[1]==='baseURL' || arr[1]==='apiType'))updateLlmInheritanceNotes();
   if(obj===cfgCache && arr.length===2 && arr[0]==='bot' && arr[1]==='strictToolLoop')updateToolLoopPolicy();
   if(obj===cfgCache && arr[arr.length-1]==='mode' && isAuxiliaryLlmGroup(arr.slice(0,-1))){var group=arr.slice(0,-1).join('.');document.querySelectorAll('[data-config-group]').forEach(function(section){if(section.dataset.configGroup===group)section.updateLlmMode?.();});}
 }

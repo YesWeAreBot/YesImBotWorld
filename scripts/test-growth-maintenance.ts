@@ -218,6 +218,12 @@ async function maintenanceAndCache(baseURL: string) {
   assert.deepEqual(await f.context.toChatMessages("T101"), prefix, "background review never mutates the current request");
   const input = requests.at(-1);
   assert.equal(input.messages.length, 2); assert.equal(input.tools, undefined);
+  assert.equal(input.tool_choice, undefined);
+  assert.equal(input.response_format.type, "json_schema");
+  assert.equal(input.response_format.json_schema.name, "growth_review");
+  assert.equal(input.response_format.json_schema.strict, true);
+  assert.deepEqual(input.response_format.json_schema.schema.properties.changes.items.properties.evidenceIds.items.enum,
+    JSON.parse(input.messages[1].content).evidence.map((item: any) => item.id));
   assert.doesNotMatch(input.messages[0].content, /Bot|Agent/);
   assert.doesNotMatch(JSON.stringify(input), /hidden-controller-diagnostic/);
   const payload = JSON.parse(input.messages[1].content);
@@ -340,7 +346,7 @@ async function partialAutomaticReview(baseURL: string) {
   response = request => {
     payload = JSON.parse(request.messages[1].content);
     return { changes: [habit(["friend1", "friend2", "walk3"]),
-      { kind: "relationship", subject: "朋友", subjectId: "person:friend", statement: "这次相处时，朋友愿意陪我聊聊。", evidenceIds: ["friend1"], insight: insight("friend1", "朋友递来一杯热茶，陪我聊了一会儿。", "疲倦时的陪伴") },
+      { kind: "relationship", subject: "朋友", subjectId: payload.evidence.find((item: any) => item.id === "friend1").experience.subjectIds[0], statement: "这次相处时，朋友愿意陪我聊聊。", evidenceIds: ["friend1"], insight: insight("friend1", "朋友递来一杯热茶，陪我聊了一会儿。", "疲倦时的陪伴") },
       { kind: "state", subject: "当时的疲倦", statement: "当时暂时想歇歇。", situation: "散步回来", evidenceIds: ["walk3"], expiresAt: payload.time.nowTU },
       { kind: "relationship", subject: "下次散步的约定", statement: "朋友提过下次一起散步，还需到时确认。", evidenceIds: ["friend2"], insight: insight("friend2", "朋友说愿意下次一起去河边。", "一起散步的意愿") }] };
   };

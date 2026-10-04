@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
 import type { BotEvent, StreamEntry, ToolCallRecord } from "../types.js";
 import { detectDeviceClaim } from "../world/device-boundary.js";
-import { derivePerceivedDeviceContext } from "./opportunities.js";
+import { currentWorldEpoch, derivePerceivedDeviceContext, type PerceivedDeviceContext } from "./opportunities.js";
+import { allowsVoluntaryConversationCue, explicitlyAddressesSelf } from "./chat-attention.js";
 
 const NOTICE_ID = "ev_conversation_material_";
 export const CONVERSATION_MATERIAL_PREFIX = "（谈话前可回想的亲历片段；不是新事件，也不是待发消息。）";
@@ -38,14 +39,17 @@ function material(event: BotEvent, call: ToolCallRecord | undefined, index: numb
   } catch { return; }
 }
 
-/** Optional recall at an explicit chat read, not a timer, message-triggered reply, or posting queue.
+/** Optional recall at a chat read or a fresh message in the conversation already being viewed.
+ * Notifications, other conversations and self echoes do not create a sharing obligation.
  * Derive from the append-only stream so restart/re-reading cannot keep prompting the same material.
  * Normal compression retires both the source window and its cues; the summary retains experiences.
  */
-export function conversationMaterialReminder(stream: readonly StreamEntry[], worldTime: number): BotEvent | undefined {
+export function conversationMaterialReminder(stream: readonly StreamEntry[], worldTime: number,
+  perceived: PerceivedDeviceContext & { worldEpoch?: string } = derivePerceivedDeviceContext(stream)): BotEvent | undefined {
   const calls = new Map<string, ToolCallRecord>();
-  const sources = new Set<string>(), bodies = new Set<string>();
+  const sources = new Set<string>(), bodies = new Set<string>(), seenMessages = new Set<string>();
   const materials: Material[] = [];
+  const epoch = perceived.worldEpoch ?? currentWorldEpoch(stream);
   let lastCue = -1, lastSend = -1, attention = -1, channel: string | undefined;
   for (const [index, entry] of stream.entries()) {
     if (entry.kind === "tool_call") {
@@ -57,11 +61,23 @@ export function conversationMaterialReminder(stream: readonly StreamEntry[], wor
     if (event.experience?.chat?.kind === "send") lastSend = index;
     if (event.source === "system" && event.originEventIds?.length === 0 &&
       event.id.startsWith(NOTICE_ID) && event.content.startsWith(CONVERSATION_MATERIAL_PREFIX)) lastCue = index;
-    // A send's automatic history echo and incoming notifications are not a fresh decision
-    // to visit a conversation. Private controller reads also must not cue public sharing.
-    if (event.source === "tool" && own(call) && ["select_channel", "read_channel"].includes(call!.name) &&
-      event.experience?.agency !== "imposed" && event.experience?.chat?.kind === "attention") {
-      attention = index; channel = event.experience.chat.channelKey;
+    // A send's automatic history echo is not a fresh decision to visit a conversation.
+    // Actual new messages can prompt recall only in the already-known visible channel.
+    // A replay of a row previously included in a history snapshot is not a new message.
+    const chat = event.experience?.chat;
+    const messageRoots = (event.originEventIds ?? []).filter(root => root.startsWith("chat-message:"));
+    const freshVisibleMessage = event.source === "koishi" && chat?.kind === "message" && explicitlyAddressesSelf(chat) &&
+      event.experience?.agency !== "imposed" && !event.experience?.worldPerception && !event.experience?.internalThought &&
+      chat.channelKey === perceived.channelKey && messageRoots.some(root => !seenMessages.has(root));
+    for (const root of messageRoots) seenMessages.add(root);
+    // A newer exchange between other people cannot inherit an old "share now"
+    // cue from our previous read. The underlying lived memories remain untouched.
+    if (chat && ["message", "attention"].includes(chat.kind) && chat.channelKey === perceived.channelKey &&
+      !allowsVoluntaryConversationCue(chat)) { attention = -1; channel = undefined; }
+    if ((event.source === "tool" && own(call) && ["select_channel", "read_channel"].includes(call!.name) &&
+      event.experience?.agency !== "imposed" && event.experience?.outcome !== "failed" && chat?.kind === "attention" &&
+      allowsVoluntaryConversationCue(chat)) || freshVisibleMessage) {
+      attention = index; channel = chat!.channelKey;
     }
     const item = material(event, call, index);
     if (!item) continue;
@@ -76,7 +92,7 @@ export function conversationMaterialReminder(stream: readonly StreamEntry[], wor
   // conservatively consume earlier suggestions across channels, even for failed/unknown
   // attempts. This retires only the cue eligibility, never the underlying memory.
   const consumedThrough = Math.max(lastCue, lastSend);
-  if (attention <= consumedThrough || !channel || derivePerceivedDeviceContext(stream).channelKey !== channel) return;
+  if (attention <= consumedThrough || !channel || perceived.channelKey !== channel) return;
   const selected = materials.filter(item => item.index > consumedThrough && item.index < attention).slice(-2);
   if (!selected.length) return;
   const read = stream[attention] as Extract<StreamEntry, { kind: "event" }>;
@@ -84,8 +100,8 @@ export function conversationMaterialReminder(stream: readonly StreamEntry[], wor
     id: NOTICE_ID + digest(JSON.stringify([read.event.id, selected.map(item => item.event.id)])),
     source: "system", originEventIds: [], worldTime,
     content: CONVERSATION_MATERIAL_PREFIX + "\n" +
-      "刚读过会话时，也可以想起自己生活里发生过什么；是否公开、是否切题、是否此刻想说由你决定。无需先附和最后一句、把每段经历都汇报，或为了分享先 think；不合适就继续做自己的事。以下只是物理世界旧感知的原文片段，不证明平台消息或软件内容；发生时刻不等于现在，也不替你认定感受。\n" +
-      selected.map(item => `来源 ${item.event.id} · ${item.observedAt === undefined ? `交付时刻 ${item.event.worldTime} TU（经历时刻未提供）` : `经历时刻 ${item.observedAt} TU`} · ${item.state}\n${excerpt(item.text)}`).join("\n\n") +
-      "\n若想分享，只说自己确实愿意表达的部分，不转发这些来源标签，不把未发生的后续说成完成，也不要求对方回应。",
+      "当前正在看的会话里，也可以谈起自己的实际经历；先顾及对方正在说什么，是否切题、适合公开、此刻想说由你决定。不必汇报每段经历或先 think。以下是旧感知的原文片段，不证明平台消息或软件内容，也不替你认定感受。\n" +
+      selected.map(item => `来源 ${item.event.id} · ${item.observedAt === undefined ? `交付时刻 ${item.event.worldTime} TU（经历时刻未提供）` : `经历时刻 ${item.observedAt} TU`} · ${item.state}${item.event.experience?.historicalWorld || item.event.experience?.worldEpoch !== undefined && item.event.experience.worldEpoch !== epoch ? " · 先前世界的经历，不代表当前处境" : ""}\n${excerpt(item.text)}`).join("\n\n") +
+      "\n想分享就用自己的话表达；不用来源标签，不把未发生的后续说成完成，不要求对方回应。没有想说的也可继续生活。",
   };
 }

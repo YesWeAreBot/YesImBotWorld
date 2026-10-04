@@ -1,4 +1,5 @@
 import { Schema } from "koishi";
+import type { ChatApiType } from "./llm/protocol.js";
 
 export interface ModalitySupport {
   image: boolean;
@@ -9,6 +10,7 @@ export interface ModalitySupport {
 /** Optional for saved configurations created before separate maintenance models existed. */
 export interface CognitiveModelConfig {
   mode: "inherit" | "independent";
+  apiType?: ChatApiType;
   baseURL: string;
   apiKey: string;
   model: string;
@@ -20,6 +22,7 @@ export interface CognitiveModelConfig {
 
 export interface BotModelConfig {
   growth: GrowthConfig;
+  apiType?: ChatApiType;
   baseURL: string;
   apiKey: string;
   model: string;
@@ -29,6 +32,10 @@ export interface BotModelConfig {
   /** 以流式方式请求 LLM（SSE 边生成边返回）。不支持的旧后端可关闭，改为一次性返回 */
   stream: boolean;
   nativeToolCalls: boolean;
+  /** Independent of the model's hidden reasoning mode; missing legacy values enable it. */
+  thinkEnabled?: boolean;
+  /** Pick-up restores a usable phone durably, independently of narrative obstacles. */
+  unrestrictedPhone?: boolean;
   disableWait: boolean;
   ignoreSendDuration: boolean;
   /** Wait for actual autonomous results, with an optional new-chat window during acts. Missing legacy values also enable it. */
@@ -61,6 +68,7 @@ export interface BotModelConfig {
 
 export interface GrowthConfig {
   llm?: CognitiveModelConfig;
+  responseFormat?: "json_schema" | "json_object" | "text";
   enabled: boolean;
   minEpisodes: number;
   reviewIntervalMs: number;
@@ -79,6 +87,7 @@ export function withoutRetiredSettings(config: Config): Config {
 
 export interface CaptionerConfig {
   enabled: boolean;
+  apiType?: ChatApiType;
   baseURL: string;
   apiKey: string;
   model: string;
@@ -116,6 +125,7 @@ export interface TtsConfig {
 }
 
 export interface WorldModelConfig {
+  apiType?: ChatApiType;
   baseURL: string;
   apiKey: string;
   model: string;
@@ -125,6 +135,10 @@ export interface WorldModelConfig {
   /** 以流式方式请求 LLM（SSE 边生成边返回）。不支持的旧后端可关闭，改为一次性返回 */
   stream: boolean;
   maxToolRounds: number;
+  responseFormat?: "json_schema" | "json_object" | "tool";
+  /** Active processing budget; confirmed in-world action duration is excluded. */
+  actionTimeoutMs?: number;
+  proposalMaxTokens?: number;
   /** Total real-time budget for a heartbeat, including correction attempts. */
   heartbeatTimeoutMs?: number;
   compressMaxInputChars: number;
@@ -297,6 +311,7 @@ export interface AssistantConfig {
   enabled: boolean;
   name: string;
   mode: "inherit" | "independent";
+  apiType?: ChatApiType;
   baseURL: string;
   apiKey: string;
   model: string;
@@ -390,16 +405,26 @@ export interface Config {
   crossing: CrossingConfig;
 }
 
+const LLM_ENDPOINT_HELP = "可填服务根地址、/v1 或完整生成地址；Chat/Responses 例：https://api.openai.com/v1，Anthropic 例：https://api.anthropic.com。协议须与服务实际提供的 API 一致。";
+function llmProtocolSchema(description = "请求 API 协议；与模型名、返回内容格式分开配置") {
+  return Schema.union([
+    Schema.const("chat-completions").description("OpenAI Chat Completions"),
+    Schema.const("responses").description("OpenAI Responses"),
+    Schema.const("anthropic").description("Anthropic Messages"),
+  ]).default("chat-completions").description(description);
+}
+
 function cognitiveModelSchema() {
   return Schema.object({
     mode: Schema.union([
       Schema.const("inherit").description("沿用 Bot LLM"),
       Schema.const("independent").description("独立配置"),
     ]).default("inherit").description("模型来源；独立模式的连接与生成参数单独设置，不借用 Bot 的密钥"),
-    baseURL: Schema.string().default("").description("独立 API 地址（OpenAI 兼容根路径，含 /v1）；独立模式必须填写"),
+    apiType: llmProtocolSchema("独立模型的请求 API 协议；沿用模式继承 Bot 协议"),
+    baseURL: Schema.string().default("").description("独立模式必须填写。" + LLM_ENDPOINT_HELP),
     apiKey: Schema.string().role("secret").default("").description("独立 API Key；本地服务可留空，留空不会使用 Bot 的密钥"),
     model: Schema.string().default("").description("独立模型名；独立模式必须填写"),
-    temperature: Schema.number().min(0).max(2).default(0.3).description("独立采样温度，直接使用此值"),
+    temperature: Schema.number().min(0).max(2).default(0.3).description("独立采样温度，仅 Chat Completions 发送；Responses / Anthropic 使用服务默认值"),
     maxTokens: Schema.natural().min(256).default(4096).description("独立请求的最大输出 token 数；结构化结果过长时需预留足够空间"),
     disableThinking: Schema.boolean().default(false).description("关闭独立模型的思考模式（仅对支持此开关的后端生效）"),
     stream: Schema.boolean().default(true).description("独立请求使用流式输出；不支持流式的后端可关闭"),
@@ -428,6 +453,11 @@ export const Config: Schema<Config> = Schema.intersect([
   Schema.object({
     bot: Schema.object({
       growth: Schema.object({
+        responseFormat: Schema.union([
+          Schema.const("json_schema").description("JSON Schema 约束（推荐）"),
+          Schema.const("json_object").description("JSON 对象兼容模式（Anthropic 不支持）"),
+          Schema.const("text").description("仅提示词约束（旧端点）"),
+        ]).default("json_schema").description("成长整理的返回协议；兼容模式仍严格校验字段和证据，不自动降级"),
         enabled: Schema.boolean().default(true).description("自动整理已感知经历，形成可修订的关系、习惯和性格倾向，并在相关情境中唤起记忆；模型可独立配置，请求不改写当前上下文前缀"),
         llm: cognitiveModelSchema(),
         minEpisodes: Schema.natural().min(1).max(24).default(4).description("积累多少段不同经历后尝试整理；这是调用节流条件，不是习惯或性格升级阈值"),
@@ -436,12 +466,13 @@ export const Config: Schema<Config> = Schema.intersect([
         maxInputChars: Schema.natural().min(4000).max(100000).default(24000).description("自动整理请求的输入预算（字符），超长证据以明确的节选呈现，原文继续保存在账本"),
         recallCount: Schema.natural().min(0).max(6).default(3).description("相关情境中最多自动想起几条认识；0 关闭自动回忆，仍可主动 recall_growth"),
       }).description("关系、习惯与性格变化"),
+      apiType: llmProtocolSchema(),
       baseURL: Schema.string()
         .default("http://127.0.0.1:8080/v1")
-        .description("API 地址（OpenAI 兼容根路径，含 /v1）"),
+        .description(LLM_ENDPOINT_HELP),
       apiKey: Schema.string().role("secret").default("").description("API Key（本地部署可留空）"),
       model: Schema.string().default("").description("模型名"),
-      temperature: Schema.number().min(0).max(2).default(0.8).description("采样温度"),
+      temperature: Schema.number().min(0).max(2).default(0.8).description("采样温度，仅 Chat Completions 发送；Responses / Anthropic 使用服务默认值"),
       maxTokens: Schema.natural()
         .default(4096)
         .description(
@@ -451,9 +482,9 @@ export const Config: Schema<Config> = Schema.intersect([
         .default(false)
         .description(
           "关闭模型思维链（对支持开关思考模式的模型生效，如 Qwen3 / DeepSeek V3.1+ / GLM 系）。" +
-            "请求会附带 enable_thinking: false，以及 chat_template_kwargs 里的 " +
-            "enable_thinking: false（Qwen/GLM 系模板）与 thinking: false（DeepSeek 系模板）。" +
-            "关闭可减少原生推理开销，是否适合取决于模型与任务。仅 chat 模式生效；不关闭角色的 think 内心独白能力",
+            "Chat Completions 使用 enable_thinking / thinking / chat_template_kwargs；" +
+            "Responses 使用 reasoning.effort=none；Anthropic 使用 thinking.type=disabled。" +
+            "仅对所选 API 实际支持的思考控制生效；不关闭角色的 think 内心独白能力",
         ),
       stream: Schema.boolean()
         .default(true)
@@ -464,11 +495,17 @@ export const Config: Schema<Config> = Schema.intersect([
       nativeToolCalls: Schema.boolean()
         .default(false)
         .description(
-          "工具的原生声明（仅 chat 模式生效）：开启后，工具通过 OpenAI tools 参数正式声明，" +
+          "工具的原生声明：开启后，工具通过所选 API 的 tools 参数正式声明，" +
             "模型以 function calling 接口调用（利用模型训练时的工具调用特殊 token，对云端 API 与做过工具调用训练的模型更稳）。" +
             "声明在建立工作窗口时保存，与固定提示一起跨重启保留。频道或应用的能力变化通过追加事件通知，失效调用立即拦截；新能力可先用正文 JSON 调用。" +
             "关闭时使用正文 JSON 协议；修改本开关及刷新固定声明都在下次记忆整理后生效，以保持上下文前缀稳定。",
         ),
+      thinkEnabled: Schema.boolean()
+        .default(true)
+        .description("启用内心独白：角色清醒时始终可以 think，不因次数或防循环而失去能力；与模型原生思考模式开关独立。"),
+      unrestrictedPhone: Schema.boolean()
+        .default(true)
+        .description("手机不受剧情限制：拿起时保证获得可用手机，丢失、损坏等障碍由后续剧情合理化恢复，不额外等待 World LLM。关闭后严格遵守世界中的手机物理条件。"),
       disableWait: Schema.boolean()
         .default(false)
         .description(
@@ -562,7 +599,7 @@ export const Config: Schema<Config> = Schema.intersect([
         ),
       modalities: Schema.object({
         image: Schema.boolean().default(false).description("模型原生支持图片输入"),
-        audio: Schema.boolean().default(false).description("模型原生支持音频输入"),
+        audio: Schema.boolean().default(false).description("模型原生支持音频输入（本机需 ffmpeg，自动转为 PCM WAV）"),
         video: Schema.boolean().default(false).description("模型原生支持视频输入"),
       }).description(
         "Bot-LLM 的原生多模态能力。原生支持的模态会以 content part 附件注入上下文；未支持的模态回退到外挂解释器。" +
@@ -573,12 +610,13 @@ export const Config: Schema<Config> = Schema.intersect([
 
   Schema.object({
     world: Schema.object({
+      apiType: llmProtocolSchema(),
       baseURL: Schema.string()
         .default("http://127.0.0.1:8080/v1")
-        .description("OpenAI 兼容 API 根路径（含 /v1）。需支持 tool calling"),
+        .description(LLM_ENDPOINT_HELP),
       apiKey: Schema.string().role("secret").default("").description("API Key"),
       model: Schema.string().default("").description("模型名"),
-      temperature: Schema.number().min(0).max(2).default(0.7).description("采样温度"),
+      temperature: Schema.number().min(0).max(2).default(0.7).description("采样温度，仅 Chat Completions 发送；Responses / Anthropic 使用服务默认值"),
       maxTokens: Schema.natural().default(4096).description("单次生成的最大 token 数"),
       disableThinking: Schema.boolean()
         .default(false)
@@ -594,6 +632,13 @@ export const Config: Schema<Config> = Schema.intersect([
             "大多数 OpenAI 兼容后端都支持；个别后端不支持 stream 且传入会报错时，请关闭本项（改为一次性返回整段结果）",
         ),
       maxToolRounds: Schema.natural().default(8).description("单次响应中允许的最大工具调用轮数"),
+      responseFormat: Schema.union([
+        Schema.const("json_schema").description("JSON Schema 约束（推荐）"),
+        Schema.const("json_object").description("JSON 对象兼容模式（Anthropic 不支持）"),
+        Schema.const("tool").description("原生工具调用兼容模式"),
+      ]).default("json_schema").description("世界裁定返回协议；默认直接返回 JSON，避免工具标签解析。兼容模式仍执行同样的事实校验，不自动降级"),
+      actionTimeoutMs: Schema.number().min(1000).max(1800000).default(180000).description("一次行动主动处理的总时限（现实毫秒），包含排队、生成和纠错，不含已确认持续行动的世界耗时；也作为单次维护生成时限。超时保留已提交事实，未确认结果不交付"),
+      proposalMaxTokens: Schema.natural().min(256).max(32768).default(2048).description("每次世界裁定的输出 token 预算，与单次最大输出取较小值；初始化、行动和校验纠错均受此限，避免异常长输出占住模型"),
       heartbeatTimeoutMs: Schema.number().min(1000).max(1800000).default(300000).description("单轮世界心跳的生成总时限（现实毫秒），包含端点等待及最多3次校验修正。超时取消未提交提案并退避重试，不影响已保存事实。"),
       compressMaxInputChars: Schema.natural()
         .default(100000)
@@ -840,10 +885,11 @@ export const Config: Schema<Config> = Schema.intersect([
         enabled: Schema.boolean().default(false).description("启用手机内的独立问答助手。"),
         name: Schema.string().default("小助手").description("应用名称，可自定义。"),
         mode: Schema.union([Schema.const("inherit").description("借用 World 模型"), Schema.const("independent").description("独立模型")]).default("inherit"),
-        baseURL: Schema.string().default("https://api.openai.com/v1").description("独立模式的 OpenAI 兼容地址。"),
+        apiType: llmProtocolSchema("独立模型的请求 API 协议；借用模式继承 World 协议"),
+        baseURL: Schema.string().default("https://api.openai.com/v1").description(LLM_ENDPOINT_HELP),
         apiKey: Schema.string().role("secret").default("").description("独立模式 API Key"),
         model: Schema.string().default("").description("独立模式模型 ID"),
-        temperature: Schema.number().min(0).max(2).step(0.05).default(0.7),
+        temperature: Schema.number().min(0).max(2).step(0.05).default(0.7).description("仅 Chat Completions 发送；Responses / Anthropic 使用服务默认值"),
         maxTokens: Schema.number().min(128).max(65536).default(4096),
         disableThinking: Schema.boolean().default(false).description("独立模式：禁用模型思考。"),
         stream: Schema.boolean().default(true).description("独立模式：流式显示回答。"),
@@ -1005,7 +1051,8 @@ export const Config: Schema<Config> = Schema.intersect([
     captioners: Schema.object({
       image: Schema.object({
         enabled: Schema.boolean().default(false).description("启用图片解释器"),
-        baseURL: Schema.string().default("http://127.0.0.1:8080/v1").description("OpenAI 兼容 API 根路径（含 /v1）"),
+        apiType: llmProtocolSchema(),
+        baseURL: Schema.string().default("http://127.0.0.1:8080/v1").description(LLM_ENDPOINT_HELP),
         apiKey: Schema.string().role("secret").default("").description("API Key"),
         model: Schema.string().default("").description("视觉模型名"),
         prompt: Schema.string()
@@ -1018,11 +1065,12 @@ export const Config: Schema<Config> = Schema.intersect([
         enabled: Schema.boolean().default(false).description("启用音频解释器"),
         api: Schema.union([
           Schema.const("transcription").description("语音转写 API（/v1/audio/transcriptions，whisper 系）"),
-          Schema.const("chat").description("多模态 chat API（input_audio content part）"),
+          Schema.const("chat").description("多模态对话 API（服务需支持原生音频输入）"),
         ])
           .default("transcription")
           .description("音频解释方式"),
-        baseURL: Schema.string().default("http://127.0.0.1:8080/v1").description("API 根路径（含 /v1）"),
+        apiType: llmProtocolSchema("仅多模态对话方式生效；当前原生音频只支持 Chat Completions。语音转写仍使用独立的 OpenAI /audio/transcriptions API"),
+        baseURL: Schema.string().default("http://127.0.0.1:8080/v1").description("对话方式：" + LLM_ENDPOINT_HELP + " 转写方式仍填 OpenAI 兼容根路径（含 /v1）。"),
         apiKey: Schema.string().role("secret").default("").description("API Key"),
         model: Schema.string().default("whisper-1").description("模型名"),
         prompt: Schema.string()
@@ -1033,7 +1081,8 @@ export const Config: Schema<Config> = Schema.intersect([
       }).description("音频 → 文本解释器"),
       video: Schema.object({
         enabled: Schema.boolean().default(false).description("启用视频解释器"),
-        baseURL: Schema.string().default("http://127.0.0.1:8080/v1").description("OpenAI 兼容 API 根路径（含 /v1）"),
+        apiType: llmProtocolSchema("当前原生视频只支持兼容 video_url 的 Chat Completions 服务；Responses / Anthropic 不接收视频"),
+        baseURL: Schema.string().default("http://127.0.0.1:8080/v1").description(LLM_ENDPOINT_HELP),
         apiKey: Schema.string().role("secret").default("").description("API Key"),
         model: Schema.string().default("").description("视频理解模型名（需支持 video_url content part，如 Qwen-VL 系）"),
         prompt: Schema.string()

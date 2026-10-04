@@ -81,7 +81,8 @@ async function fixture(generate: Generate, names = ["act"], phoneDown = false) {
     agent.phoneUi = { chatOpen: true, channelKey: "onebot@100:private:friend-b", channelIsGroup: false, forwardStack: [] };
     agent.attention = "phone"; agent.refreshToolGate();
     agent.pushEvent("koishi", { text: "小明：明天一起散步吗？", originEventIds: ["chat:friend-a:one"],
-      experience: { chat: { kind: "message", channelKey: target, senderOwn: false } } });
+      experience: { chat: { kind: "message", channelKey: target, senderOwn: false,
+        direction: { kind: "direct", accountId: "chat-user:100", mentionedIds: [], mentionsEveryone: false } } } });
     return target;
   }
   return { agent, context, files, cfg, phone, errors, worldCalls, sent, generations, advertised, finish, chat };
@@ -140,7 +141,7 @@ async function replyAndLengthGuard() {
     assert.equal(actual.name, "send"); assert.deepEqual(actual.arguments, { id: target, msg: text });
     assert.equal(actual.selection, undefined);
     const menu = events(f.context).find(event => event.content.startsWith("（当前可考虑的行动机会；"))!.content;
-    assert.match(menu, /使用 send/); assert.ok(menu.includes(target)); assert.match(menu, /不是物理 act/);
+    assert.match(menu, /使用 send/); assert.ok(menu.includes(target));
     assert.equal(f.worldCalls.length, 0); assert.equal(f.generations.length, 1);
     const navigation = allCalls(f.context).filter(call => !!call.navigationFor);
     assert.equal(navigation.length, 1);
@@ -187,12 +188,32 @@ async function newMessageCannotRedirectReply() {
   assert.ok(originalIndex, "the original menu offers a reply to the observed sender");
   const newerTarget = "onebot@100:private:friend-c";
   f.agent.pushEvent("koishi", { text: "小红：你现在有空吗？", originEventIds: ["chat:friend-c:two"],
-    experience: { chat: { kind: "message", channelKey: newerTarget, senderOwn: false } } });
+    experience: { chat: { kind: "message", channelKey: newerTarget, senderOwn: false,
+      direction: { kind: "direct", accountId: "chat-user:100", mentionedIds: [], mentionsEveryone: false } } } });
   release.resolve({ name: "send", arguments: { id: originalTarget, msg: "好的，明天见。" } });
   await f.finish();
   assert.deepEqual(f.sent, [{ id: originalTarget, msg: "好的，明天见。" }], "a new notification cannot redirect explicitly addressed text");
   assert.equal(f.worldCalls.length, 0);
 
+}
+
+async function ordinaryGroupMessageDoesNotAssignReply() {
+  const f = await fixture(request => {
+    assert.ok(request.tools.includes("send"), "choosing whether to speak remains possible");
+    assert.ok(!request.menu.some(option => option.replyTo || ["read_channel", "select_channel"].includes(option.call?.name ?? "")),
+      "an already visible ordinary group message cannot manufacture read/reply instructions");
+    assert.ok(JSON.stringify(request.messages).includes("今天食堂有南瓜"), "the original message remains visible for voluntary conversation decisions");
+    return { name: "act", arguments: { description: "整理手边的书本" }, duration: 0 };
+  }, ["act", "send"]);
+  f.agent.phoneUi = { chatOpen: true, channelKey: "onebot@100:group", channelIsGroup: true, forwardStack: [] };
+  f.agent.attention = "phone"; f.agent.refreshToolGate();
+  f.agent.pushEvent("koishi", { text: "小明：今天食堂有南瓜。", originEventIds: ["chat-message:group-meal"],
+    experience: { chat: { kind: "message", channelKey: "onebot@100:group", senderOwn: false, senderId: "chat-user:xiaoming",
+      direction: { kind: "group", accountId: "chat-user:100", mentionedIds: [], mentionsEveryone: false } } } });
+  f.agent.start(); await f.finish();
+  assert.equal(f.generations.length, 1);
+  assert.deepEqual(f.sent, []);
+  assert.equal(calls(f.context)[0]!.name, "act");
 }
 
 async function freedomAndUnavailableChoice() {
@@ -208,7 +229,7 @@ async function freedomAndUnavailableChoice() {
 async function main() {
   try {
     await worldActionAndCache(); await phoneChoice(); await replyAndLengthGuard(); await invalidActionDoesNotConsume();
-    await sceneChangedDuringGeneration(); await newMessageCannotRedirectReply(); await freedomAndUnavailableChoice();
+    await sceneChangedDuringGeneration(); await newMessageCannotRedirectReply(); await ordinaryGroupMessageDoesNotAssignReply(); await freedomAndUnavailableChoice();
     console.log("PASS direct suggestion loop: retired choose, actual tool calls, literal speech, phone posture, explicit send targets and guards, failed-action retention, reordered menus, append-only cache and free actions");
   } finally {
     for (const agent of agents) await agent.stop();

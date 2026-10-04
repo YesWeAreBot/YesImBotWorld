@@ -7,7 +7,7 @@ export function resolveGrowthModelConfig(bot: BotModelConfig): ChatClientConfig 
   const label = "Growth";
   if (!override || override.mode === "inherit" || override.mode === undefined) {
     // Preserve the former maintenance sampling policy when inheriting the Bot model.
-    return { baseURL: bot.baseURL, apiKey: bot.apiKey || undefined, model: bot.model,
+    return { apiType: bot.apiType ?? "chat-completions", baseURL: bot.baseURL, apiKey: bot.apiKey || undefined, model: bot.model,
       temperature: Math.min(bot.temperature ?? 0.3, 0.4), maxTokens: Math.max(2048, Math.min(bot.maxTokens || 4096, 8192)),
       disableThinking: bot.disableThinking, stream: bot.stream, label };
   }
@@ -21,7 +21,7 @@ export function resolveGrowthModelConfig(bot: BotModelConfig): ChatClientConfig 
   if (!model) throw Error(`${title}已选择独立 LLM，但尚未填写 model；请设置模型名或改为沿用 Bot LLM`);
   // Never send the Bot's key to an independently configured service, even when
   // the independent key is empty or the two endpoints happen to be identical.
-  return { baseURL, apiKey: override.apiKey || undefined, model,
+  return { apiType: override.apiType ?? "chat-completions", baseURL, apiKey: override.apiKey || undefined, model,
     temperature: override.temperature ?? 0.3, maxTokens: override.maxTokens ?? 4096,
     disableThinking: override.disableThinking ?? false, stream: override.stream ?? true, label };
 }

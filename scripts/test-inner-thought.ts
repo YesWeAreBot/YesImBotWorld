@@ -52,7 +52,8 @@ async function main() {
     assert.equal(declaration.properties.thought.maxLength, 1200);
     assert.equal(declaration.properties.thought.minLength, 1);
     assert.match(BOT_PROMPT_DEFAULTS.constitution, /内心独白/);
-    assert.match(THOUGHT_RUNTIME_GUIDANCE, /不强制每次行动前/);
+    assert.match(THOUGHT_RUNTIME_GUIDANCE, /不要求每步先思考/);
+    assert.match(THOUGHT_RUNTIME_GUIDANCE, /不限制连续思考次数/);
     assert.match(WORLD_PROMPT_DEFAULTS.compressSystem, /当时的想法、回忆或猜测/);
     for (const kind of ["observe", "evolve"] as const) {
       const prompt = buildWorldTaskPrompt({ narrativeSystem: WORLD_PROMPT_DEFAULTS.narrativeSystem, worldDef: "", botDef: "", kind });

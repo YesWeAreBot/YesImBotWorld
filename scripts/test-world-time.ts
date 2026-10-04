@@ -129,7 +129,7 @@ async function main(): Promise<void> {
       const world = new WorldAgent({ baseURL: `http://fixture-${randomUUID()}.invalid`, model: "fixture", compressMaxInputChars: 1000 } as any, box.files, box.clock, logger, new Prompts(), { resolution: "320x640", generateShell: false });
       const order: string[] = [];
       (world as any).client = { complete: async (messages: ChatMessage[], options: any = {}) => {
-        if (options.tools?.length) {
+        if (options.responseSchema || options.tools?.length) {
           order.push("initialize"); const input = inputOf(messages);
           assert.equal(input.timeAuthority.formatted, variant === "gregorian" ? "2012-03-04 05:06" : "星历112年3月5日 06:00");
           return response({ ...initial(variant === "gregorian" ? "2012-03-04" : "2026-09-19"), worldState: "这间房间十分安静。" });

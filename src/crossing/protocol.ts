@@ -72,9 +72,17 @@ export interface CrossingPerceptionEvent {
   opportunityRevision?: number;
 }
 
+/** Execution permission state from this authenticated visitor's durable actor record. */
+export interface CrossingConsciousnessState {
+  actorId: string;
+  worldSequence: number;
+  consciousness: import("../world/consciousness.js").NarrativeConsciousness;
+}
+
 /** SSE 推送给访客的消息 */
 export type CrossingSseMsg =
-  | ({ type: "hello"; worldName: string; timeLine: string; visitorId?: string } & Partial<CrossingTimeUnits> & Partial<CrossingOpportunityMenu>)
+  | ({ type: "hello"; worldName: string; timeLine: string; visitorId?: string; consciousnessState?: CrossingConsciousnessState } & Partial<CrossingTimeUnits> & Partial<CrossingOpportunityMenu>)
+  | ({ type: "consciousness" } & CrossingConsciousnessState)
   | CrossingPerceptionEvent
   /** UI state only: clearing a consumed menu is not a new character perception. */
   | ({ type: "opportunities" } & CrossingOpportunityMenu)

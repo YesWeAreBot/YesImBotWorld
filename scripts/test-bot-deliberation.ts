@@ -5,8 +5,9 @@ import path from "node:path";
 import { BotAgent } from "../src/bot/agent.js";
 import { BotContext } from "../src/bot/context.js";
 import { DeliberationBudget, thoughtError } from "../src/bot/deliberation.js";
-import { BOT_TOOLS } from "../src/bot/tools.js";
-import { ToolCallParseError } from "../src/llm/parse.js";
+import { BOT_TOOLS, availableTools, renderToolsText } from "../src/bot/tools.js";
+import { ChatBackend } from "../src/bot/backend.js";
+import { extractToolCall, ToolCallParseError } from "../src/llm/parse.js";
 import { Config } from "../src/config.js";
 import { WorldFiles } from "../src/files.js";
 import type { BotEvent, ParsedToolCall, ToolCallRecord } from "../src/types.js";
@@ -62,6 +63,10 @@ async function fixture(world: any = {}) {
 async function localThoughtAndFrozenPrefix() {
   const f = await fixture(new Proxy({}, { get() { throw new Error("thought must never call World"); } }));
   f.agent.running = true;
+  f.agent.tempBannedTools.add("think");
+  assert.ok(f.agent.currentToolNames().includes("think"), "legacy temporary bans cannot change the configured thought ability");
+  f.agent.refreshToolGate();
+  assert.equal(f.agent.tempBannedTools.has("think"), false);
   const original = await f.context.toChatMessages("original time", true);
   const result = await f.agent.injectExternalToolCall("think", { thought: "也许他只是忙，我还不知道。" }, { duration: 600 });
   assert.equal(result.ok, true);
@@ -110,7 +115,8 @@ async function slowActionAllowsThoughtAndIndependentWork() {
   assert.equal(generations, 5); assert.equal(slow.pending.length, 1);
   assert.ok(f.context.stream.some(entry => entry.kind === "tool_call" && entry.call.name === "observe_device"), "two thoughts cannot globally pause independent device work");
   assert.equal(f.agent.status().awaitingToolRetry, false);
-  for (const name of ["act", "observe", "think"]) assert.ok(!f.allowed().includes(name), `${name} is unavailable while the action is pending / thought allowance is exhausted`);
+  for (const name of ["act", "observe"]) assert.ok(!f.allowed().includes(name), `${name} is unavailable while the action is pending`);
+  assert.ok(f.allowed().includes("think"), "thought remains available after two monologues while a world action is pending");
   assert.ok(f.allowed().includes("observe_device"));
   assert.ok(f.context.stream.some(entry => entry.kind === "event" && entry.event.toolProgress === "pending"), "the unfinished action is announced when a later decision needs its status");
   assert.ok(!f.context.stream.some(entry => entry.kind === "event" && entry.event.content.includes("睡醒")));
@@ -155,28 +161,36 @@ async function nonblockingActsRemainConcurrent() {
 }
 
 async function invalidThoughtsYieldWithoutWorldWork() {
-  const f = await fixture(); let generations = 0, freshInput = false;
+  const f = await fixture(); let generations = 0;
+  f.cfg.bot.breakLoop = true; f.cfg.bot.breakLoopRemoveToolAt = 2; f.cfg.bot.breakLoopForceRestAt = 2;
   f.agent.backend.generate = async () => {
     generations++;
-    if (generations <= 2) return thought(`等待前的第${generations}个想法`);
-    if (!freshInput) throw new ToolCallParseError("工具 think 此刻不可用");
-    return generations === 5 ? thought("听见门外有脚步声了，先留意一下。") : { name: "wait", arguments: { n: 3600 } };
+    return generations <= 6 ? thought("我还在琢磨这个问题。") : wait();
   };
-  f.agent.start(); await until(() => f.agent.status().awaitingToolRetry);
-  assert.equal(generations, 4, "two exhausted-tool corrections are followed by execution backoff");
+  f.agent.start(); await until(() => f.agent.awaitingThought);
+  assert.equal(generations, 3, "continuous monologue receives scheduling backoff, not a two-call capability limit");
   assert.equal(f.agent.scheduler.pendingCount, 0, "thought retry backoff needs no pending world task or character timer");
   assert.equal(f.agent.waiting, null);
-  assert.ok(!f.allowed().includes("think"), "backoff does not renew the thought allowance");
-  assert.equal(f.context.stream.filter(entry => entry.kind === "event" && entry.event.content.includes("工具 think 此刻不可用")).length, 2, "correction messages are durable before backoff");
+  assert.equal(f.agent.status().consciousness, null);
+  assert.ok(f.agent.status().thoughtRetryAt > Date.now(), "status exposes scheduler pacing separately from sleep and character wait");
+  assert.ok(f.allowed().includes("think"), "backoff and generic repeat control never remove thought ability");
+  assert.equal(f.agent.tempBannedTools.has("think"), false);
+  assert.equal(f.agent.compressionRequested, null, "repetition does not invoke an extra model for memory maintenance");
   await sleep(35);
-  assert.equal(generations, 4, "unavailable think must not create a rapid generation loop");
-  freshInput = true;
+  assert.equal(generations, 3, "zero minInterval does not create an unlimited instantaneous think loop");
   f.agent.pushEvent("world", "你听见门外传来脚步声。", { originEventIds: ["new-footsteps"] });
-  await until(() => generations === 6 && !!f.agent.waiting);
+  await until(() => generations === 6 && f.agent.awaitingThought);
+  assert.ok(f.allowed().includes("think"));
+  f.agent.setManualPaused(true); await until(() => !f.agent.awaitingThought);
+  assert.equal(generations, 6, "takeover interrupts thought pacing without an autonomous follow-up");
+  f.agent.setManualPaused(false); await until(() => f.agent.awaitingThought);
+  assert.equal(generations, 6, "handback does not turn a technical pause into immediate unlimited retries");
+  f.agent.pushEvent("koishi", "门外的人发来消息。", { originEventIds: ["chat-message:new-input"] });
+  await until(() => generations === 7 && !!f.agent.waiting);
   assert.equal(f.agent.status().awaitingToolRetry, false);
   assert.equal(f.agent.parseFailures, 0);
-  assert.ok(f.allowed().includes("think"), "actual new perception restores the allowance");
-  assert.ok(f.context.stream.some(entry => entry.kind === "tool_call" && entry.call.arguments.thought === "听见门外有脚步声了，先留意一下。"));
+  assert.equal(f.context.stream.filter(entry => entry.kind === "tool_call" && entry.call.name === "think").length, 6);
+  assert.ok(!f.context.stream.some(entry => entry.kind === "event" && /think.*不可用|睡醒|恢复体力/.test(entry.event.content)));
   assert.ok(!f.context.stream.some(entry => entry.kind === "tool_call" && entry.call.name === "rest"), "scheduler backoff never fabricates character rest");
   await f.agent.stop();
 
@@ -189,6 +203,8 @@ async function invalidThoughtsYieldWithoutWorldWork() {
   assert.equal(invalidGenerations, 2, "taking control interrupts backoff without another autonomous request");
   invalid.agent.setManualPaused(false);
   await until(() => invalid.agent.status().awaitingToolRetry);
+  assert.equal(invalidGenerations, 2, "releasing manual control does not erase an outstanding technical retry deadline");
+  await until(() => invalidGenerations === 3 && invalid.agent.status().awaitingToolRetry);
   assert.equal(invalidGenerations, 3);
   await Promise.race([invalid.agent.stop(), sleep(500).then(() => { throw new Error("stop blocked on thought retry backoff"); })]);
   assert.equal(invalid.agent.status().awaitingToolRetry, false);
@@ -221,7 +237,7 @@ async function manualTakeoverAndCancellationWakeLoop() {
   f.agent.backend.generate = async () => {
     generations++;
     if (generations <= 2) return thought(`第${generations}个自己的想法`);
-    if (!cancelled) throw new ToolCallParseError("工具 think 此刻不可用");
+    if (!cancelled) throw new ToolCallParseError("工具 act 此刻不可用");
     return wait();
   };
   f.agent.start(); await until(() => f.agent.status().awaitingToolRetry);
@@ -311,19 +327,131 @@ function noSyntheticProgress() {
   const read = { name: "view_note", arguments: { title: "求职" } };
   budget.perceive(event("r1", "同一份笔记"), read);
   budget.recordThought("一个想法"); budget.recordThought("另一个想法");
-  assert.equal(budget.canThink, false);
+  assert.equal(budget.pauseMs, 0);
+  budget.recordThought("还可以继续琢磨");
+  assert.equal(budget.pauseMs, 1000);
   assert.equal(budget.perceive(event("r2", "同一份笔记"), read), false);
   assert.equal(budget.perceive(event("timer", "计时结束"), { name: "rest", arguments: {} }), false);
   assert.equal(budget.perceive({ ...event("self", "想象"), experience: { internalThought: true } }), false);
-  assert.equal(budget.canThink, false);
+  assert.equal(budget.pauseMs, 1000);
   assert.equal(budget.perceive(event("r3", "实际改过的笔记"), read), true);
-  assert.equal(budget.canThink, true);
+  assert.equal(budget.pauseMs, 0);
+  for (let index = 0; index < 150; index++) budget.recordThought(`想法 ${index}`);
+  assert.equal(budget.pauseMs, 30_000, "long monologue only caps the scheduler pause, never the ability");
+}
+
+function literalThoughtProtocol() {
+  const texts = ["一个想法", '引号"与反斜杠\\，换行\n和 emoji 🪴', '<think>这也是独白的字面内容</think> ``` {"name":"send"}',
+    '"); globalThis.__thoughtExecuted = true; think("'];
+  for (const text of texts) {
+    const encoded = `think(${JSON.stringify(text)})`;
+    for (const raw of [encoded, `<think>模型的前置推理</think>\n${encoded}`, `\`\`\`text\n${encoded}\n\`\`\``]) {
+      assert.deepEqual(extractToolCall(raw, ["think"]), { name: "think", arguments: { thought: text }, duration: undefined });
+    }
+    assert.deepEqual(extractToolCall(JSON.stringify({ name: "think", arguments: { thought: text } }), ["think"]).arguments, { thought: text },
+      "thought-like markup inside a JSON string is never removed as model reasoning");
+  }
+  assert.equal((globalThis as any).__thoughtExecuted, undefined, "the shorthand parses literal JSON without executing code");
+  for (const raw of ['think("x", "y")', 'think("x" + "y")', 'think(`x`)', 'think(() => "x")', 'think({"thought":"x"})',
+    'think("x"); {"name":"send","arguments":{}}', 'think("x")\nthink("y")', 'think("\\q")', 'think("unterminated)']) {
+    assert.throws(() => extractToolCall(raw, ["think", "send"]), error => error instanceof ToolCallParseError && !error.parsedCall,
+      "expressions, extra calls and invalid escaping must not fall through into an embedded JSON tool");
+  }
+  assert.throws(() => extractToolCall('think("关闭后也不能调用")', []), error => error instanceof ToolCallParseError && error.parsedCall?.name === "think");
+  const backend = new ChatBackend(Config({}).bot, ["think"], BOT_TOOLS) as any;
+  assert.deepEqual(backend.parseResult({ content: 'think("原生未返回时的正文")', toolCalls: [] }).arguments, { thought: "原生未返回时的正文" });
+  assert.deepEqual(backend.parseResult({ content: "", toolCalls: [{ id: "native-think", type: "function", function: { name: "think", arguments: '{"thought":"原生对象"}' } }] }).arguments,
+    { thought: "原生对象" });
+  assert.throws(() => backend.parseResult({ content: "", toolCalls: [{ id: "native-bad", type: "function", function: { name: "think", arguments: '"不是对象"' } }] }), /arguments/);
+}
+
+async function disabledThoughtUsesCurrentGateAndNextPrefix() {
+  const f = await fixture();
+  assert.equal(f.cfg.bot.thinkEnabled, true, "thinking is an independent default-on capability");
+  const before = await f.context.toChatMessages("T0", false);
+  f.cfg.bot.thinkEnabled = false; f.context.thinkEnabled = false;
+  const defs = availableTools({ tts: false, ops: f.cfg.platformOps, thinkEnabled: false });
+  assert.ok(!defs.some(def => def.name === "think"));
+  assert.ok(availableTools({ tts: false, ops: f.cfg.platformOps }).some(def => def.name === "think"));
+  f.context.setCurrentToolsText(renderToolsText(defs));
+  const backend = new ChatBackend(f.cfg.bot, BOT_TOOLS.map(def => def.name), BOT_TOOLS) as any;
+  let generations = 0;
+  backend.generate = async () => { generations++; return backend.parseResult({ content: 'think("现在不应执行")', toolCalls: [] }); };
+  f.agent.backend = backend;
+  f.agent.start(); await until(() => f.agent.status().awaitingToolRetry);
+  assert.equal(generations, 2);
+  assert.ok(!f.agent.currentToolNames().includes("think"));
+  assert.ok(!f.agent.currentToolNames(undefined, true).includes("think"), "includeBanned cannot bypass the independent config switch");
+  assert.ok(!f.agent.manualTools("avatar").some((tool: any) => tool.name === "think"));
+  assert.equal((await f.agent.injectExternalToolCall("think", { thought: "不应绕过关闭" })).ok, false);
+  assert.ok(!f.context.stream.some(entry => entry.kind === "event" && entry.event.experience?.internalThought));
+  await f.agent.drainMailbox(); await f.agent.drainMailbox();
+  assert.equal(f.context.stream.filter(entry => entry.kind === "event" && entry.event.content.startsWith("think 已由配置关闭")).length, 1);
+  assert.deepEqual((await f.context.toChatMessages("T1", false)).slice(0, before.length), before, "disabling a capability only appends facts to the current window");
+  await f.agent.stop();
+  await f.context.applyCompression({ historySummary: "调用被配置拒绝，没有执行。", memoryDigest: "" }, 20);
+  const after = String((await f.context.toChatMessages("T2", false))[0]!.content);
+  assert.doesNotMatch(after, /\bthink\b|## 内心独白/, "the next fixed block omits disabled built-in thought instructions");
+}
+
+async function committedConsciousnessGatesGeneration() {
+  const slow = slowWorld(); const f = await fixture(slow.world);
+  let generations = 0, aborted = false;
+  f.agent.backend.generate = async (_context: unknown, _time: string, signal: AbortSignal) => {
+    generations++;
+    if (generations === 1) return act("慢慢给绿植浇水");
+    if (generations === 2) return new Promise<ParsedToolCall>((_resolve, reject) => {
+      signal.addEventListener("abort", () => { aborted = true; reject(signal.reason); }, { once: true });
+    });
+    if (generations === 3) return thought("刚才的事情还记得，接下来再看看。");
+    return wait();
+  };
+  f.agent.start(); await until(() => generations === 2 && slow.pending.length === 1);
+  f.agent.attention = "phone"; f.agent.observingPlacedPhone = true;
+  assert.equal(f.agent.canViewDeviceScreen, true, "legacy unknown consciousness permits ordinary perception");
+  assert.equal(f.agent.deviceAttention, "phone");
+  f.agent.setConsciousness("unconscious");
+  await until(() => aborted && f.context.stream.some(entry => entry.kind === "event" && entry.event.content.includes("清醒状态记录：失去意识")));
+  assert.equal(f.agent.scheduler.pendingByName("act").length, 1, "loss of consciousness cancels new inference, not an already scheduled action");
+  assert.ok(!f.agent.currentToolNames().includes("think"));
+  assert.equal(f.agent.status().consciousness, "unconscious");
+  assert.equal(f.agent.status().thoughtRetryAt, null);
+  assert.equal(f.agent.canViewDeviceScreen, false);
+  assert.equal(f.agent.deviceAttention, null);
+  assert.equal(f.agent.attention, null);
+  assert.equal(f.agent.observingPlacedPhone, false);
+  assert.ok(!f.agent.currentToolNames(undefined, true).includes("think"), "includeBanned cannot bypass unconsciousness");
+  assert.equal((await f.agent.injectExternalToolCall("think", { thought: "不能越过昏迷" })).ok, false);
+  assert.ok(!f.agent.manualTools("avatar").some((tool: any) => tool.name === "think"));
+  f.agent.setConsciousness("unconscious");
+  f.agent.pushEvent("koishi", "新消息仍可进入事件记录。", { originEventIds: ["chat-message:while-unconscious"] });
+  await until(() => f.context.stream.some(entry => entry.kind === "event" && entry.event.content === "新消息仍可进入事件记录。"));
+  await sleep(20); assert.equal(generations, 2, "notifications cannot independently declare waking or restart generation");
+  assert.equal(f.context.stream.filter(entry => entry.kind === "event" && entry.event.content.includes("清醒状态记录：失去意识")).length, 1);
+  f.agent.setConsciousness("asleep"); await sleep(20); assert.equal(generations, 2);
+  f.agent.setConsciousness("awake");
+  await until(() => generations === 4 && !!f.agent.waiting);
+  assert.ok(f.agent.currentToolNames().includes("think"));
+  assert.equal(f.agent.consciousness, "awake", "wait/rest and pacing never manufacture sleep");
+  assert.equal(f.agent.status().consciousness, "awake");
+  assert.equal(f.agent.canViewDeviceScreen, true);
+  assert.equal(f.agent.deviceAttention, null, "waking alone does not claim renewed attention to an old screen");
+  assert.ok(!f.context.stream.some(entry => entry.kind === "tool_call" && entry.call.name === "rest"));
+  await f.agent.stop();
+
+  const sleeping = await fixture(); sleeping.agent.setConsciousness("asleep");
+  sleeping.agent.backend.generate = async () => { throw Error("sleeping character must not call the backend"); };
+  sleeping.agent.start(); await sleep(20);
+  await Promise.race([sleeping.agent.stop(), sleep(500).then(() => { throw Error("stop failed to interrupt consciousness wait"); })]);
 }
 
 async function main() {
   try {
     noSyntheticProgress();
+    literalThoughtProtocol();
     await localThoughtAndFrozenPrefix();
+    await disabledThoughtUsesCurrentGateAndNextPrefix();
+    await committedConsciousnessGatesGeneration();
     await slowActionAllowsThoughtAndIndependentWork();
     await repeatedUnavailableCallsBackoffAndRealResultWakes();
     await nonblockingActsRemainConcurrent();
